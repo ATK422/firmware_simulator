@@ -255,7 +255,9 @@ not modelled or not yet trusted:
   regressions, not to prove range or dynamics ([acoustics.md](docs/acoustics.md),
   [vehicles.md](docs/vehicles.md#limitations)).
 * **C board applications**: titan_firmware's C board apps need its prebuilt micro-ROS library (built in Docker),
-  so `scripts/build_c_firmware.sh` builds only the template, the Titan bootloader and its test app.
+  so `scripts/build_c_firmware.sh` builds only the template, the Titan bootloader and its test app. The firmware is
+  moving to its own nano-ROS, which needs no Docker; once that builds with the plain toolchain, the board apps can
+  join the build script and get smoke tests like the Rust images.
 
 **To verify locally.** The cloud environment this was built in has no vcan module or `CAP_NET_ADMIN`, ROS 2,
 Docker daemon, vhci-hcd module or hardware. These are written and statically checked, but never run for real:
