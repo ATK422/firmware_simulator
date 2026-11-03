@@ -14,6 +14,8 @@ use sim_core::time::Time;
 use sim_core::trace::{Category, WriterSink};
 use sim_host::Session;
 
+mod host_tools;
+
 #[derive(Parser)]
 #[command(version, about = "RP2040 emulator for UWRT titan firmware")]
 struct Cli {
@@ -29,6 +31,13 @@ enum Command {
     Run(RunArgs),
     /// Runs every board of a robot file on their shared CAN buses (and acoustic environment).
     Robot(RobotArgs),
+    /// Compares two CAN logs (hardware vs emulator, or two runs) by CANmore message: missing, extra and changed
+    /// messages, and the timing of each message stream. Exits with 1 if they differ.
+    CanDiff(host_tools::CanDiffArgs),
+    /// Prints the titan_bridge command line for each board of a robot file (or a script or launch file).
+    Bridges(host_tools::BridgesArgs),
+    /// Connects a SocketCAN interface to an emulator's `--cannelloni` tunnel over UDP.
+    CanTunnel(host_tools::TunnelArgs),
     /// What `picotool` does, against an emulated board in BOOTSEL mode.
     #[command(subcommand)]
     Picoboot(PicobootCommand),
@@ -94,6 +103,8 @@ struct RobotArgs {
     /// bridge on the board's bus.
     #[arg(long = "fault", value_parser = parse_robot_fault)]
     faults: Vec<(Time, String, sim_host::fault::Fault)>,
+    #[command(flatten)]
+    can_host: host_tools::CanHostArgs,
 }
 
 fn parse_board_udp(s: &str) -> Result<(String, String, String), String> {
@@ -200,6 +211,7 @@ fn robot(args: RobotArgs) -> Result<()> {
             v.keep_log(Time::from_ms(10));
         }
     }
+    let can_host = host_tools::attach_robot(&args.can_host, &mut r, &args.cans)?;
     r.realtime = args.realtime;
     let wall = std::time::Instant::now();
     let mut faults = faults.into_iter().peekable();
@@ -219,6 +231,7 @@ fn robot(args: RobotArgs) -> Result<()> {
     for s in r.boards.iter_mut() {
         s.flush_uarts();
     }
+    can_host.finish()?;
     eprintln!("stopped at {}; {:.2?} wall", r.now, wall.elapsed());
     for v in &r.vehicles {
         let s = &v.vehicle.state;
@@ -395,6 +408,8 @@ struct RunArgs {
     /// `3s@bridge-stop` (repeatable; see `sim_host::fault::Fault`'s `from_str` for the faults).
     #[arg(long = "fault", value_parser = parse_fault)]
     faults: Vec<(Time, sim_host::fault::Fault)>,
+    #[command(flatten)]
+    can_host: host_tools::CanHostArgs,
 }
 
 fn parse_input(s: &str) -> Result<(String, f64), String> {
@@ -611,6 +626,7 @@ fn run(args: RunArgs) -> Result<()> {
         bail!("--can and --mock-bridge need a --board with a CAN bus (or Ethernet), --udp one with Ethernet");
     }
     session.realtime = args.realtime;
+    let can_host = host_tools::attach_run(&args.can_host, &mut session)?;
 
     let wall = std::time::Instant::now();
     if let Some(addr) = &args.gdb {
@@ -649,6 +665,7 @@ fn run(args: RunArgs) -> Result<()> {
     };
     let elapsed = wall.elapsed();
     session.flush_uarts();
+    can_host.finish()?;
     for (ch, bytes) in session.rtt_text.drain(..) {
         print!("[rtt{ch}] {}", String::from_utf8_lossy(&bytes));
     }
@@ -751,6 +768,16 @@ fn main() -> Result<()> {
                 _ => unreachable!(),
             }
         }
+        Command::CanDiff(args) => match host_tools::can_diff(args) {
+            Ok(true) => Ok(()),
+            Ok(false) => std::process::exit(1),
+            Err(e) => {
+                eprintln!("error: {e:#}");
+                std::process::exit(2)
+            }
+        },
+        Command::Bridges(args) => host_tools::bridges(args),
+        Command::CanTunnel(args) => host_tools::can_tunnel(args),
     }
 }
 

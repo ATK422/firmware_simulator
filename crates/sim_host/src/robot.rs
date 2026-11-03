@@ -179,9 +179,13 @@ impl Robot {
                     rb.endpoints.iter_mut().map(|e| &mut **e as &mut dyn CanEndpoint).collect();
                 let before = rb.bus.record.as_ref().map_or(0, |r| r.len());
                 rb.bus.step(&mut nodes, &mut eps, t);
-                if let (Some(rec), Some(hook)) = (&rb.bus.record, &mut rb.on_can) {
+                if let (Some(rec), Some(hook)) = (&mut rb.bus.record, &mut rb.on_can) {
                     for r in &rec[before..] {
                         hook(r);
+                    }
+                    // The callback has seen the history; keep memory bounded on long runs (`--candump-log`)
+                    if rec.len() > 100_000 {
+                        rec.drain(..50_000);
                     }
                 }
             }
