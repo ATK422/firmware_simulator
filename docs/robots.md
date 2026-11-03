@@ -107,7 +107,7 @@ as `[t] NAME uart0: ...`); the run ends with the stop time, the wall time and ea
 | `--trace KINDS`, `--trace-board NAMES`, `--trace-file FILE` | | Traces the boards ([below](#traces-profiles-waveforms-and-the-dashboard)) |
 | `--profile-dir DIR`, `--profile-interval T` | `10us` | Profiles every board's firmware |
 | `--vcd FILE`, `--vcd-pins SPEC`, `--vcd-events` | all pins | A VCD waveform with a scope per board (and per bus) |
-| `--dashboard ADDR`, `--dashboard-hold` | | A live dashboard of all boards, buses and vehicles |
+| `--dashboard ADDR`, `--dashboard-hold`, `--dashboard-pause-at T` | | A live dashboard of all boards, buses and vehicles |
 | `--log-json FILE` | | Every log line, UART line, CAN frame and fault as JSON lines |
 | `--unmodelled MODE` | `summary` | Registers the emulator does not model, as for `run` ([running.md](running.md#traces)): one note, then a line per board at the end listing them; `first`, `every` or `off` |
 
@@ -155,6 +155,7 @@ The developer tools of `run` work on robots too ([tools.md](tools.md) has their 
 | `--vcd-events` | off | Adds each board's logs, UART lines, CAN frames and device reports, and a scope per bus with its frames |
 | `--dashboard ADDR` | | Serves the live dashboard: every board, every bus's traffic and load, the mock bridges' decoded firmware status, the vehicles; faults and inputs are posted per board |
 | `--dashboard-hold` | off | Keeps serving after the run ends |
+| `--dashboard-pause-at T` | | Pauses virtual time when it reaches `T` (`0`: from the start); resume from the page |
 | `--log-json FILE` | | JSON lines with each record's board or bus |
 
 ```bash

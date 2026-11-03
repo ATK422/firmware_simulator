@@ -1,7 +1,8 @@
-# Developer tools: profiler, waveforms, dashboard, JSON logs
+# Developer tools: profiler, waveforms, dashboard, MCP server, JSON logs
 
 Tools for looking inside a run, on `run` and `robot` alike: a sampling profiler of the firmware, VCD waveforms of
-the pins, a live dashboard in the browser, and a JSON lines log for scripts. None of them changes what a
+the pins, a live dashboard in the browser, an MCP server that gives coding agents the same as structured tools,
+and a JSON lines log for scripts. None of them changes what a
 single-core program does, and none costs anything per instruction: they cut runs at chosen times, or read trace
 events and state between slices. How to switch them on is in [running.md](running.md#profiles-waveforms-dashboard-and-json-logs)
 and [robots.md](robots.md#traces-profiles-waveforms-and-the-dashboard); this page covers what they produce and how
@@ -11,6 +12,7 @@ they work.
 - [Profiler](#profiler)
 - [Waveforms (VCD)](#waveforms-vcd)
 - [Dashboard](#dashboard)
+- [MCP server](#mcp-server)
 - [JSON log](#json-log)
 - [Robot traces](#robot-traces)
 - [To verify locally](#to-verify-locally)
@@ -22,6 +24,7 @@ they work.
 | Profiler | `--profile FILE` | `--profile-dir DIR` | Functions by time per core, and folded stacks for flame graphs | `sim_host::profile`, `unwind`, `demangle` |
 | Waveforms | `--vcd FILE` | `--vcd FILE` | VCD of the GPIOs, optionally with decoded traffic | `sim_host::vcd` |
 | Dashboard | `--dashboard ADDR` | `--dashboard ADDR` | A live page and JSON API, with fault, input and pause controls | `sim_host::dashboard`, `dashboard.html` |
+| MCP server | `firmware_simulator mcp` | | Tools for coding agents: run the emulator, read state, logs and CAN frames, inject faults, set inputs, pause | `src/mcp/` |
 | JSON log | `--log-json FILE` | `--log-json FILE` | One JSON object per log line, UART line, CAN frame, fault | `sim_host::jsonlog` |
 | Traces | `--trace KINDS` | `--trace KINDS`, `--trace-board` | Text lines per event ([running.md](running.md#traces)) | `sim_core::trace` |
 
@@ -182,6 +185,7 @@ curl -s -X POST -d '{"board": "camera_cage", "fault": "i2c-absent:0x76"}' http:/
 |---|---|---|
 | `--dashboard ADDR` | | Serves the page and its API on `ADDR` (`127.0.0.1:8080`) while the run goes |
 | `--dashboard-hold` | off | Keeps serving the final state after the run ends, until interrupted |
+| `--dashboard-pause-at T` | | Pauses virtual time when it reaches `T` (`0`: from the start, after the first 10 ms piece), to be resumed from the page or the API |
 
 The page (self-contained, no external scripts or fonts) shows, per board: the cores' states and the functions they
 are in, log and UART lines, the titan_link `FirmwareStatus` a mock bridge decoded (CAN or Puddles Ethernet, fault
@@ -207,21 +211,52 @@ theme.
 | Request | Answer |
 |---|---|
 | `GET /` | The page |
-| `GET /api/state` | The state as JSON, rebuilt every 200 ms of wall time |
+| `GET /api/state` | The state as JSON, rebuilt every 200 ms of wall time; with `?fresh=1` the run loop builds one first (within a 10 ms piece) |
+| `GET /api/logs?since=SEQ&max=N&board=NAME&tail=1` | Log and UART lines after a cursor, read live ([below](#incremental-reads)) |
+| `GET /api/frames?bus=NAME&since=SEQ&max=N&id=ID&mask=MASK&tail=1` | CAN frames after a cursor, read live |
 | `POST /api/fault` `{"board": "esc0", "fault": "can-stuck"}` | Applies a fault, in the `--fault` syntax ([faults.md](faults.md)); `run` takes its board's name or no `board` |
 | `POST /api/input` `{"board": "camera_cage", "name": "depth.pressure_pa", "value": 120000}` | Sets a physical input |
-| `POST /api/pause` `{"paused": true}` | Pauses or resumes virtual time |
+| `POST /api/pause` `{"paused": true}` | Pauses or resumes virtual time; with `"at_s": 2.5`, pausing waits for that virtual time, and resuming runs until it and pauses again |
 
 A POST is answered once the run loop has applied it and published the new state: 200 with `{"ok": true,
 "message": ...}`, 400 for a malformed request (bad JSON, an unknown fault spelling), 422 when it could not be
-applied (no such board or input, a fault that does not fit the board), 503 once the run is over. Other paths give
-404, other methods 405.
+applied (no such board or input, a fault that does not fit the board, resuming until a time already past), 503
+once the run is over. Other paths give 404, other methods 405. A pause at a time takes effect at the first 10 ms
+piece that reaches it, and the state is published then.
 
-The state has `time_s`, `wall_s`, `speed` (virtual seconds per wall second), `paused`, `realtime`, `finished`,
+The state has `time_s`, `wall_s`, `speed` (virtual seconds per wall second), `paused`, `pause_at_s`, `realtime`,
+`finished`,
 `faults` (every fault applied, from the command line or the page, with its outcome) and `fault_help` at the top,
 then `boards` (each with `name`, `image`, `powered`, `resets`, `cores`, `gpio`, `leds`, `strips`, `escs`,
-`inputs`, `logs`, `link`, and its `bus` in a robot), `buses`, `links` (the mock bridges and what they decoded) and
-`vehicles`.
+`inputs`, `logs` (the last 120 lines), `link`, and its `bus` in a robot), `buses` (with the last 40 frames),
+`links` (the mock bridges and what they decoded) and `vehicles`.
+
+### Incremental reads
+
+`/api/logs` and `/api/frames` read what the run loop has collected so far, not the last published state, so a
+client can poll them for what is new:
+
+```bash
+curl -s 'http://127.0.0.1:8080/api/logs?since=0&max=100'            # every board's lines, oldest first
+curl -s 'http://127.0.0.1:8080/api/logs?board=esc0&since=412&tail=1&max=20'
+curl -s 'http://127.0.0.1:8080/api/frames?bus=internal&id=0x1020800&mask=0x1ffff00&max=50'
+```
+
+| Parameter | Default | Meaning |
+|---|---|---|
+| `since` | `0` | Return what came after this sequence number (lines: counted across all boards; frames: the bus's frame count) |
+| `max` | `200` | At most this many (at most 2000) |
+| `tail` | off | The newest `max` after `since` instead of the oldest |
+| `board` (logs) | all | One board's lines |
+| `bus` (frames) | the only bus | Which bus; required when there are several |
+| `id`, `mask` (frames) | all | Only frames with `frame_id & mask == id & mask` (hex `0x...` or decimal; the mask defaults to all bits) |
+
+Both answer `{time_s, paused, finished, next, more, truncated, ...}` with `lines` (`seq`, `board`, `t`, `kind`:
+the defmt level or `uart0`/`uart1`, `text`) or `frames` (the [JSON log](#json-log)'s `can` records plus `seq`,
+with the bus's `total`). Read on with `since=next`: it neither repeats nor skips anything (for the same `board`
+or filter). `more` says there was more than `max`; `truncated` that some of what came after `since` was already
+dropped (2000 lines are kept per board, 2000 frames per bus). `time_s`, `paused` and `finished` are where the run
+is as of the last 10 ms piece. 400 for an unknown board or bus, or a malformed number.
 
 ### How it fits the run loop
 
@@ -232,6 +267,101 @@ device models, the mock bridges' records). With `--threads` the worker threads a
 session already runs in 100 µs slices and a robot's slices do not change, so a dashboard does not change the
 run. It works with `--realtime`: pacing carries across the pieces, and resuming after a pause starts pacing afresh
 so the run does not race to catch up.
+
+## MCP server
+
+`firmware_simulator mcp` is a [Model Context Protocol](https://modelcontextprotocol.io) server for coding agents
+(Claude Code and other MCP clients): through its tools an agent starts emulator runs, reads boards' state, log
+lines and CAN traffic as JSON, and drives a run (faults, inputs, pause), without opening the dashboard page. It
+speaks MCP's stdio transport (JSON-RPC 2.0, one message per line on stdin and stdout; protocol revisions
+2025-11-25 back to 2024-11-05) and logs to stderr (`RUST_LOG=debug` logs every tool call).
+
+### Setup
+
+Build the emulator first; the server runs the binary it is part of, and starts emulators from it:
+
+```bash
+cargo build --release
+```
+
+**Claude Code, in this repository.** The repository's [`.mcp.json`](../.mcp.json) declares the server as
+`./target/release/firmware_simulator mcp`. Claude Code starts it in the directory `claude` was started in, which
+is what that path and the paths in tool arguments are relative to, so start `claude` at the repository root. It
+asks once whether to use the project's servers; `/mcp` in a session shows the server and its tools.
+
+**Claude Code, from anywhere.** Register the binary by its absolute path (for one user, every project):
+
+```bash
+claude mcp add --scope user firmware_simulator -- $PWD/target/release/firmware_simulator mcp
+claude mcp list
+```
+
+Paths in tool arguments are then relative to wherever `claude` runs; give absolute ones, or `cwd` on `run_once`
+and `start`.
+
+**Other MCP clients.** Configure a stdio server with command `/path/to/firmware_simulator`, arguments `["mcp"]`
+and the repository as working directory. The server passes its environment on to the emulators, so set
+`TITAN_RS_RELEASE_DIR` there if the firmware is built elsewhere.
+
+### Tools
+
+| Tool | What it does |
+|---|---|
+| `run_once` | Runs a command (`args`: `["run", IMAGE, ...]`, `["robot", ROBOT, ...]`, `can-diff`, `bridges`, ...) to the end, with a `time` limit and a wall-clock `timeout_s`; returns its console output (long output keeps its start and end; `grep` narrows it), exit status and final `stopped at` line |
+| `start` | Starts `run`, `robot` or `picoboot load` in the background with its dashboard on a free port, optionally `realtime` and set to pause at `pause_at_s`; returns a session id, the boards and buses |
+| `attach` | Attaches to an emulator someone started with `--dashboard ADDR`, by its URL |
+| `list`, `stop` | Lists the sessions; stops one (kills the emulator, or detaches) and returns the end of its console |
+| `state` | The state, compact: per board cores, LEDs, inputs, the bridge's decoded firmware status, strips, ESCs and the last log lines; buses; vehicles; faults applied. `board` and `sections` narrow it, `gpio` adds pins, `full` gives the dashboard's JSON |
+| `logs` | Log and UART lines after a cursor (`since`, pass back `next`), of one board or all, filtered by `kinds` (`warn`, `error`, `uart0`, ...) and `grep` |
+| `can_frames` | Frames on a bus after a cursor, filtered by `id` and `mask` |
+| `inject_fault`, `set_input` | A fault in the `--fault` spelling ([faults.md](faults.md)), a physical input |
+| `pause`, `resume` | Pause now or at `at_s`; resume, optionally for `for_s` or until `until_s` |
+| `wait_for` | Blocks until a board logs a line matching `pattern` (substring, or `regex`), or virtual time reaches `time_s`, or `timeout_s` of wall time passes; returns early if the run is paused or over. `pause` pauses the run when it happens |
+| `console` | The console output of a started emulator: setup messages, `--candump` lines, and after the run its stop line and the unmodelled-register table |
+
+Tool errors (an unknown board, a fault that does not fit, a run that has ended) come back as results with
+`isError`, for the agent to read; unknown tools, methods and malformed messages as JSON-RPC errors. Results carry
+the JSON both as text and as `structuredContent`.
+
+### Example session
+
+What an agent's calls look like on the wire, one line each (`>` to the server, `<` back; answers shortened to
+their `structuredContent`):
+
+```
+> {"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"script","version":"0"}}}
+< {"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2025-06-18","capabilities":{"tools":{"listChanged":false}},"serverInfo":{"name":"firmware_simulator",...},"instructions":"..."}}
+> {"jsonrpc":"2.0","method":"notifications/initialized"}
+> {"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"start","arguments":{"args":["robot","robots/talos.toml","--mock-bridge","internal:1"],"time":"60s","pause_at_s":1.5}}}
+< {"session":"s1","url":"http://127.0.0.1:35505/","boards":["poac","esc0","esc1","camera_cage","actuator","led","sbc","ivc","battery"],"buses":["internal","external"],...}
+> {"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"wait_for","arguments":{"time_s":1.5}}}
+< {"matched":"time","time_s":1.5,"paused":true,"next":37,...}
+> {"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"inject_fault","arguments":{"board":"camera_cage","fault":"i2c-absent:0x76"}}}
+< {"ok":true,"message":"i2c-absent:0x76 applied to camera_cage"}
+> {"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"resume","arguments":{"for_s":3}}}
+< {"ok":true,"message":"running until 4.500000s"}
+> {"jsonrpc":"2.0","id":6,"method":"tools/call","params":{"name":"wait_for","arguments":{"board":"camera_cage","pattern":"Depth sensor","since":37}}}
+< {"matched":"log","line":{"seq":38,"board":"camera_cage","t":1.5217,"kind":"error","text":"1.389772 ERROR Depth sensor failed: Comm(NoAcknowledge)"},"next":38,...}
+> {"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"name":"can_frames","arguments":{"bus":"internal","max":2,"tail":true}}}
+< {"frames":[{"seq":81,"t":1.400676488,"id":"0x1020801","data":"00","candump":"01020801##100","acked":true,"sender":"node 0",...},...],"next":82,...}
+> {"jsonrpc":"2.0","id":8,"method":"tools/call","params":{"name":"stop","arguments":{}}}
+< {"session":"s1","stopped":"killed by signal 9","console_tail":[...]}
+```
+
+In full, a tool result is `{"content":[{"type":"text","text":"<the JSON>"}],"structuredContent":<the JSON>,
+"isError":false}`.
+
+### How it works
+
+Each tool call runs on its own thread, so a long `wait_for` or `run_once` does not hold up others. `start` runs
+the emulator as a child process with `--dashboard 127.0.0.1:0 --dashboard-hold` (and `--dashboard-pause-at` for
+`pause_at_s`, so that a fast run cannot get past it first), reads the port from its `dashboard on http://...`
+line and waits for the first state; the other tools use the [dashboard API](#api) and its
+[incremental reads](#incremental-reads). `--dashboard-hold` keeps a finished run's state readable until `stop`.
+The children's console output is collected (the last 10 000 lines) and never reaches the server's stdout. When
+stdin closes the server kills its emulators and exits; on Linux they are also spawned to die with it
+(`PR_SET_PDEATHSIG`) if it is killed. The tools run whatever `firmware_simulator` command they are given, as the
+user running the client: options such as `--vcd` and `--flash-file` write files.
 
 ## JSON log
 
@@ -279,5 +409,7 @@ Not available where this was built:
   `robot robots/talos.toml --mock-bridge internal:1 --realtime --dashboard 127.0.0.1:8080`, with the fault, input
   and pause controls. Its script is tested under Node against a stub DOM with real states
   (`crates/sim_host/tests/dashboard_page.rs`), and the API over loopback (`crates/sim_host/tests/dashboard.rs`).
+* The MCP server from Claude Code itself (`.mcp.json` approval, `/mcp`, an agent using the tools). It is tested
+  end to end with a scripted JSON-RPC client over its stdio (`tests/mcp.rs`).
 * Rendering the folded stacks with `inferno-flamegraph` or `flamegraph.pl`, and loading them in speedscope.
 * Rebuilding titan_firmware_rs with embassy-rp's `rom-func-cache` and profiling IVCBoard2 again.
