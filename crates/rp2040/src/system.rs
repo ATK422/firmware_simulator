@@ -27,7 +27,7 @@ use crate::periph::gpio::{BankDrive, Drive, Gpio, func};
 use crate::periph::i2c::{I2c, Step, StepResult};
 use crate::periph::pio::{self, Pio};
 use crate::periph::pwm::Pwm;
-use crate::periph::sio::Sio;
+use crate::periph::sio::{self, Sio};
 use crate::periph::spi::Spi;
 use crate::periph::ssi::{IoQspi, Ssi};
 use crate::periph::sysctl::{self, Psm, Resets, Vreg, bit, psm};
@@ -126,6 +126,12 @@ pub struct System {
     /// Time base of the PIO cycle count: `clk_sys` cycle `.1` was at time `.0`.
     pio_base: (Time, u64),
     in_pio: bool,
+    /// Reads of PIO registers that change nothing skip the second advance (on by default; off to check that it
+    /// changes nothing).
+    pub pio_fast_reads: bool,
+    /// SIO accesses other than to the FIFOs leave the interrupt lines alone (on by default; off to check that it
+    /// changes nothing).
+    pub sio_fast_irqs: bool,
     /// PIO IRQ lines after the last advance.
     pio_lines: u8,
     /// Pin drives and wake-ups devices scheduled for later.
@@ -218,6 +224,8 @@ impl System {
             pio: [Pio::new(0), Pio::new(1)],
             pio_base: (Time::ZERO, 0),
             in_pio: false,
+            pio_fast_reads: true,
+            sio_fast_irqs: true,
             pio_lines: 0,
             wire: WireQueue::default(),
             pin_devices: Vec::new(),
@@ -662,8 +670,11 @@ impl System {
         let level = self.gpio.level;
         let mut immediate = false;
         for dev in &mut self.pin_devices {
-            for pin in 0..NUM_GPIOS as u8 {
-                if changed & (1 << pin) != 0 && dev.watches(pin) {
+            let mut pins = changed & ((1 << NUM_GPIOS) - 1);
+            while pins != 0 {
+                let pin = pins.trailing_zeros() as u8;
+                pins &= pins - 1;
+                if dev.watches(pin) {
                     let mut ctx =
                         DevPins { now, gpio: &mut self.gpio, freqs: &self.freqs, changed: false, wire: &mut self.wire };
                     dev.pin_changed(&mut ctx, pin, level & (1 << pin) != 0);
@@ -1275,7 +1286,10 @@ impl System {
             }
             let gpio_in = self.gpio.inputs();
             if let Some(v) = self.sio.read(core, addr - SIO_BASE, gpio_in, self.io_qspi.levels()) {
-                self.irq_dirty = true;
+                // Of SIO's interrupts (the FIFOs'), only a FIFO pop can change one
+                if !self.sio_fast_irqs || addr - SIO_BASE == sio::FIFO_RD {
+                    self.irq_dirty = true;
+                }
                 return v;
             }
             return self.unmodelled.read(trace, now, core, addr);
@@ -1316,8 +1330,12 @@ impl System {
             PIO0_BASE | PIO1_BASE => {
                 self.pio_advance(trace, now);
                 let v = self.pio[(base == PIO1_BASE) as usize].read(off);
-                self.irq_dirty = true;
-                self.pio_advance(trace, now);
+                // A read that changed nothing needs nothing more (another advance at the same time would only find
+                // the same interrupt lines and schedule the same next advance)
+                if !(self.pio_fast_reads && Pio::read_is_pure(off)) {
+                    self.irq_dirty = true;
+                    self.pio_advance(trace, now);
+                }
                 v
             }
             I2C0_BASE | I2C1_BASE => {
@@ -1359,7 +1377,10 @@ impl System {
                 self.pio_advance(trace, now);
             }
             if self.sio.write(core, addr - SIO_BASE, value) {
-                self.irq_dirty = true;
+                // Only the FIFOs' interrupts are SIO's (GPIO changes flag the lines in `update_pins`)
+                if !self.sio_fast_irqs || matches!(addr - SIO_BASE, sio::FIFO_ST | sio::FIFO_WR) {
+                    self.irq_dirty = true;
+                }
                 if addr - SIO_BASE < 0x50 {
                     self.update_pins(trace, now);
                 }
@@ -2013,6 +2034,12 @@ pub struct BatchBus<'a> {
     ticked: bool,
     /// An access since the last [`Bus::take_slow_access`] went through the general path.
     slow: bool,
+    /// An access in the batch went through the general path or read the timer.
+    touched: bool,
+    /// End the batch after an access that goes through the general path (a fused batch, see
+    /// `Machine::run_until`: such an access may schedule an event or wake the other core, which the machine must
+    /// look at by the end of the quantum).
+    pub end_on_slow: bool,
 }
 
 /// What a batch touched, for busy-wait skipping (see `Machine::run_until`).
@@ -2056,7 +2083,15 @@ impl<'a> BatchBus<'a> {
             timer_ticks: None,
             ticked: false,
             slow: false,
+            touched: false,
+            end_on_slow: false,
         }
+    }
+
+    /// Whether an access in the batch went through the general path (reached a peripheral or found XIP not set
+    /// up) or read the timer.
+    pub fn touched(&self) -> bool {
+        self.touched
     }
 
     /// Whether the batch only read memory (and the timer, always at the same tick count), writing nothing: then
@@ -2102,6 +2137,10 @@ impl<'a> BatchBus<'a> {
     fn xip_check(&mut self, addr: u32) -> Result<(), BusFault> {
         self.noisy = true;
         self.slow = true;
+        self.touched = true;
+        if self.end_on_slow {
+            self.after |= Self::ATTENTION;
+        }
         let now = self.now();
         self.sys.xip_check(now, addr)
     }
@@ -2113,6 +2152,12 @@ impl<'a> BatchBus<'a> {
         let now = self.now();
         match self.sys.timer.read(&self.sys.watchdog.tick, now, addr & 0xFFC) {
             Some(v) => {
+                // A fused batch ends here too: polling the timer is what busy-waits do, and the machine only finds
+                // those at quantum boundaries
+                self.touched = true;
+                if self.end_on_slow {
+                    self.after |= Self::ATTENTION;
+                }
                 let ticks = self.sys.watchdog.tick.ticks(now);
                 if self.timer_ticks.is_some_and(|t| t != ticks) {
                     self.ticked = true;
@@ -2148,6 +2193,12 @@ impl<'a> BatchBus<'a> {
     fn after_access(&mut self, now: Time) {
         let s = &mut *self.sys;
         self.xip_ok = s.xip_ready_from(now);
+        self.touched = true;
+        if self.end_on_slow {
+            // The machine takes over (the rest of the quantum is not fused) and refreshes the interrupt lines
+            self.after |= Self::ATTENTION;
+            return;
+        }
         if s.clk_sys_changed || s.reset_request.is_some() || s.psm_forced_off != 0 || s.psm_released != 0 {
             // The machine handles these, then refreshes the interrupt lines
             self.after |= Self::ATTENTION;
@@ -2605,5 +2656,107 @@ mod tests {
             sys.update_pins(&mut NullSink, Time::from_us(10 * i + 10));
         }
         assert_eq!(r(&mut sys, Time::from_us(60), PWM_BASE + 8), 5);
+    }
+
+    /// PIO reads that change nothing skip the second advance (`System::pio_fast_reads`): the interrupt lines the run
+    /// loop sees, the next PIO advance and what is read must be as with it. A state machine fills its RX FIFO and
+    /// stalls; the CPU polls FSTAT and pops the FIFO (unstalling the machine and dropping RX-not-empty), with and
+    /// without time passing in between.
+    #[test]
+    fn pio_fast_reads_change_nothing() {
+        let run = |fast: bool| {
+            let mut sys = quiet();
+            sys.pio_fast_reads = fast;
+            let mut log = Vec::new();
+            w(&mut sys, Time::ZERO, RESETS_BASE + 0x3000, 1 << 10); // PIO0 out of reset
+            w(&mut sys, Time::ZERO, PIO0_BASE + pio::INSTR_MEM0, 0x8020); // push block (then jmp 0 from empty memory)
+            w(&mut sys, Time::ZERO, PIO0_BASE + 0x12C, 1); // IRQ0_INTE: SM0 RX not empty
+            w(&mut sys, Time::ZERO, PIO0_BASE + pio::CTRL, 1);
+            // The run loop's view of the interrupt lines
+            let mut seen = sys.irq_lines_both();
+            sys.irq_dirty = false;
+            let mut t = Time::from_us(5);
+            for i in 0..40u64 {
+                let off = match i % 5 {
+                    0 | 2 => pio::FSTAT,
+                    1 => pio::FLEVEL,
+                    _ => pio::RXF0,
+                };
+                let v = r(&mut sys, t, PIO0_BASE + off);
+                if sys.irq_dirty {
+                    sys.irq_dirty = false;
+                    seen = sys.irq_lines_both();
+                }
+                assert_eq!(seen, sys.irq_lines_both(), "read {i}: the lines changed without irq_dirty");
+                log.push((t, off, v, seen, sys.sched.next_time()));
+                if i % 7 == 6 {
+                    t += Time::from_ns(40);
+                }
+            }
+            log
+        };
+        let fast = run(true);
+        assert!(fast.iter().any(|e| e.1 == pio::RXF0 && e.3[0] & 1 << irq::PIO0_IRQ_0 == 0), "{fast:?}");
+        assert!(fast.iter().any(|e| e.3[0] & 1 << irq::PIO0_IRQ_0 != 0), "{fast:?}");
+        assert_eq!(fast, run(false));
+    }
+
+    /// SIO accesses other than to the FIFOs leave the interrupt lines alone (`System::sio_fast_irqs`): after every
+    /// access the lines the run loop would see must be the current ones, and everything read the same as with every
+    /// access flagging the lines. The cores pass words through the FIFOs (raising and dropping SIO_IRQ_PROCn, with
+    /// overflow and underflow errors) between GPIO, spinlock and divider accesses.
+    #[test]
+    fn sio_fast_irqs_change_nothing() {
+        let run = |fast: bool| {
+            let mut sys = quiet();
+            sys.sio_fast_irqs = fast;
+            let mut seen = sys.irq_lines_both();
+            sys.irq_dirty = false;
+            let mut log = Vec::new();
+            let accesses: &[(u8, bool, u32, u32)] = &[
+                (0, true, sio::FIFO_WR, 1),
+                (0, false, 0x100, 0), // SPINLOCK0
+                (1, false, sio::FIFO_ST, 0),
+                (0, true, 0x024, 1 << 3), // GPIO_OE_SET
+                (1, false, sio::FIFO_RD, 0),
+                (1, false, sio::FIFO_RD, 0), // underflow: ROE
+                (0, true, 0x100, 0),
+                (1, true, sio::FIFO_ST, 0), // clears the errors
+                (0, true, sio::FIFO_WR, 2),
+                (0, true, sio::FIFO_WR, 3),
+                (0, false, 0x004, 0), // GPIO_IN
+                (0, true, sio::FIFO_WR, 4),
+                (0, true, sio::FIFO_WR, 5),
+                (0, true, sio::FIFO_WR, 6), // overflow: WOF
+                (0, true, 0x060, 7),        // DIV_UDIVIDEND
+                (0, false, 0x070, 0),       // DIV_QUOTIENT
+                (0, true, 0x014, 1 << 3),   // GPIO_OUT_SET
+                (1, false, sio::FIFO_RD, 0),
+                (0, true, sio::FIFO_ST, 0),
+                (1, false, sio::FIFO_RD, 0),
+                (1, false, sio::FIFO_RD, 0),
+                (1, false, sio::FIFO_RD, 0),
+            ];
+            for (i, &(core, write, off, v)) in accesses.iter().enumerate() {
+                let t = Time::from_ns(10 * i as u64);
+                let r = if write {
+                    sys.write(&mut NullSink, core, t, SIO_BASE + off, Size::Word, v).unwrap();
+                    0
+                } else {
+                    sys.read(&mut NullSink, core, t, SIO_BASE + off, Size::Word).unwrap()
+                };
+                if sys.irq_dirty {
+                    sys.irq_dirty = false;
+                    seen = sys.irq_lines_both();
+                }
+                assert_eq!(seen, sys.irq_lines_both(), "access {i}: the lines changed without irq_dirty");
+                log.push((r, seen));
+            }
+            log
+        };
+        let fast = run(true);
+        let fifo = |l: &[u32; 2]| l[0] >> irq::SIO_IRQ_PROC0 & 1 | l[1] >> irq::SIO_IRQ_PROC1 & 1;
+        assert!(fast.iter().any(|e| fifo(&e.1) != 0) && fast.iter().any(|e| fifo(&e.1) == 0), "{fast:?}");
+        assert_eq!(fast, run(false));
     }
 }
