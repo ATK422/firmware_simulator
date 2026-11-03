@@ -160,9 +160,9 @@ attached device, `sys.gpio.input(pin)`, `sys.pin_device::<T>()`, `sys.i2c_device
 
 ## Inputs
 
-Setting an input takes effect at the next ADC conversion or sensor read. Values a board
-starts with come from its board file; change them there (or in `edit_board`) for a different starting point, since
-the firmware may read them during boot. A vehicle drives pressure inputs itself ([vehicles.md](vehicles.md)).
+Setting an input takes effect at the next ADC conversion or sensor read. The values a board starts with come
+from its board file; change them there (or with `edit_board`) for a different starting point, since the firmware
+may read them during boot. A vehicle drives pressure inputs itself ([vehicles.md](vehicles.md)).
 
 ## Faults
 

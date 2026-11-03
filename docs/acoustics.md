@@ -124,7 +124,9 @@ A transducer with only `receive` is a hydrophone, one with only `drive` a projec
 ## One board in an environment
 
 `run --environment FILE --position X,Y,Z` puts a board's hydrophone in an environment (its projector is not
-used: there is nobody to hear it). IVCBoard2 in pinger mode hears the environment's pinger:
+used: there is nobody to hear it). IVCBoard2 hears the pool's pinger; it reports the pinger's amplitude once the
+host sends `HostToDevice::Ivc2(ivc2::HostToDevice::PingerEnable(true))`, which a test does (the CLI's mock bridge
+only pings):
 
 ```bash
 firmware_simulator run $FW/ivc_board2 --board boards/talos/ivc_board.toml --mock-bridge 8 \
@@ -135,8 +137,8 @@ firmware_simulator run $FW/ivc_board2 --board boards/talos/ivc_board.toml --mock
 as the environment's transmission loss predicts. The ADC reads the hydrophone voltage at the exact time of each
 conversion.
 
-In code, `sim_acoustics::Hydrophone::record` keeps what a hydrophone produced and `recording_wav(rate)` writes it
-as a WAV file for inspection.
+In code, `sim_acoustics::Hydrophone::record` keeps every ADC sample a hydrophone produced and
+`recording_wav(rate)` turns them into a WAV file (`sim_acoustics::wav`) for inspection.
 
 ## The shared medium: boards hearing each other
 
