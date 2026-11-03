@@ -801,6 +801,10 @@ impl Pio {
                     s.isr = 0;
                     s.isr_count = 0;
                 } else {
+                    // With autopull, PULL is a no-op on a full OSR (datasheet 3.4.7.2: a fence against autopull)
+                    if s.autopull() && s.osr_count == 0 {
+                        return done;
+                    }
                     if if_cond && s.osr_count < s.pull_thresh() {
                         return done;
                     }

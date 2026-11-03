@@ -529,3 +529,19 @@ fn bidirectional_dshot_reply_wait_is_skipped() {
     }
     assert!(total > 10_000, "{total} ticks skipped");
 }
+
+#[test]
+fn pull_is_a_no_op_when_autopull_has_filled_the_osr() {
+    // Datasheet 3.4.7.2: with autopull enabled, PULL is a no-op if the OSR is full (a fence against autopull).
+    // OUT X, 32 autopulls A, shifts it out and refills the OSR with B; the PULL then must not discard B for C.
+    let mut p = pio(&[out(1, 32), pull(false, true), mov(2, 0, 7), jmp(0, 3)]);
+    w(&mut p, reg(0, SHIFTCTRL), 1 << 17); // autopull, threshold 32
+    for v in [0xA, 0xB, 0xC] {
+        w(&mut p, TXF0, v);
+    }
+    start(&mut p, 1);
+    p.run(10, 0);
+    let (_, x, y, _, _) = p.sm_regs(0);
+    assert_eq!((x, y), (0xA, 0xB), "PULL kept the autopulled word");
+    assert_eq!(p.read(FLEVEL).unwrap() & 0xF, 1, "C is still in the TX FIFO");
+}

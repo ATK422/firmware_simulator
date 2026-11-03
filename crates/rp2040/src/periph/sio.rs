@@ -124,7 +124,12 @@ pub struct Interp {
     pub accum: [u32; 2],
     pub base: [u32; 3],
     pub ctrl: [u32; 2],
+    /// PEEK/POP values as the processor sees them (lane results with FORCE_MSB ORed in), and the lane results
+    /// without it, which POP writes back (FORCE_MSB has no effect on the internal datapath).
     result: [u32; 3],
+    lane: [u32; 2],
+    /// Each lane's shift-and-mask value before BASEn is added (what ACCUMn_ADD reads).
+    raw: [u32; 2],
     overflow: (bool, bool),
 }
 
@@ -155,6 +160,7 @@ impl Interp {
         let (r0, of0) = lane(c0, input0);
         let (r1, of1) = lane(c1, input1);
         self.overflow = (of0, of1);
+        self.raw = [r0, r1];
 
         let add0 = self.base[0].wrapping_add(if c0.add_raw() { input0 } else { r0 });
         let add1 = self.base[1].wrapping_add(if c1.add_raw() { input1 } else { r1 });
@@ -173,16 +179,24 @@ impl Interp {
             let (b0, b1) = (self.base[0] as i64, self.base[1] as i64);
             (b0 + (alpha * (b1 - b0)).div_euclid(256)) as u32
         };
-        let msb = c0.force_msb() << 28;
-        self.result[0] = if do_blend { alpha as u32 } else { (if do_clamp { clamp0 } else { add0 }) | msb };
-        self.result[1] = (if do_blend { blend1 } else { add1 }) | msb;
+        let (msb0, msb1) = (c0.force_msb() << 28, c1.force_msb() << 28);
+        self.lane[0] = if do_blend {
+            alpha as u32
+        } else if do_clamp {
+            clamp0
+        } else {
+            add0
+        };
+        self.lane[1] = if do_blend { blend1 } else { add1 };
+        self.result[0] = if do_blend { self.lane[0] } else { self.lane[0] | msb0 };
+        self.result[1] = self.lane[1] | msb1;
         self.result[2] = add2;
     }
 
     fn writeback(&mut self) {
         let c0 = LaneCtrl(self.ctrl[0]);
         let c1 = LaneCtrl(self.ctrl[1]);
-        let (r0, r1) = (self.result[0], self.result[1]);
+        let [r0, r1] = self.lane;
         self.accum[0] = if c0.cross_result() { r1 } else { r0 };
         self.accum[1] = if c1.cross_result() { r0 } else { r1 };
         self.update();
@@ -206,8 +220,8 @@ impl Interp {
                 self.ctrl[0] | (o0 as u32) << 23 | (o1 as u32) << 24 | ((o0 || o1) as u32) << 25
             }
             0x30 => self.ctrl[1],
-            0x34 => self.accum[0],
-            0x38 => self.accum[1],
+            0x34 => self.raw[0],
+            0x38 => self.raw[1],
             _ => 0,
         }
     }
@@ -566,6 +580,45 @@ mod tests {
         assert_eq!(s.read(0, INTERP1 + 0x20, 0, 0), Some((-10i32) as u32));
         s.write(0, INTERP1, 0x05);
         assert_eq!(s.read(0, INTERP1 + 0x20, 0, 0), Some(5));
+    }
+
+    #[test]
+    fn interp_force_msb_is_per_lane() {
+        // CTRL_LANEn.FORCE_MSB is ORed into bits 29:28 of lane n's result (datasheet 2.3.1.6)
+        let mut s = Sio::default();
+        s.write(0, INTERP0 + 0x2C, 31 << 10); // lane 0: full mask, no force
+        s.write(0, INTERP0 + 0x30, 31 << 10 | 1 << 19); // lane 1: full mask, FORCE_MSB 1
+        s.write(0, INTERP0, 4);
+        s.write(0, INTERP0 + 0x04, 8);
+        assert_eq!(s.read(0, INTERP0 + 0x20, 0, 0), Some(4), "PEEK_LANE0 untouched");
+        assert_eq!(s.read(0, INTERP0 + 0x24, 0, 0), Some(1 << 28 | 8), "PEEK_LANE1 forced");
+    }
+
+    #[test]
+    fn interp_accum_add_reads_the_raw_lane_value() {
+        // ACCUMn_ADD: "Reading yields lane n's raw shift and mask value (BASEn not added)" (datasheet 2.3.1.6)
+        let mut s = Sio::default();
+        s.write(0, INTERP0 + 0x2C, 4 | 7 << 10); // lane 0: shift 4, mask bits 0..7
+        s.write(0, INTERP0 + 0x30, 8 | 3 << 10); // lane 1: shift 8, mask bits 0..3
+        s.write(0, INTERP0, 0x1234);
+        s.write(0, INTERP0 + 0x04, 0xABCD);
+        s.write(0, INTERP0 + 0x08, 0x1000);
+        s.write(0, INTERP0 + 0x0C, 0x2000);
+        assert_eq!(s.read(0, INTERP0 + 0x34, 0, 0), Some(0x23));
+        assert_eq!(s.read(0, INTERP0 + 0x38, 0, 0), Some(0xB));
+        assert_eq!(s.read(0, INTERP0, 0, 0), Some(0x1234), "the accumulators are unchanged");
+    }
+
+    #[test]
+    fn interp_force_msb_is_not_written_back() {
+        // FORCE_MSB is "ORed into bits 29:28 of the lane result presented to the processor on the bus. No effect on
+        // the internal 32-bit datapath": POP returns the forced bits but writes the unforced result back to ACCUM0
+        let mut s = Sio::default();
+        s.write(0, INTERP0 + 0x2C, 31 << 10 | 2 << 19); // lane 0: full mask, FORCE_MSB 2
+        s.write(0, INTERP0 + 0x08, 4); // BASE0
+        assert_eq!(s.read(0, INTERP0 + 0x14, 0, 0), Some(2 << 28 | 4), "POP_LANE0 shows the forced bits");
+        assert_eq!(s.read(0, INTERP0, 0, 0), Some(4), "ACCUM0 does not get them");
+        assert_eq!(s.read(0, INTERP0 + 0x20, 0, 0), Some(2 << 28 | 8), "PEEK_LANE0");
     }
 
     #[test]
