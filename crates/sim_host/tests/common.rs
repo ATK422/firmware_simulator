@@ -38,3 +38,14 @@ pub fn boot(path: &std::path::Path, trace: Option<Box<dyn TraceSink>>) -> Sessio
     m.direct_boot().unwrap();
     Session::new(m, &image)
 }
+
+/// A C titan_firmware program built by `scripts/build_c_firmware.sh`, if present.
+pub fn c_elf(rel: &str) -> Option<PathBuf> {
+    let p = repo().join("build/c").join(rel);
+    if p.exists() {
+        Some(p)
+    } else {
+        eprintln!("skipping: {} not built (scripts/build_c_firmware.sh)", p.display());
+        None
+    }
+}

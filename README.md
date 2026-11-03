@@ -24,12 +24,15 @@ cargo run --release -- run external/titan_firmware_rs/firmware/target/thumbv6m-n
 cargo run --release -- run test_programs/embassy_blinky.elf --time 2s --trace gpio
 ```
 
-The image boots as if the bootrom and boot2 had run ("direct boot"); the official bootrom is mapped at address 0
-for its function table and soft-float routines. defmt logs are decoded from RTT (the `_SEGGER_RTT` control block
+Core 0 boots the image as if the bootrom and boot2 had run ("direct boot"); the official bootrom is mapped at
+address 0 for its function table and soft-float routines, and core 1 runs it for real, waiting for the launch
+sequence on the SIO FIFO. The bootrom's flash functions are trapped and performed directly on the flash array
+(with W25Q16 erase/program times) until the QSPI flash is modelled. UART output is printed per line (or attached to
+a pseudo terminal with `--uart0 pty`). defmt logs are decoded from RTT (the `_SEGGER_RTT` control block
 and the ELF's `.defmt` table) and printed with the virtual time they were read and the firmware's own timestamp.
 
 Options: `--time` (virtual time to run, e.g. `500ms`), `--trace instr,exc,gpio,unmodelled,device`, `--trace-file`,
-`--quantum` (instructions per core before switching), `--unmodelled first|every|off` (logging of registers the
+`--quantum` (instructions per core before switching), `--uart0/--uart1 stdout|pty|none`, `--unmodelled first|every|off` (logging of registers the
 emulator does not model yet; each is named from the SVD), `--stop-on-bkpt`, `--crystal-hz`, `--gdb ADDR`.
 
 ### Debugging
@@ -50,7 +53,10 @@ cargo test --workspace
 `test_programs/` holds hand-written Thumb programs and a small embassy firmware used by the tests; the ELFs are
 committed, `make -C test_programs` rebuilds them (`arm-none-eabi-as`, and the `thumbv6m-none-eabi` Rust target).
 Tests that boot titan_firmware_rs images skip themselves unless the firmware has been built
-(`cd external/titan_firmware_rs/firmware && cargo build --workspace --release`).
+(`cd external/titan_firmware_rs/firmware && cargo build --workspace --release`); tests that boot C titan_firmware
+programs skip unless `scripts/build_c_firmware.sh` has built them into `build/c`. `test_programs/pico` holds
+pico-sdk programs equivalent to pico-examples' `hello_uart`, `hello_multicore` and `flash/program`
+(`make -C test_programs pico` rebuilds them against titan_firmware's pico-sdk).
 
 ## Third-party data
 

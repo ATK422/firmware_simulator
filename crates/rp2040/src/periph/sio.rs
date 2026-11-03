@@ -250,7 +250,7 @@ pub struct Sio {
     /// `fifo[n]` is written by core n and read by the other core.
     pub fifo: [VecDeque<u32>; 2],
     /// Sticky WOF/ROE flags per reading/writing core.
-    fifo_err: [u32; 2],
+    pub fifo_err: [u32; 2],
     pub spinlocks: u32,
     pub div: [Divider; 2],
     pub interp: [[Interp; 2]; 2],
@@ -378,7 +378,13 @@ impl Sio {
             GPIO_OE..=GPIO_OE_XOR => update(&mut self.gpio_oe, which, value, BANK0_MASK),
             GPIO_HI_OUT..=GPIO_HI_OUT_XOR => update(&mut self.gpio_hi_out, which, value, QSPI_MASK),
             GPIO_HI_OE..=GPIO_HI_OE_XOR => update(&mut self.gpio_hi_oe, which, value, QSPI_MASK),
-            FIFO_ST => self.fifo_err[c] &= !(value & (ST_WOF | ST_ROE)),
+            // The SVD calls WOF/ROE write-one-to-clear, but embassy-rp's SIO_IRQ_PROC1 handler clears the IRQ by
+            // writing 0 and works on hardware (the bootrom's core 1 handshake always leaves ROE set), so any write
+            // clears both flags here
+            FIFO_ST => {
+                let _ = value;
+                self.fifo_err[c] = 0;
+            }
             FIFO_WR => {
                 if self.fifo[c].len() < FIFO_DEPTH {
                     self.fifo[c].push_back(value);
@@ -467,8 +473,9 @@ mod tests {
         assert_eq!(s.read(1, FIFO_RD, 0, 0), Some(0xBB));
         assert_eq!(s.read(1, FIFO_RD, 0, 0), Some(0));
         assert_eq!(s.read(1, FIFO_ST, 0, 0), Some(ST_RDY | ST_ROE), "read underflow is sticky");
-        s.write(1, FIFO_ST, ST_ROE);
-        assert_eq!(s.read(1, FIFO_ST, 0, 0), Some(ST_RDY));
+        assert!(s.fifo_irq(1), "ROE raises the FIFO IRQ");
+        s.write(1, FIFO_ST, 0);
+        assert_eq!(s.read(1, FIFO_ST, 0, 0), Some(ST_RDY), "any write clears (as embassy-rp relies on)");
         for i in 0..9 {
             s.write(1, FIFO_WR, i);
         }

@@ -8,7 +8,7 @@
 //! with nothing to wake it) stops constraining time; when every core sleeps, time jumps straight to the next event
 //! ("idle fast-forward").
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use cpu_armv6m::CortexM0Plus;
@@ -19,10 +19,16 @@ use sim_core::image::Image;
 use sim_core::time::{ClockPeriod, CycleClock, Time};
 use sim_core::trace::{Category, NullSink, TraceEvent, TraceSink};
 
+use crate::hle::{self, RomFn};
 use crate::memmap::*;
 use crate::periph::sysctl::psm;
 use crate::periph::timer::WatchdogReset;
 use crate::system::{CoreBus, Event, ResetRequest, System};
+
+/// Time from releasing core 1's PSM force-off until it executes its first instruction (a few `clk_ref` cycles of
+/// PSM sequencing). Firmware relies on this: the bootrom's core 1 handshake starts with an unconditional FIFO read
+/// that would set the sticky ROE flag if core 0's first command had not arrived yet.
+pub const CORE1_RELEASE_LATENCY: Time = Time::from_us(1);
 
 /// Machine configuration.
 #[derive(Clone, Debug)]
@@ -85,10 +91,18 @@ pub struct Machine {
     pub breakpoints: BTreeSet<u32>,
     pub bkpt_policy: BkptPolicy,
     stop_requested: bool,
+    /// The core that ran the last quantum (tie-breaker for scheduling).
+    last_ran: usize,
     /// Vector table used by direct boot, reused after resets.
     boot_vtor: Option<u32>,
     /// Number of chip resets since power-on.
     pub resets: u32,
+    /// Trapped ROM functions by entry address (see [`crate::hle`]).
+    pub hle: BTreeMap<u32, RomFn>,
+    /// Whether ROM flash functions are trapped. Off once the flash chip is modelled at the SSI level.
+    pub hle_enabled: bool,
+    /// Firmware asked to reboot into BOOTSEL mode.
+    pub usb_boot_requested: bool,
     /// `External` events that fired, as `(time, id)`, for the host to collect.
     pub external_fired: Vec<(Time, u32)>,
     /// Skip the breakpoint check for this core's next instruction (resuming from a breakpoint).
@@ -128,14 +142,19 @@ impl Machine {
             breakpoints: BTreeSet::new(),
             bkpt_policy: BkptPolicy::default(),
             stop_requested: false,
+            last_ran: 1,
             boot_vtor: None,
             resets: 0,
             external_fired: Vec::new(),
+            hle: BTreeMap::new(),
+            hle_enabled: true,
+            usb_boot_requested: false,
             skip_breakpoint: [false; 2],
             trace_instructions: false,
         };
         m.clk_sys = m.sys.clk_sys;
         m.sys.clk_sys_changed = false;
+        m.hle = hle::rom_functions(&m.sys.rom);
         m
     }
 
@@ -180,12 +199,37 @@ impl Machine {
             .into_iter()
             .find(|&base| self.looks_like_vector_table(base))
             .ok_or("no vector table found at 0x10000100, 0x10000000 or 0x20000000")?;
-        let mut trace = NullSink;
-        let mut bus = CoreBus { sys: &mut self.sys, trace: &mut trace, core: 0, now: Time::ZERO };
-        self.cores[0].reset(&mut bus, vtor);
-        self.core_enabled = [true, false];
         self.boot_vtor = Some(vtor);
+        self.reboot();
         Ok(vtor)
+    }
+
+    /// Whether a bootrom with a plausible vector table is mapped.
+    pub fn has_bootrom(&self) -> bool {
+        let sp = self.sys.peek(0, Size::Word).unwrap_or(0);
+        let pc = self.sys.peek(4, Size::Word).unwrap_or(0);
+        (SRAM_BASE..=SRAM_END).contains(&sp) && pc & 1 == 1 && (pc as usize) < ROM_SIZE
+    }
+
+    /// Starts core 1 in the bootrom, where it waits for the launch sequence on the SIO FIFO (as after reset).
+    fn boot_core1_rom(&mut self) {
+        let now = self.clocks[0].now.max(self.now);
+        self.boot_core1_rom_at(now);
+    }
+
+    fn boot_core1_rom_at(&mut self, now: Time) {
+        if !self.has_bootrom() {
+            self.core_enabled[1] = false;
+            return;
+        }
+        let log = self.cores[1].log_exceptions;
+        self.cores[1] = CortexM0Plus::new();
+        self.cores[1].log_exceptions = log;
+        self.clocks[1] = CycleClock::new(now);
+        let mut trace = NullSink;
+        let mut bus = CoreBus { sys: &mut self.sys, trace: &mut trace, core: 1, now };
+        self.cores[1].reset(&mut bus, 0);
+        self.core_enabled[1] = true;
     }
 
     fn looks_like_vector_table(&self, base: u32) -> bool {
@@ -217,8 +261,10 @@ impl Machine {
         while let Some((t, ev)) = self.sys.sched.pop_due(until) {
             self.now = self.now.max(t);
             self.sys.fire_event(&mut *self.trace, t, ev);
-            if let Event::External(id) = ev {
-                self.external_fired.push((t, id));
+            match ev {
+                Event::External(id) => self.external_fired.push((t, id)),
+                Event::Core1Boot => self.boot_core1_rom_at(t),
+                _ => {}
             }
             self.after_system_change();
         }
@@ -238,11 +284,17 @@ impl Machine {
         }
         if self.sys.psm_forced_off != 0 || self.sys.psm_released != 0 {
             let off = std::mem::take(&mut self.sys.psm_forced_off);
-            let _released = std::mem::take(&mut self.sys.psm_released);
+            let released = std::mem::take(&mut self.sys.psm_released);
             if off & (1 << psm::PROC1) != 0 {
-                // Core 1 is held in reset while forced off; nothing launches it again in direct boot
+                // Core 1 is held in reset while forced off
                 self.core_enabled[1] = false;
                 self.cores[1] = CortexM0Plus::new();
+            }
+            if released & (1 << psm::PROC1) != 0 {
+                // Out of reset again after the PSM sequences the domain back on: core 1 then runs the bootrom and
+                // waits for the launch sequence
+                let t = self.clocks[0].now.max(self.clocks[1].now).max(self.now);
+                self.sys.sched.schedule(Event::Core1Boot, t + CORE1_RELEASE_LATENCY);
             }
         }
     }
@@ -264,6 +316,40 @@ impl Machine {
             self.clocks[c] = CycleClock::new(t);
         }
         self.reboot();
+    }
+
+    /// Carries out a trapped ROM function for core `c` and returns to its caller.
+    fn run_hle(&mut self, c: usize, f: RomFn) -> StepOutcome {
+        let cpu = &self.cores[c];
+        let (r0, r1, r2) = (cpu.reg(0), cpu.reg(1), cpu.reg(2));
+        let lr = cpu.reg(14);
+        let now = self.clocks[c].now;
+        let duration = match f {
+            RomFn::FlashRangeErase => {
+                log::debug!("[{now}] core{c} flash_range_erase({r0:#x}, {r1:#x}, {r2:#x})");
+                hle::erase(&mut self.sys.flash, r0, r1, r2)
+            }
+            RomFn::FlashRangeProgram => {
+                log::debug!("[{now}] core{c} flash_range_program({r0:#x}, {r1:#010x}, {r2:#x})");
+                let data: Vec<u8> =
+                    (0..r2).map(|i| self.sys.peek(r1.wrapping_add(i), Size::Byte).unwrap_or(0xFF) as u8).collect();
+                hle::program(&mut self.sys.flash, r0, &data)
+            }
+            RomFn::ResetToUsbBoot => {
+                log::warn!("[{now}] core{c} called reset_usb_boot (BOOTSEL mode is not emulated)");
+                self.usb_boot_requested = true;
+                self.request_stop();
+                Time::from_us(1)
+            }
+            RomFn::ConnectInternalFlash | RomFn::FlashExitXip | RomFn::FlashFlushCache | RomFn::FlashEnterCmdXip => {
+                Time::from_us(2)
+            }
+        };
+        self.cores[c].set_pc(lr & !1);
+        let cycles = self.clk_sys.cycles_in(duration);
+        self.cores[c].advance_idle(cycles);
+        self.clocks[c].advance(&self.clk_sys, cycles);
+        StepOutcome::Ran(0)
     }
 
     /// AIRCR.SYSRESETREQ: on the RP2040 this resets the requesting processor only (its PSM domain), not the
@@ -294,6 +380,7 @@ impl Machine {
                 let mut bus = CoreBus { sys: &mut self.sys, trace: &mut trace, core: 0, now };
                 self.cores[0].reset(&mut bus, vtor);
                 self.core_enabled = [true, false];
+                self.boot_core1_rom();
             }
             None => self.core_enabled = [false, false],
         }
@@ -317,12 +404,24 @@ impl Machine {
     /// Executes one instruction (or exception entry) on `core`.
     fn step_core(&mut self, c: usize) -> StepOutcome {
         let now = self.clocks[c].now;
+        let pc = self.cores[c].pc();
+        if (pc as usize) < ROM_SIZE
+            && self.hle_enabled
+            && !self.cores[c].is_sleeping()
+            && let Some(f) = self.hle.get(&pc).copied()
+        {
+            return self.run_hle(c, f);
+        }
         let mut bus = CoreBus { sys: &mut self.sys, trace: &mut *self.trace, core: c as u8, now };
         let outcome = self.cores[c].step(&mut bus);
         match outcome {
             StepOutcome::Ran(cycles) => {
                 self.clocks[c].advance(&self.clk_sys, cycles as u64);
-                if self.sys.clk_sys_changed || self.sys.reset_request.is_some() || self.sys.psm_forced_off != 0 {
+                if self.sys.clk_sys_changed
+                    || self.sys.reset_request.is_some()
+                    || self.sys.psm_forced_off != 0
+                    || self.sys.psm_released != 0
+                {
                     self.after_system_change();
                 }
                 if self.trace_instructions {
@@ -382,7 +481,13 @@ impl Machine {
             for c in 0..2 {
                 if self.runnable(c) {
                     self.catch_up(c);
-                    if pick.is_none_or(|p| self.clocks[c].now < self.clocks[p].now) {
+                    // Ties go to the core that did not run last, so a core woken at the other core's current
+                    // time is not starved by a busy-waiting partner
+                    let earlier = |p: usize| {
+                        self.clocks[c].now < self.clocks[p].now
+                            || (self.clocks[c].now == self.clocks[p].now && c != self.last_ran)
+                    };
+                    if pick.is_none_or(earlier) {
                         pick = Some(c);
                     }
                 }
@@ -429,6 +534,7 @@ impl Machine {
             }
 
             // Run core c for a quantum, stopping at the next event or the end
+            self.last_ran = c;
             let limit = next_event.min(end);
             for _ in 0..self.quantum {
                 let pc = self.cores[c].pc();

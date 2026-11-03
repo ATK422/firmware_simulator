@@ -263,6 +263,11 @@ impl CortexM0Plus {
         self.event_reg = true;
     }
 
+    /// The event register (set by `SEV`, exception entry/return and SEVONPEND; consumed by `WFE`).
+    pub fn event_register(&self) -> bool {
+        self.event_reg
+    }
+
     /// True (once) if the last step executed `SEV`.
     pub fn take_sev(&mut self) -> bool {
         std::mem::take(&mut self.sev_out)

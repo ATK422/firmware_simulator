@@ -16,8 +16,10 @@ use crate::periph::clocks::{Clocks, Freqs, Pll};
 use crate::periph::gpio::{Drive, Gpio, func};
 use crate::periph::pwm::Pwm;
 use crate::periph::sio::Sio;
+use crate::periph::ssi::Ssi;
 use crate::periph::sysctl::{self, Psm, Resets, Vreg, bit, psm};
 use crate::periph::timer::{Timer, Watchdog, WatchdogReset};
+use crate::periph::uart::Uart;
 use crate::unmodelled::Unmodelled;
 
 /// Scheduler keys. Each peripheral owns its keys; at most one event per key is pending.
@@ -29,6 +31,12 @@ pub enum Event {
     WatchdogTimeout,
     /// A PWM wrap interrupt or an observed output edge.
     Pwm,
+    /// UART n finished shifting out a byte.
+    UartTx(u8),
+    /// UART n received a byte from the host, or its receive timeout expired.
+    UartRx(u8),
+    /// Core 1 comes out of reset after its PSM force-off was released (handled by the machine).
+    Core1Boot,
     /// Wakes the run loop at a given time without doing anything (host input, test hooks).
     External(u32),
 }
@@ -63,6 +71,10 @@ pub struct System {
     pub gpio: Gpio,
     pub sio: Sio,
     pub pwm: Pwm,
+    pub uart: [Uart; 2],
+    pub ssi: Ssi,
+    /// Current `clk_peri` period.
+    pub clk_peri: ClockPeriod,
     pub unmodelled: Unmodelled,
     pub sched: Scheduler<Event>,
     /// Set when an IRQ line may have changed; the machine recomputes the lines it feeds the NVICs.
@@ -113,6 +125,9 @@ impl System {
             gpio: Gpio::default(),
             sio: Sio::default(),
             pwm: Pwm::default(),
+            uart: [Uart::new(0), Uart::new(1)],
+            ssi: Ssi::default(),
+            clk_peri: ClockPeriod::from_hz(freqs.clk_peri),
             unmodelled: Unmodelled::default(),
             sched: Scheduler::new(),
             irq_dirty: true,
@@ -139,6 +154,9 @@ impl System {
         self.sio = Sio::default();
         let observed = self.pwm.observed;
         self.pwm = Pwm { observed, ..Pwm::default() };
+        for u in &mut self.uart {
+            u.reset();
+        }
         self.unmodelled.reset();
         self.sched = Scheduler::new();
         self.update_clocks(now);
@@ -163,6 +181,12 @@ impl System {
         }
         if self.sio.fifo_irq(c) {
             lines |= 1 << (irq::SIO_IRQ_PROC0 + c as u32);
+        }
+        if self.uart[0].irq() {
+            lines |= 1 << irq::UART0_IRQ;
+        }
+        if self.uart[1].irq() {
+            lines |= 1 << irq::UART1_IRQ;
         }
         lines
     }
@@ -192,7 +216,37 @@ impl System {
                 self.reschedule_pwm(now);
             }
         }
+        if new.clk_peri != old.clk_peri {
+            for n in 0..2 {
+                self.uart_advance(n, now);
+            }
+            self.clk_peri = ClockPeriod::from_hz(new.clk_peri);
+        }
         self.freqs = new;
+    }
+
+    /// Advances UART `n` to `now` and schedules its next byte boundary.
+    fn uart_advance(&mut self, n: usize, now: Time) {
+        let s = self.uart[n].advance(&self.clk_peri, now);
+        match s.tx_done {
+            Some(t) => self.sched.schedule(Event::UartTx(n as u8), t),
+            None => {
+                self.sched.cancel(Event::UartTx(n as u8));
+            }
+        }
+        match s.rx_next {
+            Some(t) => self.sched.schedule(Event::UartRx(n as u8), t),
+            None => {
+                self.sched.cancel(Event::UartRx(n as u8));
+            }
+        }
+        self.irq_dirty = true;
+    }
+
+    /// Queues bytes for UART `n` to receive (from a host pty, a test or a device).
+    pub fn uart_inject(&mut self, n: usize, bytes: &[u8], now: Time) {
+        self.uart[n].inject(bytes);
+        self.uart_advance(n, now);
     }
 
     /// Resets peripherals that just entered reset through RESETS.
@@ -212,6 +266,12 @@ impl System {
                     let observed = self.pwm.observed;
                     self.pwm = Pwm { observed, ..Pwm::default() };
                     self.sched.cancel(Event::Pwm);
+                }
+                bit::UART0 | bit::UART1 => {
+                    let i = (n - bit::UART0) as usize;
+                    self.uart[i].reset();
+                    self.sched.cancel(Event::UartTx(i as u8));
+                    self.sched.cancel(Event::UartRx(i as u8));
                 }
                 bit::TIMER => {
                     self.timer = Timer::new();
@@ -273,6 +333,8 @@ impl System {
         let changed = self.gpio.evaluate(|f, pin| match f {
             func::SIO => Drive { out: sio_out & (1 << pin) != 0, oe: sio_oe & (1 << pin) != 0 },
             func::PWM => Drive { out: pwm.pin_output(&clk, now, pin), oe: true },
+            // UART TX pins idle high (the bit stream itself is not put on the pin)
+            func::UART if pin % 4 == 0 => Drive { out: true, oe: true },
             // GPOUT clock outputs on 21, 23, 24, 25 drive the pin (the waveform itself is not simulated)
             func::CLOCK if matches!(pin, 21 | 23 | 24 | 25) => Drive { out: false, oe: true },
             _ => Drive::default(),
@@ -313,7 +375,8 @@ impl System {
                 self.update_pins(trace, t);
                 self.reschedule_pwm(t);
             }
-            Event::External(_) => {}
+            Event::UartTx(n) | Event::UartRx(n) => self.uart_advance(n as usize, t),
+            Event::Core1Boot | Event::External(_) => {}
         }
     }
 
@@ -352,6 +415,13 @@ impl System {
             WATCHDOG_BASE => self.watchdog.read(now, off),
             ROSC_BASE => self.clocks.rosc.read(off),
             VREG_AND_CHIP_RESET_BASE => self.vreg.read(off),
+            XIP_SSI_BASE => self.ssi.read(off),
+            UART0_BASE | UART1_BASE => {
+                let n = (base == UART1_BASE) as usize;
+                let v = self.uart[n].read(&self.clk_peri, now, off);
+                self.uart_advance(n, now);
+                v
+            }
             _ => None,
         };
         match value {
@@ -432,6 +502,13 @@ impl System {
                 self.reschedule_watchdog(now);
             }),
             VREG_AND_CHIP_RESET_BASE => self.vreg.write(off, value, mode).then_some(()),
+            XIP_SSI_BASE => self.ssi.write(off, value, WriteMode::Normal).then_some(()),
+            UART0_BASE | UART1_BASE => {
+                let n = (base == UART1_BASE) as usize;
+                let ok = self.uart[n].write(&self.clk_peri, now, off, value, mode);
+                self.uart_advance(n, now);
+                ok.then_some(())
+            }
             SYSINFO_BASE if off <= 0x40 => Some(()),
             _ => None,
         };
@@ -527,8 +604,13 @@ impl System {
         }
     }
 
-    /// Side-effect free read of memory (not peripherals), for debuggers and loaders.
+    /// Side-effect free read (memory and peripheral registers), as core 0 sees it.
     pub fn peek(&self, addr: u32, size: Size) -> Option<u32> {
+        self.peek_core(0, addr, size)
+    }
+
+    /// Side-effect free read as `core` sees it (SIO is per core).
+    pub fn peek_core(&self, core: u8, addr: u32, size: Size) -> Option<u32> {
         match addr >> 28 {
             0x0 if (addr as usize) < ROM_SIZE => Some(mem::read(&self.rom, addr as usize, size)),
             0x1 if (0x10..=0x13).contains(&(addr >> 24)) => Some(mem::read(&self.flash, self.flash_offset(addr), size)),
@@ -536,7 +618,7 @@ impl System {
                 Some(mem::read(&self.xip_sram, (addr & 0x3FFF) as usize, size))
             }
             0x2 => sram_offset(addr).map(|o| mem::read(&self.sram, o, size)),
-            0x4 | 0x5 | 0xD | 0x1 => Some(mem::lane(self.peek_periph(0, addr & !3), addr, size)),
+            0x4 | 0x5 | 0xD | 0x1 => Some(mem::lane(self.peek_periph(core, addr & !3), addr, size)),
             _ => None,
         }
     }
@@ -725,7 +807,7 @@ impl Bus for CoreBus<'_> {
     }
 
     fn peek(&mut self, addr: u32, size: Size) -> Option<u32> {
-        self.sys.peek(addr, size)
+        self.sys.peek_core(self.core, addr, size)
     }
 }
 
@@ -785,11 +867,11 @@ mod tests {
     fn narrow_peripheral_writes_replicate() {
         let mut sys = quiet();
         let mut t = NullSink;
-        w(&mut sys, Time::ZERO, RESETS_BASE + 0x3000, 1 << bit::UART0);
-        // UART0.UARTIBRD: byte write at offset +1 lands replicated in all lanes
-        sys.write(&mut t, 0, Time::ZERO, UART0_BASE + 0x25, Size::Byte, 0xAB).unwrap();
-        assert_eq!(sys.unmodelled.peek(UART0_BASE + 0x24), 0xABAB_ABAB);
-        assert_eq!(sys.read(&mut t, 0, Time::ZERO, UART0_BASE + 0x26, Size::Half), Ok(0xABAB));
+        w(&mut sys, Time::ZERO, RESETS_BASE + 0x3000, 1 << bit::BUSCTRL);
+        // BUSCTRL.PERFSEL0 (unmodelled): a byte write at offset +1 lands replicated in all lanes
+        sys.write(&mut t, 0, Time::ZERO, BUSCTRL_BASE + 0x0D, Size::Byte, 0xAB).unwrap();
+        assert_eq!(sys.unmodelled.peek(BUSCTRL_BASE + 0x0C), 0xABAB_ABAB);
+        assert_eq!(sys.read(&mut t, 0, Time::ZERO, BUSCTRL_BASE + 0x0E, Size::Half), Ok(0xABAB));
     }
 
     #[test]

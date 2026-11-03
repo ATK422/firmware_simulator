@@ -13,3 +13,4 @@ log.workspace = true
 defmt-decoder = "1.2"
 object.workspace = true
 thiserror.workspace = true
+libc = "0.2"

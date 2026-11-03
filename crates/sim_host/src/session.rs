@@ -24,7 +24,17 @@ pub struct Session {
     pub slice: Time,
     /// Keep decoded lines in `logs` (tests); the CLI only prints them.
     pub keep_logs: bool,
+    /// Everything each UART transmitted, as text (lossy UTF-8 per byte).
+    pub uart_text: [String; 2],
+    /// Callback for complete UART lines: `(virtual time, uart, line)`.
+    pub on_uart_line: Option<UartHook>,
+    uart_line: [String; 2],
+    /// Pseudo terminals attached to the UARTs.
+    pub uart_pty: [Option<crate::pty::Pty>; 2],
 }
+
+/// Callback for complete UART output lines.
+pub type UartHook = Box<dyn FnMut(Time, usize, &str) + Send>;
 
 impl Session {
     /// Wraps a machine that has `image` loaded, finding its RTT control block and defmt table.
@@ -46,6 +56,10 @@ impl Session {
             on_log: None,
             slice: Time::from_us(100),
             keep_logs: true,
+            uart_text: [String::new(), String::new()],
+            on_uart_line: None,
+            uart_line: [String::new(), String::new()],
+            uart_pty: [None, None],
         }
     }
 
@@ -53,8 +67,53 @@ impl Session {
         self.defmt.is_some()
     }
 
+    /// Collects what the UARTs transmitted since the last poll.
+    pub fn poll_uarts(&mut self) {
+        for n in 0..2 {
+            if let Some(pty) = &self.uart_pty[n] {
+                let input = pty.read();
+                if !input.is_empty() {
+                    let now = self.machine.now;
+                    self.machine.sys.uart_inject(n, &input, now);
+                }
+            }
+            let out = std::mem::take(&mut self.machine.sys.uart[n].output);
+            if let Some(pty) = &self.uart_pty[n] {
+                let bytes: Vec<u8> = out.iter().map(|(_, b)| *b).collect();
+                pty.write(&bytes);
+            }
+            for (t, b) in out {
+                let c = b as char;
+                self.uart_text[n].push(c);
+                match b {
+                    b'\n' => {
+                        let line = std::mem::take(&mut self.uart_line[n]);
+                        if let Some(hook) = &mut self.on_uart_line {
+                            hook(t, n, line.trim_end_matches('\r'));
+                        }
+                    }
+                    _ => self.uart_line[n].push(c),
+                }
+            }
+        }
+    }
+
+    /// Flushes partial UART lines to the hook (end of a run).
+    pub fn flush_uarts(&mut self) {
+        let now = self.machine.now;
+        for n in 0..2 {
+            let line = std::mem::take(&mut self.uart_line[n]);
+            if !line.is_empty()
+                && let Some(hook) = &mut self.on_uart_line
+            {
+                hook(now, n, &line);
+            }
+        }
+    }
+
     /// Drains RTT now.
     pub fn poll_rtt(&mut self) {
+        self.poll_uarts();
         let Some(rtt) = &self.rtt else { return };
         let now = self.machine.now;
         for (ch, bytes) in rtt.poll(&mut self.machine) {
