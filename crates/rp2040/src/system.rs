@@ -27,7 +27,7 @@ use crate::periph::gpio::{BankDrive, Drive, Gpio, func};
 use crate::periph::i2c::{I2c, Step, StepResult};
 use crate::periph::pio::{self, Pio};
 use crate::periph::pwm::Pwm;
-use crate::periph::sio::Sio;
+use crate::periph::sio::{self, Sio};
 use crate::periph::spi::Spi;
 use crate::periph::ssi::{IoQspi, Ssi};
 use crate::periph::sysctl::{self, Psm, Resets, Vreg, bit, psm};
@@ -129,6 +129,9 @@ pub struct System {
     /// Reads of PIO registers that change nothing skip the second advance (on by default; off to check that it
     /// changes nothing).
     pub pio_fast_reads: bool,
+    /// SIO accesses other than to the FIFOs leave the interrupt lines alone (on by default; off to check that it
+    /// changes nothing).
+    pub sio_fast_irqs: bool,
     /// PIO IRQ lines after the last advance.
     pio_lines: u8,
     /// Pin drives and wake-ups devices scheduled for later.
@@ -222,6 +225,7 @@ impl System {
             pio_base: (Time::ZERO, 0),
             in_pio: false,
             pio_fast_reads: true,
+            sio_fast_irqs: true,
             pio_lines: 0,
             wire: WireQueue::default(),
             pin_devices: Vec::new(),
@@ -1282,7 +1286,10 @@ impl System {
             }
             let gpio_in = self.gpio.inputs();
             if let Some(v) = self.sio.read(core, addr - SIO_BASE, gpio_in, self.io_qspi.levels()) {
-                self.irq_dirty = true;
+                // Of SIO's interrupts (the FIFOs'), only a FIFO pop can change one
+                if !self.sio_fast_irqs || addr - SIO_BASE == sio::FIFO_RD {
+                    self.irq_dirty = true;
+                }
                 return v;
             }
             return self.unmodelled.read(trace, now, core, addr);
@@ -1370,7 +1377,10 @@ impl System {
                 self.pio_advance(trace, now);
             }
             if self.sio.write(core, addr - SIO_BASE, value) {
-                self.irq_dirty = true;
+                // Only the FIFOs' interrupts are SIO's (GPIO changes flag the lines in `update_pins`)
+                if !self.sio_fast_irqs || matches!(addr - SIO_BASE, sio::FIFO_ST | sio::FIFO_WR) {
+                    self.irq_dirty = true;
+                }
                 if addr - SIO_BASE < 0x50 {
                     self.update_pins(trace, now);
                 }
@@ -2688,6 +2698,65 @@ mod tests {
         let fast = run(true);
         assert!(fast.iter().any(|e| e.1 == pio::RXF0 && e.3[0] & 1 << irq::PIO0_IRQ_0 == 0), "{fast:?}");
         assert!(fast.iter().any(|e| e.3[0] & 1 << irq::PIO0_IRQ_0 != 0), "{fast:?}");
+        assert_eq!(fast, run(false));
+    }
+
+    /// SIO accesses other than to the FIFOs leave the interrupt lines alone (`System::sio_fast_irqs`): after every
+    /// access the lines the run loop would see must be the current ones, and everything read the same as with every
+    /// access flagging the lines. The cores pass words through the FIFOs (raising and dropping SIO_IRQ_PROCn, with
+    /// overflow and underflow errors) between GPIO, spinlock and divider accesses.
+    #[test]
+    fn sio_fast_irqs_change_nothing() {
+        let run = |fast: bool| {
+            let mut sys = quiet();
+            sys.sio_fast_irqs = fast;
+            let mut seen = sys.irq_lines_both();
+            sys.irq_dirty = false;
+            let mut log = Vec::new();
+            let accesses: &[(u8, bool, u32, u32)] = &[
+                (0, true, sio::FIFO_WR, 1),
+                (0, false, 0x100, 0), // SPINLOCK0
+                (1, false, sio::FIFO_ST, 0),
+                (0, true, 0x024, 1 << 3), // GPIO_OE_SET
+                (1, false, sio::FIFO_RD, 0),
+                (1, false, sio::FIFO_RD, 0), // underflow: ROE
+                (0, true, 0x100, 0),
+                (1, true, sio::FIFO_ST, 0), // clears the errors
+                (0, true, sio::FIFO_WR, 2),
+                (0, true, sio::FIFO_WR, 3),
+                (0, false, 0x004, 0), // GPIO_IN
+                (0, true, sio::FIFO_WR, 4),
+                (0, true, sio::FIFO_WR, 5),
+                (0, true, sio::FIFO_WR, 6), // overflow: WOF
+                (0, true, 0x060, 7),        // DIV_UDIVIDEND
+                (0, false, 0x070, 0),       // DIV_QUOTIENT
+                (0, true, 0x014, 1 << 3),   // GPIO_OUT_SET
+                (1, false, sio::FIFO_RD, 0),
+                (0, true, sio::FIFO_ST, 0),
+                (1, false, sio::FIFO_RD, 0),
+                (1, false, sio::FIFO_RD, 0),
+                (1, false, sio::FIFO_RD, 0),
+            ];
+            for (i, &(core, write, off, v)) in accesses.iter().enumerate() {
+                let t = Time::from_ns(10 * i as u64);
+                let r = if write {
+                    sys.write(&mut NullSink, core, t, SIO_BASE + off, Size::Word, v).unwrap();
+                    0
+                } else {
+                    sys.read(&mut NullSink, core, t, SIO_BASE + off, Size::Word).unwrap()
+                };
+                if sys.irq_dirty {
+                    sys.irq_dirty = false;
+                    seen = sys.irq_lines_both();
+                }
+                assert_eq!(seen, sys.irq_lines_both(), "access {i}: the lines changed without irq_dirty");
+                log.push((r, seen));
+            }
+            log
+        };
+        let fast = run(true);
+        let fifo = |l: &[u32; 2]| l[0] >> irq::SIO_IRQ_PROC0 & 1 | l[1] >> irq::SIO_IRQ_PROC1 & 1;
+        assert!(fast.iter().any(|e| fifo(&e.1) != 0) && fast.iter().any(|e| fifo(&e.1) == 0), "{fast:?}");
         assert_eq!(fast, run(false));
     }
 }

@@ -5,6 +5,7 @@
 //!
 //! * Quantum fusing (`Machine::fuse_quanta`, see `Machine::run_until`).
 //! * PIO register reads that change nothing skip the second advance (`System::pio_fast_reads`).
+//! * SIO accesses other than to the FIFOs leave the interrupt lines alone (`System::sio_fast_irqs`).
 
 use rp2040::Machine;
 use sim_core::cpu::Cpu;
@@ -94,4 +95,17 @@ fn smart_battery_pio_fast_reads() {
 fn hbridge_board_pio_fast_reads() {
     // A multidrop UART on PIO
     same_pio("hbridge_board", "lilboat/hbridge_board", 2);
+}
+
+fn same_sio(elf: &str, board: &str, client: u8) {
+    let Some((a, _)) = run(elf, board, client, |_| {}) else { return };
+    let (b, _) = run(elf, board, client, |m| m.sys.sio_fast_irqs = false).unwrap();
+    compare(elf, &a, &b);
+}
+
+#[test]
+fn sio_fast_irqs() {
+    // Critical sections take and release a spinlock; the ESC board runs both cores
+    same_sio("esc_board", "mk2/esc_board", 2);
+    same_sio("ivc_board2", "talos/ivc_board", 8);
 }
