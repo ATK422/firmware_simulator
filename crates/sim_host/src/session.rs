@@ -4,12 +4,16 @@
 use rp2040::{Machine, StopReason};
 use sim_core::image::Image;
 use sim_core::time::Time;
+use sim_devices::can::{BusRecord, CanBus, CanEndpoint};
 
 use crate::defmt::{DefmtDecoder, LogLine};
 use crate::rtt::RttReader;
 
 /// Callback for decoded log lines: `(virtual time, line)`.
 pub type LogHook = Box<dyn FnMut(Time, &LogLine) + Send>;
+
+/// Called with every frame completed on a bus.
+pub type CanCallback = Box<dyn FnMut(&BusRecord) + Send>;
 
 pub struct Session {
     pub machine: Machine,
@@ -31,6 +35,16 @@ pub struct Session {
     uart_line: [String; 2],
     /// Pseudo terminals attached to the UARTs.
     pub uart_pty: [Option<crate::pty::Pty>; 2],
+    /// The CAN bus the board's CAN controllers sit on, if any.
+    pub can_bus: Option<CanBus>,
+    /// Host participants on that bus (bridges, mocks).
+    pub can_endpoints: Vec<Box<dyn CanEndpoint + Send>>,
+    /// Called with every frame that went over the bus.
+    pub on_can: Option<CanCallback>,
+    /// Keep virtual time from running ahead of the wall clock.
+    pub realtime: bool,
+    pacing: Option<(std::time::Instant, Time)>,
+    behind_warned: std::time::Instant,
 }
 
 /// Callback for complete UART output lines.
@@ -60,6 +74,12 @@ impl Session {
             on_uart_line: None,
             uart_line: [String::new(), String::new()],
             uart_pty: [None, None],
+            can_bus: None,
+            can_endpoints: Vec::new(),
+            on_can: None,
+            realtime: false,
+            pacing: None,
+            behind_warned: std::time::Instant::now(),
         }
     }
 
@@ -133,12 +153,37 @@ impl Session {
         }
     }
 
+    /// Runs the CAN bus up to the machine's current time and lets the devices react to what arrived.
+    pub fn step_can(&mut self) {
+        let Some(bus) = &mut self.can_bus else { return };
+        let now = self.machine.now;
+        let mut eps: Vec<&mut dyn CanEndpoint> =
+            self.can_endpoints.iter_mut().map(|e| &mut **e as &mut dyn CanEndpoint).collect();
+        let mut nodes = self.machine.can_nodes();
+        let before = bus.record.as_ref().map_or(0, |r| r.len());
+        bus.step(&mut nodes, &mut eps, now);
+        if let (Some(rec), Some(hook)) = (&bus.record, &mut self.on_can) {
+            for r in &rec[before..] {
+                hook(r);
+            }
+        }
+        if bus.record.as_ref().is_some_and(|r| r.len() > 100_000) {
+            // Keep memory bounded on long runs; callers that need the history read it as they go
+            bus.record.as_mut().unwrap().drain(..50_000);
+        }
+        self.machine.update_devices();
+    }
+
     /// Runs until virtual time `end`, polling RTT every [`Session::slice`].
     pub fn run_until(&mut self, end: Time) -> StopReason {
         loop {
             let target = (self.machine.now + self.slice).min(end);
             let reason = self.machine.run_until(target);
+            self.step_can();
             self.poll_rtt();
+            if self.realtime {
+                self.pace();
+            }
             match reason {
                 StopReason::TimeLimit if target >= end => return StopReason::TimeLimit,
                 StopReason::TimeLimit => {}
@@ -150,6 +195,20 @@ impl Session {
     pub fn run_for(&mut self, d: Time) -> StopReason {
         let end = self.machine.now + d;
         self.run_until(end)
+    }
+
+    /// Sleeps until the wall clock catches up with virtual time; warns when the emulation falls behind.
+    fn pace(&mut self) {
+        let now = self.machine.now;
+        let (wall0, virt0) = *self.pacing.get_or_insert((std::time::Instant::now(), now));
+        let virt = std::time::Duration::from_nanos((now - virt0).as_ns());
+        let wall = wall0.elapsed();
+        if virt > wall {
+            std::thread::sleep(virt - wall);
+        } else if wall - virt > std::time::Duration::from_millis(50) && self.behind_warned.elapsed().as_secs() >= 5 {
+            self.behind_warned = std::time::Instant::now();
+            log::warn!("real-time mode: emulation is {:?} behind the wall clock", wall - virt);
+        }
     }
 
     /// Whether any log line so far contains `text`.

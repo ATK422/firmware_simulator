@@ -14,3 +14,9 @@ defmt-decoder = "1.2"
 object.workspace = true
 thiserror.workspace = true
 libc = "0.2"
+sim_devices.workspace = true
+# The real protocol crates from titan_firmware_rs, so the mock bridge speaks exactly what titan_bridge speaks
+canmore = { path = "../../external/titan_firmware_rs/crates/canmore" }
+titan_link = { path = "../../external/titan_firmware_rs/crates/titan_link" }
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"

@@ -11,7 +11,7 @@ milestones are in [PLAN.md](PLAN.md).
 | [`sim_core`](crates/sim_core) | Virtual time (picoseconds), keyed event scheduler, `Bus`/`Peripheral`/`Cpu` traits, wires, trace sinks, ELF/UF2 images |
 | [`cpu_armv6m`](crates/cpu_armv6m) | Cortex-M0+ interpreter: full ARMv6-M Thumb, exceptions, NVIC, SysTick, SCB, MPU registers, disassembler |
 | [`rp2040`](crates/rp2040) | The SoC: memory map, bus fabric, peripherals, the two-core `Machine` and its run loop; register tables generated from `rp2040.svd` |
-| [`sim_devices`](crates/sim_devices) | External chip models (from M3) |
+| [`sim_devices`](crates/sim_devices) | External chip models: SPI device trait, CAN bus, MCP2517FD/MCP2518FD |
 | [`sim_acoustics`](crates/sim_acoustics) | Underwater acoustic environments for IVC testing (from M4) |
 | [`sim_host`](crates/sim_host) | Host bridges: GDB, RTT/defmt, SocketCAN, UDP, UART ptys (from M1) |
 | [`sim_test`](crates/sim_test) | Firmware integration test harness (M7) |
@@ -34,6 +34,25 @@ and the ELF's `.defmt` table) and printed with the virtual time they were read a
 Options: `--time` (virtual time to run, e.g. `500ms`), `--trace instr,exc,gpio,unmodelled,device`, `--trace-file`,
 `--quantum` (instructions per core before switching), `--uart0/--uart1 stdout|pty|none`, `--unmodelled first|every|off` (logging of registers the
 emulator does not model yet; each is named from the SVD), `--stop-on-bkpt`, `--crystal-hz`, `--gdb ADDR`.
+
+### Boards and CAN
+
+`boards/<dir>/<board>.toml` describes a board's external chips and wiring. They are generated from titan_firmware's
+board headers by `python3 scripts/gen_boards.py` (`--check` fails if they are out of date); additions go in
+`boards/overlays/`. With `--board`, the board's MCP2517FD is attached to its SPI bus and the board sits on an
+in-process CAN bus (CAN FD 1M/5M for the internal bus, classic 250k for the external one) with arbitration, frame
+timing and acknowledgement (a frame is only acknowledged if another node or endpoint is on the bus).
+
+```bash
+# Print the bus candump style, with a scripted titan_bridge stand-in (CANmore + titan_link) for client 1
+cargo run --release -- run path/to/template --board boards/mk2/power_board.toml --mock-bridge 1 --candump --time 3s
+# Bridge the bus to a SocketCAN interface for titan_bridge, canmore_cli, candump (host tools need --realtime)
+sudo ip link add vcan0 type vcan && sudo ip link set vcan0 up
+cargo run --release -- run path/to/template --board boards/mk2/power_board.toml --can vcan0 --realtime
+```
+
+Several boards on one bus are put together in code with `sim_host::robot::Robot` (see `crates/sim_host/tests/can.rs`).
+`RUST_LOG=sim_devices=trace` logs every MCP2517FD SPI transaction.
 
 ### Debugging
 

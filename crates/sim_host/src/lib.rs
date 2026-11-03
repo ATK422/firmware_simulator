@@ -2,11 +2,15 @@
 //!
 //! Bridges see the target through [`TargetMemory`] (debug-probe style memory access) so they work with any machine.
 
+pub mod board;
 pub mod defmt;
 pub mod gdb;
+pub mod mock_bridge;
 pub mod pty;
+pub mod robot;
 pub mod rtt;
 pub mod session;
+pub mod socketcan;
 pub mod target;
 
 pub use session::Session;

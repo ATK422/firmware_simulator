@@ -341,9 +341,12 @@ impl Machine {
                 self.request_stop();
                 Time::from_us(1)
             }
-            RomFn::ConnectInternalFlash | RomFn::FlashExitXip | RomFn::FlashFlushCache | RomFn::FlashEnterCmdXip => {
+            RomFn::ConnectInternalFlash | RomFn::FlashExitXip => {
+                // Leave the SSI as the ROM does, so firmware can send its own commands (pico-sdk's flash_do_cmd)
+                self.sys.ssi.enter_command_mode();
                 Time::from_us(2)
             }
+            RomFn::FlashFlushCache | RomFn::FlashEnterCmdXip => Time::from_us(2),
         };
         self.cores[c].set_pc(lr & !1);
         let cycles = self.clk_sys.cycles_in(duration);
@@ -623,6 +626,17 @@ impl Machine {
         self.now = s.now;
         self.clk_sys = s.clk_sys;
         self.sys.irq_dirty = true;
+    }
+
+    /// Lets attached devices update their outputs (after the host delivered something to them).
+    pub fn update_devices(&mut self) {
+        let now = self.now;
+        self.sys.update_devices(&mut *self.trace, now);
+    }
+
+    /// The CAN controllers among the attached devices.
+    pub fn can_nodes(&mut self) -> Vec<&mut dyn sim_devices::can::CanNode> {
+        self.sys.spi_devices.iter_mut().filter_map(|a| a.dev.can_node()).collect()
     }
 
     /// Debugger memory read from `core`'s point of view (its PPB registers included).
