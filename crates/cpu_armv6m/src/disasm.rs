@@ -102,7 +102,12 @@ pub fn disassemble(pc: u32, hw1: u16, hw2: u16) -> String {
             }
         }
         0b01001 => {
-            format!("ldr {}, [pc, #{}] ; {:#010x}", reg((i >> 8) & 7), (i & 0xFF) * 4, (pcv & !3) + (i & 0xFF) * 4)
+            format!(
+                "ldr {}, [pc, #{}] ; {:#010x}",
+                reg((i >> 8) & 7),
+                (i & 0xFF) * 4,
+                (pcv & !3).wrapping_add((i & 0xFF) * 4)
+            )
         }
         0b01010 | 0b01011 => {
             let ops = ["str", "strh", "strb", "ldrsb", "ldr", "ldrh", "ldrb", "ldrsh"];
@@ -121,7 +126,12 @@ pub fn disassemble(pc: u32, hw1: u16, hw2: u16) -> String {
             format!("{op} {}, [sp, #{}]", reg((i >> 8) & 7), (i & 0xFF) * 4)
         }
         0b10100 => {
-            format!("add {}, pc, #{} ; {:#010x}", reg((i >> 8) & 7), (i & 0xFF) * 4, (pcv & !3) + (i & 0xFF) * 4)
+            format!(
+                "add {}, pc, #{} ; {:#010x}",
+                reg((i >> 8) & 7),
+                (i & 0xFF) * 4,
+                (pcv & !3).wrapping_add((i & 0xFF) * 4)
+            )
         }
         0b10101 => format!("add {}, sp, #{}", reg((i >> 8) & 7), (i & 0xFF) * 4),
         0b10110 | 0b10111 => match (i >> 8) & 0xF {
@@ -202,6 +212,9 @@ mod tests {
         assert_eq!(disassemble(0, 0xF3BF, 0x8F5F), "dmb sy");
         assert_eq!(disassemble(0, 0x4348, 0), "muls r0, r1");
         assert_eq!(disassemble(0, 0x4249, 0), "rsbs r1, r1, #0");
+        // PC-relative targets wrap at the top of the address space, as the core computes them
+        assert_eq!(disassemble(0xFFFF_FF00, 0x48FF, 0), "ldr r0, [pc, #1020] ; 0x00000300");
+        assert_eq!(disassemble(0xFFFF_FF00, 0xA0FF, 0), "add r0, pc, #1020 ; 0x00000300");
         assert!(is_32bit(0xF000));
         assert!(!is_32bit(0xE7FE));
     }
