@@ -256,9 +256,11 @@ When the firmware rather than the emulator looks wrong, write a test that assert
   `python3 scripts/gen_boards.py --check`, then `cargo test --release --workspace -- --nocapture`, and prints the
   smoke test and sweep tables from the log.
 * **c-firmware**: installs `gcc-arm-none-eabi`, builds the C programs with `scripts/build_c_firmware.sh` and runs
-  the tests that boot them (`sim_host`'s `pico_sdk`, `flash`, `can`).
+  the tests that boot them (`sim_host`'s `pico_sdk`, `flash`, `can`). It sets `CMAKE_POLICY_VERSION_MINIMUM=3.5`
+  because the runners' CMake 4 refuses pico-sdk's bundled pioasm and elf2uf2 projects otherwise.
 
 `external/titan_firmware_rs` is the private repository `ATK422/titan_firmware_rs`. Give the workflow a token that
 can read it as the repository secret **`TITAN_FIRMWARE_RS_TOKEN`** (a fine-grained personal access token with
 "Contents: read" on that repository). Without it the submodule is not fetched, the "Firmware images" step fails
-loudly, and the firmware tests would otherwise skip.
+loudly, and the firmware tests would otherwise skip. The c-firmware job needs it too: the emulator's workspace uses
+titan_firmware_rs's host crates (`canmore`, `titan_link`), so its tests can't build without the submodule.
