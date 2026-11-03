@@ -32,6 +32,7 @@ license.workspace = true
 sim_core.workspace = true
 rp2040.workspace = true
 sim_host.workspace = true
+sim_devices.workspace = true
 log.workspace = true
 anyhow.workspace = true
 clap = { version = "4", features = ["derive"] }

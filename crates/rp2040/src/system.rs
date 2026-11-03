@@ -9,13 +9,18 @@ use sim_core::bus::{Bus, BusFault, Size, WriteMode, mem};
 use sim_core::sched::Scheduler;
 use sim_core::time::{ClockPeriod, Time};
 use sim_core::trace::{Category, TraceEvent, TraceSink};
+use sim_core::wire::External;
+use sim_devices::DeviceCtx;
+use sim_devices::spi::SpiDevice;
 
 use crate::irq;
 use crate::memmap::*;
 use crate::periph::clocks::{Clocks, Freqs, Pll};
+use crate::periph::dma::{self, Dma, DmaBus};
 use crate::periph::gpio::{Drive, Gpio, func};
 use crate::periph::pwm::Pwm;
 use crate::periph::sio::Sio;
+use crate::periph::spi::Spi;
 use crate::periph::ssi::Ssi;
 use crate::periph::sysctl::{self, Psm, Resets, Vreg, bit, psm};
 use crate::periph::timer::{Timer, Watchdog, WatchdogReset};
@@ -31,6 +36,8 @@ pub enum Event {
     WatchdogTimeout,
     /// A PWM wrap interrupt or an observed output edge.
     Pwm,
+    /// SPI n finished a frame or its receive timeout is due.
+    SpiFrame(u8),
     /// UART n finished shifting out a byte.
     UartTx(u8),
     /// UART n received a byte from the host, or its receive timeout expired.
@@ -73,6 +80,13 @@ pub struct System {
     pub pwm: Pwm,
     pub uart: [Uart; 2],
     pub ssi: Ssi,
+    pub spi: [Spi; 2],
+    pub dma: Dma,
+    /// Devices on the SPI buses.
+    pub spi_devices: Vec<SpiAttachment>,
+    /// Pulse-type DMA requests not yet consumed (PWM wraps), by DREQ number.
+    pub dreq_pulses: [u32; 64],
+    in_dma: bool,
     /// Current `clk_peri` period.
     pub clk_peri: ClockPeriod,
     pub unmodelled: Unmodelled,
@@ -127,6 +141,11 @@ impl System {
             pwm: Pwm::default(),
             uart: [Uart::new(0), Uart::new(1)],
             ssi: Ssi::default(),
+            spi: [Spi::new(0), Spi::new(1)],
+            dma: Dma::default(),
+            spi_devices: Vec::new(),
+            dreq_pulses: [0; 64],
+            in_dma: false,
             clk_peri: ClockPeriod::from_hz(freqs.clk_peri),
             unmodelled: Unmodelled::default(),
             sched: Scheduler::new(),
@@ -157,6 +176,11 @@ impl System {
         for u in &mut self.uart {
             u.reset();
         }
+        for s in &mut self.spi {
+            s.reset();
+        }
+        self.dma = Dma::default();
+        self.dreq_pulses = [0; 64];
         self.unmodelled.reset();
         self.sched = Scheduler::new();
         self.update_clocks(now);
@@ -184,6 +208,18 @@ impl System {
         }
         if self.uart[0].irq() {
             lines |= 1 << irq::UART0_IRQ;
+        }
+        if self.spi[0].irq() {
+            lines |= 1 << irq::SPI0_IRQ;
+        }
+        if self.spi[1].irq() {
+            lines |= 1 << irq::SPI1_IRQ;
+        }
+        if self.dma.irq_line(0) {
+            lines |= 1 << irq::DMA_IRQ_0;
+        }
+        if self.dma.irq_line(1) {
+            lines |= 1 << irq::DMA_IRQ_1;
         }
         if self.uart[1].irq() {
             lines |= 1 << irq::UART1_IRQ;
@@ -267,6 +303,12 @@ impl System {
                     self.pwm = Pwm { observed, ..Pwm::default() };
                     self.sched.cancel(Event::Pwm);
                 }
+                bit::SPI0 | bit::SPI1 => {
+                    let i = (n - bit::SPI0) as usize;
+                    self.spi[i].reset();
+                    self.sched.cancel(Event::SpiFrame(i as u8));
+                }
+                bit::DMA => self.dma = Dma::default(),
                 bit::UART0 | bit::UART1 => {
                     let i = (n - bit::UART0) as usize;
                     self.uart[i].reset();
@@ -329,10 +371,20 @@ impl System {
         let sio_out = self.sio.gpio_out;
         let sio_oe = self.sio.gpio_oe;
         let pwm = &self.pwm;
+        let spis = &self.spi;
         let clk = self.clk_sys;
         let changed = self.gpio.evaluate(|f, pin| match f {
             func::SIO => Drive { out: sio_out & (1 << pin) != 0, oe: sio_oe & (1 << pin) != 0 },
             func::PWM => Drive { out: pwm.pin_output(&clk, now, pin), oe: true },
+            // SPI: SCK idles at CPOL, TX low, the hardware chip select is low while a frame is on the wire
+            func::SPI => {
+                let spi = &spis[(pin >> 3) & 1];
+                match pin & 3 {
+                    1 => Drive { out: !spi.busy(), oe: true },
+                    2 | 3 => Drive { out: false, oe: true },
+                    _ => Drive::default(),
+                }
+            }
             // UART TX pins idle high (the bit stream itself is not put on the pin)
             func::UART if pin % 4 == 0 => Drive { out: true, oe: true },
             // GPOUT clock outputs on 21, 23, 24, 25 drive the pin (the waveform itself is not simulated)
@@ -348,6 +400,138 @@ impl System {
                     }
                 }
             }
+            self.update_chip_selects(trace, now);
+        }
+    }
+
+    /// Tells SPI devices about chip select changes; devices may drive pins in response.
+    fn update_chip_selects(&mut self, trace: &mut dyn TraceSink, now: Time) {
+        let mut pins_changed = false;
+        for att in &mut self.spi_devices {
+            let level = self.gpio.level & (1 << att.cs_pin) != 0;
+            let selected = level == att.cs_active_high;
+            if selected != att.selected {
+                att.selected = selected;
+                let mut ctx = DevPins { now, gpio: &mut self.gpio, freqs: &self.freqs, changed: false };
+                att.dev.select(&mut ctx, selected);
+                pins_changed |= ctx.changed;
+            }
+        }
+        if pins_changed {
+            self.update_pins(trace, now);
+        }
+    }
+
+    /// Lets every device update its outputs (after time passed or a CAN frame reached it).
+    pub fn update_devices(&mut self, trace: &mut dyn TraceSink, now: Time) {
+        let mut pins_changed = false;
+        for att in &mut self.spi_devices {
+            let mut ctx = DevPins { now, gpio: &mut self.gpio, freqs: &self.freqs, changed: false };
+            att.dev.update(&mut ctx);
+            pins_changed |= ctx.changed;
+        }
+        if pins_changed {
+            self.update_pins(trace, now);
+        }
+    }
+
+    /// Attaches an SPI device to bus `bus` with its chip select on GPIO `cs_pin` (active low).
+    pub fn attach_spi(&mut self, bus: usize, cs_pin: u8, dev: Box<dyn SpiDevice>) {
+        self.spi_devices.push(SpiAttachment { bus, cs_pin, cs_active_high: false, selected: false, dev });
+    }
+
+    /// Runs SPI `n` up to `now`: completes frames (exchanging them with the selected devices), starts the next
+    /// ones, lets the DMA move data, and schedules the next frame end.
+    fn spi_advance(&mut self, trace: &mut dyn TraceSink, n: usize, now: Time) {
+        let was_busy = self.spi[n].busy();
+        for _ in 0..64 {
+            let mut progressed = false;
+            while let Some((frame, at)) = self.spi[n].take_completed(now) {
+                let reply = if self.spi[n].loopback() { frame } else { self.spi_exchange(trace, n, frame, at) };
+                let clk = self.clk_peri;
+                self.spi[n].complete(reply, at, &clk);
+                self.spi[n].start(&clk, at);
+                progressed = true;
+            }
+            self.spi[n].check_timeout(now);
+            let clk = self.clk_peri;
+            self.spi[n].start(&clk, now);
+            if self.service_dma(trace, now) {
+                progressed = true;
+            }
+            if !progressed {
+                break;
+            }
+        }
+        match self.spi[n].next_event() {
+            Some(t) => self.sched.schedule(Event::SpiFrame(n as u8), t.max(now)),
+            None => {
+                self.sched.cancel(Event::SpiFrame(n as u8));
+            }
+        }
+        self.irq_dirty = true;
+        if was_busy != self.spi[n].busy() && self.uses_hardware_cs(n) {
+            self.update_pins(trace, now);
+        }
+    }
+
+    fn uses_hardware_cs(&self, n: usize) -> bool {
+        (0..NUM_GPIOS).any(|p| self.gpio.funcsel(p) == func::SPI && p & 3 == 1 && (p >> 3) & 1 == n)
+    }
+
+    /// Exchanges one frame with the devices selected on bus `n`. MISO reads 0 (pulled down) with nobody selected.
+    fn spi_exchange(&mut self, trace: &mut dyn TraceSink, n: usize, frame: u16, at: Time) -> u16 {
+        let bits = self.spi[n].bits();
+        let mut reply = 0;
+        let mut pins_changed = false;
+        for att in self.spi_devices.iter_mut().filter(|a| a.bus == n && a.selected) {
+            let mut ctx = DevPins { now: at, gpio: &mut self.gpio, freqs: &self.freqs, changed: false };
+            reply = att.dev.transfer(&mut ctx, frame, bits);
+            pins_changed |= ctx.changed;
+        }
+        if pins_changed {
+            self.update_pins(trace, at);
+        }
+        reply
+    }
+
+    /// Lets the DMA move whatever it can. Returns whether anything moved.
+    pub fn service_dma(&mut self, trace: &mut dyn TraceSink, now: Time) -> bool {
+        if self.in_dma || !self.dma.any_busy() {
+            return false;
+        }
+        self.in_dma = true;
+        let mut dma = std::mem::take(&mut self.dma);
+        let moved = dma.service(&mut DmaPort { sys: self, trace, now });
+        self.dma = dma;
+        self.in_dma = false;
+        if moved {
+            self.irq_dirty = true;
+            // DMA writes may have filled FIFOs that now need to start shifting
+            for n in 0..2 {
+                if self.spi[n].busy() && !self.sched.is_pending(Event::SpiFrame(n as u8)) {
+                    let clk = self.clk_peri;
+                    if let Some(t) = self.spi[n].start(&clk, now) {
+                        self.sched.schedule(Event::SpiFrame(n as u8), t);
+                    }
+                }
+            }
+        }
+        moved
+    }
+
+    fn dreq(&self, n: u32) -> bool {
+        match n {
+            dma::dreq::SPI0_TX => self.spi[0].tx_dreq(),
+            dma::dreq::SPI0_RX => self.spi[0].rx_dreq(),
+            dma::dreq::SPI1_TX => self.spi[1].tx_dreq(),
+            dma::dreq::SPI1_RX => self.spi[1].rx_dreq(),
+            dma::dreq::UART0_TX => self.uart[0].tx_dreq(),
+            dma::dreq::UART0_RX => self.uart[0].rx_dreq(),
+            dma::dreq::UART1_TX => self.uart[1].tx_dreq(),
+            dma::dreq::UART1_RX => self.uart[1].rx_dreq(),
+            24..=31 => self.dreq_pulses[n as usize] > 0,
+            _ => false,
         }
     }
 
@@ -375,7 +559,11 @@ impl System {
                 self.update_pins(trace, t);
                 self.reschedule_pwm(t);
             }
-            Event::UartTx(n) | Event::UartRx(n) => self.uart_advance(n as usize, t),
+            Event::UartTx(n) | Event::UartRx(n) => {
+                self.uart_advance(n as usize, t);
+                self.service_dma(trace, t);
+            }
+            Event::SpiFrame(n) => self.spi_advance(trace, n as usize, t),
             Event::Core1Boot | Event::External(_) => {}
         }
     }
@@ -416,6 +604,13 @@ impl System {
             ROSC_BASE => self.clocks.rosc.read(off),
             VREG_AND_CHIP_RESET_BASE => self.vreg.read(off),
             XIP_SSI_BASE => self.ssi.read(off),
+            SPI0_BASE | SPI1_BASE => {
+                let n = (base == SPI1_BASE) as usize;
+                let v = self.spi[n].read(off);
+                self.spi_advance(trace, n, now);
+                v
+            }
+            DMA_BASE => self.dma.read(off),
             UART0_BASE | UART1_BASE => {
                 let n = (base == UART1_BASE) as usize;
                 let v = self.uart[n].read(&self.clk_peri, now, off);
@@ -503,6 +698,21 @@ impl System {
             }),
             VREG_AND_CHIP_RESET_BASE => self.vreg.write(off, value, mode).then_some(()),
             XIP_SSI_BASE => self.ssi.write(off, value, WriteMode::Normal).then_some(()),
+            SPI0_BASE | SPI1_BASE => {
+                let n = (base == SPI1_BASE) as usize;
+                let ok = self.spi[n].write(off, value, mode);
+                self.spi_advance(trace, n, now);
+                if off == crate::periph::spi::SSPCR1 {
+                    self.update_pins(trace, now);
+                }
+                ok.then_some(())
+            }
+            DMA_BASE => {
+                let ok = self.dma.write(off, value, mode);
+                self.irq_dirty = true;
+                self.service_dma(trace, now);
+                ok.then_some(())
+            }
             UART0_BASE | UART1_BASE => {
                 let n = (base == UART1_BASE) as usize;
                 let ok = self.uart[n].write(&self.clk_peri, now, off, value, mode);
@@ -644,6 +854,8 @@ impl System {
             PLL_SYS_BASE => self.clocks.pll_sys.read(now, off),
             PLL_USB_BASE => self.clocks.pll_usb.read(now, off),
             TIMER_BASE => self.timer.peek(&self.watchdog.tick, now, off),
+            SPI0_BASE | SPI1_BASE => self.spi[(base == SPI1_BASE) as usize].peek(off),
+            DMA_BASE => self.dma.read(off),
             WATCHDOG_BASE => self.watchdog.read(now, off),
             VREG_AND_CHIP_RESET_BASE => self.vreg.read(off),
             _ => None,
@@ -669,6 +881,91 @@ impl System {
             _ => return false,
         }
         true
+    }
+}
+
+/// An SPI device and how it is wired.
+#[derive(Clone)]
+pub struct SpiAttachment {
+    pub bus: usize,
+    pub cs_pin: u8,
+    /// Chip select polarity (the UWRT parts are all active low).
+    pub cs_active_high: bool,
+    pub selected: bool,
+    pub dev: Box<dyn SpiDevice>,
+}
+
+/// What a device sees of the board.
+struct DevPins<'a> {
+    now: Time,
+    gpio: &'a mut Gpio,
+    freqs: &'a Freqs,
+    changed: bool,
+}
+
+impl DeviceCtx for DevPins<'_> {
+    fn now(&self) -> Time {
+        self.now
+    }
+
+    fn set_pin(&mut self, pin: u8, value: External) {
+        if let Some(p) = self.gpio.external.get_mut(pin as usize)
+            && *p != value
+        {
+            *p = value;
+            self.changed = true;
+        }
+    }
+
+    fn pin_level(&self, pin: u8) -> bool {
+        self.gpio.level & (1 << pin) != 0
+    }
+
+    fn pin_clock_hz(&self, pin: u8) -> u64 {
+        if (pin as usize) >= NUM_GPIOS || self.gpio.funcsel(pin as usize) != func::CLOCK {
+            return 0;
+        }
+        match pin {
+            21 => self.freqs.gpout[0],
+            23 => self.freqs.gpout[1],
+            24 => self.freqs.gpout[2],
+            25 => self.freqs.gpout[3],
+            _ => 0,
+        }
+    }
+}
+
+/// The system as a DMA bus master.
+struct DmaPort<'a> {
+    sys: &'a mut System,
+    trace: &'a mut dyn TraceSink,
+    now: Time,
+}
+
+impl DmaBus for DmaPort<'_> {
+    fn dreq(&mut self, n: u32) -> bool {
+        self.sys.dreq(n)
+    }
+
+    fn ack_dreq(&mut self, n: u32) {
+        if (24..=31).contains(&n) {
+            self.sys.dreq_pulses[n as usize] = self.sys.dreq_pulses[n as usize].saturating_sub(1);
+        }
+    }
+
+    fn dma_read(&mut self, addr: u32, size: Size) -> Option<u32> {
+        // SIO and the PPB are private to the cores
+        if addr >= SIO_BASE {
+            return None;
+        }
+        self.sys.read(self.trace, 2, self.now, addr, size).ok()
+    }
+
+    fn dma_write(&mut self, addr: u32, size: Size, value: u32) -> bool {
+        if addr >= SIO_BASE {
+            return false;
+        }
+        self.sys.write(self.trace, 2, self.now, addr, size, value).is_ok()
     }
 }
 

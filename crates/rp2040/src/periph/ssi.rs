@@ -34,6 +34,16 @@ impl Default for Ssi {
 }
 
 impl Ssi {
+    /// The state the bootrom's `connect_internal_flash`/`flash_exit_xip` leave the SSI in: enabled, standard SPI,
+    /// 8-bit frames, chip select under software control. Used by the HLE flash traps.
+    pub fn enter_command_mode(&mut self) {
+        self.regs[0x08 / 4] = 0;
+        self.regs[0] = 7 << 16; // DFS_32 = 7: 8-bit frames
+        self.regs[0x10 / 4] = 1; // SER
+        self.regs[0x08 / 4] = 1;
+        self.rx.clear();
+    }
+
     fn enabled(&self) -> bool {
         self.regs[0x08 / 4] & 1 != 0
     }

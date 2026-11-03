@@ -1,0 +1,27 @@
+//! SPI device interface.
+//!
+//! The SoC's SPI controller exchanges one frame at a time with the devices whose chip select is asserted. Chip
+//! selects are ordinary GPIOs (the UWRT boards drive them from SIO), so the machine tells a device when its CS pin
+//! changes.
+
+use crate::DeviceCtx;
+use crate::can::CanNode;
+
+pub trait SpiDevice: Send {
+    fn name(&self) -> String;
+    /// The device's chip select changed (`true` = asserted).
+    fn select(&mut self, ctx: &mut dyn DeviceCtx, selected: bool);
+    /// Exchanges one frame of `bits` bits while selected; returns the device's MISO frame.
+    fn transfer(&mut self, ctx: &mut dyn DeviceCtx, mosi: u16, bits: u8) -> u16;
+    /// Lets the device update its outputs after time passed or something reached it from outside (a CAN frame).
+    fn update(&mut self, ctx: &mut dyn DeviceCtx) {
+        let _ = ctx;
+    }
+    /// The device's CAN side, if it is a CAN controller.
+    fn can_node(&mut self) -> Option<&mut dyn CanNode> {
+        None
+    }
+    fn clone_box(&self) -> Box<dyn SpiDevice>;
+}
+
+sim_core::clone_box!(SpiDevice);

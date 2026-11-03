@@ -92,6 +92,21 @@ struct RunArgs {
     /// Where UART1 goes.
     #[arg(long, value_enum, default_value = "stdout")]
     uart1: UartSink,
+    /// Board description (boards/<dir>/<board>.toml): attaches the board's external chips.
+    #[arg(long)]
+    board: Option<PathBuf>,
+    /// Bridge the board's CAN bus to this SocketCAN interface (e.g. vcan0).
+    #[arg(long)]
+    can: Option<String>,
+    /// Attach a scripted titan_bridge stand-in for this CANmore client ID (pings, enables the vehicle).
+    #[arg(long)]
+    mock_bridge: Option<u8>,
+    /// Print every CAN frame on the bus, candump style.
+    #[arg(long)]
+    candump: bool,
+    /// Pace virtual time to the wall clock (needed with host tools such as titan_bridge).
+    #[arg(long)]
+    realtime: bool,
     /// Wait for GDB on this address (e.g. `127.0.0.1:3333`) before running.
     #[arg(long)]
     gdb: Option<String>,
@@ -158,6 +173,14 @@ fn run(args: RunArgs) -> Result<()> {
         machine.set_trace(Box::new(WriterSink { categories, out, prefix: String::new() }));
     }
 
+    let board = match &args.board {
+        Some(p) => Some(sim_host::board::Board::load(p).map_err(anyhow::Error::msg)?),
+        None => None,
+    };
+    if let Some(b) = &board {
+        b.apply(&mut machine).map_err(anyhow::Error::msg)?;
+        log::info!("board {} ({} SPI device(s))", b.name, machine.sys.spi_devices.len());
+    }
     machine.load(&image).map_err(anyhow::Error::msg)?;
     let vtor = machine.direct_boot().map_err(anyhow::Error::msg)?;
     log::info!("direct boot: VTOR {vtor:#010x}, entry {:#010x}", machine.cores[0].pc());
@@ -182,6 +205,32 @@ fn run(args: RunArgs) -> Result<()> {
         let defmt = if session.has_defmt() { ", decoding defmt" } else { "" };
         log::info!("RTT control block at {:#010x}{defmt}", rtt.addr);
     }
+
+    if let Some(rates) = board.as_ref().and_then(|b| b.can_rates()) {
+        let mut bus = sim_devices::can::CanBus::new(args.can.as_deref().unwrap_or("can"), rates);
+        if args.candump {
+            bus.record = Some(Vec::new());
+            session.on_can = Some(Box::new(|r| {
+                let ack = if r.acked { "" } else { "  (no ACK)" };
+                println!("[{}] {}{ack}", r.end, sim_devices::can::candump(&r.frame));
+            }));
+        }
+        session.can_bus = Some(bus);
+        if let Some(iface) = &args.can {
+            let sock = sim_host::socketcan::SocketCan::open(iface).with_context(|| format!("opening {iface}"))?;
+            session.can_endpoints.push(Box::new(sock));
+            log::info!("CAN bus bridged to {iface}");
+        }
+        if let Some(client) = args.mock_bridge {
+            let bridge = sim_host::mock_bridge::MockBridge::new(client, rates.data.is_some(), sim_core::Time::ZERO);
+            bridge.set_kill(Some(false));
+            session.can_endpoints.push(Box::new(bridge));
+            log::info!("mock bridge for client {client} attached");
+        }
+    } else if args.can.is_some() || args.mock_bridge.is_some() {
+        bail!("--can and --mock-bridge need a --board with a CAN bus");
+    }
+    session.realtime = args.realtime;
 
     let wall = std::time::Instant::now();
     if let Some(addr) = &args.gdb {
