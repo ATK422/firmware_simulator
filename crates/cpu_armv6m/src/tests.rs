@@ -1507,3 +1507,108 @@ fn block_add_with_carry_matches_the_reference() {
         }
     }
 }
+
+#[test]
+fn stacking_wraps_around_the_address_space() {
+    // An MSP just above zero puts the frame at the top of the address space (the PPB, which takes the writes) and
+    // past 0xFFFF_FFFF to address 0: the frame addresses wrap, as the core's address arithmetic does
+    let mut rig = Rig::new(&[NOP, NOP]);
+    rig.handler(16, HANDLER, &[bx(14)]);
+    rig.cpu.r[13] = 0x10;
+    rig.cpu.nvic.enabled = 1;
+    rig.cpu.set_irq_lines(1);
+    rig.run(1);
+    assert_eq!((rig.cpu.ipsr(), rig.r(13)), (16, 0xFFFF_FFF0));
+    assert_eq!(rig.bus.word(0x8), CODE, "stacked return address at frame + 24, wrapped to 0x8");
+    rig.cpu.set_irq_lines(0);
+    rig.run(1);
+    assert_eq!((rig.cpu.ipsr(), rig.cpu.pc(), rig.r(13)), (0, CODE, 0x10));
+}
+
+#[test]
+fn wfe_does_not_wake_on_an_interrupt_masked_by_primask() {
+    // Unlike WFI, WFE wakes only on an exception that is not masked by PRIMASK (or an event, or SEVONPEND)
+    let mut rig = Rig::new(&[CPSID, WFE, movs(0, 1)]);
+    rig.cpu.nvic.enabled = 1;
+    rig.run(2);
+    assert_eq!(rig.cpu.sleep_state(), Some(Sleep::Wfe));
+    rig.cpu.set_irq_lines(1);
+    assert!(!rig.cpu.would_wake());
+    assert_eq!(rig.step(), StepOutcome::Sleeping);
+    rig.cpu.signal_event();
+    assert!(rig.cpu.would_wake());
+    rig.run(1);
+    assert_eq!((rig.cpu.ipsr(), rig.r(0)), (0, 1), "woken by the event; the interrupt stays pending");
+
+    // Without PRIMASK the same interrupt wakes it and is taken
+    let mut rig = Rig::new(&[WFE, movs(0, 1)]);
+    rig.cpu.nvic.enabled = 1;
+    rig.run(1);
+    rig.cpu.set_irq_lines(1);
+    assert!(rig.cpu.would_wake());
+    rig.run(1);
+    assert_eq!(rig.cpu.ipsr(), 16);
+}
+
+#[test]
+fn branch_to_an_even_address_faults_at_the_target() {
+    // BX/BLX/POP {pc} to an address with bit 0 clear complete (LR, SP, registers written) and the HardFault is taken
+    // for the instruction at the target: the stacked return address is the target
+    let target = HANDLER + 0x200;
+    let check = |rig: &mut Rig, lr: u32| {
+        assert_eq!(rig.cpu.ipsr(), exception::HARD_FAULT);
+        assert_eq!(rig.cpu.last_fault.unwrap(), crate::FaultRecord { pc: target, fault: Fault::InvalidState(target) });
+        let sp = rig.r(13);
+        assert_eq!(rig.bus.word(sp + 24), target, "stacked PC");
+        assert_eq!(rig.bus.word(sp + 20), lr, "stacked LR");
+    };
+    for blocks in [None, Some(false), Some(true)] {
+        let mut rig = Rig::new(&[NOP, blx(1)]);
+        rig.cpu.r[1] = target;
+        rig.cpu.r[14] = 0x1234_5679;
+        match blocks {
+            None => {
+                rig.run(2);
+            }
+            Some(b) => {
+                batch_on(&mut rig, b, 10, 1000);
+            }
+        }
+        check(&mut rig, (CODE + 4) | 1);
+
+        let mut rig = Rig::new(&[NOP, pop(0b1, true)]);
+        rig.cpu.r[13] = STACK_TOP - 8;
+        rig.bus.set_word(STACK_TOP - 8, 7);
+        rig.bus.set_word(STACK_TOP - 4, target);
+        match blocks {
+            None => {
+                rig.run(2);
+            }
+            Some(b) => {
+                batch_on(&mut rig, b, 10, 1000);
+            }
+        }
+        check(&mut rig, 0xFFFF_FFFF);
+        assert_eq!(rig.r(0), 7, "the POP completed");
+        assert_eq!(rig.r(13), (STACK_TOP - 32) & !7, "frame pushed below the popped SP");
+    }
+}
+
+#[test]
+fn systick_counts_the_cycles_of_a_hardfault_entry() {
+    // SysTick on the core clock counts every cycle, the 15 of a fault's exception entry as those of an interrupt's
+    for blocks in [None, Some(false), Some(true)] {
+        let mut rig = Rig::new(&[0xDE00, NOP]);
+        rig.handler(exception::HARD_FAULT, HANDLER, &[NOP; 4]);
+        rig.cpu.systick.rvr = 1000;
+        rig.cpu.systick.cvr = 100;
+        rig.cpu.systick.csr = 0b101;
+        let cycles = match blocks {
+            None => rig.run(1) as u64,
+            Some(b) => batch_on(&mut rig, b, 1, 1000).cycles,
+        };
+        assert_eq!(rig.cpu.ipsr(), exception::HARD_FAULT);
+        assert_eq!(cycles, 15);
+        assert_eq!(rig.cpu.systick.cvr, 85, "{blocks:?}");
+    }
+}

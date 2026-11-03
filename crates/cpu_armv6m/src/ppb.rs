@@ -231,7 +231,11 @@ impl CortexM0Plus {
         let merge = |old: u32| (old & !mask) | (value & mask);
         let set_bits = value & mask;
         match addr {
-            SYST_CSR => self.systick.csr = merge(self.systick.csr) & (CSR_ENABLE | CSR_TICKINT | CSR_CLKSOURCE),
+            // COUNTFLAG is read only: a read of SYST_CSR or a write of SYST_CVR clears it, a write here does not
+            SYST_CSR => {
+                self.systick.csr = merge(self.systick.csr) & (CSR_ENABLE | CSR_TICKINT | CSR_CLKSOURCE)
+                    | self.systick.csr & CSR_COUNTFLAG
+            }
             SYST_RVR => self.systick.rvr = merge(self.systick.rvr) & 0x00FF_FFFF,
             SYST_CVR => {
                 self.systick.cvr = 0;
@@ -404,6 +408,18 @@ mod tests {
         c.ppb_write(SCR, Size::Word, 0xFF);
         assert_eq!(c.scb.scr, 0x16);
         assert_eq!(c.ppb_read(MPU_TYPE, Size::Word), 0x800);
+    }
+
+    #[test]
+    fn systick_csr_write_keeps_countflag() {
+        let mut c = CortexM0Plus::new();
+        c.systick.csr = CSR_ENABLE | CSR_CLKSOURCE | CSR_COUNTFLAG;
+        c.ppb_write(SYST_CSR, Size::Word, CSR_ENABLE | CSR_TICKINT | CSR_CLKSOURCE);
+        assert_eq!(c.systick.csr & CSR_TICKINT, CSR_TICKINT);
+        assert!(
+            c.ppb_read(SYST_CSR, Size::Word) & CSR_COUNTFLAG != 0,
+            "only a read of SYST_CSR or a write of SYST_CVR clears COUNTFLAG"
+        );
     }
 
     #[test]

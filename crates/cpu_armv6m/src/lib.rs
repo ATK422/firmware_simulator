@@ -68,6 +68,19 @@ pub enum Fault {
     InvalidReturn(u32),
 }
 
+impl Fault {
+    /// The address of the instruction that faults, for a fault raised by the instruction at `pc`: that one, except
+    /// for an interworking branch to an address with bit 0 clear, which completes (with EPSR.T clear) and faults on
+    /// the instruction at its target (ARMv6-M ARM `BXWritePC` sets EPSR.T from bit 0 and branches; the fault is
+    /// then the next instruction's, whose address is the stacked return address).
+    pub fn faulting_pc(self, pc: u32) -> u32 {
+        match self {
+            Fault::InvalidState(target) => target & !1,
+            _ => pc,
+        }
+    }
+}
+
 impl From<BusFault> for Fault {
     fn from(f: BusFault) -> Fault {
         Fault::Bus(f)
@@ -440,7 +453,7 @@ impl CortexM0Plus {
         best
     }
 
-    /// The exception that would be taken now, ignoring PRIMASK if `ignore_primask` (used for WFI/WFE wake-up).
+    /// The exception that would be taken now, ignoring PRIMASK if `ignore_primask` (used for WFI wake-up: unlike WFE, a WFI wakes on an interrupt PRIMASK masks).
     fn preempting(&self, ignore_primask: bool) -> Option<u32> {
         let (e, p) = self.highest_pending()?;
         let limit = if ignore_primask { self.active_priority() } else { self.execution_priority() };
@@ -465,7 +478,7 @@ impl CortexM0Plus {
         let xpsr = self.xpsr() & !(1 << 9) | align << 9;
         let vals = [self.r[0], self.r[1], self.r[2], self.r[3], self.r[12], self.r[14], return_addr, xpsr];
         for (i, v) in vals.iter().enumerate() {
-            self.write_mem(bus, frame + 4 * i as u32, Size::Word, *v)?;
+            self.write_mem(bus, frame.wrapping_add(4 * i as u32), Size::Word, *v)?;
         }
         self.r[13] = frame;
         self.r[14] = if self.ipsr != 0 {
@@ -507,7 +520,7 @@ impl CortexM0Plus {
         let frame = self.r[13];
         let mut vals = [0u32; 8];
         for (i, v) in vals.iter_mut().enumerate() {
-            *v = self.read_mem(bus, frame + 4 * i as u32, Size::Word)?;
+            *v = self.read_mem(bus, frame.wrapping_add(4 * i as u32), Size::Word)?;
         }
         self.r[0] = vals[0];
         self.r[1] = vals[1];
@@ -545,6 +558,8 @@ impl CortexM0Plus {
         match self.exception_entry(bus, exception::HARD_FAULT, pc) {
             Ok(c) => {
                 self.cycles += c as u64;
+                // As for an interrupt's entry (`step_inner`): SysTick on the core clock counts these cycles too
+                self.tick(c);
                 StepOutcome::Ran(c)
             }
             Err(_) => {
@@ -643,7 +658,7 @@ impl CortexM0Plus {
         match self.sleep {
             None => true,
             Some(Sleep::Wfi) => self.preempting(true).is_some(),
-            Some(Sleep::Wfe) => self.event_reg || self.preempting(true).is_some(),
+            Some(Sleep::Wfe) => self.event_reg || self.preempting(false).is_some(),
         }
     }
 
@@ -714,7 +729,7 @@ impl CortexM0Plus {
                         return Batch { steps: steps + 1, cycles, stop };
                     }
                     f => {
-                        self.r[15] = pc;
+                        self.r[15] = f.faulting_pc(pc);
                         self.cycles += cycles;
                         self.instructions += steps as u64 - 1;
                         match self.take_fault(bus, f) {
@@ -846,7 +861,10 @@ impl CortexM0Plus {
             let wake = match sleep {
                 Sleep::Wfi => self.preempting(true).is_some(),
                 Sleep::Wfe => {
-                    if self.event_reg || self.preempting(true).is_some() {
+                    // WFE wakes on an event or an exception that would be taken, PRIMASK included (ARMv6-M ARM
+                    // B1.5.18; the Cortex-M0+ user guide: "an exception, unless masked by the exception mask
+                    // registers or the current priority level")
+                    if self.event_reg || self.preempting(false).is_some() {
                         self.event_reg = false;
                         true
                     } else {
@@ -889,7 +907,7 @@ impl CortexM0Plus {
                 StepOutcome::Breakpoint(imm)
             }
             Err(f) => {
-                self.r[15] = pc;
+                self.r[15] = f.faulting_pc(pc);
                 self.take_fault(bus, f)
             }
         }
