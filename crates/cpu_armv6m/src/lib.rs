@@ -607,16 +607,18 @@ impl CortexM0Plus {
     ///
     /// Before each instruction the bus learns how many cycles the batch has taken ([`Bus::set_elapsed`]).
     pub fn run_batch<B: Bus + ?Sized>(&mut self, bus: &mut B, max_steps: u32, budget: u64, trap_below: u32) -> Batch {
-        let mut b = Batch { steps: 0, cycles: 0, stop: None };
         if self.lockup || self.sleep.is_some() {
-            return b;
+            return Batch { steps: 0, cycles: 0, stop: None };
         }
         // Whether an exception could preempt only changes with the exception state: IRQ lines are fixed for the
         // batch and PPB accesses end it
         self.exc_changed = true;
         self.batch_break = false;
-        let mut instructions = 0;
-        while b.steps < max_steps {
+        // Counted in locals (registers) and stored once at the end
+        let (mut steps, mut cycles, mut stop) = (0u32, 0u64, None);
+        // SysTick only counts core cycles with CLKSOURCE set, which only a PPB write (ending the batch) changes
+        let systick = self.systick.counts_core_clock();
+        while steps < max_steps {
             if self.exc_changed {
                 self.exc_changed = false;
                 self.latch_irqs();
@@ -628,38 +630,42 @@ impl CortexM0Plus {
             if pc < trap_below {
                 break;
             }
-            bus.set_elapsed(b.cycles);
-            b.steps += 1;
+            bus.set_elapsed(cycles);
+            steps += 1;
             match self.execute(bus) {
-                Ok(cycles) => {
-                    let cycles = cycles + bus.take_stall_cycles();
-                    instructions += 1;
-                    self.tick(cycles);
-                    b.cycles += cycles as u64;
+                Ok(c) => {
+                    let c = c + bus.take_stall_cycles();
+                    if systick {
+                        self.tick(c);
+                    }
+                    cycles += c as u64;
                 }
                 Err(Fault::Breakpoint(imm)) => {
                     self.r[15] = pc;
-                    b.stop = Some(StepOutcome::Breakpoint(imm));
-                    break;
+                    stop = Some(StepOutcome::Breakpoint(imm));
+                    steps -= 1;
+                    self.cycles += cycles;
+                    self.instructions += steps as u64;
+                    return Batch { steps: steps + 1, cycles, stop };
                 }
                 Err(f) => {
                     self.r[15] = pc;
-                    self.cycles += b.cycles;
-                    self.instructions += instructions;
+                    self.cycles += cycles;
+                    self.instructions += steps as u64 - 1;
                     match self.take_fault(bus, f) {
-                        StepOutcome::Ran(c) => b.cycles += c as u64,
-                        other => b.stop = Some(other),
+                        StepOutcome::Ran(c) => cycles += c as u64,
+                        other => stop = Some(other),
                     }
-                    return b;
+                    return Batch { steps, cycles, stop };
                 }
             }
-            if bus.take_attention() || std::mem::take(&mut self.batch_break) || b.cycles >= budget {
+            if bus.take_attention() || std::mem::take(&mut self.batch_break) || cycles >= budget {
                 break;
             }
         }
-        self.cycles += b.cycles;
-        self.instructions += instructions;
-        b
+        self.cycles += cycles;
+        self.instructions += steps as u64;
+        Batch { steps, cycles, stop }
     }
 
     /// [`Cpu::step`] against a concrete bus type, so a machine's bus accesses can be inlined into the interpreter.

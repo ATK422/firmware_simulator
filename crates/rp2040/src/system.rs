@@ -1944,6 +1944,13 @@ impl<'a> BatchBus<'a> {
     #[inline(never)]
     fn slow_read(&mut self, addr: u32, size: Size) -> Result<u32, BusFault> {
         let now = self.now();
+        // Firmware polls the timer constantly (embassy-time, busy waits); reading it changes nothing the batch or
+        // the machine would have to look at
+        if addr & !0x3FFF == TIMER_BASE
+            && let Some(v) = self.sys.timer.read(&self.sys.watchdog.tick, now, addr & 0xFFC)
+        {
+            return Ok(mem::lane(v, addr, size));
+        }
         let r = self.sys.read(self.trace, self.core, now, addr, size);
         self.after_access(now);
         r

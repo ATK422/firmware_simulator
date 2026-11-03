@@ -53,6 +53,7 @@ impl CortexM0Plus {
         self.ipsr != 0 || !self.npriv
     }
 
+    #[inline(always)]
     fn condition_passed(&self, cond: u32) -> bool {
         let r = match cond >> 1 {
             0 => self.z,
@@ -364,6 +365,7 @@ impl CortexM0Plus {
         Ok(cycles)
     }
 
+    #[inline(always)]
     fn data_processing(&mut self, ins: u32) {
         let rdn = ins & 7;
         let rm = self.r[((ins >> 3) & 7) as usize];
