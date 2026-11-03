@@ -1524,3 +1524,28 @@ fn stacking_wraps_around_the_address_space() {
     rig.run(1);
     assert_eq!((rig.cpu.ipsr(), rig.cpu.pc(), rig.r(13)), (0, CODE, 0x10));
 }
+
+#[test]
+fn wfe_does_not_wake_on_an_interrupt_masked_by_primask() {
+    // Unlike WFI, WFE wakes only on an exception that is not masked by PRIMASK (or an event, or SEVONPEND)
+    let mut rig = Rig::new(&[CPSID, WFE, movs(0, 1)]);
+    rig.cpu.nvic.enabled = 1;
+    rig.run(2);
+    assert_eq!(rig.cpu.sleep_state(), Some(Sleep::Wfe));
+    rig.cpu.set_irq_lines(1);
+    assert!(!rig.cpu.would_wake());
+    assert_eq!(rig.step(), StepOutcome::Sleeping);
+    rig.cpu.signal_event();
+    assert!(rig.cpu.would_wake());
+    rig.run(1);
+    assert_eq!((rig.cpu.ipsr(), rig.r(0)), (0, 1), "woken by the event; the interrupt stays pending");
+
+    // Without PRIMASK the same interrupt wakes it and is taken
+    let mut rig = Rig::new(&[WFE, movs(0, 1)]);
+    rig.cpu.nvic.enabled = 1;
+    rig.run(1);
+    rig.cpu.set_irq_lines(1);
+    assert!(rig.cpu.would_wake());
+    rig.run(1);
+    assert_eq!(rig.cpu.ipsr(), 16);
+}

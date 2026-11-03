@@ -440,7 +440,7 @@ impl CortexM0Plus {
         best
     }
 
-    /// The exception that would be taken now, ignoring PRIMASK if `ignore_primask` (used for WFI/WFE wake-up).
+    /// The exception that would be taken now, ignoring PRIMASK if `ignore_primask` (used for WFI wake-up: unlike WFE, a WFI wakes on an interrupt PRIMASK masks).
     fn preempting(&self, ignore_primask: bool) -> Option<u32> {
         let (e, p) = self.highest_pending()?;
         let limit = if ignore_primask { self.active_priority() } else { self.execution_priority() };
@@ -643,7 +643,7 @@ impl CortexM0Plus {
         match self.sleep {
             None => true,
             Some(Sleep::Wfi) => self.preempting(true).is_some(),
-            Some(Sleep::Wfe) => self.event_reg || self.preempting(true).is_some(),
+            Some(Sleep::Wfe) => self.event_reg || self.preempting(false).is_some(),
         }
     }
 
@@ -846,7 +846,10 @@ impl CortexM0Plus {
             let wake = match sleep {
                 Sleep::Wfi => self.preempting(true).is_some(),
                 Sleep::Wfe => {
-                    if self.event_reg || self.preempting(true).is_some() {
+                    // WFE wakes on an event or an exception that would be taken, PRIMASK included (ARMv6-M ARM
+                    // B1.5.18; the Cortex-M0+ user guide: "an exception, unless masked by the exception mask
+                    // registers or the current priority level")
+                    if self.event_reg || self.preempting(false).is_some() {
                         self.event_reg = false;
                         true
                     } else {
