@@ -6,7 +6,7 @@
 //! use sim_test::titan_link::DeviceToHost;
 //!
 //! let Some(elf) = sim_test::titan_rs("power_board") else { return };
-//! let mut b = Bench::new(&elf).board("mk2/power_board").bridge(1).boot().unwrap();
+//! let mut b = Bench::builder(&elf).board("mk2/power_board").bridge(1).boot().unwrap();
 //! b.wait_for_log("ROS connected", Time::from_secs(1)).unwrap();
 //! b.set("sht41.temperature_c", 31.5);
 //! b.run_for(Time::from_ms(1500));
@@ -158,7 +158,7 @@ pub struct Bench {
 }
 
 impl Bench {
-    pub fn new(elf: impl AsRef<Path>) -> BenchBuilder {
+    pub fn builder(elf: impl AsRef<Path>) -> BenchBuilder {
         BenchBuilder { elf: elf.as_ref().to_path_buf(), board: None, bridge: None, rom_boot: false, record_bus: false }
     }
 
