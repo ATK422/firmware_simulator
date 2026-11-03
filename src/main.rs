@@ -21,6 +21,8 @@ struct Cli {
     command: Command,
 }
 
+// Parsed once; the size difference between the subcommands' arguments doesn't matter
+#[allow(clippy::large_enum_variant)]
 #[derive(Subcommand)]
 enum Command {
     /// Runs one firmware image (ELF or UF2).
