@@ -37,6 +37,8 @@ pub mod session;
 pub mod socketcan;
 pub mod target;
 pub mod upload;
+pub mod usb;
+pub mod usbip;
 pub mod vehicle;
 
 pub use session::Session;

@@ -202,7 +202,9 @@ pub fn sysinfo_read(offset: u32, revision: u32) -> Option<u32> {
         0x00 => revision << 28 | 0x0002 << 12 | 0x927,
         // PLATFORM: ASIC
         0x04 => 0x2,
-        0x40 => 0,
+        // GITREF_RP2040: the bootrom puts its top 24 bits at the start of the BOOTSEL serial number, which on
+        // production chips reads E0C912...
+        0x40 => 0xE0C9_12E8,
         _ => return None,
     })
 }

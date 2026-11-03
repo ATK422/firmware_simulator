@@ -40,7 +40,8 @@ and the ELF's `.defmt` table) and printed with the virtual time they were read a
 
 Options: `--time` (virtual time to run, e.g. `500ms`), `--trace instr,exc,gpio,unmodelled,device`, `--trace-file`,
 `--quantum` (instructions per core before switching), `--uart0/--uart1 stdout|pty|none`, `--unmodelled first|every|off` (logging of registers the
-emulator does not model yet; each is named from the SVD), `--stop-on-bkpt`, `--crystal-hz`, `--gdb ADDR`, `--rom-boot`, `--hle-flash`, `--flash-file FILE`.
+emulator does not model yet; each is named from the SVD), `--stop-on-bkpt`, `--crystal-hz`, `--gdb ADDR`, `--rom-boot`, `--hle-flash`, `--flash-file FILE`,
+and for USB `--usb`, `--bootsel`, `--usb-cdc stdout|pty`, `--picoboot-load FILE`, `--load-via picoboot|drive`, `--usbip ADDR` (see [USB](#usb-bootsel-picoboot-uf2-and-cdc)).
 
 ### Boards and CAN
 
@@ -230,6 +231,47 @@ kill switch kills the vehicle and the ESC board's thrusters go neutral, a failin
 `FAULT_DEPTH_ERROR`, a hung task trips the watchdog and leaves a crash record, the board rides out bit errors and
 bus-off, Puddles drops ROS with its cable out and reconnects. Its `firmware_finding_*` tests pin down behaviour
 that looks wrong in the firmware.
+
+### USB: BOOTSEL, PICOBOOT, UF2 and CDC
+
+The USB controller is modelled in device mode (USBCTRL_REGS and its DPRAM: endpoint and buffer control, single
+and double buffering, data toggles, STALL/NAK, setup packets, bus reset, SOF, the pull-up, interrupts; it needs
+`clk_usb` at 48 MHz). `--usb` plugs the board's port into a host controller model (`sim_devices::usb::host`):
+it debounces the attach, resets the bus, enumerates the device (SET_ADDRESS, descriptors, SET_CONFIGURATION) and
+runs control, bulk and interrupt transfers transaction by transaction on the virtual clock, with SOFs every 1 ms
+frame and full speed bus time (about 1.2 MB/s for a bulk pipe). `--trace device` shows what it does.
+
+With `--bootsel` the board powers on with BOOTSEL held and the real bootrom starts its USB boot mode: it
+enumerates as "RP2 Boot" with the PICOBOOT interface and the RPI-RP2 drive. Firmware that calls
+`reset_usb_boot` (pico-sdk's reset interface, its 1200 baud trick, embassy's `reset_to_usb_boot`) goes there too,
+through the watchdog and the bootrom, even when it was started with direct boot. `sim_host::usb` has the host
+tools: `Picoboot` speaks PICOBOOT as `picotool` does (exclusive access, exit XIP, erase, write, read, reboot, and
+`load` = `picotool load -v -x`), `MscDrive` speaks bulk-only mass storage and SCSI and copies a UF2 file to the
+drive, `reboot_via_reset_interface` is `picotool reboot -f [-u]`. The flash is written by the bootrom's own code
+through the SSI and the flash chip model.
+
+```bash
+# picotool load -v -x: blank flash, BOOTSEL, flash over PICOBOOT, reboot into the image and run it for 2 s
+cargo run --release -- picoboot load test_programs/embassy_blinky.elf --time 2s
+# The same by copying the UF2 to the RPI-RP2 drive, keeping the flash in a file afterwards
+cargo run --release -- picoboot load app.uf2 --load-via drive --flash-file flash.bin
+# Stay in BOOTSEL and watch the host enumerate it
+cargo run --release -- run --bootsel --time 300ms --trace device
+# pico-sdk stdio over USB (TinyUSB CDC ACM): the host opens the port (DTR/RTS, 115200 8N1) and prints its lines,
+# or puts it on a pseudo terminal for picocom/screen
+cargo run --release -- run test_programs/pico/hello_usb.elf --usb-cdc stdout --time 1s
+cargo run --release -- run test_programs/pico/hello_usb.elf --usb-cdc pty --realtime --time 600s
+```
+
+`--usbip 127.0.0.1:3240` exports the device over USB/IP, so the real host's tools can use it after `sudo usbip
+attach -r 127.0.0.1 -b 1-1` (`picotool`, `/dev/ttyACM*`, the RPI-RP2 drive); use it with `--realtime`, and attach
+again after the device reboots (the server ends the session when the device leaves the bus).
+
+`test_programs/pico/hello_usb` (pico-sdk stdio_usb) and `test_programs/c_dual_usb` (titan_firmware's
+`titan_dual_stdio_usb`, two CDC ports) are the device-side test programs (`crates/sim_host/tests/usb.rs`). Not
+modelled: host mode of the controller and isochronous endpoints. The host can suspend and resume the port
+(`HostController::suspend`/`resume`), firmware can wake it (SIE_CTRL.RESUME), and `System::detach_usb_host`
+pulls the cable.
 
 ### Debugging
 

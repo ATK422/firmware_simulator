@@ -35,6 +35,15 @@ pub struct Session {
     uart_line: [String; 2],
     /// Pseudo terminals attached to the UARTs.
     pub uart_pty: [Option<crate::pty::Pty>; 2],
+    /// Everything the device sent on its USB CDC ACM port (when the USB host has opened it), as text.
+    pub usb_cdc_text: String,
+    /// Callback for complete lines from the USB CDC port.
+    pub on_usb_cdc_line: Option<LineHook>,
+    usb_cdc_line: String,
+    /// A pseudo terminal attached to the USB CDC port (host side of the device's serial port).
+    pub usb_cdc_pty: Option<crate::pty::Pty>,
+    /// A USB/IP server exporting the board's USB device to the real host.
+    pub usbip: Option<crate::usbip::UsbIpServer>,
     /// The CAN bus the board's CAN controllers sit on, if any.
     pub can_bus: Option<CanBus>,
     /// Host participants on that bus (bridges, mocks).
@@ -50,6 +59,9 @@ pub struct Session {
     pacing: Option<(std::time::Instant, Time)>,
     behind_warned: std::time::Instant,
 }
+
+/// Callback for complete lines of text: `(virtual time, line)`.
+pub type LineHook = Box<dyn FnMut(Time, &str) + Send>;
 
 /// Callback for complete UART output lines.
 pub type UartHook = Box<dyn FnMut(Time, usize, &str) + Send>;
@@ -78,6 +90,11 @@ impl Session {
             on_uart_line: None,
             uart_line: [String::new(), String::new()],
             uart_pty: [None, None],
+            usb_cdc_text: String::new(),
+            on_usb_cdc_line: None,
+            usb_cdc_line: String::new(),
+            usb_cdc_pty: None,
+            usbip: None,
             can_bus: None,
             can_endpoints: Vec::new(),
             on_can: None,
@@ -121,6 +138,11 @@ impl Session {
             on_uart_line: None,
             uart_line: self.uart_line.clone(),
             uart_pty: [None, None],
+            usb_cdc_text: self.usb_cdc_text.clone(),
+            on_usb_cdc_line: None,
+            usb_cdc_line: self.usb_cdc_line.clone(),
+            usb_cdc_pty: None,
+            usbip: None,
             can_bus: self.can_bus.clone(),
             can_endpoints: Vec::new(),
             on_can: None,
@@ -167,6 +189,39 @@ impl Session {
         }
     }
 
+    /// Collects what the device sent on its (first) USB CDC port and passes pty input to it. Does nothing unless
+    /// the USB host has opened the port ([`sim_devices::usb::host::HostController::cdc_open`]).
+    pub fn poll_usb_cdc(&mut self) {
+        let now = self.machine.now;
+        if let Some(pty) = &self.usb_cdc_pty {
+            let input = pty.read();
+            if !input.is_empty() {
+                self.machine.sys.with_usb_host(now, |h| h.cdc_write(0, &input));
+            }
+        }
+        let Some(host) = self.machine.sys.usb_host_mut() else { return };
+        let rx = host.cdc_take_rx(0);
+        if rx.is_empty() {
+            return;
+        }
+        if let Some(pty) = &self.usb_cdc_pty {
+            pty.write(&rx);
+        }
+        for b in rx {
+            let c = b as char;
+            self.usb_cdc_text.push(c);
+            match b {
+                b'\n' => {
+                    let line = std::mem::take(&mut self.usb_cdc_line);
+                    if let Some(hook) = &mut self.on_usb_cdc_line {
+                        hook(now, line.trim_end_matches('\r'));
+                    }
+                }
+                _ => self.usb_cdc_line.push(c),
+            }
+        }
+    }
+
     /// Flushes partial UART lines to the hook (end of a run).
     pub fn flush_uarts(&mut self) {
         let now = self.machine.now;
@@ -183,6 +238,7 @@ impl Session {
     /// Drains RTT now.
     pub fn poll_rtt(&mut self) {
         self.poll_uarts();
+        self.poll_usb_cdc();
         let Some(rtt) = &self.rtt else { return };
         let now = self.machine.now;
         for (ch, bytes) in rtt.poll(&mut self.machine) {
@@ -260,6 +316,9 @@ impl Session {
             let reason = self.machine.run_until(target);
             self.step_can();
             self.poll_rtt();
+            if let Some(u) = &mut self.usbip {
+                u.poll(&mut self.machine);
+            }
             if self.realtime {
                 self.pace();
             }

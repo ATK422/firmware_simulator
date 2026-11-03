@@ -29,6 +29,31 @@ enum Command {
     Run(RunArgs),
     /// Runs every board of a robot file on their shared CAN buses (and acoustic environment).
     Robot(RobotArgs),
+    /// What `picotool` does, against an emulated board in BOOTSEL mode.
+    #[command(subcommand)]
+    Picoboot(PicobootCommand),
+}
+
+#[derive(Subcommand)]
+enum PicobootCommand {
+    /// `picotool load -v -x FILE`: powers a board on with BOOTSEL held (blank flash, or `--flash-file`), flashes
+    /// FILE over PICOBOOT through the bootrom, reboots into it and runs it for `--time`. Further options are
+    /// `run` options, e.g. `--time 2s --board ... --usb-cdc stdout`.
+    Load {
+        /// Image to flash (ELF or UF2).
+        file: PathBuf,
+        /// `run` options.
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        run_args: Vec<String>,
+    },
+}
+
+#[derive(Clone, Copy, ValueEnum, PartialEq, Eq)]
+enum LoadVia {
+    /// The PICOBOOT vendor interface (`picotool load`).
+    Picoboot,
+    /// Copy the image as a UF2 file to the BOOTSEL mass storage drive.
+    Drive,
 }
 
 #[derive(clap::Args)]
@@ -251,6 +276,14 @@ enum UartSink {
 }
 
 #[derive(Clone, Copy, ValueEnum, PartialEq, Eq)]
+enum CdcSink {
+    /// Print complete lines on stdout with their virtual time.
+    Stdout,
+    /// Create a pseudo terminal (output and input), like the device's /dev/ttyACM.
+    Pty,
+}
+
+#[derive(Clone, Copy, ValueEnum, PartialEq, Eq)]
 enum UnmodelledLog {
     First,
     Every,
@@ -259,8 +292,9 @@ enum UnmodelledLog {
 
 #[derive(clap::Args)]
 struct RunArgs {
-    /// Firmware image: ELF or UF2.
-    image: PathBuf,
+    /// Firmware image: ELF or UF2. Optional with `--bootsel` (the flash then starts blank).
+    #[arg(required_unless_present = "bootsel")]
+    image: Option<PathBuf>,
     /// Virtual time to run for, e.g. `500ms`, `2s`, `100us`.
     #[arg(short, long, default_value = "1s", value_parser = parse_time)]
     time: Time,
@@ -331,6 +365,28 @@ struct RunArgs {
     /// QSPI flash model.
     #[arg(long)]
     hle_flash: bool,
+    /// Power on with BOOTSEL held: the bootrom enters USB boot mode (PICOBOOT and the RPI-RP2 drive) instead of
+    /// booting the flash. Implies `--rom-boot` and `--usb`.
+    #[arg(long)]
+    bootsel: bool,
+    /// Plug the board's USB port into a host, which enumerates whatever the firmware presents.
+    #[arg(long)]
+    usb: bool,
+    /// Open the device's USB CDC ACM serial port (pico-sdk stdio_usb) from the host: print its lines, or attach
+    /// it to a pseudo terminal. Implies `--usb`.
+    #[arg(long, value_enum)]
+    usb_cdc: Option<CdcSink>,
+    /// Once the board is in BOOTSEL mode, flash this image (ELF or UF2) into it and reboot into it, then run for
+    /// `--time`. Implies `--usb`.
+    #[arg(long)]
+    picoboot_load: Option<PathBuf>,
+    /// Export the board's USB device over USB/IP on this address (e.g. `127.0.0.1:3240`) for the real host's tools:
+    /// `sudo usbip attach -r 127.0.0.1 -b 1-1`. Implies `--usb`; use with `--realtime`.
+    #[arg(long)]
+    usbip: Option<String>,
+    /// How `--picoboot-load` gets the image onto the board.
+    #[arg(long, value_enum, default_value = "picoboot")]
+    load_via: LoadVia,
     /// For a board with Ethernet (Puddles): relay its UDP traffic through a host socket, `LOCAL=PEER`, e.g.
     /// `127.0.0.1:2203=127.0.0.1:2204` (titan_bridge listening on PEER, sending to LOCAL).
     #[arg(long)]
@@ -373,9 +429,20 @@ fn parse_time(s: &str) -> Result<Time, String> {
     Ok(Time::from_secs_f64(v * mult))
 }
 
+fn load_image(path: &std::path::Path) -> Result<Image> {
+    let bytes = std::fs::read(path).with_context(|| format!("reading {}", path.display()))?;
+    Image::parse(&bytes).with_context(|| format!("parsing {}", path.display()))
+}
+
 fn run(args: RunArgs) -> Result<()> {
-    let bytes = std::fs::read(&args.image).with_context(|| format!("reading {}", args.image.display()))?;
-    let image = Image::parse(&bytes).with_context(|| format!("parsing {}", args.image.display()))?;
+    let image = match &args.image {
+        Some(p) => load_image(p)?,
+        None => Image::default(),
+    };
+    let to_load = match &args.picoboot_load {
+        Some(p) => Some(load_image(p)?),
+        None => None,
+    };
 
     let config = MachineConfig {
         flash_size: args.flash_size,
@@ -448,7 +515,11 @@ fn run(args: RunArgs) -> Result<()> {
         }
         machine.load(&image).map_err(anyhow::Error::msg)?;
     }
-    if args.rom_boot {
+    if args.bootsel {
+        machine.sys.io_qspi.bootsel_pressed = true;
+        machine.rom_boot().map_err(anyhow::Error::msg)?;
+        log::info!("powering on with BOOTSEL held");
+    } else if args.rom_boot {
         machine.rom_boot().map_err(anyhow::Error::msg)?;
         log::info!("booting through the bootrom");
     } else {
@@ -456,7 +527,17 @@ fn run(args: RunArgs) -> Result<()> {
         log::info!("direct boot: VTOR {vtor:#010x}, entry {:#010x}", machine.cores[0].pc());
     }
 
-    let mut session = Session::new(machine, &image);
+    if args.usb || args.bootsel || args.usb_cdc.is_some() || args.picoboot_load.is_some() || args.usbip.is_some() {
+        let mut host = sim_devices::usb::host::HostController::new();
+        if args.usb_cdc.is_some() {
+            host.cdc_open(0, 115_200);
+        }
+        machine.sys.attach_usb_host(host, Time::ZERO);
+        log::info!("USB port plugged into a host");
+    }
+
+    // RTT and defmt come from the image that ends up running
+    let mut session = Session::new(machine, to_load.as_ref().unwrap_or(&image));
     session.keep_logs = false;
     session.on_log = Some(Box::new(|t, line| println!("[{t}] {line}")));
     let sinks = [args.uart0, args.uart1];
@@ -465,6 +546,20 @@ fn run(args: RunArgs) -> Result<()> {
             println!("[{t}] uart{n}: {line}")
         }
     }));
+    if let Some(addr) = &args.usbip {
+        let server = sim_host::usbip::UsbIpServer::bind(addr.as_str()).with_context(|| format!("binding {addr}"))?;
+        eprintln!("USB/IP: exporting bus ID {} on {addr}", sim_host::usbip::BUSID);
+        session.usbip = Some(server);
+    }
+    match args.usb_cdc {
+        Some(CdcSink::Stdout) => session.on_usb_cdc_line = Some(Box::new(|t, line| println!("[{t}] usb: {line}"))),
+        Some(CdcSink::Pty) => {
+            let pty = sim_host::pty::Pty::open().context("opening a pty")?;
+            eprintln!("USB CDC port on {}", pty.path);
+            session.usb_cdc_pty = Some(pty);
+        }
+        None => {}
+    }
     for (n, sink) in sinks.iter().enumerate() {
         if *sink == UartSink::Pty {
             let pty = sim_host::pty::Pty::open().context("opening a pty")?;
@@ -526,12 +621,17 @@ fn run(args: RunArgs) -> Result<()> {
             return Ok(());
         }
     }
+    if let (Some(img), Some(path)) = (&to_load, &args.picoboot_load) {
+        picoboot_load(&mut session, img, args.flash_size as u32, args.load_via)
+            .with_context(|| format!("loading {}", path.display()))?;
+    }
+    let end = if to_load.is_some() { session.machine.now + args.time } else { args.time };
     let mut faults = args.faults.clone();
     faults.sort_by_key(|f| f.0);
     let mut faults = faults.into_iter().peekable();
     let reason = loop {
-        let next = faults.next_if(|f| f.0 <= args.time);
-        let reason = session.run_until(next.as_ref().map_or(args.time, |f| f.0));
+        let next = faults.next_if(|f| f.0 <= end);
+        let reason = session.run_until(next.as_ref().map_or(end, |f| f.0));
         let Some((_, fault)) = next.filter(|_| matches!(reason, StopReason::TimeLimit)) else { break reason };
         let n = session.machine.can_nodes().len();
         let mut bus = session.can_bus.take();
@@ -610,12 +710,47 @@ fn run(args: RunArgs) -> Result<()> {
     Ok(())
 }
 
+/// Waits for the board to be in BOOTSEL mode, flashes `image` and reboots into it (BOOTSEL released).
+fn picoboot_load(session: &mut Session, image: &Image, flash_size: u32, via: LoadVia) -> Result<()> {
+    use sim_host::usb::{MscDrive, Picoboot};
+    let t0 = session.machine.now;
+    match via {
+        LoadVia::Picoboot => {
+            let mut pb = Picoboot::open(session, Time::from_secs(5))?;
+            session.machine.sys.io_qspi.bootsel_pressed = false;
+            let r = pb.load(session, image, flash_size, Some(100))?;
+            for (a, n) in &r.ranges {
+                log::info!("PICOBOOT: wrote and verified {n} bytes at {a:#010x}");
+            }
+        }
+        LoadVia::Drive => {
+            let mut d = MscDrive::open(session, Time::from_secs(5))?;
+            session.machine.sys.io_qspi.bootsel_pressed = false;
+            let uf2 = image.to_uf2();
+            d.copy_uf2(session, &uf2, 0x1000)?;
+            log::info!("copied {} UF2 blocks to the RPI-RP2 drive", uf2.len() / 512);
+        }
+    }
+    log::info!("loaded in {} of virtual time; rebooting into it", session.machine.now - t0);
+    Ok(())
+}
+
 fn main() -> Result<()> {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).format_timestamp(None).init();
     let cli = Cli::parse();
     match cli.command {
         Command::Run(args) => run(args),
         Command::Robot(args) => robot(args),
+        Command::Picoboot(PicobootCommand::Load { file, run_args }) => {
+            let mut argv: Vec<std::ffi::OsString> = vec!["firmware_simulator".into(), "run".into(), "--bootsel".into()];
+            argv.push("--picoboot-load".into());
+            argv.push(file.into());
+            argv.extend(run_args.into_iter().map(Into::into));
+            match Cli::parse_from(argv).command {
+                Command::Run(args) => run(args),
+                _ => unreachable!(),
+            }
+        }
     }
 }
 
