@@ -235,9 +235,10 @@ pub struct CanDiffArgs {
     a: PathBuf,
     /// The log compared with it (e.g. an emulator run's `--candump-log`).
     b: PathBuf,
-    /// How B's timestamps are lined up with A's.
-    #[arg(long, value_enum, default_value = "start")]
-    align: AlignArg,
+    /// How B's timestamps are lined up with A's. By default two emulator logs (timestamps since power-on) are
+    /// compared as logged, and otherwise the first frames are lined up.
+    #[arg(long, value_enum)]
+    align: Option<AlignArg>,
     /// B's timestamps minus A's for the same moment (replaces --align), e.g. `-1.5s`.
     #[arg(long, allow_hyphen_values = true, value_parser = parse_signed_time)]
     offset: Option<i64>,
@@ -302,9 +303,13 @@ pub fn can_diff(args: CanDiffArgs) -> Result<bool> {
     let opts = DiffOptions {
         align: match (args.offset, args.align) {
             (Some(o), _) => Align::Offset(o),
-            (None, AlignArg::Start) => Align::Start,
-            (None, AlignArg::None) => Align::None,
-            (None, AlignArg::Auto) => Align::Auto,
+            (None, Some(AlignArg::Start)) => Align::Start,
+            (None, Some(AlignArg::None)) => Align::None,
+            (None, Some(AlignArg::Auto)) => Align::Auto,
+            (None, None) => {
+                let relative = |l: &[LogFrame]| l.iter().all(|f| f.time_ns < canlog::RELATIVE_LIMIT_NS);
+                if relative(&a) && relative(&b) { Align::None } else { Align::Start }
+            }
         },
         tolerance_ns: args.tolerance.as_ns() as i64,
         stream_align: !args.no_stream_align,
