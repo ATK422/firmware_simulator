@@ -5,6 +5,8 @@
 //! cargo run --release -p sim_test --example bench -- [--time 2s] [--repeat 3] [--only esc_board,talos]
 //! ```
 //!
+//! `talos_mt` is Talos with its boards on four threads (`--threads 4`); its fingerprint matches `talos`'s.
+//!
 //! For each case: the virtual time run, the best wall time over the repeats, virtual/wall (above 1 keeps up with
 //! `--realtime`), instructions executed by both cores and the emulated MIPS. The fingerprint hashes what the run
 //! produced (log lines and when they were read, every message the mock bridges received, UART and RTT text, final
@@ -30,16 +32,20 @@ struct Case {
 enum Kind {
     /// An image on its board file with a mock bridge for a client.
     Board { elf: &'static str, board: &'static str, client: u8 },
-    /// A robot file with mock bridges `(bus, client)`.
-    Robot { file: &'static str, bridges: &'static [(&'static str, u8)] },
+    /// A robot file with mock bridges `(bus, client)`, its boards run on `threads` threads (see `Robot::threads`).
+    Robot { file: &'static str, bridges: &'static [(&'static str, u8)], threads: usize },
 }
 
 const CASES: &[Case] = &[
     Case { name: "template", kind: Kind::Board { elf: "template", board: "mk2/power_board", client: 1 } },
     Case { name: "esc_board", kind: Kind::Board { elf: "esc_board", board: "mk2/esc_board", client: 2 } },
     Case { name: "ivc_board2", kind: Kind::Board { elf: "ivc_board2", board: "talos/ivc_board", client: 8 } },
-    Case { name: "talos", kind: Kind::Robot { file: "talos.toml", bridges: &[("internal", 1)] } },
-    Case { name: "ivc2_pool", kind: Kind::Robot { file: "ivc2_pool.toml", bridges: &[("talos", 8), ("surface", 8)] } },
+    Case { name: "talos", kind: Kind::Robot { file: "talos.toml", bridges: &[("internal", 1)], threads: 1 } },
+    Case { name: "talos_mt", kind: Kind::Robot { file: "talos.toml", bridges: &[("internal", 1)], threads: 4 } },
+    Case {
+        name: "ivc2_pool",
+        kind: Kind::Robot { file: "ivc2_pool.toml", bridges: &[("talos", 8), ("surface", 8)], threads: 1 },
+    },
 ];
 
 struct Outcome {
@@ -88,8 +94,9 @@ fn run(case: &Case, time: Time) -> Result<Outcome, String> {
             }
             Ok(Outcome { wall, instructions: instructions(&b.session), fingerprint: h.finish() })
         }
-        Kind::Robot { file, bridges } => {
+        Kind::Robot { file, bridges, threads } => {
             let mut r = RobotBench::load(file, bridges, |_| {})?;
+            r.robot.threads = threads;
             let wall = Instant::now();
             r.run_until(time);
             let wall = wall.elapsed();

@@ -50,6 +50,10 @@ struct RobotArgs {
     /// Pace virtual time to the wall clock.
     #[arg(long)]
     realtime: bool,
+    /// Run the boards on this many threads (0: one per core). Results are the same; robots in an acoustic
+    /// environment always run their boards in turn.
+    #[arg(long, default_value_t = 1)]
+    threads: usize,
     /// Replace the ambient noise every hydrophone hears with white noise at this level, dB re 1 µPa²/Hz.
     #[arg(long)]
     noise_db: Option<f64>,
@@ -106,6 +110,7 @@ fn robot(args: RobotArgs) -> Result<()> {
         r.set_noise_db(db);
     }
     r.realtime = args.realtime;
+    r.threads = args.threads;
     let wall = std::time::Instant::now();
     let stopped = r.run_until(args.time);
     for s in r.boards.iter_mut() {

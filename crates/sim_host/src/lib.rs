@@ -29,6 +29,7 @@ pub mod defmt;
 pub mod ethernet;
 pub mod gdb;
 pub mod mock_bridge;
+pub mod parallel;
 pub mod pty;
 pub mod robot;
 pub mod rtt;

@@ -69,6 +69,9 @@ pub struct Robot {
     /// The water the boards' transducers are in.
     pub medium: Option<SharedMedium>,
     pub slice: Time,
+    /// Threads the boards run on within a slice (1, the default: the calling thread; 0: one per core). Boards in
+    /// an acoustic medium always take turns on one (see [`crate::parallel`]).
+    pub threads: usize,
     pub now: Time,
     /// Pace virtual time to the wall clock.
     pub realtime: bool,
@@ -87,6 +90,7 @@ impl Default for Robot {
             bus_names: Vec::new(),
             medium: None,
             slice: Time::from_us(100),
+            threads: 1,
             now: Time::ZERO,
             realtime: false,
             power_on: Vec::new(),
@@ -135,21 +139,28 @@ impl Robot {
         let start = self.now;
         while self.now < end {
             let t = (self.now + self.slice).min(end);
-            for (i, b) in self.boards.iter_mut().enumerate() {
-                let (on_at, on) = &mut self.power_on[i];
-                if !*on {
-                    if t <= *on_at {
-                        continue;
+            if self.medium.is_none() {
+                // Nothing couples the boards within a slice: they can run side by side
+                if let Some(stop) = crate::parallel::run_boards(&mut self.boards, &mut self.power_on, t, self.threads) {
+                    return Some(stop);
+                }
+            } else {
+                for (i, b) in self.boards.iter_mut().enumerate() {
+                    let (on_at, on) = &mut self.power_on[i];
+                    if !*on {
+                        if t <= *on_at {
+                            continue;
+                        }
+                        b.machine.power_on_at(*on_at);
+                        *on = true;
                     }
-                    b.machine.power_on_at(*on_at);
-                    *on = true;
-                }
-                match b.machine.run_until(t) {
-                    StopReason::TimeLimit => {}
-                    other => return Some((i, other)),
-                }
-                if let Some(m) = &self.medium {
-                    m.lock().unwrap().progress(i, t);
+                    match b.machine.run_until(t) {
+                        StopReason::TimeLimit => {}
+                        other => return Some((i, other)),
+                    }
+                    if let Some(m) = &self.medium {
+                        m.lock().unwrap().progress(i, t);
+                    }
                 }
             }
             for (j, rb) in self.buses.iter_mut().enumerate() {
@@ -233,6 +244,7 @@ impl Robot {
             bus_names: self.bus_names.clone(),
             medium,
             slice: self.slice,
+            threads: self.threads,
             now: self.now,
             realtime: self.realtime,
             power_on: self.power_on.clone(),
