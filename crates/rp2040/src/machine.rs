@@ -113,10 +113,10 @@ pub struct Machine {
     /// Watchdog ticks each core's SysTick has counted, while it counts the reference clock (see
     /// [`Machine::sync_systick_reference`]).
     systick_ref: [Option<u64>; 2],
-    /// The cycle budget a quantum ended with: `(core, limit, clock, period, cycles)`, the cycles core `core` still
-    /// needed from `clock` to reach `limit` (saves recomputing it, a division, when the next quantum is the same
-    /// core's with the same limit).
-    budget_carry: Option<(usize, Time, CycleClock, ClockPeriod, u64)>,
+    /// The cycle budget a quantum ended with: `(core, limit, clock, clk_sys Hz, cycles)`, the cycles core `core`
+    /// still needed from `clock` to reach `limit` (saves recomputing it, a division, when the next quantum is the
+    /// same core's with the same limit).
+    budget_carry: Option<(usize, Time, CycleClock, u64, u64)>,
     /// The core whose last quantum was quiet (see [`Machine::skip_spin`]): its next one is checked for a loop.
     spin_watch: Option<usize>,
     /// Busy-wait skipping (on by default; off to check that it changes nothing).
@@ -890,11 +890,11 @@ impl Machine {
             let mut left = self.quantum;
             // Cycles until core c reaches `limit`, carried from one batch to the next (and one quantum to the next)
             // while nothing else moved its clock
-            let mut budget = match self.budget_carry {
-                Some((core, l, clock, period, b))
-                    if core == c && l == limit && clock == self.clocks[c] && period == self.clk_sys =>
+            let mut budget = match &self.budget_carry {
+                Some((core, l, clock, hz, b))
+                    if *core == c && *l == limit && *clock == self.clocks[c] && *hz == self.clk_sys.hz() =>
                 {
-                    Some(b)
+                    Some(*b)
                 }
                 _ => None,
             };
@@ -962,14 +962,17 @@ impl Machine {
                 }
             }
 
-            self.budget_carry = budget.map(|b| (c, limit, self.clocks[c], self.clk_sys, b));
+            self.budget_carry = match budget {
+                Some(b) => Some((c, limit, self.clocks[c], self.clk_sys.hz(), b)),
+                None => None,
+            };
             // A whole quantum that only read memory and the timer: watch the next one, and if this one came back
             // to where it started, skip the ones that would repeat it
             let spin = spin.filter(|&(_, n, _)| n == self.quantum);
             self.spin_watch = spin.filter(|_| self.skip_spins).map(|_| c);
-            let closed = match (spin, spin_start) {
-                (Some(s @ (Quiet::Memory | Quiet::Timer(_), _, _)), Some(start))
-                    if start == self.cores[c].spin_state() =>
+            let closed = match spin {
+                Some(s @ (Quiet::Memory | Quiet::Timer(_), _, _))
+                    if spin_start.as_ref().is_some_and(|start| *start == self.cores[c].spin_state()) =>
                 {
                     Some(s)
                 }
