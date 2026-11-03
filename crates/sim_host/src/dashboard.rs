@@ -12,10 +12,12 @@
 //! | Request | Answer |
 //! |---|---|
 //! | `GET /` | the page |
-//! | `GET /api/state` | the state (JSON, see [`Dashboard::session_state`]) |
+//! | `GET /api/state` (`?fresh=1`: built now) | the state (JSON, see [`Dashboard::session_state`]) |
+//! | `GET /api/logs?board=esc0&since=SEQ&max=N&tail=1` | log and UART lines after a cursor, read live |
+//! | `GET /api/frames?bus=internal&since=SEQ&max=N&id=0x100&mask=0x7ff&tail=1` | CAN frames after a cursor, read live |
 //! | `POST /api/fault` `{"board": "esc0", "fault": "can-stuck"}` | applies a fault (`sim_host::fault::Fault` syntax) |
 //! | `POST /api/input` `{"board": "esc0", "name": "esc_vcc", "value": 12.0}` | sets a physical input |
-//! | `POST /api/pause` `{"paused": true}` | pauses or resumes virtual time |
+//! | `POST /api/pause` `{"paused": true, "at_s": 2.0}` | pauses or resumes virtual time (`at_s`: pause when it gets there) |
 
 use std::collections::{BTreeMap, VecDeque};
 use std::io::{Read, Write};
@@ -37,12 +39,16 @@ use crate::mock_bridge::MockBridge;
 use crate::robot::{Robot, RobotBus};
 
 const PAGE: &str = include_str!("dashboard.html");
-/// Log lines kept per board.
-const LOG_LINES: usize = 300;
+/// Log lines kept per board (for `GET /api/logs`).
+const LOG_LINES: usize = 2000;
 /// Log lines per board in each state.
 const LOG_LINES_SENT: usize = 120;
-/// Recent frames kept per bus.
+/// Frames kept per bus (for `GET /api/frames`).
+const FRAMES_KEPT: usize = 2000;
+/// Recent frames per bus in each state.
 const RECENT_FRAMES: usize = 40;
+/// Most lines or frames one `GET /api/logs` or `/api/frames` returns.
+const MAX_READ: usize = 2000;
 /// How long a POST waits for the run loop to apply it.
 const REPLY_TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -230,18 +236,35 @@ pub struct BoardInfo {
     pub fault_names: Vec<String>,
 }
 
-#[derive(Default)]
-struct Feed {
-    next_seq: u64,
-    lines: VecDeque<(u64, Time, String, String)>,
+/// One log or UART line.
+struct LogLine {
+    seq: u64,
+    t: Time,
+    kind: String,
+    text: String,
 }
 
-impl Feed {
-    fn push(&mut self, t: Time, kind: &str, text: String) {
+/// Every board's lines. Sequence numbers count across all boards, so one cursor reads them all in order.
+#[derive(Default)]
+struct Logs {
+    next_seq: u64,
+    boards: Vec<BoardLog>,
+}
+
+#[derive(Default)]
+struct BoardLog {
+    lines: VecDeque<LogLine>,
+    /// The sequence number of the last line dropped to keep [`LOG_LINES`].
+    dropped_to: u64,
+}
+
+impl Logs {
+    fn push(&mut self, board: usize, t: Time, kind: &str, text: String) {
         self.next_seq += 1;
-        self.lines.push_back((self.next_seq, t, kind.to_string(), text));
-        if self.lines.len() > LOG_LINES {
-            self.lines.pop_front();
+        let b = &mut self.boards[board];
+        b.lines.push_back(LogLine { seq: self.next_seq, t, kind: kind.to_string(), text });
+        if b.lines.len() > LOG_LINES {
+            b.dropped_to = b.lines.pop_front().map_or(0, |l| l.seq);
         }
     }
 }
@@ -251,9 +274,21 @@ struct BusFeed {
     frames: u64,
     errors: u64,
     unacked: u64,
-    recent: VecDeque<(Time, String)>,
+    /// The last [`FRAMES_KEPT`] frames with their sequence numbers (1 for the bus's first frame).
+    kept: VecDeque<(u64, BusRecord)>,
     /// (start, end) of the frames in the last second.
     window: VecDeque<(Time, Time)>,
+}
+
+/// How a frame shows in the page's list: candump notation, and what happened to it.
+fn frame_text(r: &BusRecord) -> String {
+    let mut text = sim_devices::can::candump(&r.frame);
+    if let Some(e) = &r.error {
+        text.push_str(&format!("  (destroyed: {e:?})"));
+    } else if !r.acked {
+        text.push_str("  (no ACK)");
+    }
+    text
 }
 
 impl BusFeed {
@@ -264,15 +299,9 @@ impl BusFeed {
         } else if !r.acked {
             self.unacked += 1;
         }
-        let mut text = sim_devices::can::candump(&r.frame);
-        if let Some(e) = &r.error {
-            text.push_str(&format!("  (destroyed: {e:?})"));
-        } else if !r.acked {
-            text.push_str("  (no ACK)");
-        }
-        self.recent.push_back((r.end, text));
-        if self.recent.len() > RECENT_FRAMES {
-            self.recent.pop_front();
+        self.kept.push_back((self.frames, r.clone()));
+        if self.kept.len() > FRAMES_KEPT {
+            self.kept.pop_front();
         }
         self.window.push_back((r.start, r.end));
     }
@@ -291,19 +320,51 @@ impl BusFeed {
             "unacked": self.unacked,
             "rate_fps": self.window.len() as f64 * 1e12 / span as f64,
             "load": busy as f64 / span as f64,
-            "recent": self.recent.iter().rev().map(|(t, f)| json!({"t": t.as_secs_f64(), "frame": f})).collect::<Vec<_>>(),
+            "recent": self.kept.iter().rev().take(RECENT_FRAMES).map(|(_, r)| json!({"t": r.end.as_secs_f64(), "frame": frame_text(r)})).collect::<Vec<_>>(),
         })
     }
 }
 
 enum Command {
-    Fault { board: String, fault: Fault, spec: String, reply: mpsc::Sender<Result<String, String>> },
-    Input { board: String, name: String, value: f64, reply: mpsc::Sender<Result<String, String>> },
-    Pause { paused: bool, reply: mpsc::Sender<Result<String, String>> },
+    Fault {
+        board: String,
+        fault: Fault,
+        spec: String,
+        reply: mpsc::Sender<Result<String, String>>,
+    },
+    Input {
+        board: String,
+        name: String,
+        value: f64,
+        reply: mpsc::Sender<Result<String, String>>,
+    },
+    Pause {
+        paused: bool,
+        at: Option<Time>,
+        reply: mpsc::Sender<Result<String, String>>,
+    },
+    /// Publish a state now (`GET /api/state?fresh=1`).
+    Refresh {
+        reply: mpsc::Sender<Result<String, String>>,
+    },
 }
 
 struct Shared {
     state: String,
+    /// Where the run is, as of the last time the run loop serviced the dashboard.
+    now: Time,
+    paused: bool,
+    finished: Option<String>,
+}
+
+/// What the server threads read besides the published state.
+struct Server {
+    shared: Arc<Mutex<Shared>>,
+    logs: Arc<Mutex<Logs>>,
+    board_names: Vec<String>,
+    bus_feeds: Vec<Arc<Mutex<BusFeed>>>,
+    bus_names: Vec<String>,
+    tx: mpsc::Sender<Command>,
 }
 
 /// The dashboard of a run.
@@ -315,11 +376,13 @@ pub struct Dashboard {
     pub addr: SocketAddr,
     boards: Vec<BoardInfo>,
     links: Vec<(Option<usize>, Option<usize>, Link)>,
-    feeds: Vec<Arc<Mutex<Feed>>>,
+    logs: Arc<Mutex<Logs>>,
     bus_feeds: Vec<Arc<Mutex<BusFeed>>>,
     bus_names: Vec<String>,
     faults: Vec<Value>,
     paused: bool,
+    /// Pause when virtual time gets here.
+    pause_at: Option<Time>,
     /// Wall time between published states.
     pub publish_every: Duration,
     last_publish: Option<Instant>,
@@ -334,11 +397,22 @@ impl Dashboard {
     pub fn start(addr: &str, boards: Vec<BoardInfo>, bus_names: Vec<String>) -> std::io::Result<Dashboard> {
         let listener = TcpListener::bind(addr)?;
         let addr = listener.local_addr()?;
-        let shared = Arc::new(Mutex::new(Shared { state: "{}".into() }));
+        let shared =
+            Arc::new(Mutex::new(Shared { state: "{}".into(), now: Time::ZERO, paused: false, finished: None }));
         let stop = Arc::new(AtomicBool::new(false));
         let (tx, rx) = mpsc::channel();
+        let logs =
+            Arc::new(Mutex::new(Logs { next_seq: 0, boards: boards.iter().map(|_| BoardLog::default()).collect() }));
+        let bus_feeds: Vec<Arc<Mutex<BusFeed>>> = bus_names.iter().map(|_| Arc::default()).collect();
+        let server = Arc::new(Server {
+            shared: shared.clone(),
+            logs: logs.clone(),
+            board_names: boards.iter().map(|b| b.name.clone()).collect(),
+            bus_feeds: bus_feeds.clone(),
+            bus_names: bus_names.clone(),
+            tx,
+        });
         {
-            let shared = shared.clone();
             let stop = stop.clone();
             std::thread::Builder::new().name("dashboard".into()).spawn(move || {
                 for stream in listener.incoming() {
@@ -346,17 +420,14 @@ impl Dashboard {
                         break;
                     }
                     let Ok(stream) = stream else { continue };
-                    let shared = shared.clone();
-                    let tx = tx.clone();
+                    let server = server.clone();
                     let _ = std::thread::Builder::new().name("dashboard-conn".into()).spawn(move || {
-                        let _ = handle(stream, &shared, &tx);
+                        let _ = handle(stream, &server);
                     });
                 }
             })?;
         }
         let started = Instant::now();
-        let feeds = boards.iter().map(|_| Arc::default()).collect();
-        let bus_feeds = bus_names.iter().map(|_| Arc::default()).collect();
         Ok(Dashboard {
             shared,
             stop,
@@ -364,11 +435,12 @@ impl Dashboard {
             addr,
             boards,
             links: Vec::new(),
-            feeds,
+            logs,
             bus_feeds,
             bus_names,
             faults: Vec::new(),
             paused: false,
+            pause_at: None,
             publish_every: Duration::from_millis(200),
             last_publish: None,
             speed: (started, Time::ZERO, 0.0),
@@ -380,6 +452,14 @@ impl Dashboard {
     /// A mock bridge (or the Puddles one) attached to `board` or on bus `bus`.
     pub fn add_link(&mut self, board: Option<usize>, bus: Option<usize>, link: Link) {
         self.links.push((board, bus, link));
+    }
+
+    /// Pauses virtual time when it reaches `at` (at once for zero: the run then stops after its first piece).
+    pub fn pause_at(&mut self, at: Option<Time>) {
+        match at {
+            Some(Time::ZERO) => self.paused = true,
+            at => self.pause_at = at,
+        }
     }
 
     /// Whether the page has paused virtual time.
@@ -395,22 +475,22 @@ impl Dashboard {
         {
             self.boards[i].fault_names = fault_names(image);
         }
-        let feed = self.feeds[i].clone();
+        let logs = self.logs.clone();
         let mut prev = s.on_log.take();
         s.on_log = Some(Box::new(move |t, line| {
             if let Some(p) = &mut prev {
                 p(t, line);
             }
             let level = line.level.clone().unwrap_or_default().to_lowercase();
-            feed.lock().unwrap().push(t, &level, line.to_string());
+            logs.lock().unwrap().push(i, t, &level, line.to_string());
         }));
-        let feed = self.feeds[i].clone();
+        let logs = self.logs.clone();
         let mut prev = s.on_uart_line.take();
         s.on_uart_line = Some(Box::new(move |t, n, line| {
             if let Some(p) = &mut prev {
                 p(t, n, line);
             }
-            feed.lock().unwrap().push(t, &format!("uart{n}"), line.to_string());
+            logs.lock().unwrap().push(i, t, &format!("uart{n}"), line.to_string());
         }));
         if let (Some(bus), Some(feed)) = (&mut s.can_bus, self.bus_feeds.first()) {
             bus.record.get_or_insert_with(Vec::new);
@@ -493,18 +573,21 @@ impl Dashboard {
                     let r = self.set_input(&board, &name, value);
                     replies.push((reply, r));
                 }
-                Command::Pause { paused, reply } => {
-                    self.paused = paused;
-                    if !paused {
+                Command::Pause { paused, at, reply } => {
+                    let r = self.pause(paused, at, s.machine.now);
+                    if !self.paused {
                         s.reset_pacing();
                     }
-                    replies.push((reply, Ok(if paused { "paused" } else { "running" }.into())));
+                    replies.push((reply, r));
                 }
+                Command::Refresh { reply } => replies.push((reply, Ok(String::new()))),
             }
         }
+        let paused_now = self.pause_if_due(s.machine.now);
+        self.note_status(s.machine.now);
         // Publish what the commands did before answering them, so a client that reads the state after its
-        // answer sees their effect
-        if !replies.is_empty() || self.due() {
+        // answer sees their effect (and a pause as it happens)
+        if !replies.is_empty() || paused_now || self.due() {
             self.last_publish = Some(Instant::now());
             let state = self.session_state(s);
             self.shared.lock().unwrap().state = state.to_string();
@@ -537,16 +620,19 @@ impl Dashboard {
                 Command::Input { board, name, value, reply } => {
                     replies.push((reply, self.set_input(&board, &name, value)));
                 }
-                Command::Pause { paused, reply } => {
-                    self.paused = paused;
-                    if !paused {
+                Command::Pause { paused, at, reply } => {
+                    let res = self.pause(paused, at, r.now);
+                    if !self.paused {
                         r.reset_pacing();
                     }
-                    replies.push((reply, Ok(if paused { "paused" } else { "running" }.into())));
+                    replies.push((reply, res));
                 }
+                Command::Refresh { reply } => replies.push((reply, Ok(String::new()))),
             }
         }
-        if !replies.is_empty() || self.due() {
+        let paused_now = self.pause_if_due(r.now);
+        self.note_status(r.now);
+        if !replies.is_empty() || paused_now || self.due() {
             self.last_publish = Some(Instant::now());
             let state = self.robot_state(r);
             self.shared.lock().unwrap().state = state.to_string();
@@ -559,6 +645,7 @@ impl Dashboard {
     /// Publishes the final state (the run is over, or stopped with `why`).
     pub fn finish_session(&mut self, s: &mut Session, why: &str) {
         self.finished = Some(why.to_string());
+        self.note_status(s.machine.now);
         let state = self.session_state(s);
         self.shared.lock().unwrap().state = state.to_string();
     }
@@ -566,8 +653,57 @@ impl Dashboard {
     /// Publishes the final state of a robot.
     pub fn finish_robot(&mut self, r: &mut Robot, why: &str) {
         self.finished = Some(why.to_string());
+        self.note_status(r.now);
         let state = self.robot_state(r);
         self.shared.lock().unwrap().state = state.to_string();
+    }
+
+    /// A posted pause or resume: `at` pauses when virtual time gets there (now, if it is already past); resuming
+    /// with `at` pauses again there.
+    fn pause(&mut self, paused: bool, at: Option<Time>, now: Time) -> Result<String, String> {
+        match (paused, at) {
+            (true, None) => {
+                self.paused = true;
+                self.pause_at = None;
+                Ok("paused".into())
+            }
+            (true, Some(t)) if t <= now => {
+                self.paused = true;
+                self.pause_at = None;
+                Ok(format!("paused (at {now}, already past {t})"))
+            }
+            (true, Some(t)) => {
+                self.pause_at = Some(t);
+                Ok(format!("will pause at {t}"))
+            }
+            (false, Some(t)) if t <= now => Err(format!("{t} is already past (the time is {now})")),
+            (false, at) => {
+                self.paused = false;
+                self.pause_at = at;
+                Ok(match at {
+                    Some(t) => format!("running until {t}"),
+                    None => "running".into(),
+                })
+            }
+        }
+    }
+
+    /// Pauses if the time to has come; says whether it did.
+    fn pause_if_due(&mut self, now: Time) -> bool {
+        let due = self.pause_at.is_some_and(|t| now >= t);
+        if due {
+            self.paused = true;
+            self.pause_at = None;
+        }
+        due
+    }
+
+    /// Tells the server where the run is, for the live reads.
+    fn note_status(&self, now: Time) {
+        let mut sh = self.shared.lock().unwrap();
+        sh.now = now;
+        sh.paused = self.paused;
+        sh.finished.clone_from(&self.finished);
     }
 
     /// Keeps serving the final state (until the process is stopped), answering commands that the run is over.
@@ -576,7 +712,8 @@ impl Dashboard {
             match self.commands.recv() {
                 Ok(Command::Fault { reply, .. })
                 | Ok(Command::Input { reply, .. })
-                | Ok(Command::Pause { reply, .. }) => {
+                | Ok(Command::Pause { reply, .. })
+                | Ok(Command::Refresh { reply }) => {
                     let _ = reply.send(Err("the run is over".into()));
                 }
                 Err(_) => std::thread::sleep(Duration::from_secs(3600)),
@@ -620,6 +757,7 @@ impl Dashboard {
             "wall_s": self.started.elapsed().as_secs_f64(),
             "speed": self.speed.2,
             "paused": self.paused,
+            "pause_at_s": self.pause_at.map(Time::as_secs_f64),
             "realtime": realtime,
             "finished": self.finished,
             "faults": self.faults,
@@ -756,14 +894,14 @@ impl Dashboard {
         }
         let inputs: Vec<Value> =
             info.inputs.0.iter().map(|(n, h)| json!({"name": n, "value": *h.lock().unwrap()})).collect();
-        let feed = self.feeds[i].lock().unwrap();
-        let skip = feed.lines.len().saturating_sub(LOG_LINES_SENT);
-        let logs: Vec<Value> = feed
-            .lines
+        let all = self.logs.lock().unwrap();
+        let lines = &all.boards[i].lines;
+        let logs: Vec<Value> = lines
             .iter()
-            .skip(skip)
-            .map(|(seq, t, kind, text)| json!({"seq": seq, "t": t.as_secs_f64(), "kind": kind, "text": text}))
+            .skip(lines.len().saturating_sub(LOG_LINES_SENT))
+            .map(|l| json!({"seq": l.seq, "t": l.t.as_secs_f64(), "kind": l.kind, "text": l.text}))
             .collect();
+        drop(all);
         let link = self.links.iter().find(|l| l.0 == Some(i)).map(|l| l.2.json(now, &info.fault_names));
         json!({
             "name": info.name,
@@ -876,15 +1014,212 @@ fn json_reply(stream: &mut TcpStream, code: u16, v: Value) -> std::io::Result<()
     respond(stream, code, "application/json", v.to_string().as_bytes())
 }
 
-fn handle(mut stream: TcpStream, shared: &Mutex<Shared>, tx: &mpsc::Sender<Command>) -> std::io::Result<()> {
+/// The parameters of a query string (`a=1&b=x%20y`), percent-decoded.
+pub fn query_params(query: &str) -> BTreeMap<String, String> {
+    fn decode(s: &str) -> String {
+        let b = s.as_bytes();
+        let mut out = Vec::with_capacity(b.len());
+        let mut i = 0;
+        while i < b.len() {
+            let hex = b.get(i + 1..i + 3).and_then(|h| u8::from_str_radix(std::str::from_utf8(h).ok()?, 16).ok());
+            match (b[i], hex) {
+                (b'+', _) => out.push(b' '),
+                (b'%', Some(byte)) => {
+                    out.push(byte);
+                    i += 2;
+                }
+                (c, _) => out.push(c),
+            }
+            i += 1;
+        }
+        String::from_utf8_lossy(&out).into_owned()
+    }
+    query
+        .split('&')
+        .filter(|p| !p.is_empty())
+        .map(|p| {
+            let (k, v) = p.split_once('=').unwrap_or((p, ""));
+            (decode(k), decode(v))
+        })
+        .collect()
+}
+
+/// An unsigned number in decimal or `0x` hex.
+fn parse_u64(s: &str) -> Option<u64> {
+    let s = s.trim();
+    match s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")) {
+        Some(h) => u64::from_str_radix(h, 16).ok(),
+        None => s.parse().ok(),
+    }
+}
+
+/// A read's parameters common to `/api/logs` and `/api/frames`.
+struct Cursor {
+    since: u64,
+    max: usize,
+    tail: bool,
+}
+
+impl Cursor {
+    fn parse(q: &BTreeMap<String, String>) -> Result<Cursor, String> {
+        let since = match q.get("since") {
+            Some(v) => parse_u64(v).ok_or_else(|| format!("since: not a number: {v:?}"))?,
+            None => 0,
+        };
+        let max = match q.get("max") {
+            Some(v) => parse_u64(v).ok_or_else(|| format!("max: not a number: {v:?}"))? as usize,
+            None => 200,
+        };
+        let tail = q.get("tail").is_some_and(|v| v == "1" || v == "true");
+        Ok(Cursor { since, max: max.clamp(1, MAX_READ), tail })
+    }
+
+    /// Takes up to `max` items after the cursor: the first ones, or with `tail` the last ones. Says whether more
+    /// were left out.
+    fn take<T>(&self, mut items: Vec<T>) -> (Vec<T>, bool) {
+        let more = items.len() > self.max;
+        if more {
+            if self.tail {
+                items.drain(..items.len() - self.max);
+            } else {
+                items.truncate(self.max);
+            }
+        }
+        (items, more)
+    }
+}
+
+impl Server {
+    fn status(&self) -> serde_json::Map<String, Value> {
+        let sh = self.shared.lock().unwrap();
+        let mut m = serde_json::Map::new();
+        m.insert("time_s".into(), sh.now.as_secs_f64().into());
+        m.insert("paused".into(), sh.paused.into());
+        m.insert("finished".into(), json!(sh.finished));
+        m
+    }
+
+    /// `GET /api/logs`: the lines after `since` (of one board, or all of them in order), with the cursor to read
+    /// on from (`next`) and whether lines after `since` were already dropped (`truncated`).
+    fn logs(&self, q: &BTreeMap<String, String>) -> Result<Value, String> {
+        let c = Cursor::parse(q)?;
+        let boards: Vec<usize> = match q.get("board").map(String::as_str) {
+            None | Some("") => (0..self.board_names.len()).collect(),
+            Some(name) => vec![
+                self.board_names
+                    .iter()
+                    .position(|b| b == name)
+                    .ok_or_else(|| format!("no board {name:?}; there are: {}", self.board_names.join(", ")))?,
+            ],
+        };
+        let mut m = self.status();
+        let logs = self.logs.lock().unwrap();
+        let mut lines: Vec<(usize, &LogLine)> = boards
+            .iter()
+            .flat_map(|&i| logs.boards[i].lines.iter().filter(|l| l.seq > c.since).map(move |l| (i, l)))
+            .collect();
+        lines.sort_by_key(|(_, l)| l.seq);
+        let truncated = boards.iter().any(|&i| logs.boards[i].dropped_to > c.since);
+        let (lines, more) = c.take(lines);
+        // Reading on from `next` with the same board neither repeats nor skips a line
+        let next = match lines.last() {
+            Some((_, l)) if more => l.seq,
+            _ => logs.next_seq,
+        };
+        m.insert("next".into(), next.into());
+        m.insert("more".into(), more.into());
+        m.insert("truncated".into(), truncated.into());
+        m.insert(
+            "lines".into(),
+            lines
+                .iter()
+                .map(|(i, l)| {
+                    json!({"seq": l.seq, "board": self.board_names[*i], "t": l.t.as_secs_f64(), "kind": l.kind, "text": l.text})
+                })
+                .collect(),
+        );
+        Ok(Value::Object(m))
+    }
+
+    /// `GET /api/frames`: one bus's frames after `since` (the bus's frame count), optionally only those whose ID
+    /// matches `id` under `mask`.
+    fn frames(&self, q: &BTreeMap<String, String>) -> Result<Value, String> {
+        let c = Cursor::parse(q)?;
+        let j = match q.get("bus").map(String::as_str) {
+            None | Some("") if self.bus_names.len() == 1 => 0,
+            None | Some("") if self.bus_names.is_empty() => return Err("there is no CAN bus".into()),
+            None | Some("") => return Err(format!("which bus? there are: {}", self.bus_names.join(", "))),
+            Some(name) => self
+                .bus_names
+                .iter()
+                .position(|b| b == name)
+                .ok_or_else(|| format!("no bus {name:?}; there are: {}", self.bus_names.join(", ")))?,
+        };
+        let id = match q.get("id") {
+            Some(v) => Some(parse_u64(v).ok_or_else(|| format!("id: not a number: {v:?}"))? as u32),
+            None => None,
+        };
+        let mask = match q.get("mask") {
+            Some(v) => parse_u64(v).ok_or_else(|| format!("mask: not a number: {v:?}"))? as u32,
+            None => u32::MAX,
+        };
+        let mut m = self.status();
+        let feed = self.bus_feeds[j].lock().unwrap();
+        let frames: Vec<&(u64, BusRecord)> = feed
+            .kept
+            .iter()
+            .filter(|(seq, r)| *seq > c.since && id.is_none_or(|id| r.frame.id & mask == id & mask))
+            .collect();
+        let truncated = feed.kept.front().is_some_and(|(first, _)| *first > c.since + 1);
+        let (frames, more) = c.take(frames);
+        let next = match frames.last() {
+            Some((seq, _)) if more => *seq,
+            _ => feed.frames,
+        };
+        m.insert("bus".into(), self.bus_names[j].clone().into());
+        m.insert("total".into(), feed.frames.into());
+        m.insert("next".into(), next.into());
+        m.insert("more".into(), more.into());
+        m.insert("truncated".into(), truncated.into());
+        m.insert(
+            "frames".into(),
+            frames
+                .iter()
+                .map(|(seq, r)| {
+                    let mut f = crate::jsonlog::can_json(&self.bus_names[j], r);
+                    f["seq"] = (*seq).into();
+                    f
+                })
+                .collect(),
+        );
+        Ok(Value::Object(m))
+    }
+}
+
+fn handle(mut stream: TcpStream, server: &Server) -> std::io::Result<()> {
     stream.set_read_timeout(Some(Duration::from_secs(5)))?;
     let Some(req) = read_request(&mut stream)? else { return Ok(()) };
-    let path = req.path.split('?').next().unwrap_or("/");
+    let (path, query) = req.path.split_once('?').unwrap_or((&req.path, ""));
     match (req.method.as_str(), path) {
         ("GET", "/") | ("GET", "/index.html") => respond(&mut stream, 200, "text/html; charset=utf-8", PAGE.as_bytes()),
         ("GET", "/api/state") => {
-            let state = shared.lock().unwrap().state.clone();
+            // Fresh: have the run loop publish first (once the run is over, the last state is the final one)
+            if query_params(query).get("fresh").is_some_and(|v| v == "1" || v == "true") {
+                let (reply, answer) = mpsc::channel();
+                if server.tx.send(Command::Refresh { reply }).is_ok() {
+                    let _ = answer.recv_timeout(REPLY_TIMEOUT);
+                }
+            }
+            let state = server.shared.lock().unwrap().state.clone();
             respond(&mut stream, 200, "application/json", state.as_bytes())
+        }
+        ("GET", "/api/logs") | ("GET", "/api/frames") => {
+            let q = query_params(query);
+            let r = if path == "/api/logs" { server.logs(&q) } else { server.frames(&q) };
+            match r {
+                Ok(v) => json_reply(&mut stream, 200, v),
+                Err(e) => json_reply(&mut stream, 400, json!({"ok": false, "error": e})),
+            }
         }
         ("POST", "/api/fault") | ("POST", "/api/input") | ("POST", "/api/pause") => {
             let body: Value = match serde_json::from_slice(&req.body) {
@@ -909,9 +1244,21 @@ fn handle(mut stream: TcpStream, shared: &Mutex<Shared>, tx: &mpsc::Sender<Comma
                     };
                     Command::Input { board, name, value, reply }
                 }
-                _ => Command::Pause { paused: body["paused"].as_bool().unwrap_or(true), reply },
+                _ => {
+                    let at = match &body["at_s"] {
+                        Value::Null => None,
+                        v => match v.as_f64() {
+                            Some(t) if t.is_finite() && t >= 0.0 => Some(Time::from_secs_f64(t)),
+                            _ => {
+                                let e = "at_s must be a number of seconds, 0 or more";
+                                return json_reply(&mut stream, 400, json!({"ok": false, "error": e}));
+                            }
+                        },
+                    };
+                    Command::Pause { paused: body["paused"].as_bool().unwrap_or(true), at, reply }
+                }
             };
-            if tx.send(cmd).is_err() {
+            if server.tx.send(cmd).is_err() {
                 return json_reply(&mut stream, 503, json!({"ok": false, "error": "the run is over"}));
             }
             match answer.recv_timeout(REPLY_TIMEOUT) {
@@ -920,9 +1267,13 @@ fn handle(mut stream: TcpStream, shared: &Mutex<Shared>, tx: &mpsc::Sender<Comma
                 Err(_) => json_reply(&mut stream, 503, json!({"ok": false, "error": "the run loop did not answer"})),
             }
         }
-        (_, "/") | (_, "/api/state") | (_, "/api/fault") | (_, "/api/input") | (_, "/api/pause") => {
-            json_reply(&mut stream, 405, json!({"ok": false, "error": "method not allowed"}))
-        }
+        (_, "/")
+        | (_, "/api/state")
+        | (_, "/api/logs")
+        | (_, "/api/frames")
+        | (_, "/api/fault")
+        | (_, "/api/input")
+        | (_, "/api/pause") => json_reply(&mut stream, 405, json!({"ok": false, "error": "method not allowed"})),
         _ => json_reply(&mut stream, 404, json!({"ok": false, "error": "not found"})),
     }
 }

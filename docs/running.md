@@ -95,7 +95,7 @@ differ by roughly the boot time.
 | `--trace-file FILE` | stderr | Where the trace goes |
 | `--profile FILE`, `--profile-interval T` | `10us` | Profiles the firmware: functions by time per core to `FILE`, folded stacks next to it ([below](#profiles-waveforms-dashboard-and-json-logs)) |
 | `--vcd FILE`, `--vcd-pins SPEC`, `--vcd-events` | all pins | Writes a VCD waveform of the GPIOs, optionally with decoded traffic |
-| `--dashboard ADDR`, `--dashboard-hold` | | Serves a live dashboard with fault, input and pause controls |
+| `--dashboard ADDR`, `--dashboard-hold`, `--dashboard-pause-at T` | | Serves a live dashboard with fault, input and pause controls |
 | `--log-json FILE` | | Writes every log line, UART and USB line, CAN frame and fault as JSON lines |
 | `--unmodelled MODE` | `first` | Logging of registers the emulator does not model: `first` access to each, `every` access, or `off` |
 | `--quantum N` | 16 | Instructions a core runs before the other gets a turn (1 for lockstep debugging) |
@@ -209,6 +209,7 @@ The developer tools ([tools.md](tools.md) has their output formats and how they 
 | `--vcd-events` | off | Adds string variables with defmt logs, UART lines, CAN frames and device reports (GTKWave and Surfer show them) |
 | `--dashboard ADDR` | | Serves a live page on `ADDR` (`127.0.0.1:8080`): cores, logs, firmware status, CAN traffic, pins, LEDs, inputs; controls inject faults, set inputs and pause. No authentication: bind it to loopback |
 | `--dashboard-hold` | off | Keeps serving after the run ends |
+| `--dashboard-pause-at T` | | Pauses virtual time when it reaches `T` (`0`: from the start); resume from the page |
 | `--log-json FILE` | | One JSON object per line for every defmt log line, UART and USB serial line, CAN frame, injected fault and the end of the run, with virtual times |
 
 ```bash
@@ -219,6 +220,9 @@ firmware_simulator run $FW/esc_board --board boards/mk2/esc_board.toml --mock-br
 firmware_simulator run $FW/power_board --board boards/mk2/power_board.toml --mock-bridge 1 --realtime --time 600s \
     --dashboard 127.0.0.1:8080 --log-json power.jsonl
 ```
+
+Coding agents get the same through `firmware_simulator mcp`, an MCP server whose tools start runs, read their
+state, logs and CAN frames, and inject faults ([tools.md](tools.md#mcp-server)).
 
 None of them changes what a single-core program does; with both cores running, the profiler's extra cuts can
 shift how their instructions interleave, as a different `--quantum` would. They combine with each other and with

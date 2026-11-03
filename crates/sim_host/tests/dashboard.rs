@@ -288,3 +288,228 @@ fn a_posted_sensor_fault_comes_back_as_a_named_firmware_fault() {
     let faults: Vec<&str> = st["faults"].as_array().unwrap().iter().map(|f| f.as_str().unwrap()).collect();
     assert!(faults.contains(&"FAULT_DEPTH_INIT_ERROR"), "{st}");
 }
+
+/// `GET /api/logs`: lines after a cursor, from every board in order or from one, a page at a time or the newest,
+/// read live (not from the published state), and a warning when lines after the cursor were dropped.
+#[test]
+fn logs_are_read_after_a_cursor() {
+    let (mut a, mut b) = (blink(), blink());
+    let infos = vec![
+        BoardInfo { name: "a".into(), ..Default::default() },
+        BoardInfo { name: "b".into(), ..Default::default() },
+    ];
+    let mut d = Dashboard::start("127.0.0.1:0", infos, vec![]).unwrap();
+    d.tap_session(0, &mut a);
+    d.tap_session(1, &mut b);
+    // Lines as the sessions report them: a's UART, b's defmt log
+    for k in 0..3u64 {
+        (a.on_uart_line.as_mut().unwrap())(Time::from_ms(k), 0, &format!("a{k}"));
+        let line = sim_host::defmt::LogLine { level: Some("info".into()), timestamp: None, message: format!("b{k}") };
+        (b.on_log.as_mut().unwrap())(Time::from_ms(k), &line);
+    }
+    let addr = d.addr;
+    let get = move |q: &str| {
+        let (code, body) = request(addr, "GET", &format!("/api/logs{q}"), "");
+        (code, json(&body))
+    };
+    let (code, all) = get("");
+    assert_eq!(code, 200, "{all}");
+    let texts = |v: &Value| -> Vec<String> {
+        v["lines"].as_array().unwrap().iter().map(|l| l["text"].as_str().unwrap().to_string()).collect()
+    };
+    assert_eq!(texts(&all), ["a0", "INFO  b0", "a1", "INFO  b1", "a2", "INFO  b2"], "every board, in order");
+    assert_eq!(all["lines"][0]["board"], "a");
+    assert_eq!(all["lines"][0]["kind"], "uart0");
+    assert_eq!(all["lines"][1]["kind"], "info");
+    assert_eq!(all["lines"][5]["t"], 0.002);
+    assert_eq!(
+        (&all["next"], &all["more"], &all["truncated"]),
+        (&Value::from(6), &Value::from(false), &Value::from(false))
+    );
+    // Not published: the live read sees the lines before any state is
+    assert_eq!(json(&d.published()), serde_json::json!({}));
+    // A page at a time, and on from the cursor
+    let (_, page) = get("?max=4");
+    assert_eq!((texts(&page).len(), &page["more"], &page["next"]), (4, &Value::from(true), &Value::from(4)));
+    let (_, rest) = get("?since=4");
+    assert_eq!(texts(&rest), ["a2", "INFO  b2"]);
+    // One board; the newest lines
+    let (_, only_b) = get("?board=b&since=1");
+    assert_eq!(texts(&only_b), ["INFO  b0", "INFO  b1", "INFO  b2"]);
+    let (_, newest) = get("?board=a&max=1&tail=1");
+    assert_eq!((texts(&newest), &newest["more"]), (vec!["a2".to_string()], &Value::from(true)));
+    let (_, none) = get("?since=6");
+    assert_eq!((texts(&none).len(), &none["next"]), (0, &Value::from(6)));
+    // Bad requests
+    let (code, e) = get("?board=c");
+    assert_eq!(code, 400);
+    assert!(e["error"].as_str().unwrap().contains("there are: a, b"), "{e}");
+    assert_eq!(get("?since=x").0, 400);
+    // Lines beyond what is kept are dropped, oldest first, and a reader behind them is told
+    for k in 0..2100u64 {
+        (a.on_uart_line.as_mut().unwrap())(Time::from_ms(10 + k), 0, &format!("more {k}"));
+    }
+    let (_, behind) = get("?board=a&since=2&max=5");
+    assert_eq!(behind["truncated"], true);
+    let (_, caught_up) = get("?board=a&since=2000");
+    assert_eq!(caught_up["truncated"], false);
+    assert_eq!(get("?board=a&max=100000").1["lines"].as_array().unwrap().len(), 2000, "at most 2000 a read");
+    // The published state still carries the last 120 lines a board
+    d.service_session(&mut a);
+    assert_eq!(json(&d.published())["boards"][0]["logs"].as_array().unwrap().len(), 120);
+}
+
+/// `GET /api/frames`: a bus's frames after a cursor, as structured records, filtered by ID and mask.
+#[test]
+fn frames_are_read_after_a_cursor_and_filtered_by_id() {
+    use sim_devices::can::{BitRates, BusRecord, CanBus, CanFrame, Sender};
+    let rates = BitRates { nominal: 1_000_000, data: None };
+    let mut buses = [
+        sim_host::robot::RobotBus::new(CanBus::new("x", rates)),
+        sim_host::robot::RobotBus::new(CanBus::new("y", rates)),
+    ];
+    let d = Dashboard::start("127.0.0.1:0", vec![], vec!["x".into(), "y".into()]).unwrap();
+    for (j, rb) in buses.iter_mut().enumerate() {
+        d.tap_bus(j, rb);
+    }
+    let frame = |id: u32, k: u64, acked: bool| BusRecord {
+        start: Time::from_us(100 * k),
+        end: Time::from_us(100 * k + 50),
+        sender: Sender::Node(0),
+        frame: CanFrame::classic(id, false, &[k as u8]),
+        acked,
+        error: None,
+    };
+    for k in 0..6u64 {
+        let id = if k % 2 == 0 { 0x100 } else { 0x201 };
+        (buses[0].on_can.as_mut().unwrap())(&frame(id, k, k != 5));
+    }
+    let addr = d.addr;
+    let get = move |q: &str| {
+        let (code, body) = request(addr, "GET", &format!("/api/frames{q}"), "");
+        (code, json(&body))
+    };
+    let (code, all) = get("?bus=x");
+    assert_eq!(code, 200, "{all}");
+    let frames = all["frames"].as_array().unwrap();
+    assert_eq!(frames.len(), 6);
+    assert_eq!(frames[0]["id"], "0x100");
+    assert_eq!(frames[0]["seq"], 1);
+    assert_eq!(frames[0]["data"], "00");
+    assert_eq!(frames[0]["candump"], "100#00");
+    assert_eq!(frames[5]["acked"], false);
+    assert_eq!((&all["next"], &all["total"], &all["bus"]), (&Value::from(6), &Value::from(6), &Value::from("x")));
+    let ids = |v: &Value| -> Vec<u64> {
+        v["frames"].as_array().unwrap().iter().map(|f| f["seq"].as_u64().unwrap()).collect()
+    };
+    assert_eq!(ids(&get("?bus=x&id=0x201").1), [2, 4, 6]);
+    assert_eq!(ids(&get("?bus=x&id=0x200&mask=0x700").1), [2, 4, 6], "0x201 under mask 0x700");
+    assert_eq!(ids(&get("?bus=x&id=256&since=1").1), [3, 5]);
+    let (_, page) = get("?bus=x&max=2");
+    assert_eq!((ids(&page), &page["next"], &page["more"]), (vec![1, 2], &Value::from(2), &Value::from(true)));
+    assert_eq!(ids(&get("?bus=x&max=2&tail=1").1), [5, 6]);
+    // A filter that matches nothing still moves the cursor on
+    let (_, nothing) = get("?bus=x&id=0x7ff");
+    assert_eq!((ids(&nothing).len(), &nothing["next"]), (0, &Value::from(6)));
+    assert_eq!(get("?bus=y").1["frames"], serde_json::json!([]));
+    // Two buses: which one must be said
+    let (code, e) = get("");
+    assert_eq!(code, 400);
+    assert!(e["error"].as_str().unwrap().contains("x, y"), "{e}");
+    assert_eq!(get("?bus=z").0, 400);
+    assert_eq!(get("?bus=x&id=zz").0, 400);
+}
+
+/// `POST /api/pause` with `at_s`: pause when virtual time gets there, and run on to a time and pause again.
+#[test]
+fn pausing_at_a_virtual_time() {
+    let mut s = blink();
+    let mut d = Dashboard::start("127.0.0.1:0", vec![BoardInfo { name: "blink".into(), ..Default::default() }], vec![])
+        .unwrap();
+    d.publish_every = std::time::Duration::ZERO;
+    let wait_paused = |addr: SocketAddr| loop {
+        let st = json(&request(addr, "GET", "/api/state", "").1);
+        if st["paused"] == true {
+            break st;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(2));
+    };
+    let (first, second, past, bad, live) = run_with_client(&mut s, &mut d, move |addr| {
+        assert_eq!(request(addr, "POST", "/api/pause", r#"{"paused": true}"#).0, 200);
+        let now = json(&request(addr, "GET", "/api/state", "").1)["time_s"].as_f64().unwrap();
+        let at = now + 0.02;
+        let r = request(addr, "POST", "/api/pause", &format!(r#"{{"paused": false, "at_s": {at}}}"#));
+        assert_eq!(r.0, 200, "{}", r.1);
+        assert!(json(&r.1)["message"].as_str().unwrap().starts_with("running until"));
+        let first = (at, wait_paused(addr));
+        // Pause at a later time while running
+        assert_eq!(request(addr, "POST", "/api/pause", r#"{"paused": false}"#).0, 200);
+        let at = first.1["time_s"].as_f64().unwrap() + 0.01;
+        let r = request(addr, "POST", "/api/pause", &format!(r#"{{"paused": true, "at_s": {at}}}"#));
+        assert!(json(&r.1)["message"].as_str().unwrap().starts_with("will pause at"), "{}", r.1);
+        let second = (at, wait_paused(addr));
+        let past = request(addr, "POST", "/api/pause", r#"{"paused": false, "at_s": 0.0}"#);
+        let bad = request(addr, "POST", "/api/pause", r#"{"paused": true, "at_s": "soon"}"#);
+        let live = json(&request(addr, "GET", "/api/logs", "").1);
+        (first, second, past, bad, live)
+    });
+    for (at, st) in [first, second] {
+        let t = st["time_s"].as_f64().unwrap();
+        // The run loop pauses at the first piece that ends at or after the time (500 µs pieces here)
+        assert!(t >= at - 1e-9 && t < at + 0.001, "paused at {t}, asked for {at}");
+        assert_eq!(st["pause_at_s"], Value::Null);
+    }
+    assert_eq!(past.0, 422, "{}", past.1);
+    assert_eq!(bad.0, 400);
+    assert_eq!(live["paused"], true, "the live reads say where the run is: {live}");
+    assert!(live["time_s"].as_f64().unwrap() > 0.0);
+}
+
+#[test]
+fn query_strings_are_decoded() {
+    let q = sim_host::dashboard::query_params("board=camera%20cage&since=5&x=a+b&flag&bad=%zz");
+    assert_eq!(q["board"], "camera cage");
+    assert_eq!(q["since"], "5");
+    assert_eq!(q["x"], "a b");
+    assert_eq!(q["flag"], "");
+    assert_eq!(q["bad"], "%zz");
+}
+
+/// `--dashboard-pause-at`: a run told before it starts to pause at a time does, however fast it runs; zero pauses
+/// it from the start.
+#[test]
+fn a_run_can_be_set_to_pause_before_it_starts() {
+    let info = || vec![BoardInfo { name: "blink".into(), ..Default::default() }];
+    let mut d = Dashboard::start("127.0.0.1:0", info(), vec![]).unwrap();
+    d.pause_at(Some(Time::ZERO));
+    assert!(d.paused());
+    let mut s = blink();
+    let mut d = Dashboard::start("127.0.0.1:0", info(), vec![]).unwrap();
+    d.pause_at(Some(Time::from_ms(3)));
+    while !d.paused() {
+        s.run_for(Time::from_us(500));
+        d.service_session(&mut s);
+        assert!(s.machine.now < Time::from_ms(10), "did not pause");
+    }
+    assert!(s.machine.now >= Time::from_ms(3) && s.machine.now < Time::from_us(3500), "{}", s.machine.now);
+    assert_eq!(json(&d.published())["pause_at_s"], Value::Null, "done with");
+}
+
+/// `GET /api/state?fresh=1` has the run loop build the state now, rather than return the last one published.
+#[test]
+fn a_fresh_state_is_built_on_request() {
+    let mut s = blink();
+    let mut d = Dashboard::start("127.0.0.1:0", vec![BoardInfo { name: "blink".into(), ..Default::default() }], vec![])
+        .unwrap();
+    d.publish_every = std::time::Duration::from_secs(3600);
+    d.tap_session(0, &mut s);
+    s.run_for(Time::from_ms(1));
+    d.service_session(&mut s);
+    let (stale, fresh) = run_with_client(&mut s, &mut d, |addr| {
+        std::thread::sleep(std::time::Duration::from_millis(30));
+        (json(&request(addr, "GET", "/api/state", "").1), json(&request(addr, "GET", "/api/state?fresh=1", "").1))
+    });
+    let first = stale["time_s"].as_f64().unwrap();
+    assert!(first < 0.0011, "not due again for an hour: {first}");
+    assert!(fresh["time_s"].as_f64().unwrap() > first + 0.001, "{}", fresh["time_s"]);
+}

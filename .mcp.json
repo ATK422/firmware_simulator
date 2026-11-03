@@ -1,0 +1,10 @@
+{
+  "mcpServers": {
+    "firmware_simulator": {
+      "type": "stdio",
+      "command": "./target/release/firmware_simulator",
+      "args": ["mcp"],
+      "env": {}
+    }
+  }
+}
