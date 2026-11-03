@@ -94,6 +94,13 @@ struct RobotArgs {
     /// bridge on the board's bus.
     #[arg(long = "fault", value_parser = parse_robot_fault)]
     faults: Vec<(Time, String, sim_host::fault::Fault)>,
+    /// Profile every board's firmware: write `DIR/BOARD.txt` (functions by time, per core) and `DIR/BOARD.folded`
+    /// (folded stacks for flamegraph tools).
+    #[arg(long)]
+    profile_dir: Option<PathBuf>,
+    /// Mean virtual time between profile samples.
+    #[arg(long, default_value = "10us", value_parser = parse_time)]
+    profile_interval: Time,
 }
 
 fn parse_board_udp(s: &str) -> Result<(String, String, String), String> {
@@ -201,6 +208,12 @@ fn robot(args: RobotArgs) -> Result<()> {
         }
     }
     r.realtime = args.realtime;
+    if let Some(dir) = &args.profile_dir {
+        std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
+        for s in r.boards.iter_mut() {
+            s.start_profile(args.profile_interval);
+        }
+    }
     let wall = std::time::Instant::now();
     let mut faults = faults.into_iter().peekable();
     let stopped = loop {
@@ -231,6 +244,14 @@ fn robot(args: RobotArgs) -> Result<()> {
             s.position[2],
             sim_physics::math::norm(s.velocity)
         );
+    }
+    if let Some(dir) = &args.profile_dir {
+        for (s, name) in r.boards.iter().zip(&r.names) {
+            let Some(p) = &s.profiler else { continue };
+            let path = dir.join(format!("{name}.txt"));
+            let folded = p.report().write(&path, name).with_context(|| format!("writing {}", path.display()))?;
+            eprintln!("profile of {name}: {} and {}", path.display(), folded.display());
+        }
     }
     if let Some(path) = &args.vehicle_csv {
         let several = r.vehicles.len() > 1;
@@ -395,6 +416,13 @@ struct RunArgs {
     /// `3s@bridge-stop` (repeatable; see `sim_host::fault::Fault`'s `from_str` for the faults).
     #[arg(long = "fault", value_parser = parse_fault)]
     faults: Vec<(Time, sim_host::fault::Fault)>,
+    /// Profile the firmware: write the functions by time (per core) to FILE and folded stacks for flamegraph tools
+    /// next to it (FILE with the extension `.folded`).
+    #[arg(long)]
+    profile: Option<PathBuf>,
+    /// Mean virtual time between profile samples.
+    #[arg(long, default_value = "10us", value_parser = parse_time)]
+    profile_interval: Time,
 }
 
 fn parse_input(s: &str) -> Result<(String, f64), String> {
@@ -626,6 +654,9 @@ fn run(args: RunArgs) -> Result<()> {
             .with_context(|| format!("loading {}", path.display()))?;
     }
     let end = if to_load.is_some() { session.machine.now + args.time } else { args.time };
+    if args.profile.is_some() {
+        session.start_profile(args.profile_interval);
+    }
     let mut faults = args.faults.clone();
     faults.sort_by_key(|f| f.0);
     let mut faults = faults.into_iter().peekable();
@@ -655,6 +686,12 @@ fn run(args: RunArgs) -> Result<()> {
     if let Some(f) = &args.flash_file {
         session.machine.save_flash_file(f).with_context(|| format!("writing {}", f.display()))?;
     }
+    if let (Some(path), Some(p)) = (&args.profile, &session.profiler) {
+        let title = args.image.as_ref().or(args.picoboot_load.as_ref()).and_then(|p| p.file_name());
+        let title = title.map_or("firmware".into(), |t| t.to_string_lossy().into_owned());
+        let folded = p.report().write(path, &title).with_context(|| format!("writing {}", path.display()))?;
+        eprintln!("profile: {} and {}", path.display(), folded.display());
+    }
     if let Some(path) = &args.screenshot {
         match session.machine.sys.i2c_device::<sim_devices::ssd1306::Ssd1306>() {
             Some(oled) => {
@@ -666,7 +703,12 @@ fn run(args: RunArgs) -> Result<()> {
     }
     let machine = &mut session.machine;
     let where_ = |pc: u32| match machine.symbolize(pc) {
-        Some(s) => format!("{pc:#010x} <{s}>"),
+        Some(s) => {
+            // `name+0x12`: demangle the name part
+            let (name, off) = s.rsplit_once('+').filter(|(_, o)| o.starts_with("0x")).unwrap_or((&s, ""));
+            let off = if off.is_empty() { String::new() } else { format!("+{off}") };
+            format!("{pc:#010x} <{}{off}>", sim_host::demangle::demangle(name))
+        }
         None => format!("{pc:#010x}"),
     };
     match reason {

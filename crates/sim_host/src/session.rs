@@ -58,6 +58,8 @@ pub struct Session {
     pub realtime: bool,
     pacing: Option<(std::time::Instant, Time)>,
     behind_warned: std::time::Instant,
+    /// A sampling profiler of the firmware (see [`crate::profile`]); `None` runs the machine directly.
+    pub profiler: Option<crate::profile::Profiler>,
 }
 
 /// Callback for complete lines of text: `(virtual time, line)`.
@@ -103,6 +105,7 @@ impl Session {
             realtime: false,
             pacing: None,
             behind_warned: std::time::Instant::now(),
+            profiler: None,
         }
     }
 
@@ -151,6 +154,7 @@ impl Session {
             realtime: self.realtime,
             pacing: None,
             behind_warned: std::time::Instant::now(),
+            profiler: None,
         }
     }
 
@@ -313,7 +317,7 @@ impl Session {
     pub fn run_until(&mut self, end: Time) -> StopReason {
         loop {
             let target = (self.machine.now + self.slice).min(end);
-            let reason = self.machine.run_until(target);
+            let reason = self.run_machine(target);
             self.step_can();
             self.poll_rtt();
             if let Some(u) = &mut self.usbip {
@@ -328,6 +332,19 @@ impl Session {
                 other => return other,
             }
         }
+    }
+
+    /// Runs just the machine until `end` (through the profiler, if there is one), without polling anything.
+    pub fn run_machine(&mut self, end: Time) -> StopReason {
+        match &mut self.profiler {
+            None => self.machine.run_until(end),
+            Some(p) => p.run_until(&mut self.machine, end),
+        }
+    }
+
+    /// Starts profiling the firmware with a sample every `interval` (on average).
+    pub fn start_profile(&mut self, interval: Time) {
+        self.profiler = Some(crate::profile::Profiler::new(&self.machine, interval));
     }
 
     pub fn run_for(&mut self, d: Time) -> StopReason {

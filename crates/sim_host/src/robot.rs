@@ -160,7 +160,7 @@ impl Robot {
                     b.machine.power_on_at(*on_at);
                     *on = true;
                 }
-                match b.machine.run_until(t) {
+                match b.run_machine(t) {
                     StopReason::TimeLimit => {}
                     other => return Some((i, other)),
                 }

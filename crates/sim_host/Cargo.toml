@@ -12,6 +12,8 @@ rp2040.workspace = true
 log.workspace = true
 defmt-decoder = "1.2"
 object.workspace = true
+# Already in the dependency tree through defmt-decoder: reads .debug_frame for the profiler's stack walks
+gimli = { version = "0.29", default-features = false, features = ["read"] }
 thiserror.workspace = true
 libc = "0.2"
 sim_devices.workspace = true

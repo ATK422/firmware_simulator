@@ -948,6 +948,7 @@ dependencies = [
  "canmore",
  "cpu_armv6m",
  "defmt-decoder",
+ "gimli",
  "libc",
  "log",
  "object",

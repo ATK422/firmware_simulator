@@ -26,16 +26,19 @@ pub fn resolve_image(path: &std::path::Path) -> std::path::PathBuf {
 }
 pub mod board;
 pub mod defmt;
+pub mod demangle;
 pub mod ethernet;
 pub mod fault;
 pub mod gdb;
 pub mod mock_bridge;
+pub mod profile;
 pub mod pty;
 pub mod robot;
 pub mod rtt;
 pub mod session;
 pub mod socketcan;
 pub mod target;
+pub mod unwind;
 pub mod upload;
 pub mod usb;
 pub mod usbip;
