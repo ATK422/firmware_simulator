@@ -139,8 +139,9 @@ pool or lake environment it comes to rest on the bottom. A uniform current can b
 at 1 ms on the robot's virtual clock after every slice, so runs stay deterministic.
 
 Each thruster (position and direction on the hull, thrust `k rpm |rpm|` with separate forward and reverse curves)
-is wired to a DShot ESC of a board and spins at that ESC's motor-model RPM, so the thrust comes from the firmware's
-actual DShot frames. Pressure sensor inputs (`depth.pressure_pa` of an MS5837) get the absolute pressure at their
+is wired to a DShot ESC of a board and spins at that ESC's motor-model RPM (an `inverted` thruster, with a
+counter-rotating propeller, pushes ahead when its motor turns backwards, as the Talos ESC boards' invert mask
+expects), so the thrust comes from the firmware's actual DShot frames. Pressure sensor inputs (`depth.pressure_pa` of an MS5837) get the absolute pressure at their
 port on the hull, and transducers carried by the vehicle follow it through the acoustic medium (what other boards
 hear moves with it, Doppler included).
 

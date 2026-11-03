@@ -4,6 +4,11 @@
 //! momentum theory at a fixed advance ratio), and is weaker in reverse, where the propeller and duct work against
 //! their design. The coefficients come from one point of a thrust curve in each direction, as datasheets give
 //! them: e.g. the Blue Robotics T200 at 16 V makes about 5.25 kgf forward and 4.1 kgf in reverse near 3800 RPM.
+//!
+//! Thrusters with a counter-rotating propeller (fitted so that the torques of neighbouring thrusters cancel) are
+//! `inverted`: their motor turns backwards for the same push, and forwards gives their weaker reverse thrust. The
+//! Talos ESC boards' RPM controller knows which ones those are (its invert mask, thrusters 1 and 4 of each board by
+//! default) and turns them the other way; raw throttle commands don't.
 
 use serde::Deserialize;
 
@@ -31,6 +36,9 @@ pub struct ThrusterSpec {
     pub direction: Vec3,
     /// Its thrust curve, when it differs from the vehicle's `thruster_model`.
     pub curve: Option<ThrustCurve>,
+    /// A counter-rotating propeller: negative motor RPM pushes along `direction`.
+    #[serde(default)]
+    pub inverted: bool,
 }
 
 /// A thruster ready to use: unit direction and thrust coefficients.
@@ -42,6 +50,7 @@ pub struct Thruster {
     /// N/RPM² forwards and in reverse.
     pub k_forward: f64,
     pub k_reverse: f64,
+    pub inverted: bool,
 }
 
 impl Thruster {
@@ -54,11 +63,13 @@ impl Thruster {
             direction: unit(spec.direction),
             k_forward: c.forward_n / (c.at_rpm * c.at_rpm),
             k_reverse: c.reverse_n / (c.at_rpm * c.at_rpm),
+            inverted: spec.inverted,
         }
     }
 
-    /// Thrust along `direction` at a signed mechanical RPM, N.
+    /// Thrust along `direction` at a signed mechanical motor RPM, N.
     pub fn thrust(&self, rpm: f64) -> f64 {
+        let rpm = if self.inverted { -rpm } else { rpm };
         if rpm >= 0.0 { self.k_forward * rpm * rpm } else { -self.k_reverse * rpm * rpm }
     }
 }
@@ -74,6 +85,7 @@ mod tests {
             position_m: [0.0; 3],
             direction: [0.0, 0.0, 2.0],
             curve: Some(ThrustCurve { forward_n: 51.5, reverse_n: 40.2, at_rpm: 3800.0 }),
+            inverted: false,
         };
         let t = Thruster::new(&spec, None);
         assert_eq!(t.direction, [0.0, 0.0, 1.0]);
@@ -83,7 +95,11 @@ mod tests {
         assert_eq!(t.thrust(0.0), 0.0);
         // The vehicle's model is used when the thruster has none
         let model = ThrustCurve { forward_n: 10.0, reverse_n: 5.0, at_rpm: 1000.0 };
-        let t = Thruster::new(&ThrusterSpec { curve: None, ..spec }, Some(&model));
+        let t = Thruster::new(&ThrusterSpec { curve: None, ..spec.clone() }, Some(&model));
         assert!((t.thrust(-1000.0) + 5.0).abs() < 1e-9);
+        // A counter-rotating propeller pushes forwards with the motor turning backwards
+        let t = Thruster::new(&ThrusterSpec { inverted: true, ..spec }, None);
+        assert!((t.thrust(-3800.0) - 51.5).abs() < 1e-9);
+        assert!((t.thrust(3800.0) + 40.2).abs() < 1e-9);
     }
 }

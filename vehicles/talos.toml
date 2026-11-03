@@ -6,7 +6,10 @@
 # them with measured values when there are some; tests that use them check behaviour, not these numbers.
 #
 # Frames: body x forward, y starboard, z down, from the centre of gravity (m). Thruster `direction` is the way it
-# pushes the vehicle at positive RPM.
+# pushes the vehicle with its propeller turning the efficient way: positive motor RPM, or negative for an
+# `inverted` thruster (a counter-rotating propeller). Thrusters 1 and 4 of each ESC board are inverted, matching the
+# boards' default invert mask (`esc_core`'s `Param::InvertMask(0b1001)`), so in RPM mode a positive target pushes
+# every thruster along its `direction`; raw throttle commands turn those four the other way.
 name = "talos"
 
 mass_kg = 32.0
@@ -32,6 +35,7 @@ thruster_model = { forward_n = 51.5, reverse_n = 40.2, at_rpm = 3800.0 }
 # opposite corners together push it sideways and forward.
 [[thruster]]
 name = "fwd_stbd"
+inverted = true
 position_m = [0.33, 0.24, 0.0]
 direction = [1.0, -1.0, 0.0]
 
@@ -47,12 +51,14 @@ direction = [1.0, 1.0, 0.0]
 
 [[thruster]]
 name = "aft_port"
+inverted = true
 position_m = [-0.33, -0.24, 0.0]
 direction = [1.0, -1.0, 0.0]
 
 # ESC board 1 (thrusters 5-8): vertical thrusters; positive RPM pushes the vehicle down (dives)
 [[thruster]]
 name = "heave_fwd_stbd"
+inverted = true
 position_m = [0.25, 0.28, -0.05]
 direction = [0.0, 0.0, 1.0]
 
@@ -68,5 +74,6 @@ direction = [0.0, 0.0, 1.0]
 
 [[thruster]]
 name = "heave_aft_port"
+inverted = true
 position_m = [-0.25, -0.28, -0.05]
 direction = [0.0, 0.0, 1.0]

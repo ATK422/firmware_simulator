@@ -424,7 +424,13 @@ mod tests {
             thruster: thrusters
                 .iter()
                 .enumerate()
-                .map(|(i, (p, d))| ThrusterSpec { name: format!("t{i}"), position_m: *p, direction: *d, curve: None })
+                .map(|(i, (p, d))| ThrusterSpec {
+                    name: format!("t{i}"),
+                    position_m: *p,
+                    direction: *d,
+                    curve: None,
+                    inverted: false,
+                })
                 .collect(),
         };
         Vehicle::new(&file, Water::default(), State::at_rest([0.0, 0.0, 2.0], [0.0; 3]))
