@@ -273,8 +273,9 @@ impl Machine {
     fn refresh_irqs(&mut self) {
         if self.sys.irq_dirty {
             self.sys.irq_dirty = false;
-            for c in 0..2 {
-                self.cores[c].set_irq_lines(self.sys.irq_lines(c as u8));
+            let lines = self.sys.irq_lines_both();
+            for (core, l) in self.cores.iter_mut().zip(lines) {
+                core.set_irq_lines(l);
             }
         }
     }

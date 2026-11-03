@@ -22,7 +22,7 @@ use crate::memmap::*;
 use crate::periph::adc::{self, Adc};
 use crate::periph::clocks::{Clocks, Freqs, Pll};
 use crate::periph::dma::{self, Dma, DmaBus};
-use crate::periph::gpio::{Drive, Gpio, func};
+use crate::periph::gpio::{BankDrive, Drive, Gpio, func};
 use crate::periph::i2c::{I2c, Step, StepResult};
 use crate::periph::pio::{self, Pio};
 use crate::periph::pwm::Pwm;
@@ -323,16 +323,14 @@ impl System {
 
     /// IRQ lines seen by `core`'s NVIC.
     pub fn irq_lines(&self, core: u8) -> u32 {
-        let c = core as usize & 1;
+        self.irq_lines_both()[core as usize & 1]
+    }
+
+    /// IRQ lines seen by both cores' NVICs (the shared lines are collected once).
+    pub fn irq_lines_both(&self) -> [u32; 2] {
         let mut lines = self.timer.irq_lines();
         if self.pwm.irq_line() {
             lines |= 1 << irq::PWM_IRQ_WRAP;
-        }
-        if self.gpio.irq(c) {
-            lines |= 1 << irq::IO_IRQ_BANK0;
-        }
-        if self.sio.fifo_irq(c) {
-            lines |= 1 << (irq::SIO_IRQ_PROC0 + c as u32);
         }
         if self.uart[0].irq() {
             lines |= 1 << irq::UART0_IRQ;
@@ -362,13 +360,19 @@ impl System {
             lines |= 1 << irq::I2C1_IRQ;
         }
         for (b, base) in [(0, irq::PIO0_IRQ_0), (1, irq::PIO1_IRQ_0)] {
-            for n in 0..2 {
-                if self.pio[b].irq_line(n) {
-                    lines |= 1 << (base + n as u32);
-                }
-            }
+            let [l0, l1] = self.pio[b].irq_lines();
+            lines |= (l0 as u32) << base | (l1 as u32) << (base + 1);
         }
-        lines
+        std::array::from_fn(|c| {
+            let mut lines = lines;
+            if self.gpio.irq(c) {
+                lines |= 1 << irq::IO_IRQ_BANK0;
+            }
+            if self.sio.fifo_irq(c) {
+                lines |= 1 << (irq::SIO_IRQ_PROC0 + c as u32);
+            }
+            lines
+        })
     }
 
     // ------------------------------------------------------------------ cross-block effects
@@ -577,7 +581,13 @@ impl System {
         let spis = &self.spi;
         let pios = &self.pio;
         let clk = self.clk_sys;
-        let changed = self.gpio.evaluate(|f, pin| match f {
+        let bank = BankDrive {
+            sio_out,
+            sio_oe,
+            pio_out: [pios[0].pad_out, pios[1].pad_out],
+            pio_oe: [pios[0].pad_oe, pios[1].pad_oe],
+        };
+        let changed = self.gpio.evaluate(bank, |f, pin| match f {
             func::SIO => Drive { out: sio_out & (1 << pin) != 0, oe: sio_oe & (1 << pin) != 0 },
             func::PWM if pwm.drives_pin(pin) => Drive { out: pwm.pin_output(&clk, now, pin), oe: true },
             func::PIO0 | func::PIO1 => {
@@ -755,7 +765,7 @@ impl System {
             }
         }
         self.in_pio = false;
-        let lines = self.pio.iter().flat_map(|p| [p.irq_line(0), p.irq_line(1)]).fold(0u8, |a, l| a << 1 | l as u8);
+        let lines = self.pio.iter().flat_map(|p| p.irq_lines()).fold(0u8, |a, l| a << 1 | l as u8);
         if lines != self.pio_lines {
             self.pio_lines = lines;
             self.irq_dirty = true;
@@ -1966,7 +1976,7 @@ impl<'a> BatchBus<'a> {
         let s = &mut *self.sys;
         if s.irq_dirty {
             s.irq_dirty = false;
-            let lines = [s.irq_lines(0), s.irq_lines(1)];
+            let lines = s.irq_lines_both();
             self.lines = Some(lines);
             if lines[self.core as usize] != self.core_lines {
                 self.core_lines = lines[self.core as usize];

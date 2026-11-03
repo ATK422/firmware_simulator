@@ -94,6 +94,9 @@ impl fmt::Display for Time {
 pub struct ClockPeriod {
     fixed: u128,
     hz: u64,
+    /// The period when it is a whole number of picoseconds (125 MHz: 8000 ps): conversions are then plain 64-bit
+    /// arithmetic, with the same results.
+    whole_ps: Option<u64>,
 }
 
 impl ClockPeriod {
@@ -102,10 +105,11 @@ impl ClockPeriod {
     /// The period of a clock running at `hz`. A stopped clock (`hz == 0`) has an infinite period.
     pub fn from_hz(hz: u64) -> ClockPeriod {
         if hz == 0 {
-            return ClockPeriod { fixed: u128::MAX, hz: 0 };
+            return ClockPeriod { fixed: u128::MAX, hz: 0, whole_ps: None };
         }
         let fixed = (1_000_000_000_000u128 << Self::FRAC_BITS) / hz as u128;
-        ClockPeriod { fixed, hz }
+        let whole_ps = 1_000_000_000_000u64.is_multiple_of(hz).then(|| 1_000_000_000_000 / hz);
+        ClockPeriod { fixed, hz, whole_ps }
     }
 
     pub fn hz(&self) -> u64 {
@@ -121,6 +125,11 @@ impl ClockPeriod {
         if self.hz == 0 {
             return Time::MAX;
         }
+        if let Some(p) = self.whole_ps
+            && let Some(t) = cycles.checked_mul(p)
+        {
+            return Time(t);
+        }
         Time(((cycles as u128 * self.fixed) >> Self::FRAC_BITS) as u64)
     }
 
@@ -128,6 +137,9 @@ impl ClockPeriod {
     pub fn cycles_in(&self, t: Time) -> u64 {
         if self.hz == 0 {
             return 0;
+        }
+        if let Some(p) = self.whole_ps {
+            return t.0 / p;
         }
         (((t.0 as u128) << Self::FRAC_BITS) / self.fixed) as u64
     }
@@ -215,6 +227,21 @@ mod tests {
         let t = p12.cycles(12_000_000);
         assert!(t.as_ps().abs_diff(1_000_000_000_000) < 20, "{t:?}");
         assert_eq!(p12.cycles_in(Time::from_us(1)), 12);
+    }
+
+    #[test]
+    fn whole_picosecond_periods_convert_as_the_general_case() {
+        for hz in [125_000_000u64, 100_000_000, 1_000_000, 50_000_000, 250_000_000, 1] {
+            let p = ClockPeriod::from_hz(hz);
+            assert!(p.whole_ps.is_some(), "{hz}");
+            let general = ClockPeriod { whole_ps: None, ..p };
+            for v in [0u64, 1, 7_999, 8_000, 8_001, 123_456_789, 2_000_000_000_000, u64::MAX / 2] {
+                assert_eq!(p.cycles_in(Time(v)), general.cycles_in(Time(v)), "{hz} Hz, {v} ps");
+                assert_eq!(p.cycles(v % (1 << 40)), general.cycles(v % (1 << 40)), "{hz} Hz, {v} cycles");
+            }
+        }
+        assert!(ClockPeriod::from_hz(133_000_000).whole_ps.is_none());
+        assert!(ClockPeriod::from_hz(48_000_000).whole_ps.is_none());
     }
 
     #[test]
