@@ -35,8 +35,8 @@ logs).
 | C titan_firmware (`basic_template`, the Titan bootloader, a small OTA app) | `scripts/build_c_firmware.sh` (needs `gcc-arm-none-eabi`, `cmake`, `ninja` and titan_firmware's pico-sdk submodule) into `build/c/` |
 | Hand-written test programs (`test_programs/*.elf`, `embassy_blinky.elf`, `pico/*.elf`, `c_dual_usb`) | committed; `make -C test_programs` (Thumb and embassy), `make -C test_programs pico`, `make -C test_programs c_dual_usb` rebuild them |
 
-The C titan_firmware board applications need the prebuilt micro-ROS library and are not built here; the
-emulator runs the C template and bootloader.
+The C titan_firmware board applications need titan_firmware's prebuilt micro-ROS library (built in Docker), so the
+script does not build them; the C programs the tests run are the template, the bootloader and its test app.
 
 ## What it prints
 
@@ -120,6 +120,8 @@ afterwards (pico-sdk's `flash_do_cmd` behind `pico_unique_id`, boot2) keeps work
 `--flash-file FILE` loads the flash from `FILE` (if it exists) before the image is written over it and saves it
 at the end, so what the firmware writes (a flash recorder, crash data, or an application the C Titan bootloader
 flashed) persists between runs. Without an image (`--bootsel`) the flash is the file's contents or blank.
+`run` needs an image otherwise, so there is no way to boot a flash file's contents alone: pass the image again
+(it is written over the same place) or reflash it with `picoboot load`.
 
 The C Titan bootloader can be reflashed over CAN the way `upload_tool` does it: `sim_host::upload` speaks its
 protocol (CANmore register-mapped pages, CRC-32/MPEG-2) over the in-process bus, catching the bootloader in its
@@ -151,10 +153,10 @@ what the board sends. Like a Linux CAN interface it queues at most 10 frames, so
 piling up while the bus is unusable. `--candump` prints the traffic:
 
 ```
+[0.000065s] 01420802##10002  (no ACK)
 [0.134891s] 06F#C0
 [0.200059s] 01420802##10002
 [0.300652s] 01020801##100
-[0.000065s] 01420802##10002  (no ACK)
 ```
 
 (`(no ACK)` marks a frame nobody acknowledged, `(destroyed: ...)` one cut off by an injected bit error.)
@@ -176,7 +178,7 @@ water; see [acoustics.md](acoustics.md).
 | `exc` | Exception entry and return |
 | `gpio` | Pin level changes: `[0.229408s] GPIO24 = 1` |
 | `unmodelled` | Every access to a register the emulator does not model, named from the SVD |
-| `device` | What external devices report: WS2812 frames, DShot frames, USB host activity, ... |
+| `device` | What external devices report: WS2812 frames, DShot checksum errors and signal loss, DRV8243 state changes, USB host activity |
 
 ```bash
 firmware_simulator run test_programs/embassy_blinky.elf --time 1s --trace gpio
@@ -221,8 +223,8 @@ bus time: about 1.2 MB/s per bulk pipe). `--trace device` shows what it does.
 |---|---|
 | `firmware_simulator run --bootsel --time 300ms --trace device` | Powers on in BOOTSEL: the real bootrom enumerates as `2e8a:0003` "RP2 Boot" with the PICOBOOT interface and the RPI-RP2 drive |
 | `firmware_simulator picoboot load IMAGE --time 2s` | `picotool load -v -x`: blank flash, BOOTSEL, flash over PICOBOOT through the bootrom's own flash code, verify, reboot into the image and run it for `--time`. Further arguments are `run` options (`--board`, `--usb-cdc stdout`, `--flash-file`, ...) |
-| `... picoboot load app.uf2 --load-via drive --flash-file flash.bin` | The same by copying the UF2 to the RPI-RP2 drive (bulk-only mass storage and SCSI), keeping the flash afterwards |
-| `run IMAGE --picoboot-load OTHER` | Flashes `OTHER` once the board is in BOOTSEL mode (`run --bootsel --picoboot-load` is what `picoboot load` does) |
+| `... picoboot load app.uf2 --load-via drive --flash-file flash.bin --time 1s` | The same by copying the UF2 to the RPI-RP2 drive (bulk-only mass storage and SCSI), keeping the flash afterwards. The bootrom reboots about 500 ms after the copy, so give it a longer `--time` than with PICOBOOT |
+| `run --bootsel --picoboot-load FILE` | What `picoboot load FILE` is short for: waits (up to 5 s of virtual time) for the board to be in BOOTSEL mode, flashes `FILE`, reboots into it. With an image instead of `--bootsel`, the image has to reboot into BOOTSEL itself |
 | `run test_programs/pico/hello_usb.elf --usb-cdc stdout --time 1s` | pico-sdk stdio over USB (TinyUSB CDC ACM): the host opens the port (115200 8N1, DTR/RTS) and prints its lines as `[0.136602s] usb: Hello, USB!` |
 | `run ... --usb-cdc pty --realtime --time 600s` | Puts the CDC port on a pseudo terminal for `picocom`/`screen` (input reaches the device) |
 | `run ... --usbip 127.0.0.1:3240 --realtime` | Exports the device over USB/IP for the real host's tools after `sudo usbip attach -r 127.0.0.1 -b 1-1` (`picotool`, `/dev/ttyACM*`, the drive); attach again after the device reboots. **To verify locally**: tested only with an in-process USB/IP client, not the kernel's vhci-hcd |
