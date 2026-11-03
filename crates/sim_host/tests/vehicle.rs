@@ -158,6 +158,10 @@ fn snapshots_carry_their_own_vehicle() {
         let medium = robot.medium.as_ref().unwrap().lock().unwrap();
         assert!((medium.projectors[0].trajectory.at(0.3)[2] - want[2]).abs() < 1e-9);
     }
+    // A vehicle put somewhere else between runs is seen there from the start of the next run
+    copy.vehicles[0].vehicle.state.position[2] += 1.0;
+    assert!(copy.run_until(copy.now).is_none());
+    assert_eq!(copy.inputs[1].get("depth.pressure_pa"), copy.vehicles[0].vehicle.pressure_at(port));
 }
 
 #[test]

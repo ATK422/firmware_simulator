@@ -145,6 +145,10 @@ impl Robot {
     pub fn run_until(&mut self, end: Time) -> Option<(usize, StopReason)> {
         let wall = std::time::Instant::now();
         let start = self.now;
+        // The sensors see a vehicle moved since the last run (a scenario putting it elsewhere) from the start
+        for v in &self.vehicles {
+            v.update_outputs();
+        }
         while self.now < end {
             let t = (self.now + self.slice).min(end);
             for (i, b) in self.boards.iter_mut().enumerate() {
