@@ -747,7 +747,7 @@ impl Mcp251xfd {
     fn fifo_index(addr: u16) -> Option<(usize, u16)> {
         match addr {
             0x050..=0x058 => Some((0, addr - 0x050)),
-            0x05C..=0x1CB => Some((((addr - 0x05C) / 12 + 1) as usize, (addr - 0x05C) % 12)),
+            0x05C..=0x1CF => Some((((addr - 0x05C) / 12 + 1) as usize, (addr - 0x05C) % 12)),
             _ => None,
         }
     }
@@ -1646,6 +1646,26 @@ mod tests {
         assert!(!d.int_asserted());
         d.update(&mut c);
         assert_eq!(c.pins[22], External::Driven(Level::High));
+    }
+
+    /// FIFO31's registers end at C1FIFOUA31 (0x1CC), just before C1FLTCON0 (0x1D0); the user address read as 0.
+    #[test]
+    fn fifo31_user_address() {
+        let mut c = ctx();
+        let mut d = Mcp251xfd::new(Mcp251xfdConfig::default());
+        xfer(&mut d, &mut c, &[0, 0]); // RESET: FIFO1-31 one 16-byte object each
+        write32(&mut d, &mut c, 0xE00, 1);
+        write(&mut d, &mut c, 0x003, &[mode::NORMAL_FD]);
+        let ua30 = read32(&mut d, &mut c, 0x1C0);
+        assert_eq!(read32(&mut d, &mut c, 0x1CC), ua30 + 16, "C1FIFOUA31 follows FIFO30's object");
+        // Route a frame to FIFO31 through filter 0 (mask 0: everything) and check its object lands at the UA
+        write(&mut d, &mut c, 0x003, &[mode::CONFIG]);
+        write(&mut d, &mut c, 0x1D0, &[0x80 | 31]);
+        write(&mut d, &mut c, 0x003, &[mode::NORMAL_FD]);
+        d.receive(&CanFrame::fd(0x55, false, &[1]), Time::ZERO);
+        assert_eq!(read32(&mut d, &mut c, 0x1C8) & 1, 1, "FIFO31 not empty");
+        let ua = read32(&mut d, &mut c, 0x1CC) as u16;
+        assert_eq!(read32(&mut d, &mut c, 0x400 + ua), 0x55);
     }
 
     #[test]
