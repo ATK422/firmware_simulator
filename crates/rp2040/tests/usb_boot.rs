@@ -59,3 +59,14 @@ fn dpram_takes_any_width_and_usbctrl_irq_reaches_the_nvic() {
     assert_eq!(sys.read(&mut NullSink, 0, t, 0x5011_0090, Size::Word), Ok(0));
     assert_eq!(sys.read(&mut NullSink, 0, t, 0x5010_0100, Size::Word), Ok(0x1234_AB00));
 }
+
+#[test]
+fn blank_flash_falls_back_to_usb_boot() {
+    // No BOOTSEL: the bootrom tries the flash 128 times, finds no valid boot2 and enters USB boot anyway
+    let mut m = Machine::new(MachineConfig { bootrom: Some(rp2040::BOOTROM_B1.to_vec()), ..MachineConfig::default() });
+    m.rom_boot().unwrap();
+    m.sys.attach_usb_host(HostController::new(), Time::ZERO);
+    m.run_until(Time::from_secs(2));
+    let dev = m.sys.usb_host.as_ref().unwrap().configured().expect("RP2 Boot after the flash attempts");
+    assert_eq!(dev.product_id(), 0x0003);
+}

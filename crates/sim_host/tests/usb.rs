@@ -342,3 +342,27 @@ fn usbip_exports_the_bootsel_device() {
     assert_eq!(i32::from_be_bytes(h[20..24].try_into().unwrap()), -104, "ECONNRESET: it was still pending");
     assert!(s.usbip.as_ref().unwrap().attached());
 }
+
+#[test]
+fn tinyusb_survives_suspend_and_resume() {
+    let mut s = common::boot(&common::repo().join("test_programs/pico/hello_usb.elf"), None);
+    let mut host = HostController::new();
+    host.cdc_open(0, 115_200);
+    s.machine.sys.attach_usb_host(host, Time::ZERO);
+    assert!(cdc_wait(&mut s, 0, "Hello, USB!\r\n", Time::from_secs(2)));
+    let now = s.machine.now;
+    s.machine.sys.with_usb_host(now, |h| h.suspend(now));
+    let sink = sim_core::trace::VecSink::new(&[sim_core::trace::Category::Device]);
+    s.machine.set_trace(Box::new(sink.clone()));
+    s.run_for(Time::from_ms(50));
+    let now = s.machine.now;
+    s.machine.sys.with_usb_host(now, |h| {
+        h.resume(now);
+        h.cdc_write(0, b"z");
+    });
+    let from = s.usb_cdc_text.len();
+    assert!(cdc_wait(&mut s, from, "echo z (1)\r\n", Time::from_secs(1)), "{:?}", s.usb_cdc_text);
+    let events: Vec<String> = sink.take().iter().map(|(_, e)| e.to_string()).collect();
+    assert!(events.iter().any(|e| e.contains("device suspended")), "{events:?}");
+    assert!(events.iter().any(|e| e.contains("device resumed")), "{events:?}");
+}

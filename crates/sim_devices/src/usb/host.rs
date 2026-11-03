@@ -31,6 +31,10 @@ use super::*;
 pub const ATTACH_DEBOUNCE: Time = Time::from_ms(100);
 /// Bus reset length (USB 2.0 7.1.7.5, TDRST minimum for a hub port).
 pub const RESET_TIME: Time = Time::from_ms(10);
+/// Idle time after which a device suspends (USB 2.0 7.1.7.6).
+pub const SUSPEND_IDLE: Time = Time::from_ms(3);
+/// How long the host drives resume signalling (TDRSMDN).
+pub const RESUME_TIME: Time = Time::from_ms(20);
 /// Reset recovery before the first request (TRSTRCY).
 pub const RESET_RECOVERY: Time = Time::from_ms(10);
 /// Recovery after SET_ADDRESS (TDSETADDR).
@@ -65,6 +69,10 @@ pub enum PortState {
     Recovery(Time),
     /// Port enabled, SOFs running.
     Enabled,
+    /// Port suspended (no SOFs) since the given time; `notified` once the device saw 3 ms of idle bus.
+    Suspended { since: Time, notified: bool },
+    /// Driving resume signalling until the given time, then SOFs start again.
+    Resuming(Time),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -202,6 +210,7 @@ pub struct HostController {
     next_id: u32,
     next_address: u8,
     pending_address: u8,
+    resume_signalled: bool,
     rr: usize,
     reports: Vec<(Time, String)>,
 }
@@ -233,6 +242,7 @@ impl HostController {
             next_id: 1,
             next_address: 1,
             pending_address: 0,
+            resume_signalled: false,
             rr: 0,
             reports: Vec::new(),
         }
@@ -401,6 +411,24 @@ impl HostController {
     /// Queues CLEAR_FEATURE(ENDPOINT_HALT) for `ep` (which resets the host's toggle for it once it succeeds).
     pub fn clear_halt(&mut self, ep: u8) -> u32 {
         self.submit_control(SetupPacket::new(req_type::ENDPOINT, request::CLEAR_FEATURE, 0, ep as u16, 0), Vec::new())
+    }
+
+    /// Suspends the port (selective suspend): SOFs and transfers stop, and after 3 ms of idle bus the device
+    /// suspends.
+    pub fn suspend(&mut self, now: Time) {
+        if self.state == PortState::Enabled {
+            self.report(now, "port suspended".into());
+            self.state = PortState::Suspended { since: now, notified: false };
+        }
+    }
+
+    /// Resumes a suspended port: 20 ms of resume signalling, then SOFs and transfers carry on.
+    pub fn resume(&mut self, now: Time) {
+        if let PortState::Suspended { .. } = self.state {
+            self.report(now, "resume".into());
+            self.resume_signalled = false;
+            self.state = PortState::Resuming(now + RESUME_TIME);
+        }
     }
 
     /// Resets the port and enumerates the device again (`usbreset`).
@@ -725,6 +753,26 @@ impl HostController {
                     self.state = PortState::Recovery(now + RESET_RECOVERY);
                 }
                 PortState::Recovery(t) if now >= t => self.state = PortState::Enabled,
+                PortState::Suspended { since, notified: false } if now >= since + SUSPEND_IDLE => {
+                    port.suspend(now, true);
+                    self.state = PortState::Suspended { since, notified: true };
+                }
+                PortState::Suspended { notified: true, .. } if port.remote_wakeup() => {
+                    self.report(now, "remote wakeup".into());
+                    self.resume_signalled = false;
+                    self.state = PortState::Resuming(now + RESUME_TIME);
+                }
+                PortState::Resuming(_) if !self.resume_signalled => {
+                    // The device sees the K state
+                    port.suspend(now, false);
+                    self.resume_signalled = true;
+                }
+                PortState::Resuming(t) if now >= t => {
+                    // The frame counter kept running; the next SOF is the current frame's
+                    self.last_sof = Some(self.frame_at(now).saturating_sub(1));
+                    self.bus_free = now;
+                    self.state = PortState::Enabled;
+                }
                 _ => return,
             }
         }
@@ -797,7 +845,9 @@ impl HostController {
         let mut at = |t: Time| next = Some(next.map_or(t, |n: Time| n.min(t)));
         match self.state {
             PortState::Detached => {}
-            PortState::Debounce(t) | PortState::Reset(t) => at(t),
+            PortState::Debounce(t) | PortState::Reset(t) | PortState::Resuming(t) => at(t),
+            PortState::Suspended { since, notified: false } => at(since + SUSPEND_IDLE),
+            PortState::Suspended { notified: true, .. } => {}
             PortState::Recovery(t) => {
                 at(t);
                 at(self.frame_start(self.frame_at(now) + 1));
@@ -1049,6 +1099,8 @@ mod tests {
         in_pid: Option<Pid>,
         echo: VecDeque<u8>,
         resets: u32,
+        suspended: Vec<(Time, bool)>,
+        wake: bool,
         sofs: Vec<(Time, u16)>,
         setups: Vec<SetupPacket>,
         drop_acks: u32,
@@ -1083,6 +1135,13 @@ mod tests {
         }
         fn sof(&mut self, now: Time, frame: u16) {
             self.sofs.push((now, frame));
+        }
+        fn suspend(&mut self, now: Time, suspended: bool) {
+            self.suspended.push((now, suspended));
+            self.wake = false;
+        }
+        fn remote_wakeup(&self) -> bool {
+            self.wake
         }
         fn setup(&mut self, _now: Time, addr: u8, data: &[u8; 8]) -> Handshake {
             if addr != self.addr {
@@ -1320,6 +1379,30 @@ mod tests {
         run(&mut h, &mut d, now, now + Time::from_ms(2));
         h.take_result(w);
         assert_eq!(d.echo.iter().copied().collect::<Vec<u8>>(), b"abcde", "nothing dropped as a repeat");
+    }
+
+    #[test]
+    fn suspend_resume_and_remote_wakeup() {
+        let (mut h, mut d, now) = enumerated();
+        h.suspend(now);
+        let sofs = d.sofs.len();
+        let r = h.submit_bulk_in(0x81, 64);
+        let now = run(&mut h, &mut d, now, now + Time::from_ms(10));
+        assert_eq!(d.sofs.len(), sofs, "no SOFs while suspended");
+        assert_eq!(d.suspended, vec![(now - Time::from_ms(10) + SUSPEND_IDLE, true)]);
+        assert!(h.pending(r), "transfers wait");
+        h.resume(now);
+        let now = run(&mut h, &mut d, now, now + Time::from_ms(25));
+        assert_eq!(d.suspended[1], (now - Time::from_ms(25), false));
+        assert!(d.sofs.len() > sofs, "SOFs again after the 20 ms of resume");
+        // Remote wakeup: the device signals while suspended; the host notices at the kick and resumes
+        h.suspend(now);
+        let now = run(&mut h, &mut d, now, now + Time::from_ms(5));
+        d.wake = true;
+        h.kick(now, &mut d);
+        assert!(matches!(h.state, PortState::Resuming(_)), "{:?}", h.state);
+        run(&mut h, &mut d, now, now + Time::from_ms(25));
+        assert_eq!(h.state, PortState::Enabled);
     }
 
     #[test]

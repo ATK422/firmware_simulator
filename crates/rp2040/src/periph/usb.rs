@@ -26,7 +26,10 @@
 //! the written bits through any alias: the bootrom and TinyUSB both clear them with the CLR alias
 //! (`usb_hw_clear->sie_status = ...`).
 //!
-//! Not modelled: host mode (MAIN_CTRL.HOST_NDEVICE), isochronous endpoints, suspend and resume, the direct PHY
+//! Suspend (3 ms of idle bus) latches SIE_STATUS.SUSPENDED, the host's resume SIE_STATUS.RESUME, and
+//! SIE_CTRL.RESUME while suspended is a remote wakeup the host answers.
+//!
+//! Not modelled: host mode (MAIN_CTRL.HOST_NDEVICE), isochronous endpoints, the direct PHY
 //! drive (USBPHY_DIRECT TX bits) and the RP2040-E5 requirement for 800 µs of J after a reset (CONNECTED is set as
 //! soon as the reset ends).
 
@@ -219,6 +222,9 @@ pub struct Usb {
     conn_changed: bool,
     sof_latched: bool,
     frame: u16,
+    /// The bus is suspended (the device saw 3 ms of idle), and the firmware asked for a remote wakeup.
+    suspended: bool,
+    wakeup: bool,
     /// clk_usb runs at 48 MHz.
     pub clk_ok: bool,
     /// Set when the host should look again (a buffer was armed, the pull-up or a register changed).
@@ -258,6 +264,8 @@ impl Default for Usb {
             conn_changed: false,
             sof_latched: false,
             frame: 0,
+            suspended: false,
+            wakeup: false,
             clk_ok: false,
             kick: false,
             reports: Vec::new(),
@@ -468,6 +476,10 @@ impl Usb {
             SOF_WR => {}
             SIE_CTRL => {
                 mode.update(&mut self.sie_ctrl, value, 0xFF07_BF5F);
+                if self.sie_ctrl & sie_ctrl::RESUME != 0 && self.suspended {
+                    // Remote wakeup: the device drives K and the host takes over the resume
+                    self.wakeup = true;
+                }
                 self.sie_ctrl &= !sie_ctrl::SELF_CLEARING;
                 if !self.pullup_on() {
                     self.set_connected(false);
@@ -645,6 +657,25 @@ impl UsbDevicePort for Usb {
         } else if self.pullup() {
             self.set_connected(true);
         }
+    }
+
+    fn suspend(&mut self, now: Time, suspended: bool) {
+        if !self.live() || !self.connected {
+            return;
+        }
+        if suspended && !self.suspended {
+            self.sie_status |= sie_status::SUSPENDED;
+            self.report(now, "device suspended".into());
+        } else if !suspended && self.suspended {
+            self.sie_status |= sie_status::RESUME;
+            self.report(now, "device resumed by the host".into());
+        }
+        self.suspended = suspended;
+        self.wakeup = false;
+    }
+
+    fn remote_wakeup(&self) -> bool {
+        self.wakeup
     }
 
     fn sof(&mut self, _now: Time, frame: u16) {
@@ -887,6 +918,26 @@ mod tests {
         assert_ne!(u.intr() & intr::DEV_SOF, 0);
         assert_eq!(u.read(SOF_RD, 0), Some(0x123));
         assert_eq!(u.intr() & intr::DEV_SOF, 0);
+    }
+
+    #[test]
+    fn suspend_resume_and_remote_wakeup() {
+        let mut u = device();
+        u.bus_reset(Time::ZERO, true);
+        u.bus_reset(Time::from_ms(10), false);
+        u.write(SIE_STATUS, 0xFFFF_FFFF, WriteMode::Normal);
+        u.write(INTE, intr::DEV_SUSPEND | intr::DEV_RESUME_FROM_HOST, WriteMode::Normal);
+        u.write(SIE_CTRL, sie_ctrl::RESUME, WriteMode::Set);
+        assert!(!u.remote_wakeup(), "no wakeup unless suspended");
+        u.suspend(Time::from_ms(20), true);
+        assert_eq!(u.ints(), intr::DEV_SUSPEND);
+        u.write(SIE_STATUS, sie_status::SUSPENDED, WriteMode::Clear);
+        u.write(SIE_CTRL, sie_ctrl::RESUME, WriteMode::Set);
+        assert!(u.remote_wakeup());
+        assert_eq!(u.read(SIE_CTRL, 0).unwrap() & sie_ctrl::RESUME, 0, "self-clearing");
+        u.suspend(Time::from_ms(30), false);
+        assert_eq!(u.ints(), intr::DEV_RESUME_FROM_HOST);
+        assert!(!u.remote_wakeup());
     }
 
     #[test]

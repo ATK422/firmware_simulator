@@ -74,6 +74,15 @@ pub trait UsbDevicePort {
     fn out(&mut self, now: Time, addr: u8, ep: u8, pid: Pid, data: &[u8]) -> Handshake;
     /// An IN token to endpoint `ep` (number) of `addr`.
     fn in_token(&mut self, now: Time, addr: u8, ep: u8) -> InReply;
+    /// The bus has been idle for 3 ms and the device must suspend (`true`, USB 2.0 7.1.7.6), or the host
+    /// signals resume (`false`, K state, 7.1.7.7).
+    fn suspend(&mut self, now: Time, suspended: bool) {
+        let _ = (now, suspended);
+    }
+    /// Whether the suspended device signals a remote wakeup.
+    fn remote_wakeup(&self) -> bool {
+        false
+    }
 }
 
 /// Request type bits (bmRequestType, USB 2.0 9.3.1).
