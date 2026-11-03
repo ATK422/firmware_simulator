@@ -53,3 +53,25 @@ servo_pin = 24
 status_ledb_pin = 15
 status_ledg_pin = 14
 status_ledr_pin = 13
+
+# ---- boards/overlays/lilboat/hbridge_board.toml
+# The four DRV8243 bridges (H0, H1, H3, H4) share nSLEEP (GPIO 25) and DRVOFF (GPIO 12). The nFAULT lines of H0,
+# H1 and H3 reach ADC 0 (GPIO 26) through a CD74HC4051 mux (select GPIO 23, 28, 29; inputs 0-2), H4's is GPIO 11.
+[[analog]]
+adc = 0
+name = "mux"
+mux = { select_pins = [23, 28, 29], inputs = [
+    { volts = 3.3, name = "h0.nfault_v" },
+    { volts = 3.3, name = "h1.nfault_v" },
+    { volts = 3.3, name = "h3.nfault_v" },
+] }
+
+[[drv8243]]
+nsleep_pin = 25
+drvoff_pin = 12
+bridges = [
+    { nfault_input = "h0.nfault_v" },
+    { nfault_input = "h1.nfault_v" },
+    { nfault_input = "h3.nfault_v" },
+    { nfault_pin = 11 },
+]

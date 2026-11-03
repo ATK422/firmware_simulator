@@ -49,3 +49,46 @@ solenoid2_pin = 9
 status_ledb_pin = 15
 status_ledg_pin = 14
 status_ledr_pin = 13
+
+# ---- boards/overlays/lilboat/po_half.toml
+# Sensors (the power board's set, `power_board::sensors`): on I2C0 (GPIO 24/25) the water depth sensor, the MCP3426
+# rail monitor and an SHT41; on I2C1 (GPIO 26/27) the regulator housing depth sensor.
+[[i2c]]
+bus = 0
+device = "ms5837_02ba"
+name = "water_depth"
+depth_m = 0.0
+temperature_c = 18.0
+
+[[i2c]]
+bus = 1
+device = "ms5837_02ba"
+name = "reghousing_depth"
+depth_m = 0.0
+temperature_c = 25.0
+
+[[i2c]]
+bus = 0
+device = "sht41"
+temperature_c = 30.0
+humidity_rh = 35.0
+
+# Rail monitor: 3.3 V rail behind 10k/10k on channel 1, the balanced battery rail behind 10k/1k on channel 2
+[[i2c]]
+bus = 0
+device = "mcp3426"
+channels = [
+    { name = "rail_3v3", volts = 3.3, divider_ohms = [10_000, 10_000] },
+    { name = "rail_balanced", volts = 16.0, divider_ohms = [10_000, 1_000] },
+]
+
+# Tank and regulated pressure transducers on GPIO 28/29 (ADC 2/3): output voltages
+[[analog]]
+adc = 2
+name = "tank_pressure_v"
+volts = 2.0
+
+[[analog]]
+adc = 3
+name = "regulated_pressure_v"
+volts = 1.0

@@ -22,6 +22,10 @@ pub trait SpiDevice: Send {
         None
     }
     fn clone_box(&self) -> Box<dyn SpiDevice>;
+    /// For finding a device of a particular type again (e.g. to re-link a snapshot's copy).
+    fn as_any_mut(&mut self) -> Option<&mut dyn std::any::Any> {
+        None
+    }
 }
 
 sim_core::clone_box!(SpiDevice);

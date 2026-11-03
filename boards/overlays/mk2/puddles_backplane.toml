@@ -1,0 +1,54 @@
+# The W5500 Ethernet controller on SPI0 (MISO 0, CS 1, SCK 2, MOSI 3), INTn on GPIO 4
+[w5500]
+bus = 0
+cs = 1
+int_pin = 4
+
+# Sensor bus (I2C0, GPIO 8/9): the MS5837-30BA depth sensor outside the hull
+[[i2c]]
+bus = 0
+device = "ms5837_30ba"
+name = "depth"
+depth_m = 0.0
+temperature_c = 18.0
+
+# Board bus (I2C1, GPIO 6/7): the MCP3426 rail monitor (the power board's dividers). The ADC128D818 at 0x2F is not
+# modelled; the firmware only writes its configuration at boot and ignores failures.
+[[i2c]]
+bus = 1
+device = "mcp3426"
+channels = [
+    { name = "rail_3v3", volts = 3.3, divider_ohms = [10_000, 10_000] },
+    { name = "rail_balanced", volts = 16.0, divider_ohms = [10_000, 1_000] },
+]
+
+# Thrusters 1-8 on GPIO 25-18, bidirectional DShot300
+[[dshot_esc]]
+name = "t1"
+signal_pin = 25
+[[dshot_esc]]
+name = "t2"
+signal_pin = 24
+[[dshot_esc]]
+name = "t3"
+signal_pin = 23
+[[dshot_esc]]
+name = "t4"
+signal_pin = 22
+[[dshot_esc]]
+name = "t5"
+signal_pin = 21
+[[dshot_esc]]
+name = "t6"
+signal_pin = 20
+[[dshot_esc]]
+name = "t7"
+signal_pin = 19
+[[dshot_esc]]
+name = "t8"
+signal_pin = 18
+
+# Physical kill switch sense (GPIO 12, pulled up on chip): the switch is inserted, pulling it low (vehicle enabled)
+[[gpio]]
+pin = 12
+level = "low"

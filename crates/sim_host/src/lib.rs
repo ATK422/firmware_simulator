@@ -5,6 +5,7 @@
 pub mod acoustic;
 pub mod board;
 pub mod defmt;
+pub mod ethernet;
 pub mod gdb;
 pub mod mock_bridge;
 pub mod pty;

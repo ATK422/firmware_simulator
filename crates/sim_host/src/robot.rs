@@ -170,6 +170,7 @@ impl Robot {
                 }
             }
             for b in self.boards.iter_mut() {
+                b.step_ethernet();
                 b.machine.update_devices();
                 b.poll_rtt();
                 b.poll_uarts();

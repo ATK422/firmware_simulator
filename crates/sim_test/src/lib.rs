@@ -71,9 +71,16 @@ pub struct BenchBuilder {
     bridge: Option<(u8, Time, Option<bool>)>,
     rom_boot: bool,
     record_bus: bool,
+    edit: Option<Box<dyn FnOnce(&mut Board)>>,
 }
 
 impl BenchBuilder {
+    /// Changes the board description before it is applied (a missing part, different straps, ...).
+    pub fn edit_board(mut self, f: impl FnOnce(&mut Board) + 'static) -> Self {
+        self.edit = Some(Box::new(f));
+        self
+    }
+
     /// The board file (`mk2/power_board`, or a path to a `.toml`).
     pub fn board(mut self, name: &str) -> Self {
         self.board = Some(name.to_string());
@@ -106,11 +113,14 @@ impl BenchBuilder {
 
     pub fn boot(self) -> Result<Bench, String> {
         let image = Image::load(&self.elf).map_err(|e| format!("{}: {e}", self.elf.display()))?;
-        let board = match &self.board {
+        let mut board = match &self.board {
             Some(b) if b.ends_with(".toml") => Some(Board::load(Path::new(b))?),
             Some(b) => Some(Board::load(&board_file(b))?),
             None => None,
         };
+        if let (Some(b), Some(edit)) = (board.as_mut(), self.edit) {
+            edit(b);
+        }
         let mut m = rp2040::Machine::new(rp2040::MachineConfig {
             bootrom: Some(rp2040::BOOTROM_B1.to_vec()),
             flash_size: board.as_ref().and_then(|b| b.flash_size).unwrap_or(2 << 20),
@@ -159,7 +169,14 @@ pub struct Bench {
 
 impl Bench {
     pub fn builder(elf: impl AsRef<Path>) -> BenchBuilder {
-        BenchBuilder { elf: elf.as_ref().to_path_buf(), board: None, bridge: None, rom_boot: false, record_bus: false }
+        BenchBuilder {
+            elf: elf.as_ref().to_path_buf(),
+            board: None,
+            bridge: None,
+            rom_boot: false,
+            record_bus: false,
+            edit: None,
+        }
     }
 
     pub fn now(&self) -> Time {

@@ -57,6 +57,11 @@ pub struct Board {
     /// Dynamixel servos on a TTL bus pin.
     #[serde(default)]
     pub dynamixel: Vec<DynamixelEntry>,
+    /// DRV8243 H-bridge drivers sharing an nSLEEP line.
+    #[serde(default)]
+    pub drv8243: Vec<Drv8243Entry>,
+    /// A W5500 Ethernet controller (Puddles); its cable is `Machine::sys.ethernet`.
+    pub w5500: Option<W5500Entry>,
     /// I2C/SMBus devices on bit-banged pins.
     #[serde(default)]
     pub soft_i2c: Vec<SoftI2cEntry>,
@@ -258,6 +263,35 @@ impl Inputs {
     }
 }
 
+/// A W5500 on an SPI bus.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct W5500Entry {
+    pub bus: usize,
+    pub cs: u8,
+    pub int_pin: u8,
+}
+
+/// DRV8243 drivers on one nSLEEP line.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Drv8243Entry {
+    pub nsleep_pin: u8,
+    pub drvoff_pin: Option<u8>,
+    pub bridges: Vec<Drv8243Bridge>,
+}
+
+/// Where one bridge's nFAULT goes: a GPIO, or a named input of an `[[analog]]` entry (a mux input).
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Drv8243Bridge {
+    pub nfault_pin: Option<u8>,
+    pub nfault_input: Option<String>,
+    /// `false` for a bridge that is not fitted (never answers).
+    #[serde(default = "yes")]
+    pub fitted: bool,
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct GpioEntry {
     pub pin: u8,
@@ -395,6 +429,36 @@ impl Board {
                 }
                 (None, None) => return Err(format!("ADC input {}: needs volts or a mux", a.adc)),
             }
+        }
+        if let Some(e) = &self.w5500 {
+            let wire = sim_devices::w5500::wire();
+            m.sys.attach_spi(e.bus, e.cs, Box::new(sim_devices::w5500::W5500::new(wire.clone(), e.int_pin)));
+            m.sys.ethernet = Some(wire);
+        }
+        // After the analog inputs: nFAULT lines can feed them
+        for d in &self.drv8243 {
+            let mut bridges = Vec::new();
+            for b in &d.bridges {
+                let out = match (b.nfault_pin, &b.nfault_input) {
+                    (Some(p), None) => {
+                        m.sys.gpio.external[p as usize] = External::Driven(Level::High);
+                        sim_devices::drv8243::Nfault::Pin(p)
+                    }
+                    (None, Some(name)) => {
+                        let h = inputs
+                            .0
+                            .get(name)
+                            .ok_or_else(|| format!("DRV8243 nFAULT: no input {name:?} (name a mux input)"))?
+                            .clone();
+                        *h.lock().unwrap() = 3.3;
+                        sim_devices::drv8243::Nfault::Volts(h)
+                    }
+                    _ => return Err("DRV8243 bridge: give one of nfault_pin and nfault_input".into()),
+                };
+                bridges.push((out, b.fitted));
+            }
+            let dev = sim_devices::drv8243::Drv8243::new(d.nsleep_pin, d.drvoff_pin, bridges);
+            m.sys.attach_pin_device(Box::new(dev));
         }
         Ok(inputs)
     }
