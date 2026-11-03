@@ -37,6 +37,24 @@ fn robot(file: &str, edit: impl FnOnce(&mut RobotSpec)) -> (Robot, MockBridge, M
     (r, bridges.remove(0), bridges.remove(0))
 }
 
+/// Amplitude of the `hz` component in ADC samples `(time, volts)` taken in `[from, to)` seconds.
+fn tone_v(rec: &[(Time, f32)], from: f64, to: f64, hz: f64) -> f64 {
+    let xs: Vec<&(Time, f32)> = rec.iter().filter(|(t, _)| (from..to).contains(&t.as_secs_f64())).collect();
+    let n = xs.len() as f64;
+    let mean = xs.iter().map(|x| x.1 as f64).sum::<f64>() / n;
+    let (mut re, mut im) = (0.0, 0.0);
+    for (t, v) in &xs {
+        let ph = 2.0 * std::f64::consts::PI * hz * t.as_secs_f64();
+        re += (*v as f64 - mean) * ph.cos();
+        im += (*v as f64 - mean) * ph.sin();
+    }
+    2.0 * (re * re + im * im).sqrt() / n
+}
+
+fn hydrophone(r: &mut Robot, board: usize) -> &mut sim_acoustics::Hydrophone {
+    sim_host::acoustic::hydrophones(&mut r.boards[board].machine).next().unwrap()
+}
+
 #[test]
 fn ivc2_boards_exchange_a_byte_across_the_pool() {
     if common::titan_elf("ivc_board2").is_none() {
@@ -46,75 +64,27 @@ fn ivc2_boards_exchange_a_byte_across_the_pool() {
     // The receivers' noise floor settles over 50 captures (about 2.5 s) before they detect anything
     r.run_until(Time::from_ms(3500));
     assert!(r.boards[0].logged("ROS connected") && r.boards[1].logged("ROS connected"));
-    for i in 0..2 {
-        let h = r.boards[i].machine.sys.analog_inputs[1].as_mut().unwrap();
-        let h = h.as_any_mut().unwrap().downcast_mut::<sim_acoustics::Hydrophone>().unwrap();
-        h.recording = Some(Vec::new());
-    }
-    let wall = std::time::Instant::now();
+    hydrophone(&mut r, 1).recording = Some(Vec::new());
     talos.send(HostToDevice::Ivc2(ivc2::HostToDevice::EnqueueData(0xA5)));
     r.run_until(Time::from_ms(13_000));
-    eprintln!("{:?} wall for 9.5 s", wall.elapsed());
-    for b in &r.boards {
-        for (t, l) in &b.logs {
-            eprintln!("{t} {}", l.message);
-        }
-    }
-    for i in 0..2 {
-        let h = r.boards[i].machine.sys.analog_inputs[1].as_mut().unwrap();
-        let h = h.as_any_mut().unwrap().downcast_mut::<sim_acoustics::Hydrophone>().unwrap();
-        let rec = h.recording.take().unwrap();
-        for win in [(4.0, 4.1), (5.0, 5.1), (8.0, 8.1)] {
-            let xs: Vec<&(Time, f32)> =
-                rec.iter().filter(|(t, _)| t.as_secs_f64() >= win.0 && t.as_secs_f64() < win.1).collect();
-            let n = xs.len() as f64;
-            let mean = xs.iter().map(|x| x.1 as f64).sum::<f64>() / n;
-            let rms = (xs.iter().map(|x| (x.1 as f64 - mean).powi(2)).sum::<f64>() / n).sqrt();
-            let dft = |hz: f64| {
-                let (mut re, mut im) = (0.0, 0.0);
-                for (t, v) in &xs {
-                    let ph = 2.0 * std::f64::consts::PI * hz * t.as_secs_f64();
-                    re += (*v as f64 - mean) * ph.cos();
-                    im += (*v as f64 - mean) * ph.sin();
-                }
-                2.0 * (re * re + im * im).sqrt() / n
-            };
-            eprintln!(
-                "board {i} {win:?}: {} samples, mean {mean:.3} rms {rms:.4}, 50.5k {:.4} 51k {:.4} 51.5k {:.4}",
-                xs.len(),
-                dft(50_500.0),
-                dft(51_000.0),
-                dft(51_500.0)
-            );
-        }
-    }
-    {
-        let m = r.medium.as_ref().unwrap().lock().unwrap();
-        for p in &m.projectors {
-            eprintln!("projector {} owner {} edges {}", p.name, p.owner, p.edge_count);
-        }
-    }
     assert!(r.boards[0].logged("Transmitting 0xa5"));
+    assert!(r.boards[1].logged("packet read complete with: 0xa5"), "{:?}", r.boards[1].logs);
     assert_eq!(ivc2_bytes(&surface).iter().map(|b| b.1).collect::<Vec<_>>(), [0xA5]);
     assert!(ivc2_bytes(&talos).is_empty(), "the sender doesn't hear itself");
-}
 
-#[test]
-#[ignore]
-fn timing_experiment() {
-    for env in [
-        "/tmp/claude-0/-home-user/0dcc8d47-27f6-5448-b9b4-96ba113a8cf4/scratchpad/pool0.toml",
-        "/home/user/firmware_simulator/environments/pool.toml",
-    ] {
-        let (mut r, _a, _b) = robot("ivc2_pool.toml", |s| s.environment.as_mut().unwrap().file = env.into());
-        let w = std::time::Instant::now();
-        r.run_until(Time::from_secs(2));
-        eprintln!("{env}: {:?} for 2 s", w.elapsed());
-    }
-    let (mut r, _a, _b) = robot("ivc2_pool.toml", |s| s.environment = None);
-    let w = std::time::Instant::now();
-    r.run_until(Time::from_secs(2));
-    eprintln!("no water: {:?} for 2 s", w.elapsed());
+    // What reached the other hydrophone: the packet's first slots are sync (50.5 kHz), then bit 0 (1: 51.5 kHz)
+    let start = r.boards[0].logs.iter().find(|(_, l)| l.message.contains("Transmitting")).unwrap().0.as_secs_f64();
+    let rec = hydrophone(&mut r, 1).recording.take().unwrap();
+    let (a, b) = (start + 0.1, start + 0.4);
+    let sync = tone_v(&rec, a, b, 50_500.0);
+    assert!(sync > 0.05 && sync > 10.0 * tone_v(&rec, a, b, 51_500.0), "{sync}");
+    let (a, b) = (start + 1.1, start + 1.4);
+    let high = tone_v(&rec, a, b, 51_500.0);
+    assert!(high > 0.05 && high > 10.0 * tone_v(&rec, a, b, 50_500.0), "{high}");
+    // Talos's projector was driven for the whole packet (18 slots of 500 ms), the surface's never
+    let m = r.medium.as_ref().unwrap().lock().unwrap();
+    assert!(m.projectors[0].edge_count > 800_000, "{}", m.projectors[0].edge_count);
+    assert!(m.projectors[1].edge_count < 10);
 }
 
 fn ivc_bytes(bridge: &MockBridge) -> Vec<(Time, u8)> {

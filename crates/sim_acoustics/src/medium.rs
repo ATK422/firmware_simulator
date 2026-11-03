@@ -24,8 +24,8 @@ use crate::env::Environment;
 use crate::geometry::Vec3;
 use crate::transducer::{Response, Transducer};
 
-/// Projector pressure history kept for hydrophones to read back.
-pub const HISTORY_S: f64 = 0.25;
+/// Projector pressure history kept for hydrophones to read back: paths up to about 1.5 km.
+pub const HISTORY_S: f64 = 1.0;
 /// Sample rate of the projector waveforms.
 pub const RATE_HZ: f64 = 1_000_000.0;
 const STEP_PS: u64 = 1_000_000;
