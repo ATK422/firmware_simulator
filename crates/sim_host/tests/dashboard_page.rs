@@ -59,6 +59,11 @@ const tick = () => new Promise((r) => setTimeout(r, 5));
     await tick();
     if (!ids.conn || ids.conn.textContent) throw new Error("render failed: " + (ids.conn && ids.conn.textContent));
   }
+  // Polling the same state again updates the cards in place: the same nodes, no log line added twice
+  const card = ids.boards.children[0], firstRow = card.children[1].children[0], before = ids.boards.text();
+  await vm.runInContext("poll()", ctx);
+  await tick();
+  const inPlace = ids.boards.children[0] === card && card.children[1].children[0] === firstRow && ids.boards.text() === before;
   // The controls
   const $ = document.getElementById;
   $("fboard").value = states.at(-1).boards[0].name;
@@ -72,13 +77,15 @@ const tick = () => new Promise((r) => setTimeout(r, 5));
     boards: ids.boards.children.length,
     vehicles: ids.vehicles.children.length,
     buses: ids.buses.children.length,
-    vehiclesHidden: ids["vehicles-section"].hidden,
+    systemHidden: ids["system-section"].hidden,
+    systemTitle: ids["system-title"].textContent,
     time: ids.time.textContent,
     mode: ids.mode.textContent,
     boardText: ids.boards.text(),
     busText: ids.buses.text(),
     vehicleText: ids.vehicles.text(),
     posts,
+    inPlace,
   };
   console.log(JSON.stringify(out));
 })().catch((e) => { console.error(e.stack || e); process.exit(1); });
@@ -140,6 +147,11 @@ fn the_page_renders_real_states_and_posts_its_controls() {
     full["boards"][0]["link"] = link;
     full["boards"][0]["leds"] = json!([{"name": "status_ledr", "pin": 13, "on": true}]);
     full["boards"][0]["strips"] = json!([{"name": "status strip", "pin": 9, "colors": ["ff0a00", "000000"]}]);
+    full["boards"][0]["cores"][0]["function"] =
+        json!("<embassy_executor::platform::thread::Executor>::run::<sbc_board::__cortex_m_rt_main::{closure#0}>+0xba");
+    full["boards"][0]["cores"][1]["function"] = json!(
+        "<embassy_executor::raw::TaskStorage<ivc_board2::modem::__rx_task_task::__rx_task_task_inner_function::{closure#0}>>::poll+0x5c8"
+    );
     full["boards"][0]["escs"] = json!([{"name": "esc1", "rpm": 1234.5, "pin": 6}]);
     full["boards"][0]["logs"] = json!([{"seq": 1, "t": 0.1, "kind": "info", "text": "0.001 INFO hello"},
         {"seq": 2, "t": 0.2, "kind": "uart0", "text": "AB Hello"}]);
@@ -167,15 +179,25 @@ fn the_page_renders_real_states_and_posts_its_controls() {
     let o: Value = serde_json::from_slice(&out.stdout).unwrap();
     assert_eq!(o["boards"], 2, "{o}");
     assert_eq!(o["vehicles"], 1);
-    assert_eq!(o["vehiclesHidden"], false);
+    assert_eq!(o["systemHidden"], false);
+    assert_eq!(o["systemTitle"], "Vehicles, CAN buses and bridges");
     assert_eq!(o["buses"], 2, "a bus card and a bridge card: {o}");
     assert_eq!(o["mode"], "finished: TimeLimit");
     let boards = o["boardText"].as_str().unwrap();
-    for want in ["core0 running", "FAULT_DEPTH_INIT_ERROR", "status_ledr", "esc1 rpm", "1235", "AB Hello", "vbat"] {
+    for want in
+        ["core0 running", "FAULT_DEPTH_INIT_ERROR", "status_ledr", "esc1", "1235 rpm", "AB Hello", "vbat", "12.000"]
+    {
         assert!(boards.contains(want), "{want:?} not shown: {boards}");
     }
-    assert!(o["busText"].as_str().unwrap().contains("40.0 frames/s"));
+    // A long demangled symbol is shown short, with its offset apart (the full one is in the tooltip)
+    assert!(boards.contains("Executor::run<main> +0xba"), "{boards}");
+    assert!(boards.contains("TaskStorage<rx_task>::poll +0x5c8"), "{boards}");
+    let buses = o["busText"].as_str().unwrap();
+    for want in ["120", "40.0", "1.2%", "06F#C0", "(no ACK)", "mk2/power_board 1.0 (clean)", "asserting kill"] {
+        assert!(buses.contains(want), "{want:?} not shown: {buses}");
+    }
     assert!(o["vehicleText"].as_str().unwrap().contains("fwd_port"));
+    assert_eq!(o["inPlace"], true, "a second poll rebuilt the cards or repeated log lines");
     let posts = o["posts"].as_array().unwrap();
     assert_eq!(posts[0], json!(["/api/fault", {"board": "a", "fault": "can-stuck"}]));
     assert_eq!(posts[1][0], "/api/input");
