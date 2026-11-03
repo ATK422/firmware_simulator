@@ -20,6 +20,7 @@ firmware_simulator run $FW/power_board --board boards/mk2/power_board.toml --moc
 - [Profiles, waveforms, dashboard and JSON logs](#profiles-waveforms-dashboard-and-json-logs)
 - [Debugging with GDB](#debugging-with-gdb)
 - [USB: BOOTSEL, PICOBOOT, UF2 and CDC](#usb-bootsel-picoboot-uf2-and-cdc)
+- [Several micro-ROS boards at once](#several-micro-ros-boards-at-once)
 - [Puddles: Ethernet](#puddles-ethernet)
 - [Exit status](#exit-status)
 
@@ -293,6 +294,45 @@ Firmware that asks for BOOTSEL (pico-sdk's `reset_usb_boot`, its reset interface
 
 Not modelled: the controller's host mode, isochronous endpoints, low speed devices, bit-level errors. The
 RP2040-E5 erratum is not modelled (pico-sdk's workaround runs and works).
+
+## Several micro-ROS boards at once
+
+The C boards' micro-ROS clients choose their DDS domain themselves: titan_firmware calls
+`rclc_support_init(&support, 0, NULL, &allocator)` (e.g. `talos/IVCBoard2/src/ros.c` on `blake/ivc`) with the
+default init options, so each client asks its agent for domain 0, and `ROS_DOMAIN_ID` on the agent's side changes
+nothing. Two emulator runs, each with its own agent, therefore publish the same topics (`/talos/ivc/rx_new`, ...)
+on the same domain, and a test that listens on one sees both. Separate ports or pty paths per run only keep the
+serial links apart; the DDS traffic still meets. Ways to keep runs apart:
+
+* **One Fast DDS discovery server per run** (what the test campaign did): every participant of a run (its agent,
+  its `ros2` tools, the test) is pointed at that run's server and discovers only the others pointed at it. Fast DDS
+  reads `ROS_DISCOVERY_SERVER` itself, so this works for the agent too.
+* **A network namespace or container per run** (`docker run --network none` with the pty paths mounted, or
+  `unshare --net`): DDS discovery cannot cross it. Mind that Fast DDS's shared memory transport is per host, so
+  keep `/dev/shm` separate as well (a container does).
+* **Patching the firmware** to set a domain id in its init options, which is a firmware change, not an emulator one.
+
+A run with its own discovery server, for each run with another port, server id and pty paths (**to verify
+locally**: written from the Fast DDS 2.x and micro-ROS documentation, with no ROS 2 here to run it):
+
+```bash
+PORT=11811                     # 11812, 11813, ... for the other runs
+fastdds discovery --server-id 0 --ip-address 127.0.0.1 --port $PORT &
+export ROS_DISCOVERY_SERVER=127.0.0.1:$PORT
+firmware_simulator run $TITAN_FIRMWARE_DIR/talos/IVCBoard2/build/IVCBoard2_with_bl.uf2 \
+    --board boards/talos/ivc_board.toml --rom-boot --usb-cdc pty:/tmp/run1-log --usb-cdc2 pty:/tmp/run1-ros \
+    --log-json run1.jsonl --time 600s &
+ros2 run micro_ros_agent micro_ros_agent serial --dev /tmp/run1-ros &
+ros2 topic echo /talos/ivc/rx_new             # this run's tools, with the same ROS_DISCOVERY_SERVER
+```
+
+A discovery client only learns about the topics it uses, so `ros2 topic echo` of a known topic works, but
+`ros2 topic list` and the `ros2` daemon need to be a super client: `ROS_SUPER_CLIENT=TRUE` with a recent Fast DDS,
+or a `FASTRTPS_DEFAULT_PROFILES_FILE` with a `SUPER_CLIENT` participant profile in Humble's (the ROS 2 "Using Fast
+DDS Discovery Server" tutorial has one). Restart the daemon (`ros2 daemon stop`) after changing
+`ROS_DISCOVERY_SERVER`. Give the agent and the tools generous timeouts: a
+run that is busy may be slower than real time ([Options](#options)). Several runs in parallel are otherwise
+independent: eight IVCBoard2 runs on a 20-core machine kept up fine in the test campaign.
 
 ## Puddles: Ethernet
 
