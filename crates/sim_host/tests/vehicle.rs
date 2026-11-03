@@ -193,7 +193,10 @@ fn shipped_robot_files_load_their_vehicles() {
 
 /// The first-generation IVC boards of `robots/ivc_pool.toml` still talk when Talos's board rides on a vehicle that
 /// a current carries towards the surface vehicle: its projector and hydrophone move with the hull. (At 0.5 m/s
-/// the first byte fails its CRC, exactly as with a scripted `Trajectory::Linear` at that speed.)
+/// the first byte fails its CRC, exactly as with a scripted `Trajectory::Linear` at that speed. That is not the
+/// Doppler shift, which the receiver does not notice: the board passes spots of the pool where the previous
+/// symbol's reverberation is above the detector's threshold, and a fixed board at such a spot loses the byte too;
+/// see `firmware_finding_ivc_symbols_lost_to_pool_reverberation` in `tests/ivc_link.rs`.)
 #[test]
 fn ivc_boards_talk_from_a_drifting_vehicle() {
     use titan_link::{DeviceToHost, HostToDevice};
