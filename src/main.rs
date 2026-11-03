@@ -53,6 +53,23 @@ struct RobotArgs {
     /// Replace the ambient noise every hydrophone hears with white noise at this level, dB re 1 µPa²/Hz.
     #[arg(long)]
     noise_db: Option<f64>,
+    /// Relay an Ethernet board's UDP through a host socket: `BOARD:LOCAL=PEER`, e.g.
+    /// `backplane:127.0.0.1:2203=127.0.0.1:2204` (repeatable).
+    #[arg(long = "udp", value_parser = parse_board_udp)]
+    udps: Vec<(String, String, String)>,
+    /// Attach a scripted titan_bridge to an Ethernet board (Puddles' UDP transport), by board name (repeatable).
+    #[arg(long = "eth-mock-bridge")]
+    eth_mock_bridges: Vec<String>,
+    /// Write each vehicle's state every 10 ms to this CSV file (`NAME` in the file name is replaced by the
+    /// vehicle's name when there are several).
+    #[arg(long)]
+    vehicle_csv: Option<PathBuf>,
+}
+
+fn parse_board_udp(s: &str) -> Result<(String, String, String), String> {
+    let (board, rest) = s.split_once(':').ok_or("expected BOARD:LOCAL=PEER")?;
+    let (local, peer) = rest.split_once('=').ok_or("expected BOARD:LOCAL=PEER")?;
+    Ok((board.to_string(), local.to_string(), peer.to_string()))
 }
 
 fn parse_bus_client(s: &str) -> Result<(String, u8), String> {
@@ -105,6 +122,27 @@ fn robot(args: RobotArgs) -> Result<()> {
     if let Some(db) = args.noise_db {
         r.set_noise_db(db);
     }
+    for name in &args.eth_mock_bridges {
+        let s = r.board(name).with_context(|| format!("no board {name:?}"))?;
+        anyhow::ensure!(s.machine.sys.ethernet.is_some(), "{name} has no Ethernet");
+        let bridge = sim_host::ethernet::PuddlesBridge::new(Time::ZERO);
+        bridge.set_kill(Some(false));
+        s.eth_endpoints.push(Box::new(bridge));
+        log::info!("mock bridge attached to {name} over Ethernet");
+    }
+    for (name, local, peer) in &args.udps {
+        let s = r.board(name).with_context(|| format!("no board {name:?}"))?;
+        anyhow::ensure!(s.machine.sys.ethernet.is_some(), "{name} has no Ethernet");
+        let relay = sim_host::ethernet::UdpRelay::bind(local.parse()?, peer.parse()?)
+            .with_context(|| format!("binding {local}"))?;
+        s.eth_endpoints.push(Box::new(relay));
+        log::info!("{name} UDP relayed: host {local} <-> {peer}");
+    }
+    if args.vehicle_csv.is_some() {
+        for v in &mut r.vehicles {
+            v.keep_log(Time::from_ms(10));
+        }
+    }
     r.realtime = args.realtime;
     let wall = std::time::Instant::now();
     let stopped = r.run_until(args.time);
@@ -112,6 +150,31 @@ fn robot(args: RobotArgs) -> Result<()> {
         s.flush_uarts();
     }
     eprintln!("stopped at {}; {:.2?} wall", r.now, wall.elapsed());
+    for v in &r.vehicles {
+        let s = &v.vehicle.state;
+        let [roll, pitch, yaw] = s.attitude.euler().map(f64::to_degrees);
+        eprintln!(
+            "vehicle {}: at [{:.2}, {:.2}, {:.2}] m, roll {roll:.1} pitch {pitch:.1} yaw {yaw:.1} deg, {:.2} m/s",
+            v.vehicle.name,
+            s.position[0],
+            s.position[1],
+            s.position[2],
+            sim_physics::math::norm(s.velocity)
+        );
+    }
+    if let Some(path) = &args.vehicle_csv {
+        let several = r.vehicles.len() > 1;
+        for v in &r.vehicles {
+            let p = if several {
+                PathBuf::from(path.to_string_lossy().replace("NAME", &v.vehicle.name))
+            } else {
+                path.clone()
+            };
+            anyhow::ensure!(!several || p != *path, "--vehicle-csv needs NAME in the file name for several vehicles");
+            let csv = v.log.as_ref().map(|l| l.to_csv()).unwrap_or_default();
+            std::fs::write(&p, csv).with_context(|| format!("writing {}", p.display()))?;
+        }
+    }
     if let Some((i, why)) = stopped {
         bail!("{} stopped: {why:?}", r.names[i]);
     }

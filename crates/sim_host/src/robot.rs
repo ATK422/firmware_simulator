@@ -28,6 +28,9 @@
 //! ```
 //!
 //! Paths are relative to the robot file. Several vehicles go in one file as several buses.
+//!
+//! A `[[vehicle]]` section (see [`crate::vehicle`]) adds a simulated vehicle that the boards' thrusters move, with
+//! the depth sensors and transducers of the boards on it following its motion.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -41,6 +44,7 @@ use sim_devices::can::{CanBus, CanEndpoint, CanNode};
 
 use crate::board::{Board, GpioEntry, Inputs, TransducerEntry, bus_rates};
 use crate::session::{CanCallback, Session};
+use crate::vehicle::{VehicleSim, VehicleSpec};
 
 /// A CAN bus of the robot with the host endpoints on it.
 pub struct RobotBus {
@@ -74,6 +78,8 @@ pub struct Robot {
     pub realtime: bool,
     /// When each board is switched on (it stays unpowered before), and whether it has been.
     pub power_on: Vec<(Time, bool)>,
+    /// Simulated vehicles moved by the boards' thrusters, stepped after every slice.
+    pub vehicles: Vec<VehicleSim>,
 }
 
 impl Default for Robot {
@@ -90,6 +96,7 @@ impl Default for Robot {
             now: Time::ZERO,
             realtime: false,
             power_on: Vec::new(),
+            vehicles: Vec::new(),
         }
     }
 }
@@ -121,6 +128,11 @@ impl Robot {
 
     pub fn index(&self, name: &str) -> Option<usize> {
         self.names.iter().position(|n| n == name)
+    }
+
+    /// The vehicle called `name`.
+    pub fn vehicle(&mut self, name: &str) -> Option<&mut VehicleSim> {
+        self.vehicles.iter_mut().find(|v| v.vehicle.name == name)
     }
 
     /// The bus called `name`.
@@ -176,6 +188,9 @@ impl Robot {
                 b.poll_uarts();
             }
             self.now = t;
+            for v in &mut self.vehicles {
+                v.advance(t, &self.boards);
+            }
             if self.realtime {
                 let ahead = (self.now - start).as_secs_f64() - wall.elapsed().as_secs_f64();
                 if ahead > 0.002 {
@@ -211,7 +226,9 @@ impl Robot {
     /// A deep copy of the whole robot: every machine, device, bus and the acoustic medium, re-linked so the copy's
     /// hydrophones and projectors use the copy's medium. Host endpoints are not copied (they are often handles to
     /// shared state, like a mock bridge); give the copy its own. Physical inputs stay shared: setting one affects
-    /// the original and the copy, so set them after restoring, before running.
+    /// the original and the copy, so set them after restoring, before running. That includes the pressure inputs
+    /// a vehicle drives, so robots with a vehicle that are copies of each other must not run at the same time
+    /// (each would see the other's depth for up to a slice).
     pub fn snapshot(&self) -> Robot {
         let medium = self.medium.as_ref().map(|m| Arc::new(std::sync::Mutex::new(m.lock().unwrap().clone())));
         let mut boards: Vec<Session> = self.boards.iter().map(Session::snapshot).collect();
@@ -219,6 +236,25 @@ impl Robot {
             for b in &mut boards {
                 crate::acoustic::relink(&mut b.machine, old, new);
             }
+        }
+        // The copy's transducers follow the copy's vehicles
+        let mut vehicles = Vec::new();
+        for v in &self.vehicles {
+            let (copy, pairs) = v.deep_copy();
+            for (old, new) in pairs {
+                let (old, new) = (Trajectory::Live(old), Trajectory::Live(new));
+                if let Some(m) = &medium {
+                    for p in m.lock().unwrap().projectors.iter_mut().filter(|p| p.trajectory == old) {
+                        p.trajectory = new.clone();
+                    }
+                }
+                for b in &mut boards {
+                    for h in crate::acoustic::hydrophones(&mut b.machine).filter(|h| h.trajectory == old) {
+                        h.set_trajectory(new.clone());
+                    }
+                }
+            }
+            vehicles.push(copy);
         }
         Robot {
             boards,
@@ -236,6 +272,7 @@ impl Robot {
             now: self.now,
             realtime: self.realtime,
             power_on: self.power_on.clone(),
+            vehicles,
         }
     }
 
@@ -268,6 +305,12 @@ impl Robot {
             }
             robot.bus_names.push(b.name.clone());
             robot.buses.push(RobotBus::new(bus));
+        }
+        for v in &spec.vehicle {
+            if robot.vehicles.iter().any(|o| o.vehicle.name == v.name) {
+                return Err(format!("two vehicles called {}", v.name));
+            }
+            robot.vehicles.push(VehicleSim::new(v, dir)?);
         }
         for b in &spec.board {
             let board_file = dir.join(&b.board);
@@ -310,10 +353,18 @@ impl Robot {
             if let Some(medium) = &robot.medium
                 && board.transducer.is_some()
             {
-                let trajectory = match (&b.trajectory, b.position_m) {
-                    (Some(t), _) => t.clone(),
-                    (None, Some(p)) => Trajectory::Fixed(p),
-                    (None, None) => return Err(format!("{}: needs position_m or trajectory in the water", b.name)),
+                let carried =
+                    robot.vehicles.iter_mut().zip(&spec.vehicle).find_map(|(v, s)| v.carries(s, &b.name, owner));
+                let trajectory = match (carried, &b.trajectory, b.position_m) {
+                    (Some(_), Some(_), _) | (Some(_), _, Some(_)) => {
+                        return Err(format!("{}: on a vehicle, so it takes no position_m or trajectory", b.name));
+                    }
+                    (Some(t), None, None) => t,
+                    (None, Some(t), _) => t.clone(),
+                    (None, None, Some(p)) => Trajectory::Fixed(p),
+                    (None, None, None) => {
+                        return Err(format!("{}: needs position_m, a trajectory or a vehicle in the water", b.name));
+                    }
                 };
                 board.place_in_medium(&mut m, medium, owner, trajectory)?;
             }
@@ -332,6 +383,9 @@ impl Robot {
                 robot.power_on[owner] = (Time::from_secs_f64(ms / 1000.0), false);
             }
         }
+        for (v, s) in robot.vehicles.iter_mut().zip(&spec.vehicle) {
+            v.wire(s, &robot.names, &robot.boards, &robot.inputs)?;
+        }
         Ok(robot)
     }
 }
@@ -345,6 +399,9 @@ pub struct RobotSpec {
     pub bus: Vec<BusSpec>,
     #[serde(default)]
     pub board: Vec<BoardSpec>,
+    /// Simulated vehicles the boards are on.
+    #[serde(default)]
+    pub vehicle: Vec<VehicleSpec>,
 }
 
 #[derive(Debug, Clone, Deserialize)]

@@ -430,6 +430,7 @@ dependencies = [
  "sim_core",
  "sim_devices",
  "sim_host",
+ "sim_physics",
 ]
 
 [[package]]
@@ -955,8 +956,17 @@ dependencies = [
  "sim_acoustics",
  "sim_core",
  "sim_devices",
+ "sim_physics",
  "thiserror",
  "titan_link",
+ "toml",
+]
+
+[[package]]
+name = "sim_physics"
+version = "0.1.0"
+dependencies = [
+ "serde",
  "toml",
 ]
 

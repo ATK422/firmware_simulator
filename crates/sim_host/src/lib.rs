@@ -36,6 +36,7 @@ pub mod session;
 pub mod socketcan;
 pub mod target;
 pub mod upload;
+pub mod vehicle;
 
 pub use session::Session;
 pub use target::TargetMemory;

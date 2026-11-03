@@ -12,7 +12,8 @@
 //! the robot's slice (100 µs, 15 cm of water) therefore always reads exact values.
 //!
 //! Vehicles can move ([`Trajectory`]): the hydrophone recomputes its paths every millisecond and interpolates the
-//! delays in between, so a closing or opening range shifts the received frequency (Doppler) and timing.
+//! delays in between, so a closing or opening range shifts the received frequency (Doppler) and timing. A
+//! [`LivePath`] is a trajectory written as it happens, by a vehicle simulation running alongside the boards.
 
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
@@ -44,6 +45,77 @@ pub enum Trajectory {
     },
     /// Straight lines between `(time s, position m)` points; holds the first and last position outside them.
     Waypoints(Vec<(f64, Vec3)>),
+    /// Recorded while the robot runs (a transducer on a simulated vehicle). Not in files: a robot file puts a
+    /// board on a vehicle instead.
+    #[serde(skip)]
+    Live(LivePath),
+}
+
+/// A path being recorded: positions pushed as a vehicle simulation advances, read back by hydrophones and
+/// projectors at any time up to about [`HISTORY_S`] ago. Beyond the newest point (boards run up to a slice ahead
+/// of the vehicle) it continues at the last velocity for at most [`LivePath::AHEAD_S`].
+///
+/// Clones share the recording; [`LivePath::deep_copy`] makes an independent one (for snapshots).
+#[derive(Clone, Debug)]
+pub struct LivePath(Arc<Mutex<VecDeque<(f64, Vec3)>>>);
+
+impl PartialEq for LivePath {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+}
+
+impl LivePath {
+    /// How far past the newest point the path is extrapolated.
+    pub const AHEAD_S: f64 = 0.01;
+
+    /// A path starting at `start` at time 0.
+    pub fn new(start: Vec3) -> LivePath {
+        LivePath(Arc::new(Mutex::new(VecDeque::from([(0.0, start)]))))
+    }
+
+    /// Adds the position at `t` seconds (later than every point so far; earlier ones are ignored).
+    pub fn push(&self, t: f64, p: Vec3) {
+        let mut pts = self.0.lock().unwrap();
+        if pts.back().is_some_and(|b| t <= b.0) {
+            return;
+        }
+        pts.push_back((t, p));
+        while pts.len() > 2 && pts[1].0 < t - HISTORY_S {
+            pts.pop_front();
+        }
+    }
+
+    /// An independent copy of the recording so far.
+    pub fn deep_copy(&self) -> LivePath {
+        LivePath(Arc::new(Mutex::new(self.0.lock().unwrap().clone())))
+    }
+
+    /// The newest point.
+    pub fn last(&self) -> (f64, Vec3) {
+        *self.0.lock().unwrap().back().expect("a live path always has a point")
+    }
+
+    pub fn at(&self, t: f64) -> Vec3 {
+        let pts = self.0.lock().unwrap();
+        let n = pts.len();
+        let lerp = |(t0, p0): (f64, Vec3), (t1, p1): (f64, Vec3), t: f64| -> Vec3 {
+            let x = if t1 > t0 { (t - t0) / (t1 - t0) } else { 0.0 };
+            [p0[0] + (p1[0] - p0[0]) * x, p0[1] + (p1[1] - p0[1]) * x, p0[2] + (p1[2] - p0[2]) * x]
+        };
+        if t <= pts[0].0 {
+            return pts[0].1;
+        }
+        if t >= pts[n - 1].0 {
+            if n < 2 {
+                return pts[0].1;
+            }
+            let t = t.min(pts[n - 1].0 + Self::AHEAD_S);
+            return lerp(pts[n - 2], pts[n - 1], t);
+        }
+        let i = pts.partition_point(|p| p.0 <= t);
+        lerp(pts[i - 1], pts[i], t)
+    }
 }
 
 impl Trajectory {
@@ -67,6 +139,7 @@ impl Trajectory {
                 }
                 points.last().unwrap().1
             }
+            Trajectory::Live(path) => path.at(t),
         }
     }
 
@@ -75,6 +148,8 @@ impl Trajectory {
             Trajectory::Fixed(_) => false,
             Trajectory::Linear { velocity_mps, .. } => velocity_mps.iter().any(|v| *v != 0.0),
             Trajectory::Waypoints(p) => p.windows(2).any(|w| w[0].1 != w[1].1),
+            // Whatever the vehicle does next is not known yet
+            Trajectory::Live(_) => true,
         }
     }
 }
@@ -377,6 +452,35 @@ mod tests {
         let t: Trajectory =
             toml::from_str::<toml::Table>("t = [1.0, 2.0, 3.0]").unwrap()["t"].clone().try_into().unwrap();
         assert_eq!(t, Trajectory::Fixed([1.0, 2.0, 3.0]));
+    }
+
+    #[test]
+    fn live_paths_interpolate_extrapolate_and_forget() {
+        let path = LivePath::new([0.0, 0.0, 1.0]);
+        let t = Trajectory::Live(path.clone());
+        assert!(t.moves());
+        assert_eq!(t.at(5.0), [0.0, 0.0, 1.0]);
+        for i in 1..=3000 {
+            let s = i as f64 * 1e-3;
+            path.push(s, [s, 0.0, 1.0]);
+        }
+        // Older points than the newest one are ignored
+        path.push(1.0, [9.0, 9.0, 9.0]);
+        assert!((t.at(2.5005)[0] - 2.5005).abs() < 1e-12);
+        // Ahead of the recording: on at the last velocity, for at most 10 ms
+        assert!((t.at(3.004)[0] - 3.004).abs() < 1e-9);
+        assert!((t.at(4.0)[0] - 3.01).abs() < 1e-9);
+        // Only the last second is kept: before it, the oldest kept point
+        assert!(t.at(0.5)[0] >= 1.99 && t.at(0.5)[0] < 2.0, "{:?}", t.at(0.5));
+        // Clones share the recording, deep copies don't
+        let copy = path.deep_copy();
+        assert_ne!(Trajectory::Live(copy.clone()), t);
+        assert_eq!(Trajectory::Live(path.clone()), t);
+        path.push(3.5, [100.0, 0.0, 1.0]);
+        assert_eq!(copy.last().1[0], 3.0);
+        assert_eq!(path.last(), (3.5, [100.0, 0.0, 1.0]));
+        // Not something a robot file can say
+        assert!(toml::from_str::<toml::Table>("t = 3").unwrap()["t"].clone().try_into::<Trajectory>().is_err());
     }
 }
 

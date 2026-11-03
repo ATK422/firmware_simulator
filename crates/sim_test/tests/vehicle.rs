@@ -1,0 +1,126 @@
+//! Vehicle physics with the real firmware in the loop: thruster commands go through the boards' DShot to the ESC
+//! and motor models, the thrust moves the simulated vehicle, and the boards' own depth sensors report the motion.
+
+use sim_host::ethernet::PuddlesBridge;
+use sim_test::titan_link::puddles_backplane as pb;
+use sim_test::titan_link::{DeviceToHost, HostToDevice};
+use sim_test::{RobotBench, Time};
+
+/// Puddles from its robot file, with a scripted bridge on the backplane's Ethernet.
+fn puddles() -> Option<(RobotBench, PuddlesBridge)> {
+    sim_test::titan_rs("puddles_backplane")?;
+    let mut r = RobotBench::load("puddles.toml", &[], |_| {}).unwrap();
+    let bridge = PuddlesBridge::new(Time::ZERO);
+    bridge.set_kill(Some(false));
+    r.robot.boards[0].eth_endpoints.push(Box::new(bridge.clone()));
+    Some((r, bridge))
+}
+
+/// The depths (positive down, m) the backplane reported, with when.
+fn reported_depths(bridge: &PuddlesBridge) -> Vec<(Time, f64)> {
+    bridge
+        .state()
+        .received
+        .iter()
+        .filter_map(|(t, m)| match m {
+            DeviceToHost::PuddlesBackplane(pb::DeviceToHost::Depth(d)) => Some((*t, -*d as f64)),
+            _ => None,
+        })
+        .collect()
+}
+
+/// How deep the vehicle's depth sensor port is now, below where the firmware zeroed it (m).
+fn sensor_depth(r: &mut RobotBench, zero: f64) -> f64 {
+    let v = &r.robot.vehicle("puddles").unwrap().vehicle;
+    v.point([-0.2, 0.0, 0.0])[2] - zero
+}
+
+#[test]
+fn puddles_dives_on_thruster_commands_and_its_depth_sensor_sees_it() {
+    let Some((mut r, bridge)) = puddles() else { return };
+    let zero = r.robot.vehicle("puddles").unwrap().vehicle.point([-0.2, 0.0, 0.0])[2];
+    // Afloat until the commands take effect, 5 s after boot; the sensor zeroes meanwhile
+    r.run_until(Time::from_ms(5100));
+    assert!(r.board("backplane").logged("Depth zeroed"));
+    let before = reported_depths(&bridge);
+    assert!(before.len() > 20, "{}", before.len());
+    assert!(before.iter().all(|(_, d)| d.abs() < 0.01), "{before:?}");
+    // The vertical thrusters (5-8) at 30 % push it down
+    let dive = [0, 0, 0, 0, 300, 300, 300, 300];
+    for _ in 0..150 {
+        bridge.send(HostToDevice::PuddlesBackplane(pb::HostToDevice::Dshot(dive)));
+        r.run_for(Time::from_ms(20));
+    }
+    let v = r.robot.vehicle("puddles").unwrap().vehicle.clone();
+    eprintln!("after 3 s diving: {:?}, thrust {:?}", v.state, v.thrust_n);
+    // Throttle 300 is DShot 348, 301/1000 of the ESC's 4000 RPM: 5.17 N from each T200
+    let rpm = 301.0 / 1000.0 * 4000.0;
+    let thrust = 51.5 * (rpm / 3800.0f64).powi(2);
+    assert!(v.thrust_n[4..].iter().all(|t| (*t - thrust).abs() < 0.01), "{:?}", v.thrust_n);
+    assert!(v.thrust_n[..4].iter().all(|t| *t == 0.0));
+    // Sinking at the speed where the heave drag (33 w + 190 w^2) takes the 4 x 5.17 N less 1 N of buoyancy
+    let force = 4.0 * thrust - 1.0;
+    let terminal = (-33.0 + (33.0f64 * 33.0 + 4.0 * 190.0 * force).sqrt()) / (2.0 * 190.0);
+    let w = v.state.world_velocity()[2];
+    assert!((w - terminal).abs() < 0.002, "{w} vs {terminal}");
+    let depth = sensor_depth(&mut r, zero);
+    assert!(depth > 0.3, "{depth}");
+    // The firmware's own reading (state/depth) agrees with where the sensor is, to within a poll's motion
+    let (t, last) = *reported_depths(&bridge).last().unwrap();
+    assert!(r.now() - t < Time::from_ms(100));
+    assert!((last - depth).abs() < 0.03, "reported {last} vs {depth}");
+    // Going down monotonically, level, without turning
+    let during: Vec<f64> =
+        reported_depths(&bridge).iter().filter(|(t, _)| *t > Time::from_ms(5600)).map(|d| d.1).collect();
+    assert!(during.windows(2).all(|w| w[1] >= w[0] - 1e-3), "{during:?}");
+    let [roll, pitch, yaw] = v.state.attitude.euler();
+    assert!(roll.abs() < 0.01 && pitch.abs() < 0.01 && yaw.abs() < 1e-6, "{roll} {pitch} {yaw}");
+    // Thrusters off: the drag stops it and the 1 N of buoyancy slowly brings it back up
+    for _ in 0..200 {
+        bridge.send(HostToDevice::PuddlesBackplane(pb::HostToDevice::Dshot([0; 8])));
+        r.run_for(Time::from_ms(20));
+    }
+    let w = r.robot.vehicle("puddles").unwrap().vehicle.state.world_velocity()[2];
+    assert!((-0.03..-0.01).contains(&w), "rising: {w}");
+}
+
+#[test]
+fn a_depth_controller_through_the_firmware_reaches_and_holds_the_target() {
+    let Some((mut r, bridge)) = puddles() else { return };
+    let zero = r.robot.vehicle("puddles").unwrap().vehicle.point([-0.2, 0.0, 0.0])[2];
+    r.run_until(Time::from_ms(5100));
+    // A PD controller on the backplane's depth readings, as the robot computer would run it: thrust force from
+    // the error, plus the buoyancy to cancel, turned into throttle through the T200's square law
+    let target = 1.0;
+    let (kp, kd, buoyancy) = (40.0, 40.0, 1.0);
+    // Full throttle is 4000 RPM, where a T200 makes 51.5 * (4000/3800)^2 N forwards (40.2 * ... in reverse)
+    let full = |reverse: bool| if reverse { 40.2 } else { 51.5 } * (4000.0f64 / 3800.0).powi(2) * 4.0;
+    let mut est = (0.0, 0.0, Time::ZERO);
+    let mut trace = Vec::new();
+    while r.now() < Time::from_secs(25) {
+        if let Some(&(t, depth)) = reported_depths(&bridge).last()
+            && t > est.2
+        {
+            // Speed from successive readings, smoothed
+            let dt = (t - est.2).as_secs_f64();
+            let speed = if est.2 == Time::ZERO { 0.0 } else { (depth - est.0) / dt };
+            est = (depth, est.1 * 0.7 + speed * 0.3, t);
+        }
+        let force: f64 = kp * (target - est.0) - kd * est.1 + buoyancy;
+        let throttle = ((force.abs() / full(force < 0.0)).sqrt() * 1000.0).min(999.0) * force.signum();
+        let t = throttle.round() as i16;
+        bridge.send(HostToDevice::PuddlesBackplane(pb::HostToDevice::Dshot([0, 0, 0, 0, t, t, t, t])));
+        r.run_for(Time::from_ms(20));
+        trace.push((r.now(), est.0));
+    }
+    let late: Vec<f64> = trace.iter().filter(|(t, _)| *t > Time::from_secs(15)).map(|x| x.1).collect();
+    eprintln!("last readings {:?}", &late[late.len() - 5..]);
+    assert!(late.iter().all(|d| (d - target).abs() < 0.05), "{late:?}");
+    // It got there without much overshoot, and the truth agrees with what the firmware reported
+    let peak = trace.iter().map(|x| x.1).fold(0f64, f64::max);
+    assert!(peak < target + 0.15, "{peak}");
+    let v = r.robot.vehicle("puddles").unwrap().vehicle.clone();
+    let truth = v.point([-0.2, 0.0, 0.0])[2] - zero;
+    assert!((truth - target).abs() < 0.03, "{truth}");
+    assert!(v.state.world_velocity()[2].abs() < 0.02);
+}

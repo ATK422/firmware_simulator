@@ -1,0 +1,36 @@
+# Puddles: the backplane is the only board. It talks to the robot computer over Ethernet (UDP, see
+# `sim_host::ethernet`), drives the eight thrusters over bidirectional DShot and reads the MS5837-30BA depth sensor
+# on its sensor bus. Here it sits in a simulated vehicle that its thrusters move.
+#
+#   firmware_simulator robot robots/puddles.toml --udp backplane:127.0.0.1:2203=127.0.0.1:2204 --realtime
+#   firmware_simulator robot robots/puddles.toml --eth-mock-bridge backplane --time 10s --vehicle-csv puddles.csv
+#
+# The backplane only applies thruster commands 5 s after boot (when the ESCs have woken up).
+[[board]]
+name = "backplane"
+board = "../boards/mk2/puddles_backplane.toml"
+elf = "../external/titan_firmware_rs/firmware/target/thumbv6m-none-eabi/release/puddles_backplane"
+
+# Thrusters 1-8 of the backplane are thrusters t1-t8 of the vehicle file (horizontal 1-4, vertical 5-8: assumed).
+# Puddles starts afloat; the depth sensor zeroes there at boot.
+[[vehicle]]
+name = "puddles"
+file = "../vehicles/puddles.toml"
+position_m = [3.0, 3.0, 0.0]
+floating = true
+thrusters = [
+    { thruster = "t1", board = "backplane", esc = "t1" },
+    { thruster = "t2", board = "backplane", esc = "t2" },
+    { thruster = "t3", board = "backplane", esc = "t3" },
+    { thruster = "t4", board = "backplane", esc = "t4" },
+    { thruster = "t5", board = "backplane", esc = "t5" },
+    { thruster = "t6", board = "backplane", esc = "t6" },
+    { thruster = "t7", board = "backplane", esc = "t7" },
+    { thruster = "t8", board = "backplane", esc = "t8" },
+]
+
+# The depth sensor on the aft end cap
+[[vehicle.sensor]]
+board = "backplane"
+input = "depth.pressure_pa"
+mount_m = [-0.2, 0.0, 0.0]

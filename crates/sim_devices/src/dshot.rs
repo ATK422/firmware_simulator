@@ -140,6 +140,17 @@ impl Esc {
         self.last_update = now;
     }
 
+    /// The motor's signed mechanical RPM at `now`: the lag towards the last commanded speed carried on from the
+    /// last frame (`rpm` is only brought up to date when a frame arrives). For a vehicle simulation reading the
+    /// propeller speed between frames.
+    pub fn rpm_at(&self, now: Time) -> f64 {
+        if now <= self.last_update {
+            return self.rpm;
+        }
+        let dt = (now - self.last_update).as_secs_f64();
+        self.rpm + (self.target_rpm - self.rpm) * (1.0 - (-dt / self.tau.as_secs_f64()).exp())
+    }
+
     fn current_a(&self) -> f64 {
         self.rpm.abs() / 1000.0 * self.current_per_krpm_a
     }
@@ -396,6 +407,7 @@ mod tests {
             play(&mut e, &mut ctx, bidir_frame(548, false));
         }
         assert!((e.rpm - 2004.0).abs() < 50.0, "{}", e.rpm);
+
         assert!((e.period_us() as f64 - 60e6 / (e.rpm * 7.0)).abs() < 2.0);
         // Telemetry request: 10 bytes on GPIO 7
         ctx.scheduled.clear();
@@ -410,6 +422,13 @@ mod tests {
         ctx.now += Time::from_ms(2);
         play(&mut e, &mut ctx, bidir_frame(1548, false));
         assert!(e.target_rpm < 0.0);
+        // Between frames the speed carries on towards the new target, one time constant (60 ms) at a time
+        let (rpm, target) = (e.rpm, e.target_rpm);
+        assert!(rpm > 1900.0);
+        assert_eq!(e.rpm_at(ctx.now - Time::from_ms(5)), rpm);
+        let later = e.rpm_at(e.last_update + Time::from_ms(60));
+        assert!((later - (rpm + (target - rpm) * (1.0 - (-1f64).exp()))).abs() < 1e-6, "{later}");
+        assert_eq!(e.rpm, rpm, "reading it changes nothing");
         ctx.now += Time::from_us(400);
         play(&mut e, &mut ctx, bidir_frame(100, false) ^ 1);
         assert_eq!(e.bad_frames, 1);
