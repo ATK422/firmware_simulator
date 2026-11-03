@@ -315,11 +315,20 @@ impl UsbIpServer {
                 let status = match conn.pending.iter().position(|p| p.seqnum == victim) {
                     Some(i) => {
                         let p = conn.pending.remove(i);
-                        if let Some(h) = machine.sys.usb_host_mut() {
-                            h.cancel(p.id);
-                            h.take_result(p.id);
+                        match machine.sys.usb_host_mut().map(|h| (h.take_result(p.id), h)) {
+                            // It finished before the unlink came (its result not collected yet): as usbip-host,
+                            // send its RET_SUBMIT, and unlink nothing
+                            Some((Some(r), _)) => {
+                                conn.tx.extend(ret_submit(&p, r));
+                                0
+                            }
+                            Some((None, h)) => {
+                                h.cancel(p.id);
+                                h.take_result(p.id);
+                                ECONNRESET
+                            }
+                            None => ECONNRESET,
                         }
-                        ECONNRESET
                     }
                     // Already completed (its RET_SUBMIT is on its way)
                     None => 0,
