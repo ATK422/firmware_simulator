@@ -380,7 +380,8 @@ impl Picoboot {
 
     /// `picotool load -v -x`: erases the sectors the image's flash segments touch, writes them in 256 byte pages
     /// (padding with 0xFF), reads them back to verify, and reboots into the new image after `reboot_ms` (none if
-    /// `None`). Segments outside the flash are ignored.
+    /// `None`). An image with nothing in flash (a pico-sdk `no_flash` binary) is written to SRAM instead and the
+    /// reboot enters it at its ELF entry point, with the stack at the top of SRAM.
     pub fn load(
         &mut self,
         r: &mut impl UsbRunner,
@@ -407,8 +408,24 @@ impl Picoboot {
             report.ranges.push((*addr, data.len() as u32));
             report.bytes += data.len() as u32;
         }
+        let mut entry = 0;
+        if ranges.is_empty() {
+            let ram = |a: u32| (0x2000_0000..SRAM_END).contains(&a);
+            for seg in image.segments.iter().filter(|s| ram(s.addr) && !s.data.is_empty()) {
+                for (i, chunk) in seg.data.chunks(SECTOR as usize).enumerate() {
+                    self.write(r, seg.addr + (i as u32) * SECTOR, chunk)?;
+                }
+                let back = self.read(r, seg.addr, seg.data.len() as u32)?;
+                if let Some(i) = back.iter().zip(&seg.data).position(|(a, b)| a != b) {
+                    return Err(Error::Verify { addr: seg.addr + i as u32 });
+                }
+                report.ranges.push((seg.addr, seg.data.len() as u32));
+                report.bytes += seg.data.len() as u32;
+            }
+            entry = image.entry.filter(|&e| ram(e)).ok_or(Error::NoDevice("no flash or SRAM entry point".into()))?;
+        }
         if let Some(ms) = reboot_ms {
-            self.reboot(r, 0, SRAM_END, ms)?;
+            self.reboot(r, entry, SRAM_END, ms)?;
         }
         report.took = r.machine().now - t0;
         Ok(report)

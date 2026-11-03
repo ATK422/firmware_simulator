@@ -22,3 +22,10 @@ add_executable(hello_usb hello_usb.c)
 target_link_libraries(hello_usb pico_stdlib)
 pico_enable_stdio_usb(hello_usb 1)
 pico_enable_stdio_uart(hello_usb 0)
+
+# The same linked to run from SRAM (no_flash), for loading over PICOBOOT without touching the flash
+add_executable(hello_usb_ram hello_usb.c)
+target_link_libraries(hello_usb_ram pico_stdlib)
+pico_enable_stdio_usb(hello_usb_ram 1)
+pico_enable_stdio_uart(hello_usb_ram 0)
+pico_set_binary_type(hello_usb_ram no_flash)

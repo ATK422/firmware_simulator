@@ -1152,20 +1152,15 @@ mod tests {
                 },
                 1 if !self.echo.is_empty() => {
                     let n = self.echo.len().min(64);
-                    let d: Vec<u8> = self.echo.drain(..n).collect();
+                    let d: Vec<u8> = self.echo.iter().take(n).copied().collect();
                     let pid = self.in_pid.unwrap();
                     if self.drop_acks > 0 {
-                        // The host's ACK got lost: the device sends the same packet again next time
+                        // The host's ACK got lost: the device keeps the packet and its toggle, and sends it again
                         self.drop_acks -= 1;
-                        self.echo.extend(d.iter().rev());
-                        let mut v: Vec<u8> = self.echo.drain(..).collect();
-                        let tail = v.split_off(v.len() - d.len());
-                        let mut again: Vec<u8> = tail.into_iter().rev().collect();
-                        again.extend(v);
-                        self.echo = again.into();
-                        return InReply::Data(pid, d);
+                    } else {
+                        self.echo.drain(..n);
+                        self.in_pid = Some(pid.toggled());
                     }
-                    self.in_pid = Some(pid.toggled());
                     InReply::Data(pid, d)
                 }
                 1 => InReply::Nak,

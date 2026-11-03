@@ -188,3 +188,37 @@ fn picoboot_rejects_bad_commands_and_recovers() {
     let st = pb.status(&mut m).unwrap();
     assert_eq!((st.status, st.cmd, st.in_progress), (0, 0x84, false));
 }
+
+#[test]
+fn picoboot_load_titan_template_and_its_watchdog_reboots_go_through_the_bootrom() {
+    let Some(elf) = common::titan_elf("template") else { return };
+    let image = Image::load(&elf).unwrap();
+    let mut m = bootsel_board();
+    let mut pb = Picoboot::open(&mut m, Time::from_secs(1)).unwrap();
+    m.sys.io_qspi.bootsel_pressed = false;
+    let report = pb.load(&mut m, &image, 2 << 20, Some(10)).expect("load");
+    assert!(report.bytes > 32 * 1024, "{report:?}");
+    let resets = m.resets;
+    let mut s = Session::new(m, &image);
+    s.run_for(Time::from_ms(1500));
+    // The template panics without its CAN controller and resets through the watchdog: the bootrom boots it from
+    // flash again (through boot2), and it reports the panic
+    assert!(s.logged("mk2/power_board v1.0"), "{:?}", s.logs);
+    assert!(s.logged("Reset by panic after"), "{:?}", s.logs);
+    assert!(s.machine.resets >= resets + 2);
+}
+
+#[test]
+fn picoboot_loads_a_no_flash_binary_into_sram_and_runs_it() {
+    let image = Image::load(&common::repo().join("test_programs/pico/hello_usb_ram.elf")).unwrap();
+    let mut m = bootsel_board();
+    let mut pb = Picoboot::open(&mut m, Time::from_secs(1)).unwrap();
+    let report = pb.load(&mut m, &image, 2 << 20, Some(10)).expect("load into SRAM");
+    assert_eq!(report.ranges[0].0, 0x2000_0000);
+    assert!(m.sys.flash.iter().all(|&b| b == 0xFF), "flash untouched");
+    // The bootrom's reboot enters the image through the watchdog scratch vector; BOOTSEL stays held throughout
+    m.sys.usb_host_mut().unwrap().cdc_open(0, 115_200);
+    let mut s = Session::new(m, &image);
+    assert!(cdc_wait(&mut s, 0, "Hello, USB!\r\n", Time::from_secs(2)), "{:?}", s.usb_cdc_text);
+    assert!(s.machine.sys.io_qspi.bootsel_pressed);
+}
