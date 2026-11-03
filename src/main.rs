@@ -1,6 +1,6 @@
 //! `firmware_simulator`: runs RP2040 firmware images in the emulator.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand, ValueEnum};
@@ -528,12 +528,40 @@ enum UartSink {
     None,
 }
 
-#[derive(Clone, Copy, ValueEnum, PartialEq, Eq)]
+/// Where a USB CDC port goes: `stdout` (complete lines with their virtual time), `pty` (a pseudo terminal, like the
+/// device's /dev/ttyACM) or `pty:PATH` (the same, with a symlink at PATH so tools can use a fixed name).
+#[derive(Clone, PartialEq, Eq)]
 enum CdcSink {
-    /// Print complete lines on stdout with their virtual time.
     Stdout,
-    /// Create a pseudo terminal (output and input), like the device's /dev/ttyACM.
-    Pty,
+    Pty(Option<PathBuf>),
+}
+
+fn parse_cdc_sink(s: &str) -> Result<CdcSink, String> {
+    match s {
+        "stdout" => Ok(CdcSink::Stdout),
+        "pty" => Ok(CdcSink::Pty(None)),
+        _ => match s.strip_prefix("pty:") {
+            Some(path) if !path.is_empty() => Ok(CdcSink::Pty(Some(PathBuf::from(path)))),
+            _ => Err(format!("expected stdout, pty or pty:PATH, not {s:?}")),
+        },
+    }
+}
+
+/// Opens a pseudo terminal and, if asked, points a symlink at it (replacing an earlier run's symlink).
+fn open_pty(link: Option<&Path>, what: &str) -> Result<sim_host::pty::Pty> {
+    let pty = sim_host::pty::Pty::open().context("opening a pty")?;
+    match link {
+        Some(link) => {
+            if std::fs::symlink_metadata(link).is_ok_and(|m| m.file_type().is_symlink()) {
+                std::fs::remove_file(link).with_context(|| format!("replacing {}", link.display()))?;
+            }
+            std::os::unix::fs::symlink(&pty.path, link)
+                .with_context(|| format!("linking {} to {}", link.display(), pty.path))?;
+            eprintln!("{what} on {} (linked from {})", pty.path, link.display());
+        }
+        None => eprintln!("{what} on {}", pty.path),
+    }
+    Ok(pty)
 }
 
 #[derive(Clone, Copy, ValueEnum, PartialEq, Eq)]
@@ -625,10 +653,14 @@ struct RunArgs {
     /// Plug the board's USB port into a host, which enumerates whatever the firmware presents.
     #[arg(long)]
     usb: bool,
-    /// Open the device's USB CDC ACM serial port (pico-sdk stdio_usb) from the host: print its lines, or attach
-    /// it to a pseudo terminal. Implies `--usb`.
-    #[arg(long, value_enum)]
+    /// Open the device's USB CDC ACM serial port (pico-sdk stdio_usb) from the host: `stdout` prints its lines,
+    /// `pty` attaches it to a pseudo terminal, `pty:PATH` also links PATH to that terminal. Implies `--usb`.
+    #[arg(long, value_parser = parse_cdc_sink)]
     usb_cdc: Option<CdcSink>,
+    /// Open the device's second CDC port too (titan_dual_stdio_usb's secondary port, which titan_firmware's
+    /// micro-ROS USB transport uses) on a pseudo terminal: `pty` or `pty:PATH`. Implies `--usb`.
+    #[arg(long, value_parser = parse_cdc_sink)]
+    usb_cdc2: Option<CdcSink>,
     /// Once the board is in BOOTSEL mode, flash this image (ELF or UF2) into it and reboot into it, then run for
     /// `--time`. Implies `--usb`.
     #[arg(long)]
@@ -803,10 +835,19 @@ fn run(args: RunArgs) -> Result<()> {
         log::info!("direct boot: VTOR {vtor:#010x}, entry {:#010x}", machine.cores[0].pc());
     }
 
-    if args.usb || args.bootsel || args.usb_cdc.is_some() || args.picoboot_load.is_some() || args.usbip.is_some() {
+    if args.usb
+        || args.bootsel
+        || args.usb_cdc.is_some()
+        || args.usb_cdc2.is_some()
+        || args.picoboot_load.is_some()
+        || args.usbip.is_some()
+    {
         let mut host = sim_devices::usb::host::HostController::new();
         if args.usb_cdc.is_some() {
             host.cdc_open(0, 115_200);
+        }
+        if args.usb_cdc2.is_some() {
+            host.cdc_open(1, 115_200);
         }
         machine.sys.attach_usb_host(host, Time::ZERO);
         log::info!("USB port plugged into a host");
@@ -827,13 +868,14 @@ fn run(args: RunArgs) -> Result<()> {
         eprintln!("USB/IP: exporting bus ID {} on {addr}", sim_host::usbip::BUSID);
         session.usbip = Some(server);
     }
-    match args.usb_cdc {
+    match &args.usb_cdc {
         Some(CdcSink::Stdout) => session.on_usb_cdc_line = Some(Box::new(|t, line| println!("[{t}] usb: {line}"))),
-        Some(CdcSink::Pty) => {
-            let pty = sim_host::pty::Pty::open().context("opening a pty")?;
-            eprintln!("USB CDC port on {}", pty.path);
-            session.usb_cdc_pty = Some(pty);
-        }
+        Some(CdcSink::Pty(link)) => session.usb_cdc_pty = Some(open_pty(link.as_deref(), "USB CDC port")?),
+        None => {}
+    }
+    match &args.usb_cdc2 {
+        Some(CdcSink::Stdout) => bail!("--usb-cdc2 carries raw bytes (micro-ROS): use pty or pty:PATH"),
+        Some(CdcSink::Pty(link)) => session.usb_cdc2_pty = Some(open_pty(link.as_deref(), "USB CDC port 2")?),
         None => {}
     }
     for (n, sink) in sinks.iter().enumerate() {

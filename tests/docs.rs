@@ -64,6 +64,7 @@ const OUTSIDE: &[(&str, &str)] = &[
     ("--recursive", "git submodule"),
     ("--interface", "titan_bridge"),
     ("--client-id", "titan_bridge"),
+    ("--dev", "micro_ros_agent serial"),
     ("--check", "scripts/gen_boards.py, cargo fmt"),
     ("--down", "scripts/vcan_up.sh"),
     ("--tool", "valgrind"),

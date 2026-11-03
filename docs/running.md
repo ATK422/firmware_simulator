@@ -90,7 +90,7 @@ differ by roughly the boot time.
 | `--hle-flash` | off | Traps the bootrom's flash functions instead of running them against the flash chip model |
 | `--flash-size BYTES` | the board file's `flash_size`, else 2 MiB | Size of the QSPI flash chip |
 | `--crystal-hz HZ` | 12 MHz | XOSC frequency (a board file's `crystal_hz` replaces it) |
-| `--bootsel`, `--usb`, `--usb-cdc stdout\|pty`, `--picoboot-load FILE`, `--load-via picoboot\|drive`, `--usbip ADDR` | | USB ([below](#usb-bootsel-picoboot-uf2-and-cdc)) |
+| `--bootsel`, `--usb`, `--usb-cdc stdout\|pty\|pty:PATH`, `--usb-cdc2 pty\|pty:PATH`, `--picoboot-load FILE`, `--load-via picoboot\|drive`, `--usbip ADDR` | | USB ([below](#usb-bootsel-picoboot-uf2-and-cdc)) |
 | `--trace KINDS` | | Comma separated: `instr`, `exc`, `gpio`, `unmodelled`, `device` ([below](#traces)) |
 | `--trace-file FILE` | stderr | Where the trace goes |
 | `--profile FILE`, `--profile-interval T` | `10us` | Profiles the firmware: functions by time per core to `FILE`, folded stacks next to it ([below](#profiles-waveforms-dashboard-and-json-logs)) |
@@ -260,6 +260,7 @@ bus time: about 1.2 MB/s per bulk pipe). `--trace device` shows what it does.
 | `run --bootsel --picoboot-load FILE` | What `picoboot load FILE` is short for: waits (up to 5 s of virtual time) for the board to be in BOOTSEL mode, flashes `FILE`, reboots into it. With an image instead of `--bootsel`, the image has to reboot into BOOTSEL itself |
 | `run test_programs/pico/hello_usb.elf --usb-cdc stdout --time 1s` | pico-sdk stdio over USB (TinyUSB CDC ACM): the host opens the port (115200 8N1, DTR/RTS) and prints its lines as `[0.136602s] usb: Hello, USB!` |
 | `run ... --usb-cdc pty --realtime --time 600s` | Puts the CDC port on a pseudo terminal for `picocom`/`screen` (input reaches the device) |
+| `run ... --usb-cdc pty:/tmp/board --usb-cdc2 pty:/tmp/board-ros --time 600s` | `pty:PATH` also links `PATH` to the terminal, so tools can use a fixed name. `--usb-cdc2` opens the device's second CDC port: titan_dual_stdio_usb's secondary port, which titan_firmware's micro-ROS USB transport uses (`ros2 run micro_ros_agent micro_ros_agent serial --dev /tmp/board-ros`). The first port keeps the text log |
 | `run ... --usbip 127.0.0.1:3240 --realtime` | Exports the device over USB/IP for the real host's tools after `sudo usbip attach -r 127.0.0.1 -b 1-1` (`picotool`, `/dev/ttyACM*`, the drive); attach again after the device reboots. **To verify locally**: tested only with an in-process USB/IP client, not the kernel's vhci-hcd |
 
 Firmware that asks for BOOTSEL (pico-sdk's `reset_usb_boot`, its reset interface or 1200 baud trick, embassy's
