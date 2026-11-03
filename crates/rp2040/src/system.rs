@@ -1864,7 +1864,8 @@ pub struct BatchBus<'a> {
     period: ClockPeriod,
     /// Cycles the batch has taken before the current instruction.
     elapsed: u64,
-    attention: bool,
+    /// What the last instruction's slow accesses left to do: [`BatchBus::ATTENTION`], [`BatchBus::CHECK_IRQS`].
+    after: u8,
     /// Flash reads need no further checks (until the next peripheral access).
     xip_ok: bool,
     /// The flash size is a power of two: offsets are `addr & flash_mask` (else they go through `flash_offset`).
@@ -1873,8 +1874,6 @@ pub struct BatchBus<'a> {
     core_lines: u32,
     /// Interrupt lines computed during the batch, for the machine to hand to both cores.
     lines: Option<[u32; 2]>,
-    /// An access left `irq_dirty` set: recompute the lines after the instruction.
-    check_irqs: bool,
     /// What the batch did besides reading memory: see [`BatchBus::quiet`].
     noisy: bool,
     timer_ticks: Option<u64>,
@@ -1914,11 +1913,10 @@ impl<'a> BatchBus<'a> {
             clock,
             period,
             elapsed: 0,
-            attention: false,
+            after: 0,
             xip_ok,
             core_lines,
             lines: None,
-            check_irqs: false,
             noisy: false,
             timer_ticks: None,
             ticked: false,
@@ -2013,16 +2011,29 @@ impl<'a> BatchBus<'a> {
         self.xip_ok = s.xip_ready_from(now);
         if s.clk_sys_changed || s.reset_request.is_some() || s.psm_forced_off != 0 || s.psm_released != 0 {
             // The machine handles these, then refreshes the interrupt lines
-            self.attention = true;
+            self.after |= Self::ATTENTION;
             return;
         }
         // The lines are recomputed once the whole instruction is done, as the run loop would
-        self.check_irqs |= s.irq_dirty;
+        if s.irq_dirty {
+            self.after |= Self::CHECK_IRQS;
+        }
     }
 
+    /// The machine must act before the next instruction.
+    const ATTENTION: u8 = 1;
+    /// An access left `irq_dirty` set: recompute the lines after the instruction.
+    const CHECK_IRQS: u8 = 2;
+
+    /// Does what an instruction's slow accesses left to do; returns whether the batch must end.
     #[inline(never)]
+    fn settle(&mut self) -> bool {
+        let after = std::mem::take(&mut self.after);
+        // With ATTENTION the machine takes over, and refreshes the interrupt lines itself afterwards
+        after & Self::ATTENTION != 0 || self.refresh_irqs()
+    }
+
     fn refresh_irqs(&mut self) -> bool {
-        self.check_irqs = false;
         let s = &mut *self.sys;
         if s.irq_dirty {
             s.irq_dirty = false;
@@ -2124,13 +2135,7 @@ impl Bus for BatchBus<'_> {
 
     #[inline]
     fn take_attention(&mut self) -> bool {
-        if self.attention {
-            // The machine takes over, and refreshes the interrupt lines itself afterwards
-            self.attention = false;
-            self.check_irqs = false;
-            return true;
-        }
-        self.check_irqs && self.refresh_irqs()
+        self.after != 0 && self.settle()
     }
 
     fn peek(&mut self, addr: u32, size: Size) -> Option<u32> {
