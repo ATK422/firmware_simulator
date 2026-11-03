@@ -101,6 +101,9 @@ pub struct EscEntry {
     /// Mechanical RPM at full throttle.
     pub max_rpm: Option<f64>,
     pub pole_pairs: Option<u32>,
+    /// How long after the last DShot frame the ESC stops the motor (250 ms by default, an assumption; see
+    /// `sim_devices::dshot`); 0 keeps the last throttle forever.
+    pub signal_loss_ms: Option<f64>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -423,6 +426,9 @@ impl Board {
             let mut esc = sim_devices::dshot::Esc::new(&name, e.signal_pin, e.telemetry_pin);
             esc.max_rpm = e.max_rpm.unwrap_or(esc.max_rpm);
             esc.pole_pairs = e.pole_pairs.unwrap_or(esc.pole_pairs);
+            if let Some(ms) = e.signal_loss_ms {
+                esc.signal_loss_timeout = (ms > 0.0).then(|| sim_core::Time::from_secs_f64(ms / 1000.0));
+            }
             m.sys.attach_pin_device(Box::new(esc));
         }
         for e in &self.soft_i2c {
@@ -682,6 +688,27 @@ mux = { select_pins = [3, 4, 5], inputs = [{ volts = 1.0 }, { volts = 2.0 }] }
         let v = m.sys.analog_inputs[2].as_mut().unwrap().voltage(sim_core::Time::ZERO, 1 << 3);
         assert_eq!(v, 2.0);
         assert!(Board::parse("name = \"x\"\n[[i2c]]\nbus = 0\ndevice = \"nope\"\n").unwrap().apply(&mut m).is_err());
+    }
+
+    #[test]
+    fn esc_signal_loss_timeout() {
+        let b = Board::parse(
+            "name = \"x\"\n[[dshot_esc]]\nsignal_pin = 1\n[[dshot_esc]]\nsignal_pin = 2\nsignal_loss_ms = 100\n\
+             [[dshot_esc]]\nsignal_pin = 3\nsignal_loss_ms = 0\n",
+        )
+        .unwrap();
+        let mut m = Machine::new(Default::default());
+        b.apply(&mut m).unwrap();
+        let t: Vec<_> = m
+            .sys
+            .pin_devices
+            .iter()
+            .map(|d| d.as_any().downcast_ref::<sim_devices::dshot::Esc>().unwrap().signal_loss_timeout)
+            .collect();
+        assert_eq!(
+            t,
+            [Some(sim_devices::dshot::Esc::DEFAULT_SIGNAL_LOSS_TIMEOUT), Some(sim_core::Time::from_ms(100)), None]
+        );
     }
 
     #[test]

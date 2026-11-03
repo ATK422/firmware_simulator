@@ -391,6 +391,15 @@ fn esc_thrusters_go_neutral_when_killed() {
     // The panic resets the board (counted as a watchdog timeout, see the panic finding); after the reboot core 1
     // sends neutral again, since the ESCs are held neutral for 5 s after power-up
     let reboot = b.log_time("Crash counts since power on: CrashCounts { watchdog_timeouts: 1").expect("rebooted");
+    // Meanwhile the ESCs stop the motors themselves, their signal-loss timeout (250 ms, assumed) after the last
+    // frame, before the rebooted board sends its first neutral frame
+    for e in escs(b) {
+        let l = e.frames.iter().map(|f| f.at).rfind(|&a| a < noticed).unwrap();
+        let lost = l + sim_devices::dshot::Esc::DEFAULT_SIGNAL_LOSS_TIMEOUT;
+        assert_eq!(e.signal_losses, 1, "{}", e.name);
+        assert!(e.frames.iter().all(|f| f.at < lost || f.at > reboot), "{}: a frame before the loss", e.name);
+        assert!(e.rpm_at(lost + ms(300)).abs() < 50.0, "{} coasting down: {}", e.name, e.rpm_at(lost + ms(300)));
+    }
     for e in escs(b) {
         let after: Vec<_> = e.frames.iter().filter(|f| f.at > reboot).collect();
         assert!(!after.is_empty() && after.iter().all(|f| f.throttle == 0), "{}", e.name);

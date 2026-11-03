@@ -81,8 +81,9 @@ The PIO blocks are modelled cycle by cycle (the full instruction set, FIFOs and 
 IRQ flags, EXEC, DMA requests, pin overrides) and advanced lazily, skipping delays and stalled state machines.
 Devices on PIO-driven pins watch the pin waveforms and answer on the pins: board files list `[[ws2812]]` strips
 (frames are decoded and reported to the `device` trace), `[[dshot_esc]]` ESCs (DShot frames, bidirectional eRPM
-replies, KISS telemetry, a motor model), `[[dynamixel]]` and `[[hiwonder]]` servos on half-duplex serial pins, and
-`[[soft_i2c]]` devices on bit-banged I2C/SMBus pins (the smart battery's BQ40Z80 gauge).
+replies, KISS telemetry, a motor model that stops when the frames stop for `signal_loss_ms`, 250 ms by default),
+`[[dynamixel]]` and `[[hiwonder]]` servos on half-duplex serial pins, and `[[soft_i2c]]` devices on bit-banged
+I2C/SMBus pins (the smart battery's BQ40Z80 gauge).
 
 `test_programs/pio/*.pio` (pico-examples programs and a handshake test) and the ESC board's own `.pio` files are
 assembled by pioasm: `scripts/build_pioasm.sh` builds it from titan_firmware's pico-sdk and
