@@ -366,3 +366,24 @@ fn tinyusb_survives_suspend_and_resume() {
     assert!(events.iter().any(|e| e.contains("device suspended")), "{events:?}");
     assert!(events.iter().any(|e| e.contains("device resumed")), "{events:?}");
 }
+
+#[test]
+fn cable_pulled_and_plugged_back_in() {
+    let mut s = common::boot(&common::repo().join("test_programs/pico/hello_usb.elf"), None);
+    let mut host = HostController::new();
+    host.cdc_open(0, 115_200);
+    s.machine.sys.attach_usb_host(host, Time::ZERO);
+    assert!(cdc_wait(&mut s, 0, "Hello, USB!\r\n", Time::from_secs(2)));
+    let old = s.machine.sys.detach_usb_host().unwrap();
+    assert_eq!(old.enumerations, 1);
+    s.run_for(Time::from_ms(100));
+    // A new host (another port): enumerates the device again; the firmware's stdio carries on
+    let mut host = HostController::new();
+    host.cdc_open(0, 115_200);
+    let now = s.machine.now;
+    s.machine.sys.attach_usb_host(host, now);
+    let now = s.machine.now;
+    s.machine.sys.with_usb_host(now, |h| h.cdc_write(0, b"k"));
+    let from = s.usb_cdc_text.len();
+    assert!(cdc_wait(&mut s, from, "echo k (1)\r\n", Time::from_secs(2)), "{:?}", s.usb_cdc_text);
+}

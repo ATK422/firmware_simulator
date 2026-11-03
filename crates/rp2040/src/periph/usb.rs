@@ -284,6 +284,17 @@ impl Usb {
         *self = Usb { dpram, vbus, clk_ok, bus_in_reset, kick: true, ..Usb::default() };
     }
 
+    /// VBUS from the cable: a host plugged in (`true`) or the cable pulled. Without VBUS the bus is dead: the
+    /// device is disconnected (unless firmware overrides VBUS detection, it also sees VBUS_DETECTED drop).
+    pub fn set_vbus(&mut self, present: bool) {
+        self.vbus = present;
+        if !present {
+            self.bus_in_reset = false;
+            self.suspended = false;
+            self.set_connected(false);
+        }
+    }
+
     /// Bit of an endpoint direction in BUFF_STATUS and friends.
     fn bit(ep: u8, dir_in: bool) -> u32 {
         1 << (2 * ep as u32 + !dir_in as u32)
@@ -685,7 +696,7 @@ impl UsbDevicePort for Usb {
         }
     }
 
-    fn setup(&mut self, now: Time, addr: u8, data: &[u8; 8]) -> Handshake {
+    fn setup(&mut self, _now: Time, addr: u8, data: &[u8; 8]) -> Handshake {
         if !self.addressed(addr) {
             return Handshake::Timeout;
         }
@@ -695,7 +706,6 @@ impl UsbDevicePort for Usb {
         self.ep_stall_arm = 0;
         self.buf_sel[0] = 0;
         self.buf_sel[1] = 0;
-        let _ = now;
         Handshake::Ack
     }
 
@@ -833,6 +843,14 @@ mod tests {
         u.write(SIE_CTRL, sie_ctrl::PULLUP_EN, WriteMode::Clear);
         assert!(!u.pullup());
         assert_eq!(u.peek(SIE_STATUS, 0).unwrap() & sie_status::CONNECTED, 0);
+        // Pulling the cable disconnects too
+        u.write(SIE_CTRL, sie_ctrl::PULLUP_EN, WriteMode::Set);
+        u.bus_reset(Time::ZERO, true);
+        u.bus_reset(Time::from_ms(10), false);
+        u.write(SIE_STATUS, sie_status::CONNECTED, WriteMode::Normal);
+        u.set_vbus(false);
+        assert_eq!(u.peek(SIE_STATUS, 0).unwrap() & sie_status::CONNECTED, 0);
+        assert_ne!(u.intr() & intr::DEV_CONN_DIS, 0);
     }
 
     #[test]

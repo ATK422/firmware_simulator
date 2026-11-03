@@ -1170,9 +1170,18 @@ impl System {
     /// Plugs the chip's USB port into a host (VBUS comes up; the host enumerates the device once its pull-up
     /// appears).
     pub fn attach_usb_host(&mut self, host: HostController, now: Time) {
-        self.usb.vbus = true;
+        self.usb.set_vbus(true);
         self.usb_host = Some(Box::new(host));
+        self.usb.kick = true;
         self.usb_kicked(now);
+    }
+
+    /// Pulls the USB cable: VBUS drops, the device is disconnected, and the host (returned) is gone.
+    pub fn detach_usb_host(&mut self) -> Option<HostController> {
+        self.usb.set_vbus(false);
+        self.sched.cancel(Event::Usb);
+        self.irq_dirty = true;
+        self.usb_host.take().map(|h| *h)
     }
 
     /// The attached USB host, for queueing transfers. Call [`System::usb_reschedule`] after changing it.

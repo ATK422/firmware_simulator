@@ -181,7 +181,8 @@ again after the device reboots (the server ends the session when the device leav
 `test_programs/pico/hello_usb` (pico-sdk stdio_usb) and `test_programs/c_dual_usb` (titan_firmware's
 `titan_dual_stdio_usb`, two CDC ports) are the device-side test programs (`crates/sim_host/tests/usb.rs`). Not
 modelled: host mode of the controller and isochronous endpoints. The host can suspend and resume the port
-(`HostController::suspend`/`resume`), and firmware can wake it (SIE_CTRL.RESUME).
+(`HostController::suspend`/`resume`), firmware can wake it (SIE_CTRL.RESUME), and `System::detach_usb_host`
+pulls the cable.
 
 ### Debugging
 
