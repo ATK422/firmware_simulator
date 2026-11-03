@@ -81,6 +81,9 @@ pub fn parse(frame: &[u8]) -> Parsed {
             }
             let u = &p[ihl..total];
             let len = (u16::from_be_bytes([u[4], u[5]]) as usize).min(u.len());
+            if len < 8 {
+                return Parsed::Other;
+            }
             Parsed::Udp(Udp {
                 src_mac,
                 src: (p[12..16].try_into().unwrap(), u16::from_be_bytes([u[0], u[1]])),
@@ -400,6 +403,20 @@ mod tests {
         pseudo.extend((u.len() as u16).to_be_bytes());
         let pre: u32 = pseudo.chunks(2).map(|c| u16::from_be_bytes([c[0], c[1]]) as u32).sum();
         assert_eq!(checksum(u, pre), 0);
+    }
+
+    /// A UDP header whose length field is below its own 8 bytes (a malformed datagram from the firmware) is not
+    /// a datagram; it used to panic slicing `u[8..len]`.
+    #[test]
+    fn udp_length_below_the_header_is_not_a_datagram() {
+        for bad in [0u16, 7] {
+            let mut f = udp([1, 2, 3, 4, 5, 6], (BOARD_IP, 1234), (ROBOT_COMPUTER_IP, LINK_PORT), b"TLhello");
+            f[38..40].copy_from_slice(&bad.to_be_bytes());
+            assert_eq!(parse(&f), Parsed::Other, "UDP length {bad}");
+        }
+        let mut f = udp([1, 2, 3, 4, 5, 6], (BOARD_IP, 1234), (ROBOT_COMPUTER_IP, LINK_PORT), b"TLhello");
+        f[38..40].copy_from_slice(&8u16.to_be_bytes());
+        assert!(matches!(parse(&f), Parsed::Udp(u) if u.payload.is_empty()), "an empty datagram");
     }
 
     #[test]
