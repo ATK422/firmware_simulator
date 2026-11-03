@@ -237,5 +237,6 @@ machine: compare the best of several repeats, or the instruction counts under `v
 Measured on a shared 4-core machine (CPU time for 2 s of virtual time): template 0.03 s, ESC board 1.8 s,
 IVCBoard2 0.6 s, Talos 4.7 s, IVC2 pool 2.2 s. Under callgrind, advancing the PIO blocks (on register reads and
 their 1 µs event) still takes about 22 % of the ESC board's time: the DShot state machines' clock recovery is
-ticked cycle by cycle. In Talos, reads of the XOSC status register (about 1.5 million per 200 ms of virtual
-time, through the general peripheral path) take about 7 %.
+ticked cycle by cycle. At boot, embassy's clock setup polls the XOSC status register for its 128 ms start-up
+delay (on the ring oscillator, through the general peripheral path, so not skipped as a busy-wait): about 7 % of
+the first 200 ms of a Talos run.
