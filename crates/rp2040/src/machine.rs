@@ -630,13 +630,24 @@ impl Machine {
     /// Brings a core that slept up to the current time, letting SysTick count the idle cycles.
     fn catch_up(&mut self, c: usize) {
         if self.clocks[c].now < self.now {
-            let idle = self.now - self.clocks[c].now;
-            let cycles = self.clk_sys.cycles_in(idle);
+            let cycles = self.idle_cycles(c, self.now);
             self.cores[c].advance_idle(cycles);
             self.clocks[c].jump_to(self.now);
         }
         let t = self.clocks[c].now;
         self.sync_systick_reference(c, t);
+    }
+
+    /// Whole `clk_sys` cycles core `c`'s clock (with its fraction of a picosecond) completes by `t`: the cycles an
+    /// idle core counts up to then. A fast-forward to a SysTick wrap `n` cycles ahead ends at
+    /// `clocks[c].time_after(n)`, and this gives exactly `n` there.
+    fn idle_cycles(&self, c: usize, t: Time) -> u64 {
+        let clock = &self.clocks[c];
+        if self.clk_sys.is_stopped() || t <= clock.now {
+            return 0;
+        }
+        let n = clock.cycles_until(&self.clk_sys, t);
+        if clock.time_after(&self.clk_sys, n) > t { n - 1 } else { n }
     }
 
     /// Feeds core `c`'s SysTick, while it counts the reference clock (CLKSOURCE clear), the watchdog ticks
@@ -934,9 +945,12 @@ impl Machine {
                 let mut target = next_event.min(end);
                 for c in 0..2 {
                     if self.core_enabled[c]
+                        && !self.clk_sys.is_stopped()
                         && let Some(cycles) = self.cores[c].cycles_until_systick()
                     {
-                        let t = self.clocks[c].now.max(self.now) + self.clk_sys.cycles(cycles);
+                        // From the core's own clock, fraction included: catching it up to there counts exactly
+                        // `cycles` (see `idle_cycles`)
+                        let t = self.clocks[c].time_after(&self.clk_sys, cycles).max(self.now);
                         target = target.min(t);
                     }
                     if self.core_enabled[c]
