@@ -158,3 +158,33 @@ fn core1_forced_off_again_before_it_starts_stays_off() {
     assert_eq!(m.run_until(m.now + Time::from_us(100)), StopReason::TimeLimit);
     assert!(m.core_enabled[1] && m.cores[1].pc() < 0x4000);
 }
+
+/// A trapped `flash_range_program` with a count far larger than the chip programs what lands in flash and takes
+/// the time of every page asked for, without gathering gigabytes of source data first.
+#[test]
+fn trapped_flash_program_with_a_huge_count() {
+    use rp2040::hle::{PAGE_PROGRAM, RomFn};
+    let mut m = Machine::new(MachineConfig { bootrom: Some(rp2040::BOOTROM_B1.to_vec()), ..Default::default() });
+    m.sys.unmodelled.log_mode = rp2040::unmodelled::LogMode::Off;
+    for (off, v) in [(0x00, 0x2000_2000), (0x04, SRAM_BASE + 0x121)] {
+        assert!(m.sys.poke(SRAM_BASE + off, Size::Word, v));
+    }
+    assert!(m.sys.poke(SRAM_BASE + 0x120, Size::Half, 0xE7FE)); // b .
+    m.direct_boot().unwrap();
+    m.hle_enabled = true;
+    m.core_enabled[1] = false;
+    let entry = *m.hle.iter().find(|(_, f)| **f == RomFn::FlashRangeProgram).unwrap().0;
+    m.sys.sram[..8].fill(0);
+    let c = &mut m.cores[0];
+    c.set_reg(0, 0);
+    c.set_reg(1, SRAM_BASE);
+    c.set_reg(2, u32::MAX);
+    c.set_reg(14, SRAM_BASE + 0x121);
+    c.set_pc(entry);
+    m.run_until(Time::from_us(1));
+    assert_eq!(m.cores[0].pc(), SRAM_BASE + 0x120, "returned");
+    assert_eq!(m.sys.flash[..8], [0; 8], "programmed from SRAM");
+    let pages = (u32::MAX as u64).div_ceil(256);
+    // (In whole clk_sys cycles)
+    assert!(m.core_time(0) + Time::from_us(1) >= Time(PAGE_PROGRAM.as_ps() * pages), "{}", m.core_time(0));
+}

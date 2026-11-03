@@ -137,8 +137,14 @@ pub fn program(flash: &mut [u8], offset: u32, data: &[u8]) -> Time {
             *b &= d;
         }
     }
+    program_time(offset, data.len() as u32)
+}
+
+/// The time `flash_range_program` takes for `count` bytes at flash offset `offset` (a page program per page
+/// touched).
+pub fn program_time(offset: u32, count: u32) -> Time {
     let first_page = offset as u64 / PAGE_SIZE as u64;
-    let last_page = (offset as u64 + data.len().max(1) as u64 - 1) / PAGE_SIZE as u64;
+    let last_page = (offset as u64 + count.max(1) as u64 - 1) / PAGE_SIZE as u64;
     Time(PAGE_PROGRAM.as_ps() * (last_page - first_page + 1))
 }
 

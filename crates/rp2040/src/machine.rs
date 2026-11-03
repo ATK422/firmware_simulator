@@ -526,9 +526,12 @@ impl Machine {
             }
             RomFn::FlashRangeProgram => {
                 log::debug!("[{now}] core{c} flash_range_program({r0:#x}, {r1:#010x}, {r2:#x})");
+                // Only what lands in flash is read (the count is the guest's); the time is that of every page
+                let n = (r2 as usize).min(self.sys.flash.len().saturating_sub(r0 as usize)) as u32;
                 let data: Vec<u8> =
-                    (0..r2).map(|i| self.sys.peek(r1.wrapping_add(i), Size::Byte).unwrap_or(0xFF) as u8).collect();
-                hle::program(&mut self.sys.flash, r0, &data)
+                    (0..n).map(|i| self.sys.peek(r1.wrapping_add(i), Size::Byte).unwrap_or(0xFF) as u8).collect();
+                hle::program(&mut self.sys.flash, r0, &data);
+                hle::program_time(r0, r2)
             }
             RomFn::ResetToUsbBoot => unreachable!("reset_usb_boot is not trapped"),
             RomFn::ConnectInternalFlash | RomFn::FlashExitXip | RomFn::FlashFlushCache | RomFn::FlashEnterCmdXip => {
