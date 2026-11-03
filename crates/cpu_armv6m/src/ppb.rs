@@ -106,7 +106,13 @@ impl SysTick {
         wrapped && self.csr & CSR_TICKINT != 0
     }
 
+    /// Whether [`SysTick::tick_core`] counts anything (CLKSOURCE selects the processor clock).
+    pub fn counts_core_clock(&self) -> bool {
+        self.csr & CSR_CLKSOURCE != 0
+    }
+
     /// Core clock cycles (only counted when CLKSOURCE selects the processor clock).
+    #[inline]
     pub fn tick_core(&mut self, cycles: u64) -> bool {
         self.csr & CSR_CLKSOURCE != 0 && self.count(cycles)
     }
@@ -118,7 +124,29 @@ impl SysTick {
 
     /// Clocks until the next exception, if SysTick counts the core clock and will interrupt.
     pub fn cycles_until_wrap(&self) -> Option<u64> {
-        if !self.enabled() || self.csr & (CSR_TICKINT | CSR_CLKSOURCE) != CSR_TICKINT | CSR_CLKSOURCE {
+        if self.csr & CSR_CLKSOURCE == 0 {
+            return None;
+        }
+        self.counts_until_wrap()
+    }
+
+    /// Whether SysTick is enabled and counts the external reference clock (CLKSOURCE clear), which the SoC must
+    /// feed with [`SysTick::tick_reference`].
+    pub fn counts_reference_clock(&self) -> bool {
+        self.csr & (CSR_ENABLE | CSR_CLKSOURCE) == CSR_ENABLE
+    }
+
+    /// Reference clock ticks until the next exception, if SysTick counts the reference clock and will interrupt.
+    pub fn reference_ticks_until_wrap(&self) -> Option<u64> {
+        if self.csr & CSR_CLKSOURCE != 0 {
+            return None;
+        }
+        self.counts_until_wrap()
+    }
+
+    /// Counts of its clock until the counter wraps with TICKINT set.
+    fn counts_until_wrap(&self) -> Option<u64> {
+        if !self.enabled() || self.csr & CSR_TICKINT == 0 {
             return None;
         }
         if self.cvr != 0 {

@@ -389,3 +389,143 @@ impl Pio {
         self.force(sm, instr, 0);
     }
 }
+
+// ---- pure loops: skipped, with exactly the results of ticking through them
+
+/// Everything software or the system can see of a block.
+fn observable(p: &Pio) -> String {
+    let regs: Vec<Option<u32>> = (0..0x144).step_by(4).map(|off| p.peek(off)).collect();
+    let sms: Vec<_> = (0..4).map(|i| (p.sm_regs(i), p.sm_stalled(i), p.tx_dreq(i), p.rx_dreq(i))).collect();
+    format!(
+        "cycle {} pads {:08x}/{:08x} irq {:02x} lines {:?} busy {} regs {regs:x?} sms {sms:?}",
+        p.cycle,
+        p.pad_out,
+        p.pad_oe,
+        p.irq,
+        p.irq_lines(),
+        p.busy()
+    )
+}
+
+struct Rng(u64);
+impl Rng {
+    fn next(&mut self) -> u64 {
+        self.0 ^= self.0 << 13;
+        self.0 ^= self.0 >> 7;
+        self.0 ^= self.0 << 17;
+        self.0
+    }
+    fn below(&mut self, n: u64) -> u64 {
+        self.next() % n
+    }
+}
+
+/// A random program of `len` instructions, mostly polling loops (JMP, WAIT on pins, MOV/SET to X and Y) with some
+/// FIFO, pin and IRQ instructions in between.
+fn random_program(r: &mut Rng, len: u16) -> Vec<u16> {
+    (0..len)
+        .map(|_| {
+            let addr = r.below(len as u64) as u16;
+            let i = match r.below(12) {
+                0..=2 => jmp(r.below(8) as u16, addr),
+                3 => wait(r.below(2) as u16, r.below(2) as u16, r.below(4) as u16),
+                4 => mov(1 + r.below(2) as u16, r.below(3) as u16, [0, 1, 2, 3, 5][r.below(5) as usize]),
+                5 => set(1 + r.below(2) as u16, r.below(32) as u16),
+                6 => NOP,
+                7 => set([0, 4][r.below(2) as usize], r.below(4) as u16),
+                8 => inp([0, 1, 2][r.below(3) as usize], 1 + r.below(8) as u16),
+                9 => out([1, 2, 3][r.below(3) as usize], 1 + r.below(8) as u16),
+                10 => [push(r.below(2) == 0, r.below(2) == 0), pull(r.below(2) == 0, r.below(2) == 0)]
+                    [r.below(2) as usize],
+                _ => irq(r.below(2) == 0, false, r.below(4) as u16),
+            };
+            if r.below(3) == 0 { delay(i, r.below(4) as u16) } else { i }
+        })
+        .collect()
+}
+
+/// Runs the same random scenario on a block with loop skipping and one without, comparing what can be seen at every
+/// step: run results, pins, FIFOs, registers.
+fn compare_scenario(seed: u64, prog: Option<Vec<u16>>) -> u64 {
+    let mut r = Rng(seed | 1);
+    let len = 3 + r.below(10) as u16;
+    let prog = prog.unwrap_or_else(|| random_program(&mut r, len));
+    let mut a = pio(&prog);
+    a.skip_loops = false;
+    for sm in 0..4 {
+        let wrap_top = (prog.len() as u32 - 1) << 12;
+        let status = (r.below(2) as u32) << 4 | r.below(4) as u32; // STATUS_SEL, STATUS_N
+        let jmp_pin = (r.below(4) as u32) << 24;
+        w(&mut a, reg(sm, EXECCTRL), wrap_top | status | jmp_pin);
+        w(&mut a, reg(sm, SHIFTCTRL), (r.below(4) as u32) << 16 | 0x000C_0000);
+        w(&mut a, reg(sm, PINCTRL), 1 << 26 | 2 << 20 | (r.below(4) as u32) << 15 | (r.below(4) as u32) << 5);
+        w(&mut a, reg(sm, 0), (1 + r.below(5) as u32) << 16 | (r.below(256) as u32) << 8);
+        w(&mut a, reg(sm, SMINSTR), jmp(0, r.below(prog.len() as u64) as u16) as u32);
+    }
+    let mut b = a.clone();
+    b.skip_loops = true;
+    start(&mut a, 1 + r.below(15) as u32);
+    start(&mut b, a.read(CTRL).unwrap());
+    let mut inputs = r.next() as u32;
+    let mut until = 0;
+    for step in 0..400 {
+        match r.below(10) {
+            0 => inputs ^= 1 << r.below(4),
+            1 => {
+                let off = TXF0 + 4 * r.below(4) as u32;
+                let v = r.next() as u32;
+                w(&mut a, off, v);
+                w(&mut b, off, v);
+            }
+            2 => {
+                let off = RXF0 + 4 * r.below(4) as u32;
+                assert_eq!(a.read(off), b.read(off), "seed {seed} step {step}: RX FIFO");
+            }
+            3 => {
+                let off = reg(r.below(4) as usize, ADDR);
+                assert_eq!(a.read(off), b.read(off), "seed {seed} step {step}: ADDR");
+            }
+            _ => {}
+        }
+        until += 1 + r.below(120);
+        loop {
+            let (sa, sb) = (a.run(until, inputs), b.run(until, inputs));
+            assert_eq!((sa, a.cycle), (sb, b.cycle), "seed {seed} step {step}: run");
+            assert_eq!(observable(&a), observable(&b), "seed {seed} step {step}");
+            if sa == Stop::Reached {
+                break;
+            }
+        }
+    }
+    a.executed - b.executed
+}
+
+#[test]
+fn skipped_loops_match_ticking_on_random_programs() {
+    let mut skipped = 0;
+    for seed in 0..300 {
+        skipped += compare_scenario(0x5EED_0000 + seed, None);
+    }
+    assert!(skipped > 100_000, "loops were skipped: {skipped} ticks");
+}
+
+#[test]
+fn bidirectional_dshot_reply_wait_is_skipped() {
+    // The ESC board's bidir_dshot.pio receive wait: poll the TX FIFO status and the pin until the reply starts
+    let prog = vec![
+        pull(false, true),
+        set(0, 0),    // drive
+        set(4, 0),    // release the pin
+        mov(2, 0, 5), // wait_rx: mov y, status
+        jmp(3, 0),    // jmp !y start
+        jmp(6, 3),    // jmp pin wait_rx
+        inp(0, 1),
+        push(false, false),
+        jmp(0, 0),
+    ];
+    let mut total = 0;
+    for seed in 0..50 {
+        total += compare_scenario(0xD5_0000 + seed, Some(prog.clone()));
+    }
+    assert!(total > 10_000, "{total} ticks skipped");
+}

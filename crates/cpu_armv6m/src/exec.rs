@@ -53,6 +53,7 @@ impl CortexM0Plus {
         self.ipsr != 0 || !self.npriv
     }
 
+    #[inline(always)]
     fn condition_passed(&self, cond: u32) -> bool {
         let r = match cond >> 1 {
             0 => self.z,
@@ -68,7 +69,7 @@ impl CortexM0Plus {
     }
 
     /// `BXWritePC`: interworking branch that also performs exception return from handler mode.
-    fn bx_write_pc(&mut self, bus: &mut dyn Bus, target: u32) -> Result<(Next, u32), Fault> {
+    fn bx_write_pc<B: Bus + ?Sized>(&mut self, bus: &mut B, target: u32) -> Result<(Next, u32), Fault> {
         if self.ipsr != 0 && target & 0xF000_0000 == 0xF000_0000 {
             let c = self.exception_return(bus, target)?;
             return Ok((Next::AlreadySet, c));
@@ -79,12 +80,18 @@ impl CortexM0Plus {
         Ok((Next::Branch(target & !1), 0))
     }
 
-    /// Executes the instruction at the PC. Returns the cycles it took.
-    pub(crate) fn execute(&mut self, bus: &mut dyn Bus) -> Result<u32, Fault> {
+    /// Executes the instruction at the PC. Returns the cycles it took. With `TRACK` the instruction's address and
+    /// encoding are kept in `last_pc`/`last_opcode` (for tracing); batches leave them alone.
+    pub(crate) fn execute<B: Bus + ?Sized, const TRACK: bool>(&mut self, bus: &mut B) -> Result<u32, Fault> {
         let pc = self.r[15];
-        let ins = bus.fetch16(pc)? as u32;
-        self.last_pc = pc;
-        self.last_opcode = ins;
+        let ins = match bus.fetch16_fast(pc) {
+            Some(v) => v,
+            None => bus.fetch16(pc)?,
+        } as u32;
+        if TRACK {
+            self.last_pc = pc;
+            self.last_opcode = ins;
+        }
         let pcv = pc.wrapping_add(4);
         let mut width = 2;
         let mut cycles = 1;
@@ -347,7 +354,9 @@ impl CortexM0Plus {
             // 32-bit encodings
             0b11101..=0b11111 => {
                 let hw2 = bus.fetch16(pc.wrapping_add(2))? as u32;
-                self.last_opcode = ins << 16 | hw2;
+                if TRACK {
+                    self.last_opcode = ins << 16 | hw2;
+                }
                 width = 4;
                 let (n, c) = self.execute32(ins, hw2, pc)?;
                 next = n;
@@ -364,6 +373,7 @@ impl CortexM0Plus {
         Ok(cycles)
     }
 
+    #[inline(always)]
     fn data_processing(&mut self, ins: u32) {
         let rdn = ins & 7;
         let rm = self.r[((ins >> 3) & 7) as usize];
@@ -518,7 +528,7 @@ impl CortexM0Plus {
     }
 
     /// ADD/CMP/MOV with high registers, BX and BLX.
-    fn special_data(&mut self, bus: &mut dyn Bus, ins: u32, pcv: u32) -> Result<(Next, u32), Fault> {
+    fn special_data<B: Bus + ?Sized>(&mut self, bus: &mut B, ins: u32, pcv: u32) -> Result<(Next, u32), Fault> {
         let rm = (ins >> 3) & 0xF;
         let rd = (ins & 7) | ((ins >> 4) & 8);
         match (ins >> 8) & 3 {
@@ -575,7 +585,7 @@ impl CortexM0Plus {
     }
 
     /// The miscellaneous 16-bit instructions (`1011 xxxx xxxx xxxx`).
-    fn misc(&mut self, bus: &mut dyn Bus, ins: u32) -> Result<(Next, u32), Fault> {
+    fn misc<B: Bus + ?Sized>(&mut self, bus: &mut B, ins: u32) -> Result<(Next, u32), Fault> {
         match (ins >> 8) & 0xF {
             // ADD/SUB SP, SP, #imm7*4
             0x0 => {
@@ -619,6 +629,7 @@ impl CortexM0Plus {
                 }
                 if self.privileged() {
                     self.primask = ins & (1 << 4) != 0;
+                    self.exc_changed = true;
                 }
             }
             // REV, REV16, REVSH
@@ -676,17 +687,20 @@ impl CortexM0Plus {
                             self.event_reg = false;
                         } else {
                             self.sleep = Some(Sleep::Wfe);
+                            self.batch_break = true;
                         }
                         return Ok((Next::Sequential, 2));
                     }
                     // WFI
                     3 => {
                         self.sleep = Some(Sleep::Wfi);
+                        self.batch_break = true;
                         return Ok((Next::Sequential, 2));
                     }
                     // SEV
                     4 => {
                         self.sev_out = true;
+                        self.batch_break = true;
                         self.event_reg = true;
                     }
                     // Other hints execute as NOP
@@ -728,7 +742,10 @@ impl CortexM0Plus {
                 }
                 8 if self.privileged() => self.set_msp(v),
                 9 if self.privileged() => self.set_psp(v),
-                16 if self.privileged() => self.primask = v & 1 != 0,
+                16 if self.privileged() => {
+                    self.primask = v & 1 != 0;
+                    self.exc_changed = true;
+                }
                 20 if self.privileged() => {
                     self.npriv = v & 1 != 0;
                     if self.ipsr == 0 {
