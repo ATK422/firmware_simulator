@@ -4,8 +4,9 @@
 //! Counters are computed lazily from virtual time. The machine asks for [`Pwm::next_event`] to schedule wrap
 //! interrupts and, for pins someone observes (traces, attached devices), output edges.
 //!
-//! The input modes (DIVMODE gated/rising/falling on the B pin) are not modelled yet: the counter holds still in
-//! those modes.
+//! The input modes (DIVMODE) count on the B pin: gated mode counts at the divided rate while B is high, the edge
+//! modes advance the (fractionally divided) counter on each rising or falling edge. The system reports B pin levels
+//! with [`Pwm::set_input`]; in an input mode the B output is not driven.
 
 use sim_core::bus::WriteMode;
 use sim_core::time::{ClockPeriod, Time};
@@ -33,6 +34,9 @@ pub struct Slice {
     /// Wraps counted before `base_time` (to report wraps lazily).
     wraps_before: u64,
     wraps_seen: u64,
+    /// Level of the B pin input, and edges counted towards the next tick (in 1/16ths) in the edge modes.
+    input: bool,
+    edge_acc: u64,
 }
 
 impl Default for Slice {
@@ -47,13 +51,52 @@ impl Default for Slice {
             base_pos: 0,
             wraps_before: 0,
             wraps_seen: 0,
+            input: false,
+            edge_acc: 0,
         }
     }
 }
 
 impl Slice {
+    /// DIVMODE: 0 free running, 1 gated by B, 2 rising edges of B, 3 falling edges of B.
+    pub fn divmode(&self) -> u32 {
+        (self.csr >> 4) & 3
+    }
+
+    /// Whether the counter advances with the clock right now.
     fn running(&self) -> bool {
-        self.csr & CSR_EN != 0 && (self.csr >> 4) & 3 == 0
+        self.csr & CSR_EN != 0 && (self.divmode() == 0 || self.divmode() == 1 && self.input)
+    }
+
+    /// The B pin changed to `level`.
+    fn set_input(&mut self, clk: &ClockPeriod, now: Time, level: bool) {
+        if level == self.input {
+            return;
+        }
+        self.sync(clk, now);
+        self.rebase(clk, now);
+        self.input = level;
+        let counts = match self.divmode() {
+            2 => level,
+            3 => !level,
+            _ => false,
+        };
+        if counts && self.csr & CSR_EN != 0 {
+            self.edge_acc += 16;
+            let div = self.divfix();
+            while self.edge_acc >= div {
+                self.edge_acc -= div;
+                self.base_pos += 1;
+                if self.base_pos >= self.period_len() {
+                    self.base_pos -= self.period_len();
+                    self.wraps_before += 1;
+                    if let Some((cc, top)) = self.pending.take() {
+                        self.cc = cc;
+                        self.top = top;
+                    }
+                }
+            }
+        }
     }
 
     fn phase_correct(&self) -> bool {
@@ -135,8 +178,8 @@ impl Slice {
     pub fn output(&self, clk: &ClockPeriod, now: Time, ch: usize) -> bool {
         let cc = if ch == 0 { self.cc & 0xFFFF } else { self.cc >> 16 };
         let inv = self.csr & if ch == 0 { CSR_A_INV } else { CSR_B_INV } != 0;
-        let level = if self.csr & CSR_EN == 0 {
-            // A disabled slice holds its output where the counter stopped
+        let level = if !self.running() {
+            // A disabled (or input-paused) slice holds its output where the counter stopped
             self.counter_from_pos(self.base_pos) < cc
         } else {
             self.counter(clk, now) < cc
@@ -212,6 +255,22 @@ impl Pwm {
     /// Output of the PWM function on GPIO `pin`.
     pub fn pin_output(&self, clk: &ClockPeriod, now: Time, pin: usize) -> bool {
         self.slices[(pin / 2) % NUM_SLICES].output(clk, now, pin % 2)
+    }
+
+    /// Whether the PWM function drives GPIO `pin` (B pins are inputs in the input modes).
+    pub fn drives_pin(&self, pin: usize) -> bool {
+        pin.is_multiple_of(2) || self.slices[(pin / 2) % NUM_SLICES].divmode() == 0
+    }
+
+    /// Slices counting on their B input.
+    pub fn input_slices(&self) -> u32 {
+        self.slices.iter().enumerate().fold(0, |m, (i, s)| m | ((s.divmode() != 0) as u32) << i)
+    }
+
+    /// Reports the level of slice `slice`'s B input.
+    pub fn set_input(&mut self, clk: &ClockPeriod, now: Time, slice: usize, level: bool) {
+        self.slices[slice].set_input(clk, now, level);
+        self.sync(clk, now);
     }
 
     /// Earliest time something needs the machine's attention: a wrap with its interrupt enabled, or an output
@@ -429,5 +488,46 @@ mod tests {
         p.write(&c, Time::from_ns(80), 0x00, CSR_EN, WriteMode::Clear);
         assert_eq!(p.read(&c, Time::from_us(5), 0x08), Some(10));
         assert!(p.pin_output(&c, Time::from_us(5), 0));
+    }
+
+    #[test]
+    fn gated_by_b_input() {
+        let c = clk();
+        // DIVMODE 1, divider 1: counts clk_sys cycles while B is high
+        let mut p = setup(0xFFFF, 0, 0x10, 1 << 4);
+        p.write(&c, Time::ZERO, 0xA8, 1, WriteMode::Normal);
+        assert_eq!(p.read(&c, c.cycles(100), 0x08), Some(0), "B low: paused");
+        p.set_input(&c, c.cycles(100), 0, true);
+        p.set_input(&c, c.cycles(150), 0, false);
+        assert_eq!(p.read(&c, c.cycles(1000), 0x08), Some(50));
+        assert!(!p.drives_pin(1) && p.drives_pin(0));
+        assert_eq!(p.input_slices(), 1);
+        assert!(p.next_event(&c, c.cycles(1000)).is_none(), "no wrap while paused");
+        p.set_input(&c, c.cycles(1000), 0, true);
+        assert!(p.next_event(&c, c.cycles(1000)).is_some());
+    }
+
+    #[test]
+    fn counts_rising_and_falling_edges_with_divider() {
+        let c = clk();
+        let mut p = setup(9, 0, 0x10, 2 << 4);
+        let mut t = 0;
+        let toggle = |p: &mut Pwm, t: &mut u64, n: usize| {
+            for _ in 0..n {
+                *t += 10;
+                p.set_input(&c, c.cycles(*t), 0, true);
+                *t += 10;
+                p.set_input(&c, c.cycles(*t), 0, false);
+            }
+        };
+        toggle(&mut p, &mut t, 7);
+        assert_eq!(p.read(&c, c.cycles(t), 0x08), Some(7), "rising edges");
+        toggle(&mut p, &mut t, 5);
+        assert_eq!(p.read(&c, c.cycles(t), 0x08), Some(2), "wrapped at TOP 9");
+        assert_ne!(p.read(&c, c.cycles(t), 0xA4).unwrap() & 1, 0, "wrap flag");
+        // Falling edges with a divider of 2.5: 5 edges make 2 counts
+        let mut p = setup(0xFFFF, 0, 0x28, 3 << 4);
+        toggle(&mut p, &mut t, 5);
+        assert_eq!(p.read(&c, c.cycles(t), 0x08), Some(2));
     }
 }

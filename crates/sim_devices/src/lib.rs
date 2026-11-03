@@ -2,15 +2,27 @@
 //! and the CAN bus they talk on.
 //!
 //! * [`DeviceCtx`]: what a device sees of the board (time, pins it drives or senses, clocks fed to it)
-//! * [`spi`]: the SPI device interface
+//! * [`spi`], [`i2c`], [`uart`]: the SPI, I2C and UART device interfaces
 //! * [`can`]: CAN frames and the in-process, arbitrating CAN bus
 //! * [`mcp251xfd`]: the MCP2517FD/MCP2518FD SPI CAN FD controller
+//! * [`sht41`], [`mcp342x`], [`ms5837`], [`ssd1306`]: I2C sensors, ADC and display
+//! * [`cd74hc4051`]: an analog multiplexer in front of an ADC input
+//!
+//! Physical inputs (temperatures, pressures, voltages) are [`sim_core::analog::Signal`]s.
 //!
 //! Models are SoC independent: the machine implements [`DeviceCtx`] for them.
 
 pub mod can;
+pub mod cd74hc4051;
+pub mod i2c;
 pub mod mcp251xfd;
+pub mod mcp342x;
+pub mod ms5837;
+pub mod png;
+pub mod sht41;
 pub mod spi;
+pub mod ssd1306;
+pub mod uart;
 
 use sim_core::time::Time;
 use sim_core::wire::External;

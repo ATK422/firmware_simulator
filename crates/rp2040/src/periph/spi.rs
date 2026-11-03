@@ -321,7 +321,7 @@ mod tests {
         }
         assert_eq!(s.read(SSPSR).unwrap() & SR_TNF, 0, "TX FIFO full at 8");
         assert!(!s.tx_dreq());
-        let mut exchange = |s: &mut Spi| {
+        let exchange = |s: &mut Spi| {
             let done = s.start(&c, Time::ZERO).unwrap();
             let (f, t) = s.take_completed(done).unwrap();
             s.complete(f, t, &c);

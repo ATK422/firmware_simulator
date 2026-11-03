@@ -1,0 +1,12 @@
+# Deep open sea: no boundaries within reach, sea water absorption, moderate shipping and wind noise.
+kind = "open"
+water = { temperature_c = 12.0, salinity_ppt = 35.0 }
+noise = { kind = "wenz", shipping = 0.5, wind_mps = 5.0 }
+
+[[source]]
+kind = "pinger"
+position_m = [50.0, 0.0, 10.0]
+frequency_hz = 30_000
+pulse_ms = 4
+period_ms = 2000
+source_level_db = 180

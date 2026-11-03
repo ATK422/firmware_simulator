@@ -1,0 +1,16 @@
+# A 25 m competition pool: concrete walls and bottom, fresh warm water, quiet, with the competition pinger.
+kind = "tank"
+size_m = [25.0, 12.0, 3.0]
+wall_reflection = 0.6
+bottom_reflection = 0.5
+water = { temperature_c = 26.0, salinity_ppt = 0.0 }
+noise = { kind = "white", level_db_re_upa_per_hz = 50.0 }
+multipath = { max_order = 3 }
+
+[[source]]
+kind = "pinger"
+position_m = [20.0, 6.0, 2.0]
+frequency_hz = 25_000
+pulse_ms = 4
+period_ms = 2000
+source_level_db = 180

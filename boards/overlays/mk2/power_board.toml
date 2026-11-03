@@ -1,0 +1,29 @@
+# Sensors on the board I2C bus (I2C0, GPIO 4/5) and the battery measurement inputs, with nominal values.
+[[i2c]]
+bus = 0
+device = "sht41"
+temperature_c = 30.0
+humidity_rh = 35.0
+
+# Rail monitor: 3.3 V rail behind 10k/10k on channel 1, the balanced battery rail behind 10k/1k on channel 2
+[[i2c]]
+bus = 0
+device = "mcp3426"
+channels = [
+    { name = "rail_3v3", volts = 3.3, divider_ohms = [10_000, 10_000] },
+    { name = "rail_balanced", volts = 16.0, divider_ohms = [10_000, 1_000] },
+]
+
+# Port and starboard battery measurement (GPIO 26/27) behind 10k/1k dividers
+[[analog]]
+adc = 0
+name = "port_battery"
+volts = 16.2
+divider_ohms = [10_000, 1_000]
+
+[[analog]]
+adc = 1
+name = "stbd_battery"
+volts = 16.4
+divider_ohms = [10_000, 1_000]
+

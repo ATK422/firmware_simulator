@@ -11,8 +11,8 @@ milestones are in [PLAN.md](PLAN.md).
 | [`sim_core`](crates/sim_core) | Virtual time (picoseconds), keyed event scheduler, `Bus`/`Peripheral`/`Cpu` traits, wires, trace sinks, ELF/UF2 images |
 | [`cpu_armv6m`](crates/cpu_armv6m) | Cortex-M0+ interpreter: full ARMv6-M Thumb, exceptions, NVIC, SysTick, SCB, MPU registers, disassembler |
 | [`rp2040`](crates/rp2040) | The SoC: memory map, bus fabric, peripherals, the two-core `Machine` and its run loop; register tables generated from `rp2040.svd` |
-| [`sim_devices`](crates/sim_devices) | External chip models: SPI device trait, CAN bus, MCP2517FD/MCP2518FD |
-| [`sim_acoustics`](crates/sim_acoustics) | Underwater acoustic environments for IVC testing (from M4) |
+| [`sim_devices`](crates/sim_devices) | External chip models: SPI/I2C/UART device traits, CAN bus, MCP2517FD/MCP2518FD, SHT41, MCP3426/8, MS5837, SSD1306, CD74HC4051 |
+| [`sim_acoustics`](crates/sim_acoustics) | Underwater acoustic environments: water, transducers by spec, receive chains, multipath, noise, sources |
 | [`sim_host`](crates/sim_host) | Host bridges: GDB, RTT/defmt, SocketCAN, UDP, UART ptys (from M1) |
 | [`sim_test`](crates/sim_test) | Firmware integration test harness (M7) |
 | `firmware_simulator` (root) | The command line tool |
@@ -53,6 +53,30 @@ cargo run --release -- run path/to/template --board boards/mk2/power_board.toml 
 
 Several boards on one bus are put together in code with `sim_host::robot::Robot` (see `crates/sim_host/tests/can.rs`).
 `RUST_LOG=sim_devices=trace` logs every MCP2517FD SPI transaction.
+
+### Sensors and scripted inputs
+
+Board files also list I2C devices (`[[i2c]]`: `sht41`, `mcp3426`/`mcp3428`, `ms5837_02ba`/`ms5837_30ba`,
+`ssd1306`), what drives the ADC inputs (`[[analog]]`: a voltage behind a divider, or a CD74HC4051 mux) and bytes
+programmed into flash (`[[flash]]`, e.g. the smart battery's serial number). Their physical values are named
+inputs: `--input sht41.temperature_c=31.5`, `--input port_battery=14.2`; tests change them while the board runs
+(`Board::apply` returns them). `--screenshot oled.png` saves what an SSD1306 shows.
+
+```bash
+cargo run --release -- run path/to/power_board --board boards/mk2/power_board.toml --mock-bridge 1 --input stbd_battery=15.1
+```
+
+### Acoustic environments
+
+`environments/*.toml` describe a body of water (open water, a tank or pool, a lake or harbour: boundaries and
+their reflections, water temperature and salinity, ambient noise, multipath order) and the sound sources in it
+(pingers, tones, chirps, WAV recordings). A board with a `[transducer]` section (specs, and the receive chain to an
+ADC input) is placed in one with `--environment` and `--position x,y,z` (metres, z is depth):
+
+```bash
+cargo run --release -- run path/to/ivc_board2 --board boards/talos/ivc_board.toml --mock-bridge 8 \
+    --environment environments/pool.toml --position 2,6,1
+```
 
 ### Debugging
 

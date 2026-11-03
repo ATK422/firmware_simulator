@@ -51,3 +51,19 @@ status_ledb_pin = 15
 status_ledg_pin = 14
 status_ledr_pin = 13
 stbd_stat_pin = 11
+
+# ---- boards/overlays/talos/poac_board.toml
+# Sensors on the board I2C bus (I2C0, GPIO 4/5), as on the power board
+[[i2c]]
+bus = 0
+device = "sht41"
+temperature_c = 28.0
+humidity_rh = 30.0
+
+[[i2c]]
+bus = 0
+device = "mcp3426"
+channels = [
+    { name = "rail_3v3", volts = 3.3, divider_ohms = [10_000, 10_000] },
+    { name = "rail_balanced", volts = 15.5, divider_ohms = [10_000, 1_000] },
+]

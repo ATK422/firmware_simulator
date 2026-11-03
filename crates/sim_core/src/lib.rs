@@ -1,5 +1,6 @@
 //! Core abstractions of the simulator, shared by every machine and free of any SoC knowledge.
 //!
+//! * [`analog`]: scripted values over time and analog sources
 //! * [`time`]: virtual time ([`Time`], picoseconds) and clock periods
 //! * [`sched`]: the keyed event [`Scheduler`]
 //! * [`bus`]: the [`Bus`] a CPU executes against and the [`Peripheral`] trait for memory mapped blocks
@@ -9,6 +10,7 @@
 //! * [`image`]: ELF and UF2 firmware images
 //! * [`snapshot`]: whole-machine snapshot support
 
+pub mod analog;
 pub mod bus;
 pub mod cpu;
 pub mod image;

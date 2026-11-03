@@ -15,6 +15,7 @@ object.workspace = true
 thiserror.workspace = true
 libc = "0.2"
 sim_devices.workspace = true
+sim_acoustics.workspace = true
 # The real protocol crates from titan_firmware_rs, so the mock bridge speaks exactly what titan_bridge speaks
 canmore = { path = "../../external/titan_firmware_rs/crates/canmore" }
 titan_link = { path = "../../external/titan_firmware_rs/crates/titan_link" }
