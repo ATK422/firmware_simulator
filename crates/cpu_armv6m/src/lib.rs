@@ -13,6 +13,7 @@
 //! The core knows nothing about the SoC: it executes against a [`sim_core::Bus`] and gets its interrupt lines from
 //! [`CortexM0Plus::set_irq_lines`].
 
+mod block;
 pub mod disasm;
 mod exec;
 pub mod ppb;
@@ -23,6 +24,7 @@ mod tests;
 use sim_core::bus::{Bus, BusFault, Size};
 use sim_core::cpu::{Cpu, StepOutcome};
 
+pub use block::BlockCache;
 pub use ppb::{Mpu, Nvic, Scb, SysTick};
 
 /// Exception numbers.
@@ -159,6 +161,10 @@ pub struct CortexM0Plus {
     /// Exception entries (number) and returns since the last [`CortexM0Plus::take_exception_log`], for tracing.
     pub(crate) exception_log: Vec<(bool, u32, u32)>,
     pub log_exceptions: bool,
+    /// Whether batches execute decoded blocks (see [`BlockCache`]); off, every instruction is decoded as it runs.
+    /// Either way they do the same.
+    pub decode_blocks: bool,
+    pub(crate) blocks: BlockCache,
 }
 
 impl Default for CortexM0Plus {
@@ -200,6 +206,8 @@ impl CortexM0Plus {
             last_fault: None,
             exception_log: Vec::new(),
             log_exceptions: false,
+            decode_blocks: true,
+            blocks: BlockCache::default(),
         }
     }
 
@@ -559,6 +567,7 @@ impl CortexM0Plus {
 
     // ------------------------------------------------------------------ memory
 
+    #[inline(always)]
     pub(crate) fn read_mem<B: Bus + ?Sized>(&mut self, bus: &mut B, addr: u32, size: Size) -> Result<u32, Fault> {
         if addr & (size.bytes() - 1) != 0 {
             return Err(Fault::Unaligned(addr));
@@ -570,6 +579,7 @@ impl CortexM0Plus {
         Ok(bus.read(addr, size)?)
     }
 
+    #[inline(always)]
     pub(crate) fn write_mem<B: Bus + ?Sized>(
         &mut self,
         bus: &mut B,
@@ -653,6 +663,24 @@ impl CortexM0Plus {
         if self.lockup || self.sleep.is_some() {
             return Batch { steps: 0, cycles: 0, stop: None };
         }
+        // The cache is taken out for the batch so that its blocks can be read while the core executes them
+        let mut cache = self.decode_blocks.then(|| std::mem::take(&mut self.blocks));
+        let b = self.run_batch_with(bus, max_steps, budget, trap_below, cache.as_mut());
+        if let Some(cache) = cache {
+            self.blocks = cache;
+        }
+        b
+    }
+
+    #[inline(always)]
+    fn run_batch_with<B: Bus + ?Sized>(
+        &mut self,
+        bus: &mut B,
+        max_steps: u32,
+        budget: u64,
+        trap_below: u32,
+        mut cache: Option<&mut BlockCache>,
+    ) -> Batch {
         // Whether an exception could preempt only changes with the exception state: IRQ lines are fixed for the
         // batch and PPB accesses end it
         self.exc_changed = true;
@@ -661,7 +689,36 @@ impl CortexM0Plus {
         let (mut steps, mut cycles, mut stop) = (0u32, 0u64, None);
         // SysTick only counts core cycles with CLKSOURCE set, which only a PPB write (ending the batch) changes
         let systick = self.systick.counts_core_clock();
-        while steps < max_steps {
+        // What a step that faulted (`pc`: its address) leaves
+        macro_rules! fault {
+            ($f:expr, $pc:expr) => {{
+                let pc = $pc;
+                match $f {
+                    Fault::Breakpoint(imm) => {
+                        self.r[15] = pc;
+                        // What a tracked step leaves for `escalate_breakpoint`
+                        self.last_pc = pc;
+                        self.last_opcode = 0xBE00 | imm as u32;
+                        stop = Some(StepOutcome::Breakpoint(imm));
+                        steps -= 1;
+                        self.cycles += cycles;
+                        self.instructions += steps as u64;
+                        return Batch { steps: steps + 1, cycles, stop };
+                    }
+                    f => {
+                        self.r[15] = pc;
+                        self.cycles += cycles;
+                        self.instructions += steps as u64 - 1;
+                        match self.take_fault(bus, f) {
+                            StepOutcome::Ran(c) => cycles += c as u64,
+                            other => stop = Some(other),
+                        }
+                        return Batch { steps, cycles, stop };
+                    }
+                }
+            }};
+        }
+        'batch: while steps < max_steps {
             if self.exc_changed {
                 self.exc_changed = false;
                 self.latch_irqs();
@@ -673,6 +730,77 @@ impl CortexM0Plus {
             if pc < trap_below {
                 break;
             }
+            if let Some(cache) = cache.as_deref_mut() {
+                if !systick {
+                    let (c, ran, exit) = self.run_blocks(bus, cache, max_steps - steps, cycles, budget, trap_below);
+                    cycles = c;
+                    steps += ran;
+                    match exit {
+                        block::Exit::Batch => break,
+                        block::Exit::Fault(f, at) => fault!(f, at),
+                        block::Exit::Next if ran > 0 => continue,
+                        block::Exit::Next => {}
+                    }
+                }
+                // Op by op, as the interpreter checks after each instruction (the budget is close, or SysTick
+                // counts every cycle)
+                if let Some(code) = bus.code_at(pc) {
+                    let block = cache.lookup(pc, code);
+                    let len = block.len();
+                    let ops = block.ops();
+                    let run = &ops[..ops.len().min((max_steps - steps) as usize)];
+                    let mut leave = false;
+                    // After `$i` ops, the last of them `$op`: where the PC goes on
+                    macro_rules! done {
+                        ($i:expr, $op:expr) => {{
+                            steps += $i as u32;
+                            if !$op.kind.sets_pc() {
+                                self.r[15] = pc.wrapping_add($op.off as u32 + 2);
+                            }
+                        }};
+                    }
+                    for (i, &op) in run.iter().enumerate() {
+                        let mut c = match self.exec_op(bus, op, pc, len, cycles, &mut leave) {
+                            Ok(c) => c,
+                            Err(f) => {
+                                steps += i as u32 + 1;
+                                fault!(f, pc.wrapping_add(op.off as u32))
+                            }
+                        };
+                        let uses_bus = op.kind.uses_bus();
+                        if uses_bus {
+                            c += bus.take_stall_cycles();
+                        }
+                        if systick {
+                            self.tick(c);
+                        }
+                        cycles += c as u64;
+                        if uses_bus {
+                            if bus.take_attention() || std::mem::take(&mut self.batch_break) || cycles >= budget {
+                                done!(i + 1, op);
+                                break 'batch;
+                            }
+                            if bus.take_slow_access() || leave || self.exc_changed {
+                                done!(i + 1, op);
+                                continue 'batch;
+                            }
+                        } else {
+                            if cycles >= budget {
+                                done!(i + 1, op);
+                                break 'batch;
+                            }
+                            if systick && self.exc_changed {
+                                done!(i + 1, op);
+                                continue 'batch;
+                            }
+                        }
+                    }
+                    if let Some(op) = run.last() {
+                        done!(run.len(), op);
+                        continue;
+                    }
+                }
+            }
             bus.set_elapsed(cycles);
             steps += 1;
             match self.execute::<B, false>(bus) {
@@ -683,27 +811,7 @@ impl CortexM0Plus {
                     }
                     cycles += c as u64;
                 }
-                Err(Fault::Breakpoint(imm)) => {
-                    self.r[15] = pc;
-                    // What a tracked step leaves for `escalate_breakpoint`
-                    self.last_pc = pc;
-                    self.last_opcode = 0xBE00 | imm as u32;
-                    stop = Some(StepOutcome::Breakpoint(imm));
-                    steps -= 1;
-                    self.cycles += cycles;
-                    self.instructions += steps as u64;
-                    return Batch { steps: steps + 1, cycles, stop };
-                }
-                Err(f) => {
-                    self.r[15] = pc;
-                    self.cycles += cycles;
-                    self.instructions += steps as u64 - 1;
-                    match self.take_fault(bus, f) {
-                        StepOutcome::Ran(c) => cycles += c as u64,
-                        other => stop = Some(other),
-                    }
-                    return Batch { steps, cycles, stop };
-                }
+                Err(f) => fault!(f, pc),
             }
             if bus.take_attention() || std::mem::take(&mut self.batch_break) || cycles >= budget {
                 break;

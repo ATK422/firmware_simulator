@@ -2011,6 +2011,8 @@ pub struct BatchBus<'a> {
     noisy: bool,
     timer_ticks: Option<u64>,
     ticked: bool,
+    /// An access since the last [`Bus::take_slow_access`] went through the general path.
+    slow: bool,
 }
 
 /// What a batch touched, for busy-wait skipping (see `Machine::run_until`).
@@ -2053,6 +2055,7 @@ impl<'a> BatchBus<'a> {
             noisy: false,
             timer_ticks: None,
             ticked: false,
+            slow: false,
         }
     }
 
@@ -2098,6 +2101,7 @@ impl<'a> BatchBus<'a> {
     #[inline(never)]
     fn xip_check(&mut self, addr: u32) -> Result<(), BusFault> {
         self.noisy = true;
+        self.slow = true;
         let now = self.now();
         self.sys.xip_check(now, addr)
     }
@@ -2123,6 +2127,7 @@ impl<'a> BatchBus<'a> {
     #[inline(never)]
     fn slow_read(&mut self, addr: u32, size: Size) -> Result<u32, BusFault> {
         self.noisy = true;
+        self.slow = true;
         let now = self.now();
         let r = self.sys.read(self.trace, self.core, now, addr, size);
         self.after_access(now);
@@ -2132,6 +2137,7 @@ impl<'a> BatchBus<'a> {
     #[inline(never)]
     fn slow_write(&mut self, addr: u32, size: Size, value: u32) -> Result<(), BusFault> {
         self.noisy = true;
+        self.slow = true;
         let now = self.now();
         let r = self.sys.write(self.trace, self.core, now, addr, size, value);
         self.after_access(now);
@@ -2233,6 +2239,29 @@ impl Bus for BatchBus<'_> {
             return half(&self.sys.rom, addr as usize);
         }
         None
+    }
+
+    #[inline(always)]
+    fn code_at(&mut self, addr: u32) -> Option<&[u8]> {
+        // Exactly where fetch16_fast serves halfwords from
+        let (buf, off) = if addr >> 26 == XIP_BASE >> 26 {
+            let mask = self.flash_mask.filter(|_| self.xip_ok)?;
+            // What xip_check does when XIP works
+            self.sys.xip_failed = false;
+            (&self.sys.flash, addr as usize & mask)
+        } else if addr.wrapping_sub(SRAM_BASE) < SRAM_SIZE as u32 {
+            (&self.sys.sram, addr.wrapping_sub(SRAM_BASE) as usize)
+        } else if (addr as usize) < ROM_SIZE {
+            (&self.sys.rom, addr as usize)
+        } else {
+            return None;
+        };
+        buf.get(off..).filter(|b| b.len() >= 2)
+    }
+
+    #[inline]
+    fn take_slow_access(&mut self) -> bool {
+        std::mem::take(&mut self.slow)
     }
 
     #[inline(always)]

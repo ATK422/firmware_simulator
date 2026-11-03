@@ -66,6 +66,26 @@ pub trait Bus {
         None
     }
 
+    /// The memory that [`Bus::fetch16_fast`] serves `addr` from, from `addr` to its end, with the same side effects
+    /// as a fast fetch at `addr`; `None` where `fetch16_fast` would return `None`. Lets an interpreter decode a run
+    /// of instructions at once (and see later whether they are still the same). Every fast fetch from the returned
+    /// bytes must be one that `fetch16_fast` would have served (with no further side effects) until an access
+    /// reports [`Bus::take_slow_access`]. A bus that serves code must also answer [`Bus::take_attention`] for
+    /// accesses only: an interpreter running decoded instructions does not ask it after those that access nothing.
+    #[inline]
+    fn code_at(&mut self, addr: u32) -> Option<&[u8]> {
+        let _ = addr;
+        None
+    }
+
+    /// Whether an access since the last call went anywhere but plain memory (a peripheral register, a checked flash
+    /// access): it may have changed what [`Bus::code_at`] returned, or whether fast fetches are still allowed. The
+    /// default says yes after every access.
+    #[inline]
+    fn take_slow_access(&mut self) -> bool {
+        true
+    }
+
     /// Extra stall cycles accumulated by accesses since the last call (e.g. XIP cache misses).
     fn take_stall_cycles(&mut self) -> u32 {
         0
