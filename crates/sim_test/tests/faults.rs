@@ -706,6 +706,26 @@ fn hung_c_firmware_reports_a_watchdog_reset() {
     assert!(out.contains("Fault FAULT_WATCHDOG_RESET (0) Raised"), "{out}");
 }
 
+/// A watchdog timeout without a hang (as if the timer had run out), and faults that do not fit the board.
+#[test]
+fn watchdog_timeout_and_faults_that_do_not_apply() {
+    let Some(mut b) = power_board() else { return };
+    b.inject(Fault::WatchdogTimeout).unwrap();
+    b.wait_for_log("Watchdog timeout after", ms(500)).unwrap();
+    assert!(b.logged("watchdog_timeouts: 1, panics: 0"));
+    for (fault, why) in [
+        (Fault::EthernetLink(false), "the board has no Ethernet"),
+        (Fault::I2c { address: 0x50, fault: Some(I2cFault::Absent) }, "no I2C device at 0x50"),
+        (Fault::Adc { input: 4, fault: None }, "ADC input 4 is not a pin (0-3)"),
+        (Fault::Hang { core: 2, interrupts_masked: false }, "core 2 is not running"),
+    ] {
+        assert_eq!(b.inject(fault), Err(why.to_string()));
+    }
+    let Some(elf) = sim_test::titan_rs("puddles_backplane") else { return };
+    let mut p = Bench::builder(&elf).board("mk2/puddles_backplane").bridge(1).boot().unwrap();
+    assert_eq!(p.inject(Fault::CanStuckDominant(true)), Err("the board is not on a CAN bus".into()));
+}
+
 /// A panic before ROS connects (3 s watchdog) is recorded as a panic; a brownout then clears the crash record.
 #[test]
 fn panic_and_brownout_resets() {
