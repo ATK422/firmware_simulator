@@ -80,12 +80,18 @@ impl CortexM0Plus {
         Ok((Next::Branch(target & !1), 0))
     }
 
-    /// Executes the instruction at the PC. Returns the cycles it took.
-    pub(crate) fn execute<B: Bus + ?Sized>(&mut self, bus: &mut B) -> Result<u32, Fault> {
+    /// Executes the instruction at the PC. Returns the cycles it took. With `TRACK` the instruction's address and
+    /// encoding are kept in `last_pc`/`last_opcode` (for tracing); batches leave them alone.
+    pub(crate) fn execute<B: Bus + ?Sized, const TRACK: bool>(&mut self, bus: &mut B) -> Result<u32, Fault> {
         let pc = self.r[15];
-        let ins = bus.fetch16(pc)? as u32;
-        self.last_pc = pc;
-        self.last_opcode = ins;
+        let ins = match bus.fetch16_fast(pc) {
+            Some(v) => v,
+            None => bus.fetch16(pc)?,
+        } as u32;
+        if TRACK {
+            self.last_pc = pc;
+            self.last_opcode = ins;
+        }
         let pcv = pc.wrapping_add(4);
         let mut width = 2;
         let mut cycles = 1;
@@ -348,7 +354,9 @@ impl CortexM0Plus {
             // 32-bit encodings
             0b11101..=0b11111 => {
                 let hw2 = bus.fetch16(pc.wrapping_add(2))? as u32;
-                self.last_opcode = ins << 16 | hw2;
+                if TRACK {
+                    self.last_opcode = ins << 16 | hw2;
+                }
                 width = 4;
                 let (n, c) = self.execute32(ins, hw2, pc)?;
                 next = n;

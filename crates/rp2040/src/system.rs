@@ -2029,6 +2029,29 @@ impl Bus for BatchBus<'_> {
     }
 
     #[inline(always)]
+    fn fetch16_fast(&mut self, addr: u32) -> Option<u16> {
+        fn half(buf: &[u8], off: usize) -> Option<u16> {
+            buf.get(off..off + 2).map(|b| u16::from_le_bytes([b[0], b[1]]))
+        }
+        if addr >> 26 == XIP_BASE >> 26 {
+            if self.xip_ok && self.flash_mask.is_some() {
+                // What xip_check does when XIP works
+                self.sys.xip_failed = false;
+                return half(&self.sys.flash, addr as usize & self.flash_mask.unwrap_or(0));
+            }
+            return None;
+        }
+        let sram = addr.wrapping_sub(SRAM_BASE) as usize;
+        if sram < SRAM_SIZE {
+            return half(&self.sys.sram, sram);
+        }
+        if (addr as usize) < ROM_SIZE {
+            return half(&self.sys.rom, addr as usize);
+        }
+        None
+    }
+
+    #[inline(always)]
     fn fetch16(&mut self, addr: u32) -> Result<u16, BusFault> {
         // Halfword aligned (the PC always is), so the second byte is in range whenever the first is
         fn half(buf: &[u8], off: usize) -> Option<u16> {

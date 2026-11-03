@@ -136,7 +136,8 @@ pub struct CortexM0Plus {
     pub(crate) exc_changed: bool,
     /// CPUID value (`0x410CC601` for r0p1).
     pub cpuid: u32,
-    /// Address and encoding of the last executed instruction, for tracing.
+    /// Address and encoding of the last instruction executed by a step (for tracing; batches, which run only while
+    /// nothing traces instructions, update them for a `BKPT` only).
     pub last_pc: u32,
     pub last_opcode: u32,
     pub last_fault: Option<FaultRecord>,
@@ -632,7 +633,7 @@ impl CortexM0Plus {
             }
             bus.set_elapsed(cycles);
             steps += 1;
-            match self.execute(bus) {
+            match self.execute::<B, false>(bus) {
                 Ok(c) => {
                     let c = c + bus.take_stall_cycles();
                     if systick {
@@ -642,6 +643,9 @@ impl CortexM0Plus {
                 }
                 Err(Fault::Breakpoint(imm)) => {
                     self.r[15] = pc;
+                    // What a tracked step leaves for `escalate_breakpoint`
+                    self.last_pc = pc;
+                    self.last_opcode = 0xBE00 | imm as u32;
                     stop = Some(StepOutcome::Breakpoint(imm));
                     steps -= 1;
                     self.cycles += cycles;
@@ -714,7 +718,7 @@ impl CortexM0Plus {
         }
 
         let pc = self.r[15];
-        match self.execute(bus) {
+        match self.execute::<B, true>(bus) {
             Ok(cycles) => {
                 let cycles = cycles + bus.take_stall_cycles();
                 self.cycles += cycles as u64;

@@ -1212,6 +1212,7 @@ fn batch_stops_at_breakpoints_faults_and_trapped_addresses() {
     let b = rig.batch(100, u64::MAX);
     assert_eq!((b.steps, b.stop), (2, Some(StepOutcome::Breakpoint(7))));
     assert_eq!(rig.cpu.pc(), CODE + 2, "the PC stays on the BKPT");
+    assert_eq!((rig.cpu.last_pc, rig.cpu.last_opcode), (CODE + 2, 0xBE07), "for escalate_breakpoint");
 
     // An undefined instruction is taken as a HardFault, which ends the batch
     let mut rig = Rig::new(&[NOP, 0xDE00, NOP]);

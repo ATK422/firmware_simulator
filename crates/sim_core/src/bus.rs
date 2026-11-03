@@ -58,6 +58,14 @@ pub trait Bus {
         self.read(addr, Size::Half).map(|v| v as u16)
     }
 
+    /// Instruction fetch from memory that needs no checks (no faults, no side effects), or `None` to go through
+    /// [`Bus::fetch16`]. Lets an interpreter keep its fast path free of error handling.
+    #[inline]
+    fn fetch16_fast(&mut self, addr: u32) -> Option<u16> {
+        let _ = addr;
+        None
+    }
+
     /// Extra stall cycles accumulated by accesses since the last call (e.g. XIP cache misses).
     fn take_stall_cycles(&mut self) -> u32 {
         0
