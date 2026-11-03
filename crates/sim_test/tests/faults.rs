@@ -785,6 +785,8 @@ fn robot_board_faults_stay_local() {
     let mut r = RobotBench::load("talos.toml", &[("internal", 1)], |spec| {
         spec.board.retain(|b| keep.contains(&b.name.as_str()));
         spec.bus.retain(|b| b.name == "internal");
+        // The vehicle's thrusters are on the ESC boards, which this test leaves out
+        spec.vehicle.clear();
     })
     .unwrap();
     let mut bridges = vec![r.bridges[0].clone().unwrap()];
