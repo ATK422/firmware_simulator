@@ -64,6 +64,9 @@ pub fn board_file(name: &str) -> PathBuf {
     repo().join("boards").join(format!("{name}.toml"))
 }
 
+/// A change to a board description before it is applied.
+pub type BoardEdit = Box<dyn FnOnce(&mut Board)>;
+
 /// Builds a [`Bench`].
 pub struct BenchBuilder {
     elf: PathBuf,
@@ -71,7 +74,7 @@ pub struct BenchBuilder {
     bridge: Option<(u8, Time, Option<bool>)>,
     rom_boot: bool,
     record_bus: bool,
-    edit: Option<Box<dyn FnOnce(&mut Board)>>,
+    edit: Option<BoardEdit>,
 }
 
 impl BenchBuilder {
