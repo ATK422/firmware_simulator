@@ -458,7 +458,6 @@ fn depths(b: &Bench, after: Time) -> Vec<(Time, f32)> {
 }
 
 const FAULT_DEPTH_ERROR: u32 = 1 << 7;
-const FAULT_SHT41_ERROR: u32 = 1 << 8;
 
 #[test]
 fn depth_sensor_failures_on_the_camera_cage() {
@@ -578,6 +577,23 @@ fn sensor_faults_on_the_power_board() {
                 b.run_for(ms(3000));
                 (None, b.faults().unwrap())
             }),
+            // 50 mV of noise on the sense pin (0.55 V at the battery through the 10k/1k divider): the spread of
+            // the published voltage, as (mean, standard deviation)
+            Box::new(move |mut b: Bench| {
+                b.inject(Fault::Adc { input: 0, fault: Some(AnalogFault::Noise(0.05)) }).unwrap();
+                b.run_for(ms(20_000));
+                let v: Vec<f32> = electrical(&b, t0 + ms(300)).iter().map(|e| e.port_voltage).collect();
+                let mean = v.iter().sum::<f32>() / v.len() as f32;
+                let sd = (v.iter().map(|x| (x - mean).powi(2)).sum::<f32>() / v.len() as f32).sqrt();
+                (Some((mean, sd)), b.faults().unwrap())
+            }),
+            // The MCP3426 rail monitor stops answering
+            Box::new(move |mut b: Bench| {
+                b.inject(Fault::I2c { address: 0x68, fault: Some(I2cFault::Absent) }).unwrap();
+                b.run_for(ms(3000));
+                let e = electrical(&b, t0 + ms(2000));
+                (e.last().map(|e| (e.three_volt_voltage, e.balanced_voltage)), b.faults().unwrap())
+            }),
         ],
     );
     let (v, faults) = results[0];
@@ -588,9 +604,17 @@ fn sensor_faults_on_the_power_board() {
     let (port, _) = v.unwrap();
     assert!((port - 16.2).abs() < 2.0, "an open input wanders near its last value: {port}");
     let (_, faults) = results[2];
-    assert_eq!(faults & 0x1F, 0);
-    assert_ne!(faults, 0, "the board's SHT41 fault is raised");
-    let _ = FAULT_SHT41_ERROR;
+    assert_eq!(faults, 1 << 7, "the power board's FAULT_SHT41_ERROR (7) is raised");
+    let (v, faults) = results[3];
+    let (mean, sd) = v.unwrap();
+    eprintln!("port battery with 50 mV pin noise: {mean:.2} V, sd {sd:.2} V");
+    // Each published value is one raw conversion: the noise goes straight to ROS, unfiltered and unflagged
+    assert!((mean - 16.2).abs() < 0.3 && sd > 0.3, "{mean} {sd}");
+    assert_eq!(faults, 0);
+    let (v, faults) = results[4];
+    let (three, balanced) = v.unwrap();
+    assert!(three.is_nan() && balanced.is_nan(), "rails without a reading are NaN: {three} {balanced}");
+    assert_eq!(faults, 1 << 6, "FAULT_ADC_ERROR (6)");
 }
 
 /// The smart battery's BQ40Z80 gauge (bit-banged SMBus) drops off and comes back: FAULT_BQ40_NOT_CONNECTED is
