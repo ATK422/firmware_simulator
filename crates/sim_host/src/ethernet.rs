@@ -143,7 +143,7 @@ pub fn udp(dst_mac: [u8; 6], src: ([u8; 4], u16), dst: ([u8; 4], u16), payload: 
 }
 
 /// The robot computer's network presence: ARP for its address, and the board's MAC once known.
-#[derive(Debug, Default)]
+#[derive(Clone, Debug, Default)]
 struct Host {
     board_mac: Option<[u8; 6]>,
     arp_sent: Option<Time>,
@@ -180,7 +180,7 @@ impl Host {
 }
 
 /// What the Puddles mock bridge saw and is about to send.
-#[derive(Debug, Default)]
+#[derive(Clone, Debug, Default)]
 pub struct PuddlesState {
     pub running: bool,
     /// The `state/kill` value forwarded with every ping (`Some(false)` enables the vehicle).
@@ -213,12 +213,26 @@ impl PuddlesBridge {
         self.state().kill = kill;
     }
 
+    /// An independent bridge with a copy of this one's state (for a snapshot of the session it is attached to).
+    pub fn fork(&self) -> Self {
+        PuddlesBridge(Arc::new(Mutex::new(self.state().clone())))
+    }
+
     pub fn send(&self, msg: HostToDevice) {
         self.state().pending.push(msg);
     }
 
     pub fn stop(&self) {
         self.state().running = false;
+    }
+
+    /// Starts again (pinging from `at`), like restarting the `titan_bridge` process: it has to learn the board's
+    /// MAC address again.
+    pub fn start(&self, at: Time) {
+        let mut s = self.state();
+        s.running = true;
+        s.next_ping = at;
+        s.host = Host::default();
     }
 
     pub fn statuses(&self) -> Vec<(Time, titan_link::FirmwareStatus)> {

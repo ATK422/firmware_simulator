@@ -116,6 +116,14 @@ impl W5500 {
         w
     }
 
+    /// Power lost and restored (a brownout of the board's 3.3 V rail): registers back to their power-on values,
+    /// sockets closed, no SPI frame in progress.
+    pub fn power_on_reset(&mut self) {
+        self.reset();
+        self.phase = Phase::Addr0;
+        self.int_low = None;
+    }
+
     /// Software reset (MR.RST) and power-on values.
     fn reset(&mut self) {
         self.common = [0; 0x40];

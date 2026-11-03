@@ -27,6 +27,7 @@ pub fn resolve_image(path: &std::path::Path) -> std::path::PathBuf {
 pub mod board;
 pub mod defmt;
 pub mod ethernet;
+pub mod fault;
 pub mod gdb;
 pub mod mock_bridge;
 pub mod pty;

@@ -168,6 +168,12 @@ impl CanEndpoint for MockBridge {
         out
     }
 
+    /// `titan_bridge` writes to its SocketCAN interface and drops a frame the interface refuses (`ENOBUFS`), so
+    /// pings do not pile up while the bus is unusable.
+    fn tx_queue_limit(&self) -> Option<usize> {
+        Some(sim_devices::can::ENDPOINT_TX_QUEUE)
+    }
+
     fn receive(&mut self, frame: &CanFrame, at: Time) {
         let mut s = self.state();
         let fields = Fields::decode(frame.id, frame.extended);
