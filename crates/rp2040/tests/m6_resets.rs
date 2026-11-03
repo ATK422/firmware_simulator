@@ -5,6 +5,7 @@
 
 use rp2040::{Machine, MachineConfig};
 use sim_core::bus::Size;
+use sim_core::cpu::Cpu;
 use sim_core::image::Image;
 use sim_core::time::Time;
 
@@ -122,4 +123,44 @@ fn sysresetreq_resets_only_the_core() {
     assert_eq!(m.resets, 0, "no chip or watchdog reset");
     assert_eq!(rd(&mut m, 0x4005_8008), 0, "watchdog REASON untouched");
     assert_eq!(rd(&mut m, CHIP_RESET), HAD_POR);
+}
+
+/// A snapshot holds how the machine boots (directly or through the bootrom), the USB boot request and the reset
+/// count: restored after the machine was switched to booting through the bootrom, the next watchdog reset boots
+/// the program directly again, as it does in a copy that was never switched.
+#[test]
+fn snapshot_restores_the_boot_settings() {
+    let bytes = std::fs::read(concat!(env!("CARGO_MANIFEST_DIR"), "/../../test_programs/watchdog.elf")).unwrap();
+    let image = Image::parse(&bytes).unwrap();
+    let mut m = Machine::new(MachineConfig { bootrom: Some(rp2040::BOOTROM_B1.to_vec()), ..Default::default() });
+    m.sys.unmodelled.log_mode = rp2040::unmodelled::LogMode::Off;
+    m.load(&image).unwrap();
+    m.direct_boot().unwrap();
+    m.run_until(Time::from_ms(15));
+    assert_eq!((m.resets, rd(&mut m, SCRATCH0)), (1, 2));
+    let snap = m.snapshot();
+    let mut original = m.fork();
+    // Rebooted through the bootrom (which finds no boot2 and goes into USB boot), with a USB boot request
+    m.usb_boot_requested = true;
+    m.rom_boot().unwrap();
+    m.run_until(Time::from_ms(18));
+    m.restore(&snap);
+    assert!(!m.boots_from_rom() && !m.usb_boot_requested);
+    assert_eq!(m.resets, 1);
+    original.run_until(Time::from_ms(25));
+    m.run_until(Time::from_ms(25));
+    assert_eq!((original.resets, rd(&mut original, SCRATCH0)), (2, 3), "the watchdog bit again at 20 ms");
+    assert_eq!((m.resets, rd(&mut m, SCRATCH0)), (2, 3), "and the restored machine booted the program again");
+    assert_eq!(m.cores[0].pc(), original.cores[0].pc());
+    // And the other way: a snapshot of a machine that boots through the bootrom restores that
+    let mut rom = Machine::new(MachineConfig { bootrom: Some(rp2040::BOOTROM_B1.to_vec()), ..Default::default() });
+    rom.sys.unmodelled.log_mode = rp2040::unmodelled::LogMode::Off;
+    rom.rom_boot().unwrap();
+    let snap = rom.snapshot();
+    rom.load(&image).unwrap();
+    rom.direct_boot().unwrap();
+    rom.restore(&snap);
+    assert!(rom.boots_from_rom());
+    rom.power_cycle();
+    assert!(rom.cores[0].pc() < 0x4000, "the power-on reset starts in the bootrom");
 }

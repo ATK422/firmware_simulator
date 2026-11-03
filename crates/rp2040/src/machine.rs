@@ -126,7 +126,7 @@ pub struct Machine {
     pub spin_skipped: u64,
 }
 
-/// A snapshot of a machine: everything except the trace sink.
+/// A snapshot of a machine: everything except the trace sink (and the host's settings: breakpoints, HLE, quantum).
 #[derive(Clone)]
 pub struct Snapshot {
     cores: [CortexM0Plus; 2],
@@ -136,6 +136,12 @@ pub struct Snapshot {
     now: Time,
     clk_sys: ClockPeriod,
     systick_ref: [Option<u64>; 2],
+    /// How resets boot, and what they have done so far.
+    boot_vtor: Option<u32>,
+    rom_boot: bool,
+    usb_boot_requested: bool,
+    resets: u32,
+    last_ran: usize,
 }
 
 impl Machine {
@@ -1081,6 +1087,11 @@ impl Machine {
             now: self.now,
             clk_sys: self.clk_sys,
             systick_ref: self.systick_ref,
+            boot_vtor: self.boot_vtor,
+            rom_boot: self.rom_boot,
+            usb_boot_requested: self.usb_boot_requested,
+            resets: self.resets,
+            last_ran: self.last_ran,
         }
     }
 
@@ -1093,6 +1104,11 @@ impl Machine {
         self.now = s.now;
         self.clk_sys = s.clk_sys;
         self.systick_ref = s.systick_ref;
+        self.boot_vtor = s.boot_vtor;
+        self.rom_boot = s.rom_boot;
+        self.usb_boot_requested = s.usb_boot_requested;
+        self.resets = s.resets;
+        self.last_ran = s.last_ran;
         self.sys.irq_dirty = true;
         // The run loop's caches describe the state before the restore (as in `fork`, the copy starts without them)
         self.budget_carry = None;
