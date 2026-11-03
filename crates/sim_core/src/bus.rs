@@ -86,6 +86,15 @@ pub trait Bus {
         true
     }
 
+    /// Plain memory at `addr..addr + len` (word aligned) that a CPU may read or (with `write`) write directly, as
+    /// word accesses through [`Bus::read`]/[`Bus::write`] would, in address order and with no other effect than
+    /// they would have; `None` to go through them. For multi-word transfers (`PUSH`, `POP`, `LDM`, `STM`).
+    #[inline]
+    fn ram(&mut self, addr: u32, len: u32, write: bool) -> Option<&mut [u8]> {
+        let _ = (addr, len, write);
+        None
+    }
+
     /// Extra stall cycles accumulated by accesses since the last call (e.g. XIP cache misses).
     fn take_stall_cycles(&mut self) -> u32 {
         0

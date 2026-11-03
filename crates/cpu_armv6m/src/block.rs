@@ -605,29 +605,113 @@ impl CortexM0Plus {
 
     // The longer ops, out of line so that the loop running blocks stays small
 
+    // Multi-word transfers go straight to plain RAM where the bus allows (`Bus::ram`), else word by word
+
     #[inline(never)]
     fn op_stm<B: Bus + ?Sized>(&mut self, bus: &mut B, rn: u32, list: u32) -> Result<u32, Fault> {
+        let count = list.count_ones();
+        let start = self.r[rn as usize & 7];
+        if start & 3 == 0
+            && let Some(mem) = bus.ram(start, 4 * count, true)
+        {
+            let mut words = mem.chunks_exact_mut(4);
+            for i in 0..8 {
+                if list & (1 << i) != 0
+                    && let Some(w) = words.next()
+                {
+                    w.copy_from_slice(&self.r[i].to_le_bytes());
+                }
+            }
+            self.r[rn as usize & 7] = start.wrapping_add(4 * count);
+            return Ok(1 + count);
+        }
         self.stm(bus, rn, list)
     }
 
     #[inline(never)]
     fn op_ldm<B: Bus + ?Sized>(&mut self, bus: &mut B, rn: u32, list: u32) -> Result<u32, Fault> {
+        let count = list.count_ones();
+        let start = self.r[rn as usize & 7];
+        if start & 3 == 0
+            && let Some(mem) = bus.ram(start, 4 * count, false)
+        {
+            let mut words = mem.chunks_exact(4);
+            for i in 0..8 {
+                if list & (1 << i) != 0
+                    && let Some(w) = words.next()
+                {
+                    self.r[i] = u32::from_le_bytes([w[0], w[1], w[2], w[3]]);
+                }
+            }
+            if list & (1 << rn) == 0 {
+                self.r[rn as usize & 7] = start.wrapping_add(4 * count);
+            }
+            return Ok(1 + count);
+        }
         self.ldm(bus, rn, list)
     }
 
     #[inline(never)]
     fn op_push<B: Bus + ?Sized>(&mut self, bus: &mut B, list: u32) -> Result<u32, Fault> {
+        let count = list.count_ones();
+        let start = self.r[13].wrapping_sub(4 * count);
+        if start & 3 == 0
+            && let Some(mem) = bus.ram(start, 4 * count, true)
+        {
+            let mut words = mem.chunks_exact_mut(4);
+            for i in 0..15 {
+                if list & (1 << i) != 0
+                    && let Some(w) = words.next()
+                {
+                    w.copy_from_slice(&self.r[i].to_le_bytes());
+                }
+            }
+            self.r[13] = start;
+            return Ok(1 + count);
+        }
         self.push(bus, list)
     }
 
+    /// `POP` straight from plain RAM: the cycles and the PC popped (if the list has it), or `None` to pop word by
+    /// word.
+    #[inline(always)]
+    fn pop_ram<B: Bus + ?Sized>(&mut self, bus: &mut B, list: u32) -> Option<(u32, Option<u32>)> {
+        let count = list.count_ones();
+        let start = self.r[13];
+        if start & 3 != 0 {
+            return None;
+        }
+        let mem = bus.ram(start, 4 * count, false)?;
+        let mut words = mem.chunks_exact(4).map(|w| u32::from_le_bytes([w[0], w[1], w[2], w[3]]));
+        for i in 0..8 {
+            if list & (1 << i) != 0
+                && let Some(v) = words.next()
+            {
+                self.r[i] = v;
+            }
+        }
+        let pc = words.next();
+        self.r[13] = start.wrapping_add(4 * count);
+        Some((1 + count, pc))
+    }
+
     #[inline(never)]
-    fn op_pop<B: Bus + ?Sized>(&mut self, bus: &mut B, list: u32) -> Result<(Next, u32), Fault> {
-        self.pop(bus, list)
+    fn op_pop<B: Bus + ?Sized>(&mut self, bus: &mut B, list: u32) -> Result<u32, Fault> {
+        match self.pop_ram(bus, list) {
+            Some((c, _)) => Ok(c),
+            None => self.pop(bus, list).map(|(_, c)| c),
+        }
     }
 
     #[inline(never)]
     fn op_pop_pc<B: Bus + ?Sized>(&mut self, bus: &mut B, list: u32) -> Result<u32, Fault> {
-        let (n, c) = self.pop(bus, list)?;
+        let (n, c) = match self.pop_ram(bus, list) {
+            Some((c, Some(pc))) => {
+                let (n, extra) = self.bx_write_pc(bus, pc)?;
+                (n, c + 2 + extra)
+            }
+            _ => self.pop(bus, list)?,
+        };
         if let Next::Branch(t) = n {
             self.r[15] = t;
         }
@@ -965,7 +1049,7 @@ impl CortexM0Plus {
             }
             K::Pop => {
                 timed!();
-                return self.op_pop(bus, imm).map(|(_, c)| c);
+                return self.op_pop(bus, imm);
             }
             K::B => {
                 self.r[15] = imm;

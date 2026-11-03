@@ -2188,7 +2188,7 @@ impl<'a> BatchBus<'a> {
 }
 
 impl Bus for BatchBus<'_> {
-    #[inline]
+    #[inline(always)]
     fn read(&mut self, addr: u32, size: Size) -> Result<u32, BusFault> {
         let sram = addr.wrapping_sub(SRAM_BASE) as usize;
         if sram < SRAM_SIZE {
@@ -2207,7 +2207,7 @@ impl Bus for BatchBus<'_> {
         self.slow_read(addr, size)
     }
 
-    #[inline]
+    #[inline(always)]
     fn write(&mut self, addr: u32, size: Size, value: u32) -> Result<(), BusFault> {
         let sram = addr.wrapping_sub(SRAM_BASE) as usize;
         if sram < SRAM_SIZE {
@@ -2262,6 +2262,17 @@ impl Bus for BatchBus<'_> {
     #[inline]
     fn take_slow_access(&mut self) -> bool {
         std::mem::take(&mut self.slow)
+    }
+
+    #[inline(always)]
+    fn ram(&mut self, addr: u32, len: u32, write: bool) -> Option<&mut [u8]> {
+        let off = addr.wrapping_sub(SRAM_BASE) as usize;
+        if off < SRAM_SIZE && len as usize <= SRAM_SIZE - off {
+            // What write does for SRAM
+            self.noisy |= write;
+            return Some(&mut self.sys.sram[off..off + len as usize]);
+        }
+        None
     }
 
     #[inline(always)]

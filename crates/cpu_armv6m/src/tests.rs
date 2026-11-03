@@ -19,11 +19,13 @@ struct TestBus {
     rom: Vec<u8>,
     ram: Vec<u8>,
     writes: Vec<(u32, Size, u32)>,
+    /// RAM handed out for writing (`Bus::ram`) and not yet logged in `writes`: logged at the next access.
+    pending: Option<(u32, u32)>,
 }
 
 impl TestBus {
     fn new() -> Self {
-        TestBus { rom: vec![0; 0x1_0000], ram: vec![0; RAM_SIZE], writes: Vec::new() }
+        TestBus { rom: vec![0; 0x1_0000], ram: vec![0; RAM_SIZE], writes: Vec::new(), pending: None }
     }
     fn region(&mut self, addr: u32) -> Option<(&mut Vec<u8>, usize)> {
         if (addr as usize) < self.rom.len() {
@@ -1232,11 +1234,31 @@ fn batch_stops_at_breakpoints_faults_and_trapped_addresses() {
 /// everything is plain memory) as the default does not.
 struct CodeBus<'a>(&'a mut TestBus);
 
+impl CodeBus<'_> {
+    /// Logs what was written through `ram`.
+    fn flush(&mut self) {
+        if let Some((addr, len)) = self.0.pending.take() {
+            for k in 0..len / 4 {
+                let v = self.0.word(addr + 4 * k);
+                self.0.writes.push((addr + 4 * k, Size::Word, v));
+            }
+        }
+    }
+}
+
+impl Drop for CodeBus<'_> {
+    fn drop(&mut self) {
+        self.flush();
+    }
+}
+
 impl Bus for CodeBus<'_> {
     fn read(&mut self, addr: u32, size: Size) -> Result<u32, BusFault> {
+        self.flush();
         self.0.read(addr, size)
     }
     fn write(&mut self, addr: u32, size: Size, value: u32) -> Result<(), BusFault> {
+        self.flush();
         self.0.write(addr, size, value)
     }
     fn fetch16_fast(&mut self, addr: u32) -> Option<u16> {
@@ -1244,6 +1266,18 @@ impl Bus for CodeBus<'_> {
     }
     fn code_at(&mut self, addr: u32) -> Option<&[u8]> {
         self.0.region(addr).map(|(b, o)| &b[o..]).filter(|b| b.len() >= 2)
+    }
+    fn ram(&mut self, addr: u32, len: u32, write: bool) -> Option<&mut [u8]> {
+        // RAM only, and logged as the word writes would be
+        self.flush();
+        if !(RAM..RAM + RAM_SIZE as u32).contains(&addr) || (addr - RAM + len) as usize > RAM_SIZE {
+            return None;
+        }
+        if write {
+            self.0.pending = Some((addr, len));
+        }
+        let off = (addr - RAM) as usize;
+        Some(&mut self.0.ram[off..off + len as usize])
     }
     fn take_slow_access(&mut self) -> bool {
         false
