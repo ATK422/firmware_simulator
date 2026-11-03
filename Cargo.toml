@@ -1,6 +1,47 @@
+[workspace]
+resolver = "3"
+members = [".", "crates/*"]
+
+[workspace.package]
+edition = "2024"
+version = "0.1.0"
+license = "MIT"
+rust-version = "1.85"
+
+[workspace.dependencies]
+sim_core = { path = "crates/sim_core" }
+cpu_armv6m = { path = "crates/cpu_armv6m" }
+rp2040 = { path = "crates/rp2040" }
+sim_devices = { path = "crates/sim_devices" }
+sim_acoustics = { path = "crates/sim_acoustics" }
+sim_host = { path = "crates/sim_host" }
+sim_test = { path = "crates/sim_test" }
+log = "0.4"
+object = { version = "0.36", default-features = false, features = ["read_core", "elf", "std"] }
+anyhow = "1"
+thiserror = "2"
+
 [package]
 name = "firmware_simulator"
-version = "0.1.0"
-edition = "2024"
+description = "RP2040 emulator for UWRT titan firmware"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
 
 [dependencies]
+sim_core.workspace = true
+rp2040.workspace = true
+log.workspace = true
+anyhow.workspace = true
+clap = { version = "4", features = ["derive"] }
+env_logger = "0.11"
+
+[profile.release]
+debug = 1
+
+[profile.dev]
+# The interpreter is unusably slow unoptimised; keep debug info but optimise
+opt-level = 1
+
+[profile.test]
+opt-level = 1

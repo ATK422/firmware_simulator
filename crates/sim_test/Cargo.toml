@@ -1,0 +1,12 @@
+[package]
+name = "sim_test"
+description = "Firmware integration test harness"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+sim_core.workspace = true
+rp2040.workspace = true
+sim_host.workspace = true
+log.workspace = true

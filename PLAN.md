@@ -72,6 +72,7 @@ WS2812 strip (decode only).
 | `cpu_armv6m` | Cortex-M0+ interpreter: ARMv6-M Thumb (all 16-bit plus `BL`, `MRS`, `MSR`, `DMB`, `DSB`, `ISB`), exception entry/return, NVIC, SysTick, SCB, cycle counts. Implements a `Cpu` trait from `sim_core`. |
 | `rp2040` | The SoC: memory map, bus fabric, every RP2040 peripheral, `Machine` builder. Register offsets generated at build time from `rp2040.svd` (from pico-sdk). |
 | `sim_devices` | External chip models, each attached to SPI/I2C/UART/GPIO wires. |
+| `sim_acoustics` | Underwater acoustic environments for IVC testing: transducers described by their specs, a water channel (spreading, absorption, multipath, noise, Doppler) and receive chains, connected to board output pins and ADC inputs. No board or chip knowledge. See [Acoustic environments](#acoustic-environments-ivc). |
 | `sim_host` | Host bridges: SocketCAN, UDP, GDB remote protocol, RTT/defmt reader, UART pty. |
 | `firmware_simulator` (bin) | CLI: load ELF/UF2 + board/robot description, run, attach debugger, record traces. |
 | `sim_test` | Library for firmware integration tests (`#[test]` that boots an ELF, drives pins/sensors, asserts on CAN traffic). |
@@ -128,6 +129,79 @@ A robot file lists boards with their ELF and the CAN buses they share; `firmware
 them all in one process on an in-process bus that is also bridged to `vcan0`/`vcan1`. Board pin maps come from
 `titan_firmware/lib/titan_boards/include/boards/*.h`; generate the TOML from those headers rather than retyping them.
 
+### Acoustic environments (IVC)
+
+The IVC boards are acoustic modems: IVCBoard drives its transducer with a PWM square wave on GPIO 7 (17/19 kHz
+tones) and samples a hydrophone with the ADC at 500 kS/s; IVCBoard2/IVCDAC do the same at 50.5-51.5 kHz, with a
+GPIO-selected analog filter, and listen for 20-40 kHz pingers. Testing them needs the water between boards, and the
+team wants to build different environments to test in. `sim_acoustics` provides that, and it is deliberately not tied
+to the current IVC hardware or modem: an environment is simulated from the specs of whatever transducers, water and
+receive electronics it is given, so a new transducer, a different modem scheme or a non-IVC acoustic board is a
+config change, not emulator code.
+
+* **Transducers by spec.** Each transducer is a projector, a hydrophone or both, described by numbers from its
+  datasheet: transmitting voltage response (TVR, dB re 1 µPa/V at 1 m) and receive sensitivity (dB re 1 V/µPa),
+  either as a frequency table or as a resonance (centre frequency, Q, peak level); directivity (omni, piston of a
+  given radius, or a beam-pattern table); maximum drive voltage; position and orientation on its vehicle.
+* **Electrical coupling, also by spec.** A projector is attached to any board output (a GPIO/PWM/PIO pin, through a
+  driver stage given as supply voltage and output impedance, or a DAC-like voltage) and a hydrophone to any ADC
+  channel through a receive chain given as preamp gain, band-pass corners and order (optionally several filters
+  switched by a GPIO, like IVC's filter select on GPIO 3), DC bias and clipping at the rails. Nothing in the chain
+  knows about IVC symbols; it sees pin waveforms in and ADC voltages out.
+* **The water.** An environment file describes the body of water: open water, a pool or tank (rectangular, with wall
+  reflection coefficients) or a lake/harbour (depth, bottom type); sound speed (constant or from temperature,
+  salinity and depth); absorption (Francois-Garrison); spherical/cylindrical spreading; multipath by the image
+  method (surface, bottom and walls, configurable reflection order); ambient noise (white, or a Wenz-style spectrum
+  by sea state and shipping, plus optional snapping-shrimp impulses); and Doppler from vehicle motion. Vehicles
+  have positions or scripted trajectories.
+* **Other sound sources.** Pingers (frequency, pulse length, period, source level), tones and chirps, WAV playback
+  (including real recordings) and interferers can be placed in the environment without any board behind them.
+* **How it runs.** Projector pin waveforms are sampled into the acoustic model on the virtual clock; each
+  source-receiver path is a delay, gain and absorption filter per image source; hydrophone voltages are produced
+  lazily, so the ADC reads exactly the value at its conversion time. Noise comes from the machine's seed, so runs
+  are reproducible. Hydrophone signals can be recorded to WAV for inspection.
+* **Using it.** Environments live in `environments/*.toml` (e.g. `pool.toml`, `open_water.toml`, `harbour.toml`)
+  and a robot file (or several robots, for Talos and the surface vehicle) names one and places its boards' transducers
+  in it. `sim_test` can sweep range, noise level and multipath to measure byte error rates and pinger amplitude
+  against distance.
+
+```toml
+# environments/pool.toml
+kind = "tank"
+size_m = [25.0, 12.0, 3.0]
+wall_reflection = 0.6
+bottom_reflection = 0.5
+water = { temperature_c = 26.0, salinity_ppt = 0.0 }
+noise = { kind = "white", level_db_re_upa_per_hz = 50.0 }
+multipath = { max_order = 3 }
+
+[[source]]
+kind = "pinger"
+position_m = [20.0, 6.0, 2.0]
+frequency_hz = 25_000
+pulse_ms = 4
+period_ms = 2000
+source_level_db = 180
+```
+
+```toml
+# in a robot file
+[environment]
+file = "environments/pool.toml"
+
+[[board]]
+name = "ivc2"
+elf = "…/ivc_board2"
+position_m = [2.0, 6.0, 1.0]
+
+[board.transducer]
+tvr = { resonance_hz = 51_000, q = 8, peak_db = 140 }
+rvs_db = -190
+beam = "omni"
+drive = { pin = 7, supply_v = 12.0 }
+receive = { adc = 1, gain_db = 40, bandpass_hz = [40_000, 60_000], select_pin = 3 }
+```
+
 ## Milestones
 
 Each milestone ends with something you can run.
@@ -155,8 +229,11 @@ bridge. *Done when*:
 
 **M4 – Sensors and actuators.** I2C (master, with NAK/clock stretching), ADC (+ FIFO/DMA, scripted waveforms per
 channel), PWM (counter compare readout, PWM-as-input), UART; models for SHT41, MCP3426, depth sensor, CD74HC4051,
-gauge, SSD1306 (render to PNG/terminal). *Done when* power, poac, camera cage, SBC and smart battery boards run with
-scripted sensor inputs and their ROS topics carry the expected values through `titan_bridge`.
+gauge, SSD1306 (render to PNG/terminal); `sim_acoustics` core (transducer, receive chain and water models,
+environment files, pingers and WAV sources, ADC coupling). *Done when* power, poac, camera cage, SBC and smart
+battery boards run with scripted sensor inputs and their ROS topics carry the expected values through
+`titan_bridge`, and IVCBoard2 in pinger mode reports a pinger amplitude that falls off with distance as the
+environment predicts.
 
 **M5 – PIO.** Full PIO instruction set, FIFOs/joins, side-set, autopush/pull, IRQ flags, `EXEC`, DMA DREQs, GPIO
 override; WS2812 decoder, DShot ESC model (including bidirectional eRPM reply), Dynamixel servo model on a PIO UART.
@@ -172,7 +249,9 @@ after a forced panic.
 **M7 – Robot and CI.** Robot description, many boards per process, W5500 model + UDP for Puddles, `sim_test`
 harness (boot ELF, inject sensor values/faults, assert on CAN frames or `titan_link` messages decoded with the
 `titan_link` crate), snapshot/restore for fast test setup, GitHub Actions job that builds `titan_firmware_rs` and runs
-every board's smoke test.
+every board's smoke test; boards of one or more robots placed in a shared acoustic environment. *Done when* the smoke
+tests run in CI, and two IVC boards (IVCBoard to IVCBoard, and IVCBoard2 to IVCBoard2) exchange bytes through a
+`pool.toml` environment, with a `sim_test` sweep showing delivery degrading as range and noise grow.
 
 **Later – USB** (PICOBOOT for `upload_tool -u`, CDC for C stdio), RTC, sleep/dormant modes.
 
@@ -194,6 +273,8 @@ every board's smoke test.
 | PIO cost | Step PIO only while enabled; batch stalled SMs; profile before optimising. |
 | MCP2517FD model fidelity (big register set, subtle FIFO semantics) | Model what `titan_rp2040::mcp251xfd` and the C `driver_canbus` use; log every other register access; test both drivers against it. |
 | Firmware relies on timing the emulator gets wrong | Expose cycle-cost tables; flag busy-wait loops on the timer that run "too fast"; keep the hardware checklist for what simulation cannot prove. |
+| Acoustic model too slow at 500 kS/s per hydrophone | Sample projector waveforms only while a projector is driven; precompute per-path impulse responses; cap the multipath order per environment. |
+| Acoustic model gives false confidence | It is for comparing environments and catching regressions, not for proving range: calibrate against IVCDAC recordings once available, and keep in-water tests on the hardware checklist. |
 | Silent divergence from hardware | Unknown-register log is on by default; datasheet-derived peripheral tests; later, hardware trace diffs. |
 
 ## Orin (later)
@@ -219,4 +300,7 @@ keep the SoC out of `sim_core`.
 * Should C firmware support (M2) come before the CAN milestone, or is Rust-first enough? The plan assumes both, since
   coexistence testing needs C boards.
 * Is `rp2040js` (TypeScript, MIT) acceptable as a reference oracle in tests (needs Node in CI)?
+* How detailed should the acoustic channel be? The plan's recommendation is image-method multipath with
+  frequency-dependent absorption, which handles pools, tanks and shallow open water; ray tracing (e.g. a
+  Bellhop-style model for sound-speed profiles) only if tests in deep or stratified water need it.
 * RP2350 later? The Cortex-M33/Hazard3 cores and new peripherals would be a third machine; nothing here blocks it.

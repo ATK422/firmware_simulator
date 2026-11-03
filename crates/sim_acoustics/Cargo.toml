@@ -1,0 +1,9 @@
+[package]
+name = "sim_acoustics"
+description = "Underwater acoustic environments: transducers, water channel and receive chains"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+log.workspace = true
