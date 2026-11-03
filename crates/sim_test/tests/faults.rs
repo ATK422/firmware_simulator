@@ -331,7 +331,14 @@ fn esc_thrusters_go_neutral_when_killed() {
             Box::new(move |mut b: Bench| {
                 let t = b.now();
                 b.inject(Fault::KillSwitch(None)).unwrap();
-                commanding(&mut b, 1000);
+                commanding(&mut b, 1500);
+                (escs(&b).iter().map(|e| neutral_from(e, t).map(|n| n - t)).collect(), b)
+            }),
+            // `state/kill` asserts kill (the kill switch pulled, or the operator killing the vehicle)
+            Box::new(move |mut b: Bench| {
+                let t = b.now();
+                b.inject(Fault::KillSwitch(Some(true))).unwrap();
+                commanding(&mut b, 500);
                 (escs(&b).iter().map(|e| neutral_from(e, t).map(|n| n - t)).collect(), b)
             }),
             // Core 1, which runs the control loop and sends the DShot frames, hangs
@@ -364,9 +371,18 @@ fn esc_thrusters_go_neutral_when_killed() {
         assert!(n > ms(390) && n < ms(520), "neutral {n} after the kill switch stopped");
     }
     assert!(!b.logged("Lost connection"));
+    let st = b.statuses();
+    let last = &st.last().unwrap().1;
+    assert_eq!((last.kill_switches_timed_out, last.kill_switches_asserting_kill), (1, 0), "{last:?}");
+    // Kill asserted: neutral at the next ping (every 100 ms), within a control loop tick of it
+    let (neutral, _) = &results[2];
+    for n in neutral {
+        let n = n.expect("neutral");
+        assert!(n < ms(101), "neutral {n} after the kill");
+    }
     // Core 1 hung: no more DShot frames at all (the ESCs see the signal stop), core 0 notices after 250 ms and
     // panics, which resets the board
-    let (last, b) = &results[2];
+    let (last, b) = &results[3];
     for l in last {
         assert!(l.is_none_or(|l| l < base.now() + ms(5)), "frames after the hang: {l:?}");
     }
