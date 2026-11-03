@@ -11,7 +11,7 @@ milestones are in [PLAN.md](PLAN.md).
 | [`sim_core`](crates/sim_core) | Virtual time (picoseconds), keyed event scheduler, `Bus`/`Peripheral`/`Cpu` traits, wires, trace sinks, ELF/UF2 images |
 | [`cpu_armv6m`](crates/cpu_armv6m) | Cortex-M0+ interpreter: full ARMv6-M Thumb, exceptions, NVIC, SysTick, SCB, MPU registers, disassembler |
 | [`rp2040`](crates/rp2040) | The SoC: memory map, bus fabric, peripherals, the two-core `Machine` and its run loop; register tables generated from `rp2040.svd` |
-| [`sim_devices`](crates/sim_devices) | External chip models: SPI/I2C/UART device traits, CAN bus, MCP2517FD/MCP2518FD, SHT41, MCP3426/8, MS5837, SSD1306, CD74HC4051 |
+| [`sim_devices`](crates/sim_devices) | External chip models: SPI/I2C/UART/pin-level device traits, CAN bus, MCP2517FD/MCP2518FD, SHT41, MCP3426/8, MS5837, SSD1306, CD74HC4051, BQ40Z80, WS2812, DShot ESC, Dynamixel and Hiwonder servos |
 | [`sim_acoustics`](crates/sim_acoustics) | Underwater acoustic environments: water, transducers by spec, receive chains, multipath, noise, sources |
 | [`sim_host`](crates/sim_host) | Host bridges: GDB, RTT/defmt, SocketCAN, UDP, UART ptys (from M1) |
 | [`sim_test`](crates/sim_test) | Firmware integration test harness (M7) |
@@ -65,6 +65,19 @@ inputs: `--input sht41.temperature_c=31.5`, `--input port_battery=14.2`; tests c
 ```bash
 cargo run --release -- run path/to/power_board --board boards/mk2/power_board.toml --mock-bridge 1 --input stbd_battery=15.1
 ```
+
+### PIO and bit-banged devices
+
+The PIO blocks are modelled cycle by cycle (the full instruction set, FIFOs and joins, side-set, autopush/pull,
+IRQ flags, EXEC, DMA requests, pin overrides) and advanced lazily, skipping delays and stalled state machines.
+Devices on PIO-driven pins watch the pin waveforms and answer on the pins: board files list `[[ws2812]]` strips
+(frames are decoded and reported to the `device` trace), `[[dshot_esc]]` ESCs (DShot frames, bidirectional eRPM
+replies, KISS telemetry, a motor model), `[[dynamixel]]` and `[[hiwonder]]` servos on half-duplex serial pins, and
+`[[soft_i2c]]` devices on bit-banged I2C/SMBus pins (the smart battery's BQ40Z80 gauge).
+
+`test_programs/pio/*.pio` (pico-examples programs and a handshake test) and the ESC board's own `.pio` files are
+assembled by pioasm: `scripts/build_pioasm.sh` builds it from titan_firmware's pico-sdk and
+`python3 scripts/assemble_pio.py` writes the `.prog` files the tests read.
 
 ### Acoustic environments
 

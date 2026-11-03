@@ -1,0 +1,8 @@
+# Assembled by pioasm from test_programs/pio/squarewave.pio (scripts/assemble_pio.py)
+program squarewave
+wrap_target 0
+wrap 3
+instr e081
+instr e101
+instr e000
+instr 0001

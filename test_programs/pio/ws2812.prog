@@ -1,0 +1,12 @@
+# Assembled by pioasm from test_programs/pio/ws2812.pio (scripts/assemble_pio.py)
+program ws2812
+wrap_target 0
+wrap 3
+sideset 1 0 0
+define T1 2
+define T2 5
+define T3 3
+instr 6221
+instr 1123
+instr 1400
+instr a442

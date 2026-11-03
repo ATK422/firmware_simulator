@@ -13,6 +13,7 @@ use sim_core::trace::{Category, TraceEvent, TraceSink};
 use sim_core::wire::External;
 use sim_devices::DeviceCtx;
 use sim_devices::i2c::I2cDevice;
+use sim_devices::pin::PinDevice;
 use sim_devices::spi::SpiDevice;
 use sim_devices::uart::UartDevice;
 
@@ -23,6 +24,7 @@ use crate::periph::clocks::{Clocks, Freqs, Pll};
 use crate::periph::dma::{self, Dma, DmaBus};
 use crate::periph::gpio::{Drive, Gpio, func};
 use crate::periph::i2c::{I2c, Step, StepResult};
+use crate::periph::pio::{self, Pio};
 use crate::periph::pwm::Pwm;
 use crate::periph::sio::Sio;
 use crate::periph::spi::Spi;
@@ -49,6 +51,10 @@ pub enum Event {
     UartRx(u8),
     /// I2C n finished a bus step.
     I2cStep(u8),
+    /// Advance the PIO blocks (while a state machine is running).
+    Pio,
+    /// A device drives a pin, or asked to be woken.
+    Wire,
     /// An ADC conversion ends or starts.
     Adc,
     /// Core 1 comes out of reset after its PSM force-off was released (handled by the machine).
@@ -102,6 +108,16 @@ pub struct System {
     /// The device addressed by the transfer in progress on each I2C bus (index into `i2c_devices`).
     i2c_target: [Option<usize>; 2],
     pub adc: Adc,
+    pub pio: [Pio; 2],
+    /// Time base of the PIO cycle count: `clk_sys` cycle `.1` was at time `.0`.
+    pio_base: (Time, u64),
+    in_pio: bool,
+    /// PIO IRQ lines after the last advance.
+    pio_lines: u8,
+    /// Pin drives and wake-ups devices scheduled for later.
+    pub wire: WireQueue,
+    /// Devices watching and driving pins.
+    pub pin_devices: Vec<Box<dyn PinDevice>>,
     /// What drives ADC inputs 0-3 (GPIO 26-29). Unconnected inputs read 0 V.
     pub analog_inputs: [Option<Box<dyn AnalogSource>>; 4],
     /// Die temperature in °C, for the temperature sensor (ADC input 4).
@@ -175,6 +191,12 @@ impl System {
             i2c_devices: Vec::new(),
             i2c_target: [None; 2],
             adc: Adc::default(),
+            pio: [Pio::new(0), Pio::new(1)],
+            pio_base: (Time::ZERO, 0),
+            in_pio: false,
+            pio_lines: 0,
+            wire: WireQueue::default(),
+            pin_devices: Vec::new(),
             analog_inputs: [None, None, None, None],
             chip_temp_c: Signal::Const(27.0),
             adc_vref: 3.3,
@@ -219,6 +241,9 @@ impl System {
         }
         self.i2c_target = [None; 2];
         self.adc = Adc::default();
+        for p in &mut self.pio {
+            p.reset();
+        }
         self.dma = Dma::default();
         self.dreq_pulses = [0; 64];
         self.unmodelled.reset();
@@ -273,6 +298,13 @@ impl System {
         if self.i2c[1].irq() {
             lines |= 1 << irq::I2C1_IRQ;
         }
+        for (b, base) in [(0, irq::PIO0_IRQ_0), (1, irq::PIO1_IRQ_0)] {
+            for n in 0..2 {
+                if self.pio[b].irq_line(n) {
+                    lines |= 1 << (base + n as u32);
+                }
+            }
+        }
         lines
     }
 
@@ -294,6 +326,8 @@ impl System {
             if new.clk_sys == 0 {
                 log::error!("[{now}] clk_sys configured to stop; keeping {} Hz", old.clk_sys);
             } else {
+                self.pio_advance(&mut sim_core::trace::NullSink, now);
+                self.pio_base = (now, self.pio_cycle(now));
                 self.pwm.rebase_all(&self.clk_sys, now);
                 self.clk_sys = ClockPeriod::from_hz(new.clk_sys);
                 self.clk_sys_changed = true;
@@ -350,7 +384,8 @@ impl System {
         }
         let mut replies = Vec::new();
         if let Some(dev) = &mut self.uart_devices[n] {
-            let mut ctx = DevPins { now, gpio: &mut self.gpio, freqs: &self.freqs, changed: false };
+            let mut ctx =
+                DevPins { now, gpio: &mut self.gpio, freqs: &self.freqs, changed: false, wire: &mut self.wire };
             for b in new {
                 replies.extend(dev.receive(&mut ctx, b));
             }
@@ -409,6 +444,10 @@ impl System {
                 bit::ADC => {
                     self.adc = Adc::default();
                     self.sched.cancel(Event::Adc);
+                }
+                bit::PIO0 | bit::PIO1 => {
+                    let i = (n - bit::PIO0) as usize;
+                    self.pio[i].reset();
                 }
                 bit::UART0 | bit::UART1 => {
                     let i = (n - bit::UART0) as usize;
@@ -473,10 +512,15 @@ impl System {
         let sio_oe = self.sio.gpio_oe;
         let pwm = &self.pwm;
         let spis = &self.spi;
+        let pios = &self.pio;
         let clk = self.clk_sys;
         let changed = self.gpio.evaluate(|f, pin| match f {
             func::SIO => Drive { out: sio_out & (1 << pin) != 0, oe: sio_oe & (1 << pin) != 0 },
             func::PWM if pwm.drives_pin(pin) => Drive { out: pwm.pin_output(&clk, now, pin), oe: true },
+            func::PIO0 | func::PIO1 => {
+                let p = &pios[(f == func::PIO1) as usize];
+                Drive { out: p.pad_out & (1 << pin) != 0, oe: p.pad_oe & (1 << pin) != 0 }
+            }
             // SPI: SCK idles at CPOL, TX low, the hardware chip select is low while a frame is on the wire
             func::SPI => {
                 let spi = &spis[(pin >> 3) & 1];
@@ -497,6 +541,9 @@ impl System {
             if self.pwm.input_slices() != 0 {
                 self.update_pwm_inputs(now);
             }
+            if !self.pin_devices.is_empty() {
+                self.notify_pin_devices(trace, changed, now);
+            }
             if trace.wants(Category::Gpio) {
                 for pin in 0..NUM_GPIOS as u8 {
                     if changed & (1 << pin) != 0 {
@@ -505,6 +552,149 @@ impl System {
                 }
             }
             self.update_chip_selects(trace, now);
+        }
+    }
+
+    /// Tells pin-level devices about level changes on the pins they watch.
+    fn notify_pin_devices(&mut self, trace: &mut dyn TraceSink, changed: u32, now: Time) {
+        let level = self.gpio.level;
+        let mut immediate = false;
+        for dev in &mut self.pin_devices {
+            for pin in 0..NUM_GPIOS as u8 {
+                if changed & (1 << pin) != 0 && dev.watches(pin) {
+                    let mut ctx =
+                        DevPins { now, gpio: &mut self.gpio, freqs: &self.freqs, changed: false, wire: &mut self.wire };
+                    dev.pin_changed(&mut ctx, pin, level & (1 << pin) != 0);
+                    immediate |= ctx.changed;
+                }
+            }
+        }
+        self.schedule_wire();
+        self.flush_reports(trace);
+        if immediate {
+            self.update_pins(trace, now);
+        }
+    }
+
+    /// Sends device reports to the trace (and the log).
+    fn flush_reports(&mut self, trace: &mut dyn TraceSink) {
+        for (t, m) in self.wire.reports.drain(..) {
+            log::debug!("[{t}] {m}");
+            if trace.wants(Category::Device) {
+                trace.event(t, TraceEvent::Device { source: "pin".into(), message: m });
+            }
+        }
+    }
+
+    fn schedule_wire(&mut self) {
+        match self.wire.next_time() {
+            Some(t) => self.sched.schedule(Event::Wire, t),
+            None => {
+                self.sched.cancel(Event::Wire);
+            }
+        }
+    }
+
+    /// Applies the drives and wake-ups due by `now`.
+    fn apply_wire(&mut self, trace: &mut dyn TraceSink, now: Time) {
+        while let Some((t, item)) = self.wire.pop_due(now) {
+            match item {
+                WireItem::Drive(pin, value) => {
+                    self.gpio.external[pin as usize] = value;
+                    self.update_pins(trace, t);
+                }
+                WireItem::Wake => {
+                    let mut immediate = false;
+                    for dev in &mut self.pin_devices {
+                        let mut ctx = DevPins {
+                            now: t,
+                            gpio: &mut self.gpio,
+                            freqs: &self.freqs,
+                            changed: false,
+                            wire: &mut self.wire,
+                        };
+                        dev.update(&mut ctx);
+                        immediate |= ctx.changed;
+                    }
+                    if immediate {
+                        self.update_pins(trace, t);
+                    }
+                    self.flush_reports(trace);
+                }
+            }
+        }
+        self.schedule_wire();
+    }
+
+    /// Attaches a pin-level device.
+    pub fn attach_pin_device(&mut self, dev: Box<dyn PinDevice>) {
+        self.pin_devices.push(dev);
+    }
+
+    /// The first pin device model of type `T`.
+    pub fn pin_device<T: 'static>(&self) -> Option<&T> {
+        self.pin_devices.iter().find_map(|d| d.as_any().downcast_ref::<T>())
+    }
+
+    /// The `clk_sys` cycle at `t` on the PIO time base.
+    fn pio_cycle(&self, t: Time) -> u64 {
+        if t <= self.pio_base.0 {
+            return self.pio_base.1;
+        }
+        self.pio_base.1 + self.clk_sys.cycles_in(t - self.pio_base.0)
+    }
+
+    fn pio_time(&self, c: u64) -> Time {
+        self.pio_base.0 + self.clk_sys.cycles(c.saturating_sub(self.pio_base.1))
+    }
+
+    /// Runs both PIO blocks up to `now`: pin output changes are resolved (and reach pin devices) at the cycle they
+    /// happen, and device drives due meanwhile are applied on time.
+    pub fn pio_advance(&mut self, trace: &mut dyn TraceSink, now: Time) {
+        if self.in_pio {
+            return;
+        }
+        self.in_pio = true;
+        let target = self.pio_cycle(now);
+        // When both blocks run, neither gets more than this many cycles ahead of the other
+        const MAX_SKEW: u64 = 32;
+        loop {
+            let wire_t = self.wire.next_time().filter(|&t| t <= now);
+            let seg_end = wire_t.map_or(target, |t| self.pio_cycle(t).min(target));
+            let both = self.pio[0].busy() && self.pio[1].busy();
+            let b = (self.pio[1].cycle < self.pio[0].cycle) as usize;
+            if self.pio[b].cycle < seg_end {
+                let limit = if both { seg_end.min(self.pio[1 - b].cycle + MAX_SKEW) } else { seg_end };
+                let inputs = self.gpio.inputs();
+                if self.pio[b].run(limit, inputs) == pio::Stop::Outputs {
+                    let t = self.pio_time(self.pio[b].cycle);
+                    self.update_pins(trace, t);
+                }
+                continue;
+            }
+            if self.pio[1 - b].cycle < seg_end {
+                let inputs = self.gpio.inputs();
+                if self.pio[1 - b].run(seg_end, inputs) == pio::Stop::Outputs {
+                    let t = self.pio_time(self.pio[1 - b].cycle);
+                    self.update_pins(trace, t);
+                }
+                continue;
+            }
+            match wire_t {
+                Some(t) if self.pio_cycle(t) <= seg_end => self.apply_wire(trace, t),
+                _ => break,
+            }
+        }
+        self.in_pio = false;
+        let lines = self.pio.iter().flat_map(|p| [p.irq_line(0), p.irq_line(1)]).fold(0u8, |a, l| a << 1 | l as u8);
+        if lines != self.pio_lines {
+            self.pio_lines = lines;
+            self.irq_dirty = true;
+        }
+        if self.pio.iter().any(|p| p.busy()) {
+            self.sched.schedule(Event::Pio, now + Time::from_us(1));
+        } else {
+            self.sched.cancel(Event::Pio);
         }
     }
 
@@ -539,7 +729,8 @@ impl System {
             let selected = level == att.cs_active_high;
             if selected != att.selected {
                 att.selected = selected;
-                let mut ctx = DevPins { now, gpio: &mut self.gpio, freqs: &self.freqs, changed: false };
+                let mut ctx =
+                    DevPins { now, gpio: &mut self.gpio, freqs: &self.freqs, changed: false, wire: &mut self.wire };
                 att.dev.select(&mut ctx, selected);
                 pins_changed |= ctx.changed;
             }
@@ -553,12 +744,14 @@ impl System {
     pub fn update_devices(&mut self, trace: &mut dyn TraceSink, now: Time) {
         let mut pins_changed = false;
         for att in &mut self.spi_devices {
-            let mut ctx = DevPins { now, gpio: &mut self.gpio, freqs: &self.freqs, changed: false };
+            let mut ctx =
+                DevPins { now, gpio: &mut self.gpio, freqs: &self.freqs, changed: false, wire: &mut self.wire };
             att.dev.update(&mut ctx);
             pins_changed |= ctx.changed;
         }
         for att in &mut self.i2c_devices {
-            let mut ctx = DevPins { now, gpio: &mut self.gpio, freqs: &self.freqs, changed: false };
+            let mut ctx =
+                DevPins { now, gpio: &mut self.gpio, freqs: &self.freqs, changed: false, wire: &mut self.wire };
             att.dev.update(&mut ctx);
             pins_changed |= ctx.changed;
         }
@@ -640,7 +833,8 @@ impl System {
     fn i2c_perform(&mut self, trace: &mut dyn TraceSink, n: usize, step: Step, at: Time) -> StepResult {
         let mut r = StepResult { addr_ack: true, data_ack: true, read: 0xFF, stretch: Time::ZERO };
         let connected = self.i2c_pins_connected(n);
-        let mut ctx = DevPins { now: at, gpio: &mut self.gpio, freqs: &self.freqs, changed: false };
+        let mut ctx =
+            DevPins { now: at, gpio: &mut self.gpio, freqs: &self.freqs, changed: false, wire: &mut self.wire };
         if let Some((addr, read)) = step.start {
             let target = if connected {
                 self.i2c_devices.iter().position(|a| a.bus == n && a.dev.responds_to(addr))
@@ -779,7 +973,8 @@ impl System {
         let mut reply = 0;
         let mut pins_changed = false;
         for att in self.spi_devices.iter_mut().filter(|a| a.bus == n && a.selected) {
-            let mut ctx = DevPins { now: at, gpio: &mut self.gpio, freqs: &self.freqs, changed: false };
+            let mut ctx =
+                DevPins { now: at, gpio: &mut self.gpio, freqs: &self.freqs, changed: false, wire: &mut self.wire };
             reply = att.dev.transfer(&mut ctx, frame, bits);
             pins_changed |= ctx.changed;
         }
@@ -829,6 +1024,10 @@ impl System {
             dma::dreq::I2C1_TX => self.i2c[1].tx_dreq(),
             dma::dreq::I2C1_RX => self.i2c[1].rx_dreq(),
             dma::dreq::ADC => self.adc.dreq(),
+            0..=3 => self.pio[0].tx_dreq(n as usize),
+            4..=7 => self.pio[0].rx_dreq(n as usize - 4),
+            8..=11 => self.pio[1].tx_dreq(n as usize - 8),
+            12..=15 => self.pio[1].rx_dreq(n as usize - 12),
             24..=31 => self.dreq_pulses[n as usize] > 0,
             _ => false,
         }
@@ -864,6 +1063,14 @@ impl System {
             }
             Event::SpiFrame(n) => self.spi_advance(trace, n as usize, t),
             Event::I2cStep(n) => self.i2c_advance(trace, n as usize, t),
+            Event::Pio => {
+                self.pio_advance(trace, t);
+                self.service_dma(trace, t);
+            }
+            Event::Wire => {
+                self.pio_advance(trace, t);
+                self.apply_wire(trace, t);
+            }
             Event::Adc => self.adc_advance(trace, t),
             Event::Core1Boot | Event::External(_) => {}
         }
@@ -877,6 +1084,9 @@ impl System {
 
     fn periph_read(&mut self, trace: &mut dyn TraceSink, core: u8, now: Time, addr: u32) -> u32 {
         if (SIO_BASE..SIO_BASE + 0x1000).contains(&addr) {
+            if addr - SIO_BASE < 0x50 {
+                self.pio_advance(trace, now);
+            }
             let gpio_in = self.gpio.inputs();
             if let Some(v) = self.sio.read(core, addr - SIO_BASE, gpio_in, 0) {
                 self.irq_dirty = true;
@@ -912,6 +1122,13 @@ impl System {
                 v
             }
             DMA_BASE => self.dma.read(off),
+            PIO0_BASE | PIO1_BASE => {
+                self.pio_advance(trace, now);
+                let v = self.pio[(base == PIO1_BASE) as usize].read(off);
+                self.irq_dirty = true;
+                self.pio_advance(trace, now);
+                v
+            }
             I2C0_BASE | I2C1_BASE => {
                 let n = (base == I2C1_BASE) as usize;
                 self.i2c_advance(trace, n, now);
@@ -941,6 +1158,9 @@ impl System {
 
     fn periph_write(&mut self, trace: &mut dyn TraceSink, core: u8, now: Time, addr: u32, value: u32) {
         if (SIO_BASE..SIO_BASE + 0x1000).contains(&addr) {
+            if addr - SIO_BASE < 0x50 {
+                self.pio_advance(trace, now);
+            }
             if self.sio.write(core, addr - SIO_BASE, value) {
                 self.irq_dirty = true;
                 if addr - SIO_BASE < 0x50 {
@@ -964,7 +1184,24 @@ impl System {
             }
             return;
         }
+        if matches!(base, IO_BANK0_BASE | PADS_BANK0_BASE) {
+            self.pio_advance(trace, now);
+        }
         let handled = match base {
+            PIO0_BASE | PIO1_BASE => {
+                self.pio_advance(trace, now);
+                let b = (base == PIO1_BASE) as usize;
+                let inputs = self.gpio.inputs();
+                let ok = self.pio[b].write(off, value, mode, inputs);
+                self.irq_dirty = true;
+                if self.pio[b].take_outputs_changed() {
+                    self.update_pins(trace, now);
+                }
+                // The write may have unstalled a state machine: run it (and schedule the next advance)
+                self.pio_advance(trace, now);
+                self.service_dma(trace, now);
+                ok.then_some(())
+            }
             CLOCKS_BASE => self.clocks.write(now, off, value, mode).map(|changed| {
                 if changed {
                     self.update_clocks(now);
@@ -1189,6 +1426,7 @@ impl System {
             SPI0_BASE | SPI1_BASE => self.spi[(base == SPI1_BASE) as usize].peek(off),
             I2C0_BASE | I2C1_BASE => self.i2c[(base == I2C1_BASE) as usize].peek(off),
             ADC_BASE => self.adc.peek(off),
+            PIO0_BASE | PIO1_BASE => self.pio[(base == PIO1_BASE) as usize].peek(off),
             DMA_BASE => self.dma.read(off),
             WATCHDOG_BASE => self.watchdog.read(now, off),
             VREG_AND_CHIP_RESET_BASE => self.vreg.read(off),
@@ -1236,12 +1474,51 @@ pub struct I2cAttachment {
     pub dev: Box<dyn I2cDevice>,
 }
 
+/// Something scheduled on the wires: a device driving a pin, or a device wake-up.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum WireItem {
+    Drive(u8, External),
+    Wake,
+}
+
+/// Pin drives and wake-ups in time order (equal times in the order they were scheduled).
+#[derive(Clone, Debug, Default)]
+pub struct WireQueue {
+    items: std::collections::VecDeque<(Time, WireItem)>,
+    /// Device reports waiting to go to the trace.
+    pub reports: Vec<(Time, String)>,
+}
+
+impl WireQueue {
+    pub fn push(&mut self, t: Time, item: WireItem) {
+        let i = self.items.partition_point(|(x, _)| *x <= t);
+        self.items.insert(i, (t, item));
+    }
+
+    pub fn next_time(&self) -> Option<Time> {
+        self.items.front().map(|i| i.0)
+    }
+
+    pub fn pop_due(&mut self, now: Time) -> Option<(Time, WireItem)> {
+        if self.items.front().is_some_and(|i| i.0 <= now) { self.items.pop_front() } else { None }
+    }
+
+    pub fn len(&self) -> usize {
+        self.items.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.items.is_empty()
+    }
+}
+
 /// What a device sees of the board.
 struct DevPins<'a> {
     now: Time,
     gpio: &'a mut Gpio,
     freqs: &'a Freqs,
     changed: bool,
+    wire: &'a mut WireQueue,
 }
 
 impl DeviceCtx for DevPins<'_> {
@@ -1260,6 +1537,20 @@ impl DeviceCtx for DevPins<'_> {
 
     fn pin_level(&self, pin: u8) -> bool {
         self.gpio.level & (1 << pin) != 0
+    }
+
+    fn drive_at(&mut self, at: Time, pin: u8, value: External) {
+        if (pin as usize) < NUM_GPIOS {
+            self.wire.push(at.max(self.now), WireItem::Drive(pin, value));
+        }
+    }
+
+    fn wake_at(&mut self, at: Time) {
+        self.wire.push(at.max(self.now), WireItem::Wake);
+    }
+
+    fn report(&mut self, message: String) {
+        self.wire.reports.push((self.now, message));
     }
 
     fn pin_clock_hz(&self, pin: u8) -> u64 {

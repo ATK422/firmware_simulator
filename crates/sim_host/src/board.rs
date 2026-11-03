@@ -48,6 +48,60 @@ pub struct Board {
     /// Bytes programmed into flash before boot (serial numbers and other per-board data).
     #[serde(default)]
     pub flash: Vec<FlashEntry>,
+    /// WS2812 LED strips.
+    #[serde(default)]
+    pub ws2812: Vec<Ws2812Entry>,
+    /// DShot ESCs with their motors.
+    #[serde(default)]
+    pub dshot_esc: Vec<EscEntry>,
+    /// Dynamixel servos on a TTL bus pin.
+    #[serde(default)]
+    pub dynamixel: Vec<DynamixelEntry>,
+    /// I2C/SMBus devices on bit-banged pins.
+    #[serde(default)]
+    pub soft_i2c: Vec<SoftI2cEntry>,
+    /// Hiwonder bus servos on a half-duplex serial pin.
+    #[serde(default)]
+    pub hiwonder: Vec<HiwonderEntry>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct HiwonderEntry {
+    pub pin: u8,
+    pub id: u8,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct DynamixelEntry {
+    pub pin: u8,
+    pub id: u8,
+    #[serde(default = "dxl_baud")]
+    pub baud: u32,
+    /// Where the horn is at power-up (pulses, 4096 per turn).
+    pub position: Option<f64>,
+    /// Operating mode register (3 position, 4 extended position).
+    pub operating_mode: Option<u8>,
+}
+
+fn dxl_baud() -> u32 {
+    57_600
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct EscEntry {
+    pub name: Option<String>,
+    pub signal_pin: u8,
+    pub telemetry_pin: Option<u8>,
+    /// Mechanical RPM at full throttle.
+    pub max_rpm: Option<f64>,
+    pub pole_pairs: Option<u32>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct Ws2812Entry {
+    pub pin: u8,
+    pub leds: usize,
+    pub name: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -110,6 +164,7 @@ fn yes() -> bool {
 /// A device on an I2C bus.
 #[derive(Debug, Clone, Deserialize)]
 pub struct I2cEntry {
+    #[serde(default)]
     pub bus: usize,
     /// `sht41`, `mcp3426`, `mcp3428`, `ms5837_02ba`, `ms5837_30ba` or `ssd1306`.
     pub device: String,
@@ -128,6 +183,21 @@ pub struct I2cEntry {
     // SSD1306: let page-mode positioning commands work in every addressing mode
     #[serde(default)]
     pub page_commands_in_any_mode: bool,
+    // BQ40Z80: serial number, pack state, side detect (true = port)
+    pub serial: Option<u16>,
+    pub voltage_mv: Option<f64>,
+    pub current_ma: Option<f64>,
+    pub soc_percent: Option<f64>,
+    pub side_port: Option<bool>,
+}
+
+/// An I2C device on two bit-banged pins (a PIO or software I2C/SMBus).
+#[derive(Debug, Clone, Deserialize)]
+pub struct SoftI2cEntry {
+    pub sda: u8,
+    pub scl: u8,
+    #[serde(flatten)]
+    pub device: I2cEntry,
 }
 
 /// A voltage measured through an optional resistor divider (`[top, bottom]` ohms).
@@ -267,6 +337,34 @@ impl Board {
                 }
             }
         }
+        for e in &self.ws2812 {
+            let name = e.name.clone().unwrap_or_else(|| "ws2812".into());
+            m.sys.attach_pin_device(Box::new(sim_devices::ws2812::Ws2812::new(&name, e.pin, e.leds)));
+        }
+        for (i, e) in self.dshot_esc.iter().enumerate() {
+            let name = e.name.clone().unwrap_or_else(|| format!("esc{}", i + 1));
+            let mut esc = sim_devices::dshot::Esc::new(&name, e.signal_pin, e.telemetry_pin);
+            esc.max_rpm = e.max_rpm.unwrap_or(esc.max_rpm);
+            esc.pole_pairs = e.pole_pairs.unwrap_or(esc.pole_pairs);
+            m.sys.attach_pin_device(Box::new(esc));
+        }
+        for e in &self.soft_i2c {
+            let dev = i2c_device(&e.device, &mut inputs)?;
+            m.sys.attach_pin_device(Box::new(sim_devices::i2c_pins::I2cPinTarget::new(e.sda, e.scl, dev)));
+        }
+        for h in &self.hiwonder {
+            m.sys.attach_pin_device(Box::new(sim_devices::hiwonder::Hiwonder::new(h.pin, h.id)));
+        }
+        for d in &self.dynamixel {
+            let mut dxl = sim_devices::dynamixel::Dynamixel::xl430(d.pin, d.id, d.baud);
+            if let Some(p) = d.position {
+                dxl.set_physical_position(p);
+            }
+            if let Some(mode) = d.operating_mode {
+                dxl.table[11] = mode;
+            }
+            m.sys.attach_pin_device(Box::new(dxl));
+        }
         for e in &self.i2c {
             if e.bus > 1 {
                 return Err(format!("I2C bus {} does not exist", e.bus));
@@ -356,6 +454,15 @@ fn i2c_device(e: &I2cEntry, inputs: &mut Inputs) -> Result<Box<dyn I2cDevice>, S
             let p = inputs.add(n("pressure_pa"), p, 1.0);
             let t = inputs.add(n("temperature_c"), e.temperature_c.unwrap_or(20.0), 1.0);
             Box::new(Ms5837::new(model, p, t))
+        }
+        "bq40z80" => {
+            let mut g = sim_devices::bq40z80::Bq40z80::new(e.serial.unwrap_or(1));
+            g.voltage_mv = inputs.add(n("voltage_mv"), e.voltage_mv.unwrap_or(16_400.0), 1.0);
+            g.current_ma = inputs.add(n("current_ma"), e.current_ma.unwrap_or(-2_500.0), 1.0);
+            g.soc_percent = inputs.add(n("soc_percent"), e.soc_percent.unwrap_or(80.0), 1.0);
+            g.temperature_c = inputs.add(n("temperature_c"), e.temperature_c.unwrap_or(25.0), 1.0);
+            g.side_port = e.side_port.unwrap_or(true);
+            Box::new(g)
         }
         "ssd1306" => {
             let mut d = Ssd1306::new();

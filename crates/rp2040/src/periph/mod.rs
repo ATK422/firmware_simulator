@@ -5,6 +5,7 @@ pub mod clocks;
 pub mod dma;
 pub mod gpio;
 pub mod i2c;
+pub mod pio;
 pub mod pwm;
 pub mod sio;
 pub mod spi;

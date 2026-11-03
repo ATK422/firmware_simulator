@@ -1,0 +1,21 @@
+# Assembled by pioasm from external/titan_firmware_rs/firmware/esc_board/src/uart_rx.pio (scripts/assemble_pio.py)
+program uart_rx_mini
+wrap_target 0
+wrap 3
+instr 2020
+instr ea27
+instr 4001
+instr 0642
+
+program uart_rx
+wrap_target 0
+wrap 8
+instr 2020
+instr ea27
+instr 4001
+instr 0642
+instr 00c8
+instr c014
+instr 20a0
+instr 0000
+instr 8020

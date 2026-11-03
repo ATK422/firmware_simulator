@@ -1,0 +1,19 @@
+# Assembled by pioasm from test_programs/pio/handshake.pio (scripts/assemble_pio.py)
+program ping
+wrap_target 0
+wrap 6
+sideset 2 1 1
+instr 80a0
+instr 60f0
+instr a051
+instr a0c2
+instr 8020
+instr d830
+instr b042
+
+program pong
+wrap_target 0
+wrap 2
+instr 20c0
+instr e201
+instr e000

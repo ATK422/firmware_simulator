@@ -1,0 +1,15 @@
+; Two state machines handing a token back and forth through relative IRQ flags, with MOV tricks and OUT EXEC.
+.program ping
+.side_set 1 opt pindirs
+    pull block                ; get a word: low half is an instruction to execute, high half data
+    out exec, 16              ; execute it (sets X)
+    mov y, ::x                ; bit-reverse X into Y
+    mov isr, y
+    push block
+    irq wait 0 rel side 1     ; flag (0 + sm) for the partner, wait until it is cleared
+    nop side 0
+
+.program pong
+    wait 1 irq 0              ; wait for SM0's flag (absolute 0), clears it
+    set pins, 1 [2]
+    set pins, 0
