@@ -1464,6 +1464,10 @@ impl CanNode for Mcp251xfd {
         }
     }
 
+    fn error_passive(&self) -> bool {
+        Mcp251xfd::error_passive(self) && !self.bus_off
+    }
+
     fn recessive_sequences(&mut self, _at: Time, n: u64) {
         self.dominant_run = 0;
         self.stuck_transmitter = false;

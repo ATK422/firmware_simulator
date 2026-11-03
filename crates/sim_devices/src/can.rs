@@ -16,6 +16,10 @@
 //! * **unplugged node**: the node sends alone on its stub, so nothing it sends is acknowledged and it hears
 //!   nothing, while the rest of the bus carries on without it;
 //! * **floods**: an extra node sending one frame at a set bus load, competing in arbitration like any other.
+//!
+//! An unacknowledged frame is 6 bits longer (the transmitter's error flag after the ACK slot), and an error
+//! passive transmitter waits 8 more bit times before its next frame ("suspend transmission"), so error active
+//! nodes get the bus first.
 
 use std::collections::VecDeque;
 
@@ -150,6 +154,11 @@ pub trait CanNode {
     fn recessive_sequences(&mut self, at: Time, n: u64) {
         let _ = (at, n);
     }
+    /// Whether the node is error passive: after sending it then waits 8 more bit times ("suspend transmission")
+    /// before it may start another frame, letting error active nodes go first.
+    fn error_passive(&self) -> bool {
+        false
+    }
 }
 
 /// A host-side participant: a SocketCAN bridge, a scripted mock, a recorder. Endpoints always acknowledge.
@@ -268,6 +277,12 @@ impl BusFaults {
     }
 }
 
+/// Bits an ACK error adds to a frame: the transmitter's error flag (6) starts after the ACK slot, then its
+/// delimiter (8) and the intermission (3), instead of the ACK delimiter (1), EOF (7) and intermission (3).
+const ACK_ERROR_EXTRA_BITS: u64 = 6;
+/// An error passive transmitter's "suspend transmission" time.
+const SUSPEND_TRANSMISSION_BITS: u64 = 8;
+
 /// Default transmit queue length of a Linux CAN interface (`txqueuelen`).
 pub const ENDPOINT_TX_QUEUE: usize = 10;
 
@@ -293,6 +308,8 @@ pub struct CanBus {
     idle_carry: Time,
     /// Dominant bits of a stuck bus have been reported up to here.
     dominant_reported: Time,
+    /// An error passive node that just sent may not start again before this time.
+    suspended: Option<(usize, Time)>,
 }
 
 impl CanBus {
@@ -309,12 +326,17 @@ impl CanBus {
             idle_reported: Time::ZERO,
             idle_carry: Time::ZERO,
             dominant_reported: Time::ZERO,
+            suspended: None,
         }
     }
 
     /// One nominal bit time.
     fn bit_time(&self) -> Time {
         Time(1_000_000_000_000 / self.rates.nominal.max(1))
+    }
+
+    fn bits(&self, n: u64) -> Time {
+        Time(self.bit_time().as_ps() * n)
     }
 
     /// Holds the bus dominant from `at` (`stuck`), or releases it at `at`.
@@ -393,12 +415,15 @@ impl CanBus {
             for _ in 0..10_000 {
                 let Some(r) = nodes[i].tx_request() else { break };
                 let start = r.ready_at.max(free);
-                let end = start + r.frame.duration(self.rates.nominal, data_rate);
+                let end = start + r.frame.duration(self.rates.nominal, data_rate) + self.bits(ACK_ERROR_EXTRA_BITS);
                 if end > until {
                     break;
                 }
                 nodes[i].tx_done(r.token, end, false);
                 free = end;
+                if nodes[i].error_passive() {
+                    free += self.bits(SUSPEND_TRANSMISSION_BITS);
+                }
             }
             self.faults.unplugged[k].1 = free;
         }
@@ -435,7 +460,11 @@ impl CanBus {
                     continue;
                 }
                 if let Some(r) = node.tx_request() {
-                    cands.push((r.ready_at, Sender::Node(i), r.token, r.frame));
+                    let ready = match self.suspended {
+                        Some((n, until)) if n == i => r.ready_at.max(until),
+                        _ => r.ready_at,
+                    };
+                    cands.push((ready, Sender::Node(i), r.token, r.frame));
                 }
             }
             for (i, q) in self.endpoint_queue.iter().enumerate() {
@@ -487,8 +516,14 @@ impl CanBus {
                     }
                 };
                 self.faults.corrupted += 1;
+                self.suspended = None;
                 match sender {
-                    Sender::Node(i) => nodes[i].tx_error(token, end, err),
+                    Sender::Node(i) => {
+                        nodes[i].tx_error(token, end, err);
+                        if nodes[i].error_passive() {
+                            self.suspended = Some((i, end + self.bits(SUSPEND_TRANSMISSION_BITS)));
+                        }
+                    }
                     // An endpoint's or a flood's frame is simply retried (their controllers are outside the model)
                     Sender::Endpoint(_) | Sender::Flood(_) => {}
                 }
@@ -510,7 +545,6 @@ impl CanBus {
                 }
                 continue;
             }
-            let end = full_end;
             // Acknowledged if any other active node or any endpoint listens
             let mut acked = (0..endpoints.len()).any(|i| Sender::Endpoint(i) != sender);
             for (i, node) in nodes.iter().enumerate() {
@@ -518,8 +552,15 @@ impl CanBus {
                     acked = true;
                 }
             }
+            let end = if acked { full_end } else { full_end + self.bits(ACK_ERROR_EXTRA_BITS) };
+            self.suspended = None;
             match sender {
-                Sender::Node(i) => nodes[i].tx_done(token, end, acked),
+                Sender::Node(i) => {
+                    nodes[i].tx_done(token, end, acked);
+                    if nodes[i].error_passive() {
+                        self.suspended = Some((i, end + self.bits(SUSPEND_TRANSMISSION_BITS)));
+                    }
+                }
                 // An endpoint's frame is sent once whether or not anyone acknowledges it (SocketCAN reports errors
                 // to its own writer, which is outside the simulation)
                 Sender::Endpoint(i) => {
@@ -895,5 +936,48 @@ mod tests {
         bus.step(&mut [&mut a], &mut [&mut mon], Time::from_ms(10));
         assert_eq!(a.rx.len(), 10, "the first ten go out once it is free");
         assert_eq!(a.rx[9].1.data, vec![9]);
+    }
+
+    #[test]
+    fn error_passive_transmitter_suspends_and_ack_errors_add_an_error_flag() {
+        struct Passive(Node);
+        impl CanNode for Passive {
+            fn bit_rates(&self) -> Option<BitRates> {
+                self.0.bit_rates()
+            }
+            fn acknowledges(&self) -> bool {
+                true
+            }
+            fn tx_request(&mut self) -> Option<TxRequest> {
+                self.0.tx_request()
+            }
+            fn tx_done(&mut self, token: u64, at: Time, acked: bool) {
+                self.0.tx_done(token, at, acked)
+            }
+            fn receive(&mut self, frame: &CanFrame, at: Time) {
+                self.0.receive(frame, at)
+            }
+            fn error_passive(&self) -> bool {
+                true
+            }
+        }
+        let f = CanFrame::classic(0x10, false, &[0; 8]);
+        let g = CanFrame::classic(0x20, false, &[0; 8]);
+        // The passive node has the lower ID and two frames ready; the active one gets in between
+        let mut a = Passive(node(&[(0, f.clone()), (0, f.clone())]));
+        let mut b = node(&[(0, g.clone())]);
+        let mut bus = CanBus::new("can0", FD);
+        bus.record = Some(vec![]);
+        bus.step(&mut [&mut a, &mut b], &mut [], Time::from_ms(1));
+        let ids: Vec<u32> = bus.record.as_ref().unwrap().iter().map(|r| r.frame.id).collect();
+        assert_eq!(ids, vec![0x10, 0x20, 0x10], "suspend transmission lets the higher ID go first");
+        // Alone, without acknowledgement: each attempt is 6 bits longer, and 8 bits apart
+        let mut a = Passive(node(&[(0, f.clone())]));
+        let mut bus = CanBus::new("can0", FD);
+        bus.step(&mut [&mut a], &mut [], Time::from_us(500));
+        let done = &a.0.done;
+        let d = f.duration(1_000_000, 1_000_000);
+        assert_eq!(done[0].1, d + Time::from_us(6));
+        assert_eq!(done[1].1 - done[0].1, d + Time::from_us(6 + 8));
     }
 }
