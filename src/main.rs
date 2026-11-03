@@ -272,6 +272,10 @@ struct RunArgs {
     /// `--time`. Implies `--usb`.
     #[arg(long)]
     picoboot_load: Option<PathBuf>,
+    /// Export the board's USB device over USB/IP on this address (e.g. `127.0.0.1:3240`) for the real host's tools:
+    /// `sudo usbip attach -r 127.0.0.1 -b 1-1`. Implies `--usb`; use with `--realtime`.
+    #[arg(long)]
+    usbip: Option<String>,
     /// How `--picoboot-load` gets the image onto the board.
     #[arg(long, value_enum, default_value = "picoboot")]
     load_via: LoadVia,
@@ -411,7 +415,7 @@ fn run(args: RunArgs) -> Result<()> {
         log::info!("direct boot: VTOR {vtor:#010x}, entry {:#010x}", machine.cores[0].pc());
     }
 
-    if args.usb || args.bootsel || args.usb_cdc.is_some() || args.picoboot_load.is_some() {
+    if args.usb || args.bootsel || args.usb_cdc.is_some() || args.picoboot_load.is_some() || args.usbip.is_some() {
         let mut host = sim_devices::usb::host::HostController::new();
         if args.usb_cdc.is_some() {
             host.cdc_open(0, 115_200);
@@ -430,6 +434,11 @@ fn run(args: RunArgs) -> Result<()> {
             println!("[{t}] uart{n}: {line}")
         }
     }));
+    if let Some(addr) = &args.usbip {
+        let server = sim_host::usbip::UsbIpServer::bind(addr.as_str()).with_context(|| format!("binding {addr}"))?;
+        eprintln!("USB/IP: exporting bus ID {} on {addr}", sim_host::usbip::BUSID);
+        session.usbip = Some(server);
+    }
     match args.usb_cdc {
         Some(CdcSink::Stdout) => session.on_usb_cdc_line = Some(Box::new(|t, line| println!("[{t}] usb: {line}"))),
         Some(CdcSink::Pty) => {

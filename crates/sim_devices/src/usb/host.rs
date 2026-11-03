@@ -398,9 +398,8 @@ impl HostController {
         self.toggles.remove(&(addr, ep));
     }
 
-    /// Queues CLEAR_FEATURE(ENDPOINT_HALT) for `ep` and resets the host's toggle for it.
+    /// Queues CLEAR_FEATURE(ENDPOINT_HALT) for `ep` (which resets the host's toggle for it once it succeeds).
     pub fn clear_halt(&mut self, ep: u8) -> u32 {
-        self.reset_toggle(ep);
         self.submit_control(SetupPacket::new(req_type::ENDPOINT, request::CLEAR_FEATURE, 0, ep as u16, 0), Vec::new())
     }
 
@@ -639,9 +638,7 @@ impl HostController {
                 self.next_string(step);
             }
             EnumStep::SetConfiguration => {
-                // Bulk and interrupt toggles start at DATA0 in the new configuration
-                let addr = dev.address;
-                self.toggles.retain(|(a, ep), _| *a != addr || *ep == 0);
+                // (`finish` reset the bulk and interrupt toggles)
                 self.enumerations += 1;
                 self.enumeration = Enumeration::Configured;
                 let d = self.device.clone().unwrap_or_default();
@@ -845,6 +842,21 @@ impl HostController {
 
     fn finish(&mut self, i: usize, r: Result<Vec<u8>, UsbError>) {
         let t = self.queue.remove(i);
+        // Standard requests that reset data toggles on the device reset the host's too (USB 2.0 9.4.5, 9.4.10:
+        // SET_CONFIGURATION and SET_INTERFACE reset every endpoint, CLEAR_FEATURE(ENDPOINT_HALT) one)
+        if let (Kind::Control(s), Ok(_)) = (t.kind, &r)
+            && s.request_type & 0x60 == req_type::STANDARD
+        {
+            match s.request {
+                request::SET_CONFIGURATION | request::SET_INTERFACE => {
+                    self.toggles.retain(|(a, ep), _| *a != t.addr || *ep == 0);
+                }
+                request::CLEAR_FEATURE if s.request_type & 0x1F == req_type::ENDPOINT && s.value == 0 => {
+                    self.toggles.remove(&(t.addr, s.index as u8));
+                }
+                _ => {}
+            }
+        }
         self.results.insert(t.id, r);
     }
 
@@ -1092,6 +1104,14 @@ mod tests {
                     self.pending_addr = Some(s.value as u8);
                     None
                 }
+                (request::CLEAR_FEATURE, _) => {
+                    match s.index {
+                        0x01 => self.out_pid = Some(Pid::Data0),
+                        0x81 => self.in_pid = Some(Pid::Data0),
+                        _ => {}
+                    }
+                    None
+                }
                 (request::SET_CONFIGURATION, _) => {
                     self.config = s.value as u8;
                     self.out_pid = Some(Pid::Data0);
@@ -1274,6 +1294,32 @@ mod tests {
         h.set_deadline(r, now + Time::from_ms(20));
         run(&mut h, &mut d, now, now + Time::from_ms(30));
         assert_eq!(h.take_result(r), Some(Err(UsbError::TimedOut)));
+    }
+
+    #[test]
+    fn standard_requests_reset_toggles() {
+        let (mut h, mut d, now) = enumerated();
+        let w = h.submit_bulk_out(0x01, b"abc".to_vec());
+        let now = run(&mut h, &mut d, now, now + Time::from_ms(2));
+        assert_eq!(h.take_result(w), Some(Ok(Vec::new())));
+        assert_eq!(h.toggle(1, 0x01), Pid::Data1);
+        // CLEAR_FEATURE(ENDPOINT_HALT) resets that endpoint's toggle once it succeeds
+        let c = h.clear_halt(0x01);
+        let now = run(&mut h, &mut d, now, now + Time::from_ms(2));
+        assert_eq!(h.take_result(c), Some(Ok(Vec::new())));
+        assert_eq!(h.toggle(1, 0x01), Pid::Data0);
+        // So does SET_CONFIGURATION for every endpoint (the device resets its own: the next OUT is DATA0 again)
+        let w = h.submit_bulk_out(0x01, b"d".to_vec());
+        let now = run(&mut h, &mut d, now, now + Time::from_ms(2));
+        h.take_result(w);
+        let c = h.submit_control(SetupPacket::new(0, request::SET_CONFIGURATION, 1, 0, 0), Vec::new());
+        let now = run(&mut h, &mut d, now, now + Time::from_ms(2));
+        assert_eq!(h.take_result(c), Some(Ok(Vec::new())));
+        assert_eq!(h.toggle(1, 0x01), Pid::Data0);
+        let w = h.submit_bulk_out(0x01, b"e".to_vec());
+        run(&mut h, &mut d, now, now + Time::from_ms(2));
+        h.take_result(w);
+        assert_eq!(d.echo.iter().copied().collect::<Vec<u8>>(), b"abcde", "nothing dropped as a repeat");
     }
 
     #[test]

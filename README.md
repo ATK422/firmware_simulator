@@ -41,7 +41,7 @@ and the ELF's `.defmt` table) and printed with the virtual time they were read a
 Options: `--time` (virtual time to run, e.g. `500ms`), `--trace instr,exc,gpio,unmodelled,device`, `--trace-file`,
 `--quantum` (instructions per core before switching), `--uart0/--uart1 stdout|pty|none`, `--unmodelled first|every|off` (logging of registers the
 emulator does not model yet; each is named from the SVD), `--stop-on-bkpt`, `--crystal-hz`, `--gdb ADDR`, `--rom-boot`, `--hle-flash`, `--flash-file FILE`,
-and for USB `--usb`, `--bootsel`, `--usb-cdc stdout|pty`, `--picoboot-load FILE`, `--load-via picoboot|drive` (see [USB](#usb-bootsel-picoboot-uf2-and-cdc)).
+and for USB `--usb`, `--bootsel`, `--usb-cdc stdout|pty`, `--picoboot-load FILE`, `--load-via picoboot|drive`, `--usbip ADDR` (see [USB](#usb-bootsel-picoboot-uf2-and-cdc)).
 
 ### Boards and CAN
 
@@ -173,6 +173,10 @@ cargo run --release -- run --bootsel --time 300ms --trace device
 cargo run --release -- run test_programs/pico/hello_usb.elf --usb-cdc stdout --time 1s
 cargo run --release -- run test_programs/pico/hello_usb.elf --usb-cdc pty --realtime --time 600s
 ```
+
+`--usbip 127.0.0.1:3240` exports the device over USB/IP, so the real host's tools can use it after `sudo usbip
+attach -r 127.0.0.1 -b 1-1` (`picotool`, `/dev/ttyACM*`, the RPI-RP2 drive); use it with `--realtime`, and attach
+again after the device reboots (the server ends the session when the device leaves the bus).
 
 `test_programs/pico/hello_usb` (pico-sdk stdio_usb) and `test_programs/c_dual_usb` (titan_firmware's
 `titan_dual_stdio_usb`, two CDC ports) are the device-side test programs (`crates/sim_host/tests/usb.rs`). Not

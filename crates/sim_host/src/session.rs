@@ -42,6 +42,8 @@ pub struct Session {
     usb_cdc_line: String,
     /// A pseudo terminal attached to the USB CDC port (host side of the device's serial port).
     pub usb_cdc_pty: Option<crate::pty::Pty>,
+    /// A USB/IP server exporting the board's USB device to the real host.
+    pub usbip: Option<crate::usbip::UsbIpServer>,
     /// The CAN bus the board's CAN controllers sit on, if any.
     pub can_bus: Option<CanBus>,
     /// Host participants on that bus (bridges, mocks).
@@ -90,6 +92,7 @@ impl Session {
             on_usb_cdc_line: None,
             usb_cdc_line: String::new(),
             usb_cdc_pty: None,
+            usbip: None,
             can_bus: None,
             can_endpoints: Vec::new(),
             on_can: None,
@@ -136,6 +139,7 @@ impl Session {
             on_usb_cdc_line: None,
             usb_cdc_line: self.usb_cdc_line.clone(),
             usb_cdc_pty: None,
+            usbip: None,
             can_bus: self.can_bus.clone(),
             can_endpoints: Vec::new(),
             on_can: None,
@@ -301,6 +305,9 @@ impl Session {
             let reason = self.machine.run_until(target);
             self.step_can();
             self.poll_rtt();
+            if let Some(u) = &mut self.usbip {
+                u.poll(&mut self.machine);
+            }
             if self.realtime {
                 self.pace();
             }

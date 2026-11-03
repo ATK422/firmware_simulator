@@ -37,6 +37,7 @@ pub mod socketcan;
 pub mod target;
 pub mod upload;
 pub mod usb;
+pub mod usbip;
 
 pub use session::Session;
 pub use target::TargetMemory;

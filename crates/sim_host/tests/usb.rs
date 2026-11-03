@@ -222,3 +222,123 @@ fn picoboot_loads_a_no_flash_binary_into_sram_and_runs_it() {
     assert!(cdc_wait(&mut s, 0, "Hello, USB!\r\n", Time::from_secs(2)), "{:?}", s.usb_cdc_text);
     assert!(s.machine.sys.io_qspi.bootsel_pressed);
 }
+
+/// A minimal USB/IP client (what vhci-hcd sends), driving the session while it waits for answers.
+struct UsbIpClient {
+    sock: std::net::TcpStream,
+    seq: u32,
+    rx: Vec<u8>,
+}
+
+impl UsbIpClient {
+    fn read_exact(&mut self, s: &mut Session, n: usize) -> Vec<u8> {
+        use std::io::Read;
+        let mut buf = [0u8; 4096];
+        let wall = std::time::Instant::now();
+        while wall.elapsed() < std::time::Duration::from_secs(10) {
+            if self.rx.len() >= n {
+                return self.rx.drain(..n).collect();
+            }
+            match self.sock.read(&mut buf) {
+                Ok(0) => panic!("server closed the connection"),
+                Ok(k) => self.rx.extend_from_slice(&buf[..k]),
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    s.run_for(Time::from_us(500));
+                }
+                Err(e) => panic!("{e}"),
+            }
+        }
+        panic!("no answer from the USB/IP server ({} of {n} bytes, at {})", self.rx.len(), s.machine.now);
+    }
+
+    fn send(&mut self, b: &[u8]) {
+        use std::io::Write;
+        self.sock.write_all(b).unwrap();
+    }
+
+    /// CMD_SUBMIT; returns the sequence number.
+    fn submit(&mut self, ep: u32, dir_in: bool, setup: [u8; 8], len: u32, out: &[u8]) -> u32 {
+        self.seq += 1;
+        let mut m = Vec::new();
+        for w in [1, self.seq, 0x0001_0002, dir_in as u32, ep, 0, len, 0, 0xFFFF_FFFF, 0] {
+            m.extend(u32::to_be_bytes(w));
+        }
+        m.extend(setup);
+        m.extend(out);
+        self.send(&m);
+        self.seq
+    }
+
+    /// Reads one RET_SUBMIT: (seqnum, status, data).
+    fn ret(&mut self, s: &mut Session) -> (u32, i32, Vec<u8>) {
+        let h = self.read_exact(s, 48);
+        let w = |i: usize| u32::from_be_bytes(h[i..i + 4].try_into().unwrap());
+        assert_eq!(w(0), 3, "RET_SUBMIT");
+        // (Only IN requests are submitted here, so the actual length is data that follows)
+        let data = self.read_exact(s, w(24) as usize);
+        (w(4), w(20) as i32, data)
+    }
+}
+
+#[test]
+fn usbip_exports_the_bootsel_device() {
+    let mut m = bootsel_board();
+    sim_host::usb::wait_for_device(&mut m, Time::from_secs(1), |_| true).unwrap();
+    let mut s = Session::new(m, &Image::default());
+    let server = sim_host::usbip::UsbIpServer::bind("127.0.0.1:0").unwrap();
+    let addr = server.local_addr().unwrap();
+    s.usbip = Some(server);
+    let sock = std::net::TcpStream::connect(addr).unwrap();
+    sock.set_nonblocking(true).unwrap();
+    // As usbip does (otherwise Nagle holds back small requests behind unacknowledged ones)
+    sock.set_nodelay(true).unwrap();
+    let mut c = UsbIpClient { sock, seq: 0, rx: Vec::new() };
+    // OP_REQ_DEVLIST: one device, 2e8a:0003, two interfaces (mass storage, vendor)
+    c.send(&[0x01, 0x11, 0x80, 0x05, 0, 0, 0, 0]);
+    let r = c.read_exact(&mut s, 12 + 312 + 8);
+    assert_eq!(&r[..4], &[0x01, 0x11, 0x00, 0x05]);
+    assert_eq!(u32::from_be_bytes(r[8..12].try_into().unwrap()), 1);
+    let dev = &r[12..324];
+    assert_eq!(&dev[256..259], b"1-1");
+    assert_eq!(&dev[300..304], &[0x2E, 0x8A, 0x00, 0x03]);
+    assert_eq!(dev[311], 2, "bNumInterfaces");
+    assert_eq!(&r[324..332], &[0x08, 0x06, 0x50, 0, 0xFF, 0, 0, 0]);
+    // OP_REQ_IMPORT 1-1 (on a fresh connection, as usbip does)
+    drop(c);
+    s.run_for(Time::from_ms(1));
+    let sock = std::net::TcpStream::connect(addr).unwrap();
+    sock.set_nonblocking(true).unwrap();
+    // As usbip does (otherwise Nagle holds back small requests behind unacknowledged ones)
+    sock.set_nodelay(true).unwrap();
+    let mut c = UsbIpClient { sock, seq: 0, rx: Vec::new() };
+    let mut imp = vec![0x01, 0x11, 0x80, 0x03, 0, 0, 0, 0];
+    let mut busid = b"1-1".to_vec();
+    busid.resize(32, 0);
+    imp.extend(busid);
+    c.send(&imp);
+    let r = c.read_exact(&mut s, 8 + 312);
+    assert_eq!(&r[..8], &[0x01, 0x11, 0x00, 0x03, 0, 0, 0, 0]);
+    // GET_DESCRIPTOR(device) through CMD_SUBMIT
+    let seq = c.submit(0, true, [0x80, 6, 0, 1, 0, 0, 18, 0], 18, &[]);
+    let (rs, status, data) = c.ret(&mut s);
+    assert_eq!((rs, status, data.len()), (seq, 0, 18));
+    assert_eq!(&data[8..12], &[0x8A, 0x2E, 0x03, 0x00]);
+    // PICOBOOT_IF_CMD_STATUS on interface 1
+    let seq = c.submit(0, true, [0xC1, 0x42, 0, 0, 1, 0, 16, 0], 16, &[]);
+    let (rs, status, data) = c.ret(&mut s);
+    assert_eq!((rs, status, data.len()), (seq, 0, 16));
+    // A bulk IN that would wait forever, unlinked
+    let victim = c.submit(4, true, [0; 8], 64, &[]);
+    s.run_for(Time::from_ms(5));
+    c.seq += 1;
+    let mut m = Vec::new();
+    for w in [2, c.seq, 0x0001_0002, 0, 0, victim] {
+        m.extend(u32::to_be_bytes(w));
+    }
+    m.resize(48, 0);
+    c.send(&m);
+    let h = c.read_exact(&mut s, 48);
+    assert_eq!(u32::from_be_bytes(h[0..4].try_into().unwrap()), 4, "RET_UNLINK");
+    assert_eq!(i32::from_be_bytes(h[20..24].try_into().unwrap()), -104, "ECONNRESET: it was still pending");
+    assert!(s.usbip.as_ref().unwrap().attached());
+}
