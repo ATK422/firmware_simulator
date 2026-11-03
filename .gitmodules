@@ -1,0 +1,6 @@
+[submodule "external/titan_firmware"]
+	path = external/titan_firmware
+	url = https://github.com/osu-uwrt/titan_firmware.git
+[submodule "external/titan_firmware_rs"]
+	path = external/titan_firmware_rs
+	url = https://github.com/ATK422/titan_firmware_rs.git
