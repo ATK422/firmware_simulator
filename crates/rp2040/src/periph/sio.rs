@@ -124,7 +124,10 @@ pub struct Interp {
     pub accum: [u32; 2],
     pub base: [u32; 3],
     pub ctrl: [u32; 2],
+    /// PEEK/POP values as the processor sees them (lane results with FORCE_MSB ORed in), and the lane results
+    /// without it, which POP writes back (FORCE_MSB has no effect on the internal datapath).
     result: [u32; 3],
+    lane: [u32; 2],
     /// Each lane's shift-and-mask value before BASEn is added (what ACCUMn_ADD reads).
     raw: [u32; 2],
     overflow: (bool, bool),
@@ -177,15 +180,23 @@ impl Interp {
             (b0 + (alpha * (b1 - b0)).div_euclid(256)) as u32
         };
         let (msb0, msb1) = (c0.force_msb() << 28, c1.force_msb() << 28);
-        self.result[0] = if do_blend { alpha as u32 } else { (if do_clamp { clamp0 } else { add0 }) | msb0 };
-        self.result[1] = (if do_blend { blend1 } else { add1 }) | msb1;
+        self.lane[0] = if do_blend {
+            alpha as u32
+        } else if do_clamp {
+            clamp0
+        } else {
+            add0
+        };
+        self.lane[1] = if do_blend { blend1 } else { add1 };
+        self.result[0] = if do_blend { self.lane[0] } else { self.lane[0] | msb0 };
+        self.result[1] = self.lane[1] | msb1;
         self.result[2] = add2;
     }
 
     fn writeback(&mut self) {
         let c0 = LaneCtrl(self.ctrl[0]);
         let c1 = LaneCtrl(self.ctrl[1]);
-        let (r0, r1) = (self.result[0], self.result[1]);
+        let [r0, r1] = self.lane;
         self.accum[0] = if c0.cross_result() { r1 } else { r0 };
         self.accum[1] = if c1.cross_result() { r0 } else { r1 };
         self.update();
@@ -596,6 +607,18 @@ mod tests {
         assert_eq!(s.read(0, INTERP0 + 0x34, 0, 0), Some(0x23));
         assert_eq!(s.read(0, INTERP0 + 0x38, 0, 0), Some(0xB));
         assert_eq!(s.read(0, INTERP0, 0, 0), Some(0x1234), "the accumulators are unchanged");
+    }
+
+    #[test]
+    fn interp_force_msb_is_not_written_back() {
+        // FORCE_MSB is "ORed into bits 29:28 of the lane result presented to the processor on the bus. No effect on
+        // the internal 32-bit datapath": POP returns the forced bits but writes the unforced result back to ACCUM0
+        let mut s = Sio::default();
+        s.write(0, INTERP0 + 0x2C, 31 << 10 | 2 << 19); // lane 0: full mask, FORCE_MSB 2
+        s.write(0, INTERP0 + 0x08, 4); // BASE0
+        assert_eq!(s.read(0, INTERP0 + 0x14, 0, 0), Some(2 << 28 | 4), "POP_LANE0 shows the forced bits");
+        assert_eq!(s.read(0, INTERP0, 0, 0), Some(4), "ACCUM0 does not get them");
+        assert_eq!(s.read(0, INTERP0 + 0x20, 0, 0), Some(2 << 28 | 8), "PEEK_LANE0");
     }
 
     #[test]
