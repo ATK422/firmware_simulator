@@ -367,7 +367,8 @@ impl Machine {
             self.sys.fire_event(&mut *self.trace, t, ev);
             match ev {
                 Event::External(id) => self.external_fired.push((t, id)),
-                Event::Core1Boot => self.boot_core1_rom_at(t),
+                // (Not while the PSM holds core 1 in reset again: its release schedules another start)
+                Event::Core1Boot if self.sys.psm.frce_off & (1 << psm::PROC1) == 0 => self.boot_core1_rom_at(t),
                 _ => {}
             }
             self.after_system_change();
@@ -525,9 +526,12 @@ impl Machine {
             }
             RomFn::FlashRangeProgram => {
                 log::debug!("[{now}] core{c} flash_range_program({r0:#x}, {r1:#010x}, {r2:#x})");
+                // Only what lands in flash is read (the count is the guest's); the time is that of every page
+                let n = (r2 as usize).min(self.sys.flash.len().saturating_sub(r0 as usize)) as u32;
                 let data: Vec<u8> =
-                    (0..r2).map(|i| self.sys.peek(r1.wrapping_add(i), Size::Byte).unwrap_or(0xFF) as u8).collect();
-                hle::program(&mut self.sys.flash, r0, &data)
+                    (0..n).map(|i| self.sys.peek(r1.wrapping_add(i), Size::Byte).unwrap_or(0xFF) as u8).collect();
+                hle::program(&mut self.sys.flash, r0, &data);
+                hle::program_time(r0, r2)
             }
             RomFn::ResetToUsbBoot => unreachable!("reset_usb_boot is not trapped"),
             RomFn::ConnectInternalFlash | RomFn::FlashExitXip | RomFn::FlashFlushCache | RomFn::FlashEnterCmdXip => {
@@ -580,7 +584,11 @@ impl Machine {
                 self.cores[0].reset(&mut bus, vtor);
             }
         } else {
+            // Core 1 comes out of reset in the bootrom, as when its PSM force-off is released, and waits there for
+            // the launch sequence
             self.core_enabled[1] = false;
+            let t = self.clocks[1].now.max(self.now);
+            self.sys.sched.schedule(Event::Core1Boot, t + CORE1_RELEASE_LATENCY);
         }
     }
 
@@ -623,6 +631,13 @@ impl Machine {
             return false;
         }
         let t = self.clocks[c].now.max(self.now);
+        if self.cores[c].is_sleeping() && self.clocks[c].now < self.now && self.cores[c].systick.counts_core_clock() {
+            // A sleeping core's SysTick counts the cycles the other core ran meanwhile (without moving its clock
+            // past them: whole cycles, so that doing this every quantum loses none)
+            let cycles = self.idle_cycles(c, self.now);
+            self.cores[c].advance_idle(cycles);
+            self.clocks[c].advance(&self.clk_sys, cycles);
+        }
         self.sync_systick_reference(c, t);
         self.cores[c].would_wake()
     }
@@ -630,13 +645,24 @@ impl Machine {
     /// Brings a core that slept up to the current time, letting SysTick count the idle cycles.
     fn catch_up(&mut self, c: usize) {
         if self.clocks[c].now < self.now {
-            let idle = self.now - self.clocks[c].now;
-            let cycles = self.clk_sys.cycles_in(idle);
+            let cycles = self.idle_cycles(c, self.now);
             self.cores[c].advance_idle(cycles);
             self.clocks[c].jump_to(self.now);
         }
         let t = self.clocks[c].now;
         self.sync_systick_reference(c, t);
+    }
+
+    /// Whole `clk_sys` cycles core `c`'s clock (with its fraction of a picosecond) completes by `t`: the cycles an
+    /// idle core counts up to then. A fast-forward to a SysTick wrap `n` cycles ahead ends at
+    /// `clocks[c].time_after(n)`, and this gives exactly `n` there.
+    fn idle_cycles(&self, c: usize, t: Time) -> u64 {
+        let clock = &self.clocks[c];
+        if self.clk_sys.is_stopped() || t <= clock.now {
+            return 0;
+        }
+        let n = clock.cycles_until(&self.clk_sys, t);
+        if clock.time_after(&self.clk_sys, n) > t { n - 1 } else { n }
     }
 
     /// Feeds core `c`'s SysTick, while it counts the reference clock (CLKSOURCE clear), the watchdog ticks
@@ -934,9 +960,12 @@ impl Machine {
                 let mut target = next_event.min(end);
                 for c in 0..2 {
                     if self.core_enabled[c]
+                        && !self.clk_sys.is_stopped()
                         && let Some(cycles) = self.cores[c].cycles_until_systick()
                     {
-                        let t = self.clocks[c].now.max(self.now) + self.clk_sys.cycles(cycles);
+                        // From the core's own clock, fraction included: catching it up to there counts exactly
+                        // `cycles` (see `idle_cycles`)
+                        let t = self.clocks[c].time_after(&self.clk_sys, cycles).max(self.now);
                         target = target.min(t);
                     }
                     if self.core_enabled[c]
