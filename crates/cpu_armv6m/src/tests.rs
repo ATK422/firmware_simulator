@@ -19,11 +19,13 @@ struct TestBus {
     rom: Vec<u8>,
     ram: Vec<u8>,
     writes: Vec<(u32, Size, u32)>,
+    /// RAM handed out for writing (`Bus::ram`) and not yet logged in `writes`: logged at the next access.
+    pending: Option<(u32, u32)>,
 }
 
 impl TestBus {
     fn new() -> Self {
-        TestBus { rom: vec![0; 0x1_0000], ram: vec![0; RAM_SIZE], writes: Vec::new() }
+        TestBus { rom: vec![0; 0x1_0000], ram: vec![0; RAM_SIZE], writes: Vec::new(), pending: None }
     }
     fn region(&mut self, addr: u32) -> Option<(&mut Vec<u8>, usize)> {
         if (addr as usize) < self.rom.len() {
@@ -1224,4 +1226,284 @@ fn batch_stops_at_breakpoints_faults_and_trapped_addresses() {
     // Below `trap_below` the batch hands back to single steps
     let mut rig = Rig::new(&[NOP, NOP]);
     assert_eq!(rig.cpu.run_batch(&mut QuietBus(&mut rig.bus), 100, u64::MAX, CODE + 1).steps, 0);
+}
+
+// ------------------------------------------------------------------ decoded blocks
+
+/// A quiet bus that also serves code (ROM and RAM), so batches run decoded blocks. Counts slow accesses (none:
+/// everything is plain memory) as the default does not.
+struct CodeBus<'a>(&'a mut TestBus);
+
+impl CodeBus<'_> {
+    /// Logs what was written through `ram`.
+    fn flush(&mut self) {
+        if let Some((addr, len)) = self.0.pending.take() {
+            for k in 0..len / 4 {
+                let v = self.0.word(addr + 4 * k);
+                self.0.writes.push((addr + 4 * k, Size::Word, v));
+            }
+        }
+    }
+}
+
+impl Drop for CodeBus<'_> {
+    fn drop(&mut self) {
+        self.flush();
+    }
+}
+
+impl Bus for CodeBus<'_> {
+    fn read(&mut self, addr: u32, size: Size) -> Result<u32, BusFault> {
+        self.flush();
+        self.0.read(addr, size)
+    }
+    fn write(&mut self, addr: u32, size: Size, value: u32) -> Result<(), BusFault> {
+        self.flush();
+        self.0.write(addr, size, value)
+    }
+    fn fetch16_fast(&mut self, addr: u32) -> Option<u16> {
+        self.0.region(addr).filter(|(b, o)| o + 2 <= b.len()).map(|(b, o)| mem::read(b, o, Size::Half) as u16)
+    }
+    fn code_at(&mut self, addr: u32) -> Option<&[u8]> {
+        self.0.region(addr).map(|(b, o)| &b[o..]).filter(|b| b.len() >= 2)
+    }
+    fn ram(&mut self, addr: u32, len: u32, write: bool) -> Option<&mut [u8]> {
+        // RAM only, and logged as the word writes would be
+        self.flush();
+        if !(RAM..RAM + RAM_SIZE as u32).contains(&addr) || (addr - RAM + len) as usize > RAM_SIZE {
+            return None;
+        }
+        if write {
+            self.0.pending = Some((addr, len));
+        }
+        let off = (addr - RAM) as usize;
+        Some(&mut self.0.ram[off..off + len as usize])
+    }
+    fn take_slow_access(&mut self) -> bool {
+        false
+    }
+    fn take_attention(&mut self) -> bool {
+        false
+    }
+}
+
+/// Small deterministic generator for the tests below.
+struct XorShift(u64);
+
+impl XorShift {
+    fn next(&mut self) -> u32 {
+        self.0 ^= self.0 << 13;
+        self.0 ^= self.0 >> 7;
+        self.0 ^= self.0 << 17;
+        (self.0 >> 16) as u32
+    }
+}
+
+/// Everything about a core but its block cache.
+fn core_state(cpu: &CortexM0Plus) -> String {
+    let mut c = cpu.clone();
+    c.decode_blocks = true;
+    format!("{c:?}")
+}
+
+/// Runs a batch on `rig` with or without decoded blocks.
+fn batch_on(rig: &mut Rig, blocks: bool, max_steps: u32, budget: u64) -> crate::Batch {
+    rig.cpu.decode_blocks = blocks;
+    rig.cpu.run_batch(&mut CodeBus(&mut rig.bus), max_steps, budget, 0)
+}
+
+/// Random register state: plain random values, or (`mem`) addresses in RAM for loads, stores and the stack.
+fn random_state(cpu: &mut CortexM0Plus, rng: &mut XorShift, mem: bool) {
+    for r in 0..13 {
+        cpu.r[r] =
+            if mem && !rng.next().is_multiple_of(4) { RAM + 0x1000 + (rng.next() % 0x6000) * 2 } else { rng.next() };
+        if rng.next().is_multiple_of(8) {
+            cpu.r[r] = rng.next() % 40;
+        }
+    }
+    cpu.r[13] = if mem { STACK_TOP - 0x100 - (rng.next() % 0x40) * 4 } else { rng.next() & !3 };
+    cpu.r[14] = rng.next();
+    let f = rng.next();
+    (cpu.n, cpu.z, cpu.c, cpu.v) = (f & 1 != 0, f & 2 != 0, f & 4 != 0, f & 8 != 0);
+}
+
+#[test]
+fn every_16_bit_encoding_runs_as_decoded_as_interpreted() {
+    // One rig per way of running; both see the same programs and states, and must stay identical
+    let mut interp = Rig::new(&[NOP]);
+    let mut decoded = Rig::new(&[NOP]);
+    interp.handler(exception::SVCALL, HANDLER, &[NOP]);
+    decoded.handler(exception::SVCALL, HANDLER, &[NOP]);
+    let start = interp.cpu.clone();
+    let mut rng = XorShift(0x1234_5678_9ABC_DEF1);
+    for ins in 0..=0xFFFFu32 {
+        for trial in 0..6 {
+            let mut cpu = start.clone();
+            random_state(&mut cpu, &mut rng, trial % 2 == 0);
+            if trial == 5 {
+                // Handler mode, so that BX and POP {pc} can return from an exception
+                cpu.ipsr = 16;
+                cpu.active |= 1 << 16;
+                cpu.r[1] = 0xFFFF_FFF9;
+            }
+            // The instruction, a second halfword for 32-bit encodings, then more code
+            let code = [ins as u16, rng.next() as u16, movs(0, 1), adds_i8(0, 1)];
+            for rig in [&mut interp, &mut decoded] {
+                rig.bus.load_code(CODE, &code);
+                rig.cpu = cpu.clone();
+                rig.cpu.r[15] = CODE;
+                rig.bus.writes.clear();
+            }
+            let a = batch_on(&mut interp, false, 1, u64::MAX);
+            let b = batch_on(&mut decoded, true, 1, u64::MAX);
+            assert_eq!(a, b, "{ins:#06x} trial {trial}");
+            assert_eq!(core_state(&interp.cpu), core_state(&decoded.cpu), "{ins:#06x} trial {trial}");
+            assert_eq!(interp.bus.writes, decoded.bus.writes, "{ins:#06x} trial {trial}");
+        }
+    }
+    assert_eq!(interp.bus.ram, decoded.bus.ram);
+}
+
+#[test]
+fn bl_runs_as_decoded_as_interpreted() {
+    let mut rng = XorShift(99);
+    for _ in 0..2000 {
+        let from = CODE + (rng.next() % 0x100) * 2;
+        let to = (rng.next() % 0xF000) & !1;
+        let mut interp = Rig::new(&[NOP]);
+        interp.bus.load_code(from, &bl(from, to));
+        interp.cpu.r[15] = from;
+        let mut decoded = Rig { cpu: interp.cpu.clone(), bus: TestBus { ..TestBus::new() } };
+        decoded.bus.rom = interp.bus.rom.clone();
+        decoded.bus.ram = interp.bus.ram.clone();
+        assert_eq!(batch_on(&mut interp, false, 1, u64::MAX), batch_on(&mut decoded, true, 1, u64::MAX));
+        assert_eq!(core_state(&interp.cpu), core_state(&decoded.cpu));
+        assert_eq!(decoded.cpu.pc(), to);
+    }
+}
+
+/// A random program of instructions that keep to RAM (registers point there) and branch around in it.
+fn random_program(rng: &mut XorShift, len: usize) -> Vec<u16> {
+    let mut code = Vec::with_capacity(len);
+    while code.len() < len {
+        let ins = match rng.next() % 16 {
+            // Short branches, forward and back
+            0 => bcond((rng.next() % 14) as u16, (rng.next() % 16) as i16 - 8),
+            1 => b((rng.next() % 16) as i16 - 6),
+            // Loads and stores relative to r6/r7 (kept pointing into RAM by not being written: rd/rt < 6)
+            2 => ldr_i((rng.next() % 6) as u16, 6 + (rng.next() % 2) as u16, (rng.next() % 32) as u16),
+            3 => str_i((rng.next() % 6) as u16, 6 + (rng.next() % 2) as u16, (rng.next() % 32) as u16),
+            4 => strb_i((rng.next() % 6) as u16, 7, (rng.next() % 32) as u16),
+            5 => ldrh_i((rng.next() % 6) as u16, 6, (rng.next() % 32) as u16),
+            6 => push((rng.next() % 64) as u16 | 1, rng.next().is_multiple_of(2)),
+            7 => pop((rng.next() % 64) as u16 | 1, false),
+            // Data processing and the rest of the arithmetic on r0-r5
+            8 => dp((rng.next() % 16) as u16, (rng.next() % 6) as u16, (rng.next() % 8) as u16),
+            9 => adds_r((rng.next() % 6) as u16, (rng.next() % 8) as u16, (rng.next() % 8) as u16),
+            10 => lsls_i((rng.next() % 6) as u16, (rng.next() % 8) as u16, (rng.next() % 32) as u16),
+            11 => lsrs_i((rng.next() % 6) as u16, (rng.next() % 8) as u16, (rng.next() % 32) as u16),
+            12 => cmp_i((rng.next() % 8) as u16, (rng.next() % 256) as u16),
+            13 => subs_i8((rng.next() % 6) as u16, (rng.next() % 256) as u16),
+            14 => mov_hi((rng.next() % 6) as u16, 8 + (rng.next() % 5) as u16),
+            _ => add_hi(8 + (rng.next() % 5) as u16, (rng.next() % 8) as u16),
+        };
+        code.push(ins);
+    }
+    code
+}
+
+#[test]
+fn random_programs_run_as_decoded_as_interpreted() {
+    let mut rng = XorShift(0xDEC0_DEB1_0C55);
+    for program in 0..300 {
+        let code = random_program(&mut rng, 64);
+        // Half the programs run from RAM, where their stores can overwrite them
+        let at = if program % 2 == 0 { CODE } else { RAM + 0x800 };
+        let mut interp = Rig::new(&[NOP]);
+        random_state(&mut interp.cpu, &mut rng, true);
+        interp.cpu.r[6] = RAM + 0x7C0 + (rng.next() % 32) * 4;
+        interp.cpu.r[7] = at + (rng.next() % 32) * 2 - 0x20;
+        for (i, hw) in code.iter().enumerate() {
+            let (buf, off) = interp.bus.region(at + 2 * i as u32).unwrap();
+            mem::write(buf, off, Size::Half, *hw as u32);
+        }
+        // Past the program: spin
+        let end = at + 2 * code.len() as u32;
+        for i in 0..16 {
+            let (buf, off) = interp.bus.region(end + 2 * i).unwrap();
+            mem::write(buf, off, Size::Half, b(-2) as u32);
+        }
+        interp.cpu.r[15] = at;
+        let mut decoded = Rig { cpu: interp.cpu.clone(), bus: TestBus::new() };
+        decoded.bus.rom = interp.bus.rom.clone();
+        decoded.bus.ram = interp.bus.ram.clone();
+        for batch in 0..60 {
+            let max_steps = 1 + rng.next() % 24;
+            let budget = (rng.next() % 40) as u64;
+            let x = batch_on(&mut interp, false, max_steps, budget);
+            let y = batch_on(&mut decoded, true, max_steps, budget);
+            assert_eq!(x, y, "program {program} batch {batch}");
+            assert_eq!(core_state(&interp.cpu), core_state(&decoded.cpu), "program {program} batch {batch}");
+            assert_eq!(interp.bus.writes, decoded.bus.writes, "program {program} batch {batch}");
+            if interp.cpu.ipsr() != 0 {
+                break;
+            }
+        }
+        assert_eq!(interp.bus.ram, decoded.bus.ram, "program {program}");
+    }
+}
+
+#[test]
+fn a_store_into_the_running_block_takes_effect() {
+    // In RAM: r0 points at the MOVS r2, #1 two instructions on; r1 holds MOVS r2, #7
+    let code = [strh_i(1, 0, 0), NOP, movs(2, 1), adds_i8(2, 1), b(-2)];
+    for blocks in [false, true] {
+        let mut rig = Rig::new(&[NOP]);
+        for (i, hw) in code.iter().enumerate() {
+            let (buf, off) = rig.bus.region(RAM + 2 * i as u32).unwrap();
+            mem::write(buf, off, Size::Half, *hw as u32);
+        }
+        rig.cpu.r[15] = RAM;
+        rig.cpu.r[0] = RAM + 4;
+        // First a run that stores what is already there, so that the block is decoded and cached
+        rig.cpu.r[1] = movs(2, 1) as u32;
+        assert_eq!(batch_on(&mut rig, blocks, 4, u64::MAX).steps, 4);
+        assert_eq!(rig.r(2), 2);
+        rig.cpu.r[15] = RAM;
+        rig.cpu.r[1] = movs(2, 7) as u32;
+        let b = batch_on(&mut rig, blocks, 4, u64::MAX);
+        assert_eq!(b.steps, 4);
+        assert_eq!(rig.r(2), 8, "blocks {blocks}");
+    }
+}
+
+#[test]
+fn changed_code_is_decoded_again() {
+    let mut rig = Rig::new(&[movs(0, 1), movs(1, 2), b(-2)]);
+    rig.cpu.decode_blocks = true;
+    let start = rig.cpu.clone();
+    rig.cpu.run_batch(&mut CodeBus(&mut rig.bus), 3, u64::MAX, 0);
+    assert_eq!((rig.r(0), rig.r(1)), (1, 2));
+    // Same core (and cache), new code at the same address
+    rig.bus.load_code(CODE + 2, &[movs(1, 9)]);
+    let blocks = std::mem::take(&mut rig.cpu.blocks);
+    rig.cpu = start;
+    rig.cpu.blocks = blocks;
+    rig.cpu.run_batch(&mut CodeBus(&mut rig.bus), 3, u64::MAX, 0);
+    assert_eq!((rig.r(0), rig.r(1)), (1, 9));
+}
+
+#[test]
+fn block_add_with_carry_matches_the_reference() {
+    let edges = [0, 1, 2, 0x7FFF_FFFE, 0x7FFF_FFFF, 0x8000_0000, 0x8000_0001, 0xFFFF_FFFE, 0xFFFF_FFFF];
+    let mut rng = XorShift(7);
+    let mut values: Vec<u32> = edges.to_vec();
+    values.extend((0..200).map(|_| rng.next()));
+    for &x in &values {
+        for &y in &values {
+            for c in [false, true] {
+                assert_eq!(crate::block::adc(x, y, c), crate::exec::add_with_carry(x, y, c), "{x:#x} {y:#x} {c}");
+            }
+        }
+    }
 }

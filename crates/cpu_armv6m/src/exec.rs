@@ -17,13 +17,13 @@ pub(crate) fn add_with_carry(x: u32, y: u32, carry: bool) -> (u32, bool, bool) {
 }
 
 #[inline]
-fn sext(value: u32, bits: u32) -> u32 {
+pub(crate) fn sext(value: u32, bits: u32) -> u32 {
     let shift = 32 - bits;
     ((value << shift) as i32 >> shift) as u32
 }
 
 /// Where execution continues after an instruction.
-enum Next {
+pub(crate) enum Next {
     /// The following instruction (PC + 2 or + 4).
     Sequential,
     /// A branch target, already with bit 0 cleared.
@@ -34,7 +34,7 @@ enum Next {
 
 impl CortexM0Plus {
     #[inline]
-    fn set_nz(&mut self, v: u32) {
+    pub(crate) fn set_nz(&mut self, v: u32) {
         self.n = v & 0x8000_0000 != 0;
         self.z = v == 0;
     }
@@ -54,7 +54,7 @@ impl CortexM0Plus {
     }
 
     #[inline(always)]
-    fn condition_passed(&self, cond: u32) -> bool {
+    pub(crate) fn condition_passed(&self, cond: u32) -> bool {
         let r = match cond >> 1 {
             0 => self.z,
             1 => self.c,
@@ -69,7 +69,7 @@ impl CortexM0Plus {
     }
 
     /// `BXWritePC`: interworking branch that also performs exception return from handler mode.
-    fn bx_write_pc<B: Bus + ?Sized>(&mut self, bus: &mut B, target: u32) -> Result<(Next, u32), Fault> {
+    pub(crate) fn bx_write_pc<B: Bus + ?Sized>(&mut self, bus: &mut B, target: u32) -> Result<(Next, u32), Fault> {
         if self.ipsr != 0 && target & 0xF000_0000 == 0xF000_0000 {
             let c = self.exception_return(bus, target)?;
             return Ok((Next::AlreadySet, c));
@@ -283,45 +283,19 @@ impl CortexM0Plus {
             }
             // STM Rn!, {list}
             0b11000 => {
-                let rn = ((ins >> 8) & 7) as usize;
                 let list = ins & 0xFF;
                 if list == 0 {
                     return Err(Fault::Undefined(ins));
                 }
-                let mut addr = self.r[rn];
-                for i in 0..8 {
-                    if list & (1 << i) != 0 {
-                        self.write_mem(bus, addr, Size::Word, self.r[i])?;
-                        addr = addr.wrapping_add(4);
-                    }
-                }
-                self.r[rn] = addr;
-                cycles = 1 + list.count_ones();
+                cycles = self.stm(bus, (ins >> 8) & 7, list)?;
             }
             // LDM Rn{!}, {list}
             0b11001 => {
-                let rn = ((ins >> 8) & 7) as usize;
                 let list = ins & 0xFF;
                 if list == 0 {
                     return Err(Fault::Undefined(ins));
                 }
-                let mut addr = self.r[rn];
-                let mut vals = [0u32; 8];
-                for (i, val) in vals.iter_mut().enumerate() {
-                    if list & (1 << i) != 0 {
-                        *val = self.read_mem(bus, addr, Size::Word)?;
-                        addr = addr.wrapping_add(4);
-                    }
-                }
-                for (i, val) in vals.iter().enumerate() {
-                    if list & (1 << i) != 0 {
-                        self.r[i] = *val;
-                    }
-                }
-                if list & (1 << rn) == 0 {
-                    self.r[rn] = addr;
-                }
-                cycles = 1 + list.count_ones();
+                cycles = self.ldm(bus, (ins >> 8) & 7, list)?;
             }
             // B<cond>, UDF, SVC
             0b11010 | 0b11011 => {
@@ -576,7 +550,86 @@ impl CortexM0Plus {
         }
     }
 
-    fn write_any(&mut self, n: u32, v: u32) {
+    /// `STM Rn!, {list}` (`list` not empty): the cycles taken.
+    #[inline(always)]
+    pub(crate) fn stm<B: Bus + ?Sized>(&mut self, bus: &mut B, rn: u32, list: u32) -> Result<u32, Fault> {
+        let rn = rn as usize;
+        let mut addr = self.r[rn];
+        for i in 0..8 {
+            if list & (1 << i) != 0 {
+                self.write_mem(bus, addr, Size::Word, self.r[i])?;
+                addr = addr.wrapping_add(4);
+            }
+        }
+        self.r[rn] = addr;
+        Ok(1 + list.count_ones())
+    }
+
+    /// `LDM Rn{!}, {list}` (`list` not empty): the cycles taken.
+    #[inline(always)]
+    pub(crate) fn ldm<B: Bus + ?Sized>(&mut self, bus: &mut B, rn: u32, list: u32) -> Result<u32, Fault> {
+        let rn = rn as usize;
+        let mut addr = self.r[rn];
+        let mut vals = [0u32; 8];
+        for (i, val) in vals.iter_mut().enumerate() {
+            if list & (1 << i) != 0 {
+                *val = self.read_mem(bus, addr, Size::Word)?;
+                addr = addr.wrapping_add(4);
+            }
+        }
+        for (i, val) in vals.iter().enumerate() {
+            if list & (1 << i) != 0 {
+                self.r[i] = *val;
+            }
+        }
+        if list & (1 << rn) == 0 {
+            self.r[rn] = addr;
+        }
+        Ok(1 + list.count_ones())
+    }
+
+    /// `PUSH {list}` (bit 14 for LR, `list` not empty): the cycles taken.
+    #[inline(always)]
+    pub(crate) fn push<B: Bus + ?Sized>(&mut self, bus: &mut B, list: u32) -> Result<u32, Fault> {
+        let count = list.count_ones();
+        let mut addr = self.r[13].wrapping_sub(4 * count);
+        let start = addr;
+        for i in 0..15 {
+            if list & (1 << i) != 0 {
+                self.write_mem(bus, addr, Size::Word, self.r[i])?;
+                addr = addr.wrapping_add(4);
+            }
+        }
+        self.r[13] = start;
+        Ok(1 + count)
+    }
+
+    /// `POP {list}` (bit 15 for the PC, `list` not empty).
+    #[inline(always)]
+    pub(crate) fn pop<B: Bus + ?Sized>(&mut self, bus: &mut B, list: u32) -> Result<(Next, u32), Fault> {
+        let count = list.count_ones();
+        let mut addr = self.r[13];
+        let mut vals = [0u32; 16];
+        for (i, val) in vals.iter_mut().enumerate() {
+            if list & (1 << i) != 0 {
+                *val = self.read_mem(bus, addr, Size::Word)?;
+                addr = addr.wrapping_add(4);
+            }
+        }
+        for (i, val) in vals.iter().enumerate().take(8) {
+            if list & (1 << i) != 0 {
+                self.r[i] = *val;
+            }
+        }
+        self.r[13] = addr;
+        if list & (1 << 15) != 0 {
+            let (n, c) = self.bx_write_pc(bus, vals[15])?;
+            return Ok((n, 3 + count + c));
+        }
+        Ok((Next::Sequential, 1 + count))
+    }
+
+    pub(crate) fn write_any(&mut self, n: u32, v: u32) {
         if n == 13 {
             self.r[13] = v & !3;
         } else {
@@ -610,17 +663,7 @@ impl CortexM0Plus {
                 if list == 0 {
                     return Err(Fault::Undefined(ins));
                 }
-                let count = list.count_ones();
-                let mut addr = self.r[13].wrapping_sub(4 * count);
-                let start = addr;
-                for i in 0..15 {
-                    if list & (1 << i) != 0 {
-                        self.write_mem(bus, addr, Size::Word, self.r[i])?;
-                        addr = addr.wrapping_add(4);
-                    }
-                }
-                self.r[13] = start;
-                return Ok((Next::Sequential, 1 + count));
+                return Ok((Next::Sequential, self.push(bus, list)?));
             }
             // CPSIE i / CPSID i
             0x6 => {
@@ -649,26 +692,7 @@ impl CortexM0Plus {
                 if list == 0 {
                     return Err(Fault::Undefined(ins));
                 }
-                let count = list.count_ones();
-                let mut addr = self.r[13];
-                let mut vals = [0u32; 16];
-                for (i, val) in vals.iter_mut().enumerate() {
-                    if list & (1 << i) != 0 {
-                        *val = self.read_mem(bus, addr, Size::Word)?;
-                        addr = addr.wrapping_add(4);
-                    }
-                }
-                for (i, val) in vals.iter().enumerate().take(8) {
-                    if list & (1 << i) != 0 {
-                        self.r[i] = *val;
-                    }
-                }
-                self.r[13] = addr;
-                if list & (1 << 15) != 0 {
-                    let (n, c) = self.bx_write_pc(bus, vals[15])?;
-                    return Ok((n, 3 + count + c));
-                }
-                return Ok((Next::Sequential, 1 + count));
+                return self.pop(bus, list);
             }
             // BKPT #imm8
             0xE => return Err(Fault::Breakpoint(ins as u8)),
