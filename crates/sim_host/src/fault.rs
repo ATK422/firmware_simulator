@@ -85,6 +85,131 @@ pub enum Fault {
     PacketLoss { to_board: f64, from_board: f64 },
 }
 
+fn parse_duration(s: &str) -> Result<Time, String> {
+    let (num, scale) = if let Some(n) = s.strip_suffix("ms") {
+        (n, 1e-3)
+    } else if let Some(n) = s.strip_suffix("us") {
+        (n, 1e-6)
+    } else if let Some(n) = s.strip_suffix('s') {
+        (n, 1.0)
+    } else {
+        (s, 1e-3)
+    };
+    let v: f64 = num.parse().map_err(|_| format!("bad time {s:?}"))?;
+    Ok(Time::from_secs_f64(v * scale))
+}
+
+fn parse_num<T: std::str::FromStr>(s: Option<&str>, what: &str) -> Result<T, String> {
+    let s = s.ok_or_else(|| format!("missing {what}"))?;
+    let parsed = match s.strip_prefix("0x") {
+        Some(hex) => u64::from_str_radix(hex, 16).map(|v| v.to_string()).map_err(|e| e.to_string())?,
+        None => s.to_string(),
+    };
+    parsed.parse().map_err(|_| format!("bad {what} {s:?}"))
+}
+
+impl std::str::FromStr for Fault {
+    type Err = String;
+
+    /// Parses `name[:arg...]`, the form the command line's `--fault` takes:
+    ///
+    /// | Spec | Fault |
+    /// |---|---|
+    /// | `can-error-rate:P`, `can-corrupt:N` | [`Fault::CanErrorRate`], [`Fault::CanCorrupt`] |
+    /// | `can-stuck`, `can-release` | [`Fault::CanStuckDominant`] |
+    /// | `can-unplug`, `can-plug` | [`Fault::CanUnplugged`] |
+    /// | `can-flood:ID:LOAD[:LEN]`, `can-flood-stop` | [`Fault::CanFlood`] (standard ID, 8 bytes by default) |
+    /// | `i2c-absent:ADDR`, `i2c-stuck:ADDR`, `i2c-ok:ADDR` | [`Fault::I2c`] |
+    /// | `i2c-intermittent:ADDR:P`, `i2c-glitch:ADDR:P`, `i2c-stretch:ADDR:TIME` | [`Fault::I2c`] |
+    /// | `adc-short:IN:VOLTS`, `adc-open:IN`, `adc-noise:IN:SIGMA`, `adc-spikes:IN:P:VOLTS`, `adc-ok:IN` | [`Fault::Adc`] |
+    /// | `gpio:PIN:high`, `gpio:PIN:low`, `gpio:PIN:release` | [`Fault::Gpio`] |
+    /// | `brownout:TIME`, `hang:CORE`, `hang-masked:CORE`, `panic`, `watchdog` | power and chip faults |
+    /// | `bridge-stop`, `bridge-start`, `kill:on`, `kill:off`, `kill:none` | [`Fault::Bridge`], [`Fault::KillSwitch`] |
+    /// | `eth-unplug`, `eth-plug`, `packet-loss:TO:FROM` | [`Fault::EthernetLink`], [`Fault::PacketLoss`] |
+    ///
+    /// Times take `us`, `ms` or `s` (milliseconds without a unit); numbers may be hex (`0x76`).
+    fn from_str(spec: &str) -> Result<Fault, String> {
+        let mut parts = spec.split(':');
+        let name = parts.next().unwrap_or("");
+        let mut arg = || parts.next();
+        let i2c = |addr: Option<&str>, fault| -> Result<Fault, String> {
+            Ok(Fault::I2c { address: parse_num(addr, "I2C address")?, fault })
+        };
+        Ok(match name {
+            "can-error-rate" => Fault::CanErrorRate(parse_num(arg(), "probability")?),
+            "can-corrupt" => Fault::CanCorrupt(parse_num(arg(), "frame count")?),
+            "can-stuck" => Fault::CanStuckDominant(true),
+            "can-release" => Fault::CanStuckDominant(false),
+            "can-unplug" => Fault::CanUnplugged(true),
+            "can-plug" => Fault::CanUnplugged(false),
+            "can-flood" => {
+                let id = parse_num(arg(), "identifier")?;
+                let load = parse_num(arg(), "load")?;
+                let len = arg().map(|l| parse_num(Some(l), "length")).transpose()?.unwrap_or(8);
+                Fault::CanFlood { id, extended: id > 0x7FF, len, load }
+            }
+            "can-flood-stop" => Fault::CanFloodStop,
+            "i2c-absent" => i2c(arg(), Some(I2cFault::Absent))?,
+            "i2c-stuck" => i2c(arg(), Some(I2cFault::Stuck))?,
+            "i2c-ok" => i2c(arg(), None)?,
+            "i2c-intermittent" | "i2c-glitch" | "i2c-stretch" => {
+                let addr = arg();
+                let v = arg();
+                let f = match name {
+                    "i2c-intermittent" => I2cFault::Intermittent(parse_num(v, "probability")?),
+                    "i2c-glitch" => I2cFault::Glitch(parse_num(v, "probability")?),
+                    _ => I2cFault::Stretch(parse_duration(v.ok_or("missing time")?)?),
+                };
+                i2c(addr, Some(f))?
+            }
+            "adc-short" | "adc-open" | "adc-noise" | "adc-spikes" | "adc-ok" => {
+                let input = parse_num(arg(), "ADC input")?;
+                let fault = match name {
+                    "adc-short" => Some(AnalogFault::Shorted(parse_num(arg(), "volts")?)),
+                    "adc-open" => Some(AnalogFault::Open),
+                    "adc-noise" => Some(AnalogFault::Noise(parse_num(arg(), "sigma")?)),
+                    "adc-spikes" => {
+                        let p = parse_num(arg(), "probability")?;
+                        Some(AnalogFault::Spikes(p, parse_num(arg(), "volts")?))
+                    }
+                    _ => None,
+                };
+                Fault::Adc { input, fault }
+            }
+            "gpio" => {
+                let pin = parse_num(arg(), "pin")?;
+                let level = match arg() {
+                    Some("high") => Some(true),
+                    Some("low") => Some(false),
+                    Some("release") => None,
+                    other => return Err(format!("gpio level {other:?}: high, low or release")),
+                };
+                Fault::Gpio { pin, level }
+            }
+            "brownout" => Fault::Brownout { off: parse_duration(arg().ok_or("missing time")?)? },
+            "hang" => Fault::Hang { core: parse_num(arg(), "core")?, interrupts_masked: false },
+            "hang-masked" => Fault::Hang { core: parse_num(arg(), "core")?, interrupts_masked: true },
+            "panic" => Fault::Panic,
+            "watchdog" => Fault::WatchdogTimeout,
+            "bridge-stop" => Fault::Bridge(false),
+            "bridge-start" => Fault::Bridge(true),
+            "kill" => Fault::KillSwitch(match arg() {
+                Some("on") => Some(true),
+                Some("off") => Some(false),
+                Some("none") => None,
+                other => return Err(format!("kill {other:?}: on, off or none")),
+            }),
+            "eth-unplug" => Fault::EthernetLink(false),
+            "eth-plug" => Fault::EthernetLink(true),
+            "packet-loss" => Fault::PacketLoss {
+                to_board: parse_num(arg(), "probability")?,
+                from_board: parse_num(arg(), "probability")?,
+            },
+            other => return Err(format!("unknown fault {other:?}")),
+        })
+    }
+}
+
 /// A stand-in for `titan_bridge` that faults can stop, start and use to forward the kill switch.
 pub trait BridgeControl {
     fn stop(&self);
@@ -235,6 +360,21 @@ impl FaultTarget<'_> {
     }
 }
 
+/// Board `board` of `robot` as a fault target: the bus it is on (with its CAN controllers' place among that bus's
+/// nodes, after those of the boards before it), its power switch, and `bridge`.
+pub fn robot_target<'a>(
+    robot: &'a mut crate::robot::Robot,
+    board: usize,
+    bridge: Option<&'a dyn BridgeControl>,
+) -> FaultTarget<'a> {
+    let j = robot.board_bus[board];
+    let first: usize =
+        (0..board).filter(|&k| robot.board_bus[k] == j).map(|k| robot.boards[k].machine.can_nodes().len()).sum();
+    let n = robot.boards[board].machine.can_nodes().len();
+    let bus = j.map(|j| (&mut robot.buses[j].bus, first..first + n));
+    FaultTarget { session: &mut robot.boards[board], bus, bridge, power: Some(&mut robot.power_on[board]) }
+}
+
 fn apply_can(bus: &mut CanBus, nodes: Range<usize>, fault: &Fault, now: Time) -> Result<(), String> {
     match fault {
         Fault::CanErrorRate(p) => bus.faults.error_rate = *p,
@@ -382,6 +522,28 @@ pub fn can_controller(s: &mut Session) -> Option<&mut Mcp251xfd> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parses_fault_specs() {
+        let p = |s: &str| s.parse::<Fault>();
+        assert_eq!(p("can-stuck"), Ok(Fault::CanStuckDominant(true)));
+        assert_eq!(p("can-error-rate:0.25"), Ok(Fault::CanErrorRate(0.25)));
+        assert_eq!(p("can-flood:0x10:0.5"), Ok(Fault::CanFlood { id: 0x10, extended: false, len: 8, load: 0.5 }));
+        assert_eq!(p("i2c-absent:0x76"), Ok(Fault::I2c { address: 0x76, fault: Some(I2cFault::Absent) }));
+        assert_eq!(
+            p("i2c-stretch:118:30ms"),
+            Ok(Fault::I2c { address: 0x76, fault: Some(I2cFault::Stretch(Time::from_ms(30))) })
+        );
+        assert_eq!(p("adc-short:0:0"), Ok(Fault::Adc { input: 0, fault: Some(AnalogFault::Shorted(0.0)) }));
+        assert_eq!(p("gpio:1:low"), Ok(Fault::Gpio { pin: 1, level: Some(false) }));
+        assert_eq!(p("brownout:50ms"), Ok(Fault::Brownout { off: Time::from_ms(50) }));
+        assert_eq!(p("hang-masked:0"), Ok(Fault::Hang { core: 0, interrupts_masked: true }));
+        assert_eq!(p("kill:none"), Ok(Fault::KillSwitch(None)));
+        assert_eq!(p("packet-loss:0.1:0"), Ok(Fault::PacketLoss { to_board: 0.1, from_board: 0.0 }));
+        assert!(p("i2c-absent").is_err());
+        assert!(p("gpio:1:sideways").is_err());
+        assert!(p("teleport").is_err());
+    }
 
     #[test]
     fn packet_loss_drops_about_that_share() {

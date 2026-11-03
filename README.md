@@ -142,6 +142,44 @@ way `upload_tool` does, over the in-process CAN bus: it catches the bootloader i
 programs the application, verifies it and reboots into it. The tests build the C bootloader with a small
 application (`test_programs/c_bl_app`, two versions) to exercise it.
 
+### Fault injection
+
+`sim_host::fault::Fault` lists what can go wrong around a board, each modelled as the hardware fails rather than
+by poking firmware state; `--fault TIME@FAULT` (`TIME@BOARD:FAULT` for `robot`) injects one from the command line,
+and `sim_test`'s `Bench::inject`/`inject_at` (`RobotBench::inject`/`inject_at` with a board name) from a test.
+
+* **CAN bus**: bit errors at a rate or on the next frames (`can-error-rate:0.3`, `can-corrupt:5`) become error
+  frames: the frame is cut off where the error struck, followed by an error flag, delimiter and intermission, and
+  retransmitted. The MCP2517FD/MCP2518FD model keeps ISO 11898-1 fault confinement (TEC/REC, error warning and
+  passive, bus-off above 255 with automatic recovery after 128 x 11 recessive bits) and shows it as the datasheet
+  says: C1TREC, C1BDIAG0/1 (error counts by phase, error kinds, TXBOERR), CERRIF and IVMIF. A stuck-dominant bus
+  (`can-stuck`, `can-release`) lets nothing start and drives every node's error counters up; an unplugged node
+  (`can-unplug`, `can-plug`) sends alone without acknowledgement (error passive, never bus-off) and hears nothing;
+  a flood (`can-flood:ID:LOAD`) competes in arbitration like a babbling node. The mock bridge's interface queue
+  holds 10 frames (Linux's default `txqueuelen`), so pings are refused rather than piling up while the bus is
+  unusable.
+* **Sensors**: an I2C device that does not answer (`i2c-absent:0x76`), answers intermittently, freezes
+  (`i2c-stuck`, replaying its last answer to each command), flips bits (`i2c-glitch:0x76:0.02`) or stretches the
+  clock (`i2c-stretch:0x76:30ms`); `i2c-ok` repairs it. An ADC input shorted (`adc-short:0:0`), open (floating),
+  noisy or spiking. A GPIO driven from outside (`gpio:1:low`: the power board's physical kill switch).
+* **Power and the chip**: a brownout (`brownout:50ms`: the RP2040 and the chips on its 3.3 V rail lose power and the
+  RP2040 comes back through a power-on reset), a hung task (`hang:0`, or `hang-masked:0` with interrupts masked,
+  which starves the safety task until the watchdog fires), a panic, a watchdog timeout.
+* **Links**: titan_bridge stopping and starting (`bridge-stop`, `bridge-start`), the `state/kill` it forwards
+  (`kill:on`, `kill:off`, `kill:none` to stop forwarding), the Puddles Ethernet cable (`eth-unplug`, `eth-plug`) and
+  packet loss on it (`packet-loss:0.3:0.3`).
+
+```bash
+cargo run --release -- run path/to/power_board --board boards/mk2/power_board.toml --mock-bridge 1 \
+    --fault 1s@can-stuck --fault 3s@can-release --time 4s --candump
+```
+
+`crates/sim_test/tests/faults.rs` shows how the titan_firmware_rs safety system reacts: losing the bridge or the
+kill switch kills the vehicle and the ESC board's thrusters go neutral, a failing depth sensor raises
+`FAULT_DEPTH_ERROR`, a hung task trips the watchdog and leaves a crash record, the board rides out bit errors and
+bus-off, Puddles drops ROS with its cable out and reconnects. Its `firmware_finding_*` tests pin down behaviour
+that looks wrong in the firmware.
+
 ### Debugging
 
 `--gdb 127.0.0.1:3333` waits for GDB before running. Each core is a thread; breakpoints, stepping, Ctrl-C, memory
@@ -158,12 +196,13 @@ cargo test --release --workspace
 ```
 
 `crates/sim_test` is the harness for firmware tests: `Bench` boots one image on its board next to a mock bridge,
-sets inputs, injects faults (panics, resets, missing parts) and reads what the bridge received; `RobotBench` does
-the same for a robot file; both snapshot in a few milliseconds, and `sweep` runs a scenario from a snapshot over a
-set of parameters in parallel. Its tests are the smoke test of every board image (`tests/smoke.rs`), the whole of
-Talos on its buses (`tests/robot.rs`), Puddles over UDP (`tests/puddles.rs`), the H-bridge and harness checks
-(`tests/harness.rs`) and the IVC range and noise sweeps (`tests/ivc_sweep.rs`, run with `--nocapture` to see the
-tables). CI (`.github/workflows/ci.yml`) builds titan_firmware_rs and runs all of them.
+sets inputs, injects faults (see [Fault injection](#fault-injection)) and reads what the bridge received;
+`RobotBench` does the same for a robot file; both snapshot in a few milliseconds, and `sweep` runs a scenario from
+a snapshot over a set of parameters in parallel. Its tests are the smoke test of every board image
+(`tests/smoke.rs`), the whole of Talos on its buses (`tests/robot.rs`), Puddles over UDP (`tests/puddles.rs`), the
+H-bridge and harness checks (`tests/harness.rs`), the fault injection tests (`tests/faults.rs`) and the IVC range
+and noise sweeps (`tests/ivc_sweep.rs`, run with `--nocapture` to see the tables). CI (`.github/workflows/ci.yml`)
+builds titan_firmware_rs and runs all of them.
 
 `test_programs/` holds hand-written Thumb programs and a small embassy firmware used by the tests; the ELFs are
 committed, `make -C test_programs` rebuilds them (`arm-none-eabi-as`, and the `thumbv6m-none-eabi` Rust target).

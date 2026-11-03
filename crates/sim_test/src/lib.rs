@@ -488,14 +488,8 @@ impl RobotBench {
     /// bridge faults to the mock bridge on that bus.
     pub fn inject(&mut self, board: &str, fault: Fault) -> Result<(), String> {
         let i = self.robot.index(board).ok_or_else(|| format!("no board {board}"))?;
-        let r = &mut self.robot;
-        let j = r.board_bus[i];
-        // The board's CAN controllers come after those of the boards before it on the same bus
-        let first: usize = (0..i).filter(|&k| r.board_bus[k] == j).map(|k| r.boards[k].machine.can_nodes().len()).sum();
-        let n = r.boards[i].machine.can_nodes().len();
-        let bus = j.map(|j| (&mut r.buses[j].bus, first..first + n));
-        let bridge = j.and_then(|j| self.bridges[j].as_ref()).map(|b| b as &dyn BridgeControl);
-        FaultTarget { session: &mut r.boards[i], bus, bridge, power: Some(&mut r.power_on[i]) }.apply(&fault)
+        let bridge = self.robot.board_bus[i].and_then(|j| self.bridges[j].as_ref()).map(|b| b as &dyn BridgeControl);
+        sim_host::fault::robot_target(&mut self.robot, i, bridge).apply(&fault)
     }
 
     /// Injects `fault` on board `board` when the robot reaches `at`.

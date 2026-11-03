@@ -53,6 +53,32 @@ struct RobotArgs {
     /// Replace the ambient noise every hydrophone hears with white noise at this level, dB re 1 µPa²/Hz.
     #[arg(long)]
     noise_db: Option<f64>,
+    /// Inject a fault on a board at a virtual time: `TIME@BOARD:FAULT`, e.g. `1.5s@camera_cage:can-unplug`
+    /// (repeatable; see `sim_host::fault::Fault`'s `from_str` for the faults). Bridge faults act on the first mock
+    /// bridge on the board's bus.
+    #[arg(long = "fault", value_parser = parse_robot_fault)]
+    faults: Vec<(Time, String, sim_host::fault::Fault)>,
+}
+
+fn parse_robot_fault(s: &str) -> Result<(Time, String, sim_host::fault::Fault), String> {
+    let (at, rest) = s.split_once('@').ok_or("expected TIME@BOARD:FAULT")?;
+    let (board, fault) = rest.split_once(':').ok_or("expected TIME@BOARD:FAULT")?;
+    Ok((parse_time(at)?, board.to_string(), fault.parse()?))
+}
+
+fn parse_fault(s: &str) -> Result<(Time, sim_host::fault::Fault), String> {
+    let (at, fault) = s.split_once('@').ok_or("expected TIME@FAULT")?;
+    Ok((parse_time(at)?, fault.parse()?))
+}
+
+/// How a frame on the bus is shown in `--candump`.
+fn candump_line(rec: &sim_devices::can::BusRecord) -> String {
+    let note = match (rec.error, rec.acked) {
+        (Some(e), _) => format!("  (destroyed: {e:?})"),
+        (None, false) => "  (no ACK)".into(),
+        (None, true) => String::new(),
+    };
+    format!("{}{note}", sim_devices::can::candump(&rec.frame))
 }
 
 fn parse_bus_client(s: &str) -> Result<(String, u8), String> {
@@ -80,13 +106,22 @@ fn robot(args: RobotArgs) -> Result<()> {
         s.on_log = Some(Box::new(move |t, line| println!("[{t}] {n}: {line}")));
         s.on_uart_line = Some(Box::new(move |t, u, line| println!("[{t}] {name} uart{u}: {line}")));
     }
+    let mut bridges: Vec<Option<sim_host::mock_bridge::MockBridge>> = vec![None; r.buses.len()];
     for (bus, client) in &args.mock_bridges {
-        let rb = r.bus(bus).with_context(|| format!("no bus {bus:?}"))?;
+        let j = r.bus_names.iter().position(|n| n == bus).with_context(|| format!("no bus {bus:?}"))?;
+        let rb = &mut r.buses[j];
         let b = sim_host::mock_bridge::MockBridge::new(*client, rb.bus.rates.data.is_some(), Time::ZERO);
         b.set_kill(Some(false));
-        rb.endpoints.push(Box::new(b));
+        rb.endpoints.push(Box::new(b.clone()));
+        bridges[j].get_or_insert(b);
         log::info!("mock bridge for client {client} on {bus}");
     }
+    let mut faults = Vec::new();
+    for (t, board, fault) in args.faults {
+        let i = r.index(&board).with_context(|| format!("--fault: no board {board:?}"))?;
+        faults.push((t, i, fault));
+    }
+    faults.sort_by_key(|f| f.0);
     for (bus, iface) in &args.cans {
         let sock = sim_host::socketcan::SocketCan::open(iface).with_context(|| format!("opening {iface}"))?;
         r.bus(bus).with_context(|| format!("no bus {bus:?}"))?.endpoints.push(Box::new(sock));
@@ -96,10 +131,7 @@ fn robot(args: RobotArgs) -> Result<()> {
         for (j, rb) in r.buses.iter_mut().enumerate() {
             rb.bus.record = Some(Vec::new());
             let name = r.bus_names[j].clone();
-            rb.on_can = Some(Box::new(move |rec| {
-                let ack = if rec.acked { "" } else { "  (no ACK)" };
-                println!("[{}] {name} {}{ack}", rec.end, sim_devices::can::candump(&rec.frame));
-            }));
+            rb.on_can = Some(Box::new(move |rec| println!("[{}] {name} {}", rec.end, candump_line(rec))));
         }
     }
     if let Some(db) = args.noise_db {
@@ -107,7 +139,20 @@ fn robot(args: RobotArgs) -> Result<()> {
     }
     r.realtime = args.realtime;
     let wall = std::time::Instant::now();
-    let stopped = r.run_until(args.time);
+    let mut faults = faults.into_iter().peekable();
+    let stopped = loop {
+        let next = faults.next_if(|f| f.0 <= args.time);
+        let until = next.as_ref().map_or(args.time, |f| f.0);
+        if let Some(s) = r.run_until(until) {
+            break Some(s);
+        }
+        let Some((_, i, fault)) = next else { break None };
+        let bridge = r.board_bus[i].and_then(|j| bridges[j].clone());
+        let ctl = bridge.as_ref().map(|b| b as &dyn sim_host::fault::BridgeControl);
+        if let Err(e) = sim_host::fault::robot_target(&mut r, i, ctl).apply(&fault) {
+            bail!("fault {fault:?} on {}: {e}", r.names[i]);
+        }
+    };
     for s in r.boards.iter_mut() {
         s.flush_uarts();
     }
@@ -227,6 +272,10 @@ struct RunArgs {
     /// `127.0.0.1:2203=127.0.0.1:2204` (titan_bridge listening on PEER, sending to LOCAL).
     #[arg(long)]
     udp: Option<String>,
+    /// Inject a fault at a virtual time: `TIME@FAULT`, e.g. `1s@can-stuck`, `2s@i2c-absent:0x76`,
+    /// `3s@bridge-stop` (repeatable; see `sim_host::fault::Fault`'s `from_str` for the faults).
+    #[arg(long = "fault", value_parser = parse_fault)]
+    faults: Vec<(Time, sim_host::fault::Fault)>,
 }
 
 fn parse_input(s: &str) -> Result<(String, f64), String> {
@@ -365,14 +414,12 @@ fn run(args: RunArgs) -> Result<()> {
         log::info!("RTT control block at {:#010x}{defmt}", rtt.addr);
     }
 
+    let mut bridge_ctl: Option<Box<dyn sim_host::fault::BridgeControl>> = None;
     if let Some(rates) = board.as_ref().and_then(|b| b.can_rates()) {
         let mut bus = sim_devices::can::CanBus::new(args.can.as_deref().unwrap_or("can"), rates);
         if args.candump {
             bus.record = Some(Vec::new());
-            session.on_can = Some(Box::new(|r| {
-                let ack = if r.acked { "" } else { "  (no ACK)" };
-                println!("[{}] {}{ack}", r.end, sim_devices::can::candump(&r.frame));
-            }));
+            session.on_can = Some(Box::new(|r| println!("[{}] {}", r.end, candump_line(r))));
         }
         session.can_bus = Some(bus);
         if let Some(iface) = &args.can {
@@ -383,14 +430,16 @@ fn run(args: RunArgs) -> Result<()> {
         if let Some(client) = args.mock_bridge {
             let bridge = sim_host::mock_bridge::MockBridge::new(client, rates.data.is_some(), sim_core::Time::ZERO);
             bridge.set_kill(Some(false));
-            session.can_endpoints.push(Box::new(bridge));
+            session.can_endpoints.push(Box::new(bridge.clone()));
+            bridge_ctl = Some(Box::new(bridge));
             log::info!("mock bridge for client {client} attached");
         }
     } else if session.machine.sys.ethernet.is_some() {
         if args.mock_bridge.is_some() {
             let bridge = sim_host::ethernet::PuddlesBridge::new(Time::ZERO);
             bridge.set_kill(Some(false));
-            session.eth_endpoints.push(Box::new(bridge));
+            session.eth_endpoints.push(Box::new(bridge.clone()));
+            bridge_ctl = Some(Box::new(bridge));
             log::info!("mock bridge attached over Ethernet (UDP {})", sim_host::ethernet::LINK_PORT);
         }
         if let Some(spec) = &args.udp {
@@ -414,7 +463,27 @@ fn run(args: RunArgs) -> Result<()> {
             return Ok(());
         }
     }
-    let reason = session.run_until(args.time);
+    let mut faults = args.faults.clone();
+    faults.sort_by_key(|f| f.0);
+    let mut faults = faults.into_iter().peekable();
+    let reason = loop {
+        let next = faults.next_if(|f| f.0 <= args.time);
+        let reason = session.run_until(next.as_ref().map_or(args.time, |f| f.0));
+        let Some((_, fault)) = next.filter(|_| matches!(reason, StopReason::TimeLimit)) else { break reason };
+        let n = session.machine.can_nodes().len();
+        let mut bus = session.can_bus.take();
+        let target = sim_host::fault::FaultTarget {
+            session: &mut session,
+            bus: bus.as_mut().map(|b| (b, 0..n)),
+            bridge: bridge_ctl.as_deref(),
+            power: None,
+        };
+        let applied = target.apply(&fault);
+        session.can_bus = bus;
+        if let Err(e) = applied {
+            bail!("fault {fault:?}: {e}");
+        }
+    };
     let elapsed = wall.elapsed();
     session.flush_uarts();
     for (ch, bytes) in session.rtt_text.drain(..) {
@@ -499,5 +568,17 @@ mod tests {
         assert_eq!(parse_time("100ns").unwrap(), Time::from_ns(100));
         assert_eq!(parse_time("1.5").unwrap(), Time::from_ms(1500));
         assert!(parse_time("x").is_err());
+    }
+
+    #[test]
+    fn fault_parsing() {
+        use sim_host::fault::Fault;
+        assert_eq!(parse_fault("1.5s@can-stuck").unwrap(), (Time::from_ms(1500), Fault::CanStuckDominant(true)));
+        assert_eq!(
+            parse_robot_fault("2s@camera_cage:can-unplug").unwrap(),
+            (Time::from_secs(2), "camera_cage".to_string(), Fault::CanUnplugged(true))
+        );
+        assert!(parse_fault("can-stuck").is_err());
+        assert!(parse_robot_fault("1s@can-stuck").is_err(), "the board is missing: `can-stuck` is not a fault");
     }
 }
