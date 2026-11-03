@@ -13,4 +13,5 @@ sim_devices.workspace = true
 sim_acoustics.workspace = true
 log.workspace = true
 toml = "0.8"
+canmore = { path = "../../external/titan_firmware_rs/crates/canmore" }
 titan_link = { path = "../../external/titan_firmware_rs/crates/titan_link" }

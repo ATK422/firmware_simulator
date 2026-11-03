@@ -318,6 +318,11 @@ impl UdpRelay {
         socket.set_nonblocking(true)?;
         Ok(UdpRelay { socket, peer, host: Host::default() })
     }
+
+    /// The local address (for a port chosen by the system).
+    pub fn local_addr(&self) -> std::io::Result<SocketAddr> {
+        self.socket.local_addr()
+    }
 }
 
 impl EthEndpoint for UdpRelay {

@@ -71,3 +71,39 @@ fn puddles_thrusters_follow_udp_commands() {
     assert!(last.rpm[7] > 0 && last.rpm[1] < 0 && last.rpm[2] == 0, "{last:?}");
     assert!(last.rpm[7].abs() > last.rpm[0].abs());
 }
+
+/// The relay to a real host socket, as `titan_bridge` would use it: a UDP socket on loopback plays the bridge.
+#[test]
+fn puddles_backplane_through_a_host_udp_socket() {
+    let Some(elf) = sim_test::titan_rs("puddles_backplane") else { return };
+    let mut b = Bench::builder(&elf).board("mk2/puddles_backplane").boot().unwrap();
+    let host = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+    host.set_nonblocking(true).unwrap();
+    let relay = sim_host::ethernet::UdpRelay::bind("127.0.0.1:0".parse().unwrap(), host.local_addr().unwrap()).unwrap();
+    let relay_addr = relay.local_addr().unwrap();
+    b.session.eth_endpoints.push(Box::new(relay));
+    let mut buf = [0u8; 512];
+    let mut got = Vec::new();
+    for i in 0..30 {
+        // A ping every 100 ms, as titan_bridge sends them
+        let mut d = b"TL".to_vec();
+        let mut enc = [0u8; 64];
+        d.extend_from_slice(
+            sim_test::titan_link::encode(
+                &HostToDevice::Ping { protocol_version: sim_test::titan_link::PROTOCOL_VERSION },
+                &mut enc,
+            )
+            .unwrap(),
+        );
+        host.send_to(&d, relay_addr).unwrap();
+        b.run_until(Time::from_ms(100 * (i + 1))).unwrap();
+        while let Ok((n, _)) = host.recv_from(&mut buf) {
+            if let Some(Ok(m)) = buf[..n].strip_prefix(b"TL").map(sim_test::titan_link::decode::<DeviceToHost>) {
+                got.push(m);
+            }
+        }
+    }
+    assert!(b.logged("ROS connected"));
+    assert!(got.iter().any(|m| matches!(m, DeviceToHost::FirmwareStatus(_))), "{got:?}");
+    assert!(got.iter().filter(|m| matches!(m, DeviceToHost::Heartbeat)).count() >= 10);
+}

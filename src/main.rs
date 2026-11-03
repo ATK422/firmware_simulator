@@ -25,6 +25,95 @@ struct Cli {
 enum Command {
     /// Runs one firmware image (ELF or UF2).
     Run(RunArgs),
+    /// Runs every board of a robot file on their shared CAN buses (and acoustic environment).
+    Robot(RobotArgs),
+}
+
+#[derive(clap::Args)]
+struct RobotArgs {
+    /// Robot file (robots/*.toml).
+    robot: PathBuf,
+    /// Virtual time to run for.
+    #[arg(short, long, default_value = "5s", value_parser = parse_time)]
+    time: Time,
+    /// Attach a scripted titan_bridge for a client on a bus: `BUS:CLIENT`, e.g. `talos:8` (repeatable).
+    #[arg(long = "mock-bridge", value_parser = parse_bus_client)]
+    mock_bridges: Vec<(String, u8)>,
+    /// Bridge a bus to a SocketCAN interface: `BUS=IFACE`, e.g. `talos=vcan0` (repeatable).
+    #[arg(long = "can", value_parser = parse_bus_iface)]
+    cans: Vec<(String, String)>,
+    /// Print every CAN frame, candump style, with its bus.
+    #[arg(long)]
+    candump: bool,
+    /// Pace virtual time to the wall clock.
+    #[arg(long)]
+    realtime: bool,
+    /// Replace the ambient noise every hydrophone hears with white noise at this level, dB re 1 µPa²/Hz.
+    #[arg(long)]
+    noise_db: Option<f64>,
+}
+
+fn parse_bus_client(s: &str) -> Result<(String, u8), String> {
+    let (bus, client) = s.split_once(':').ok_or("expected BUS:CLIENT")?;
+    Ok((bus.to_string(), client.parse().map_err(|e| format!("{client:?}: {e}"))?))
+}
+
+fn parse_bus_iface(s: &str) -> Result<(String, String), String> {
+    let (bus, iface) = s.split_once('=').ok_or("expected BUS=IFACE")?;
+    Ok((bus.to_string(), iface.to_string()))
+}
+
+fn robot(args: RobotArgs) -> Result<()> {
+    let mut r = sim_host::robot::Robot::load(&args.robot).map_err(anyhow::Error::msg)?;
+    log::info!(
+        "{} board(s) on {} bus(es){}",
+        r.boards.len(),
+        r.buses.len(),
+        if r.medium.is_some() { ", in an acoustic environment" } else { "" }
+    );
+    for (i, s) in r.boards.iter_mut().enumerate() {
+        let name = r.names[i].clone();
+        s.keep_logs = false;
+        let n = name.clone();
+        s.on_log = Some(Box::new(move |t, line| println!("[{t}] {n}: {line}")));
+        s.on_uart_line = Some(Box::new(move |t, u, line| println!("[{t}] {name} uart{u}: {line}")));
+    }
+    for (bus, client) in &args.mock_bridges {
+        let rb = r.bus(bus).with_context(|| format!("no bus {bus:?}"))?;
+        let b = sim_host::mock_bridge::MockBridge::new(*client, rb.bus.rates.data.is_some(), Time::ZERO);
+        b.set_kill(Some(false));
+        rb.endpoints.push(Box::new(b));
+        log::info!("mock bridge for client {client} on {bus}");
+    }
+    for (bus, iface) in &args.cans {
+        let sock = sim_host::socketcan::SocketCan::open(iface).with_context(|| format!("opening {iface}"))?;
+        r.bus(bus).with_context(|| format!("no bus {bus:?}"))?.endpoints.push(Box::new(sock));
+        log::info!("bus {bus} bridged to {iface}");
+    }
+    if args.candump {
+        for (j, rb) in r.buses.iter_mut().enumerate() {
+            rb.bus.record = Some(Vec::new());
+            let name = r.bus_names[j].clone();
+            rb.on_can = Some(Box::new(move |rec| {
+                let ack = if rec.acked { "" } else { "  (no ACK)" };
+                println!("[{}] {name} {}{ack}", rec.end, sim_devices::can::candump(&rec.frame));
+            }));
+        }
+    }
+    if let Some(db) = args.noise_db {
+        r.set_noise_db(db);
+    }
+    r.realtime = args.realtime;
+    let wall = std::time::Instant::now();
+    let stopped = r.run_until(args.time);
+    for s in r.boards.iter_mut() {
+        s.flush_uarts();
+    }
+    eprintln!("stopped at {}; {:.2?} wall", r.now, wall.elapsed());
+    if let Some((i, why)) = stopped {
+        bail!("{} stopped: {why:?}", r.names[i]);
+    }
+    Ok(())
 }
 
 #[derive(Clone, Copy, ValueEnum, PartialEq, Eq)]
@@ -132,6 +221,10 @@ struct RunArgs {
     /// QSPI flash model.
     #[arg(long)]
     hle_flash: bool,
+    /// For a board with Ethernet (Puddles): relay its UDP traffic through a host socket, `LOCAL=PEER`, e.g.
+    /// `127.0.0.1:2203=127.0.0.1:2204` (titan_bridge listening on PEER, sending to LOCAL).
+    #[arg(long)]
+    udp: Option<String>,
 }
 
 fn parse_input(s: &str) -> Result<(String, f64), String> {
@@ -291,8 +384,22 @@ fn run(args: RunArgs) -> Result<()> {
             session.can_endpoints.push(Box::new(bridge));
             log::info!("mock bridge for client {client} attached");
         }
-    } else if args.can.is_some() || args.mock_bridge.is_some() {
-        bail!("--can and --mock-bridge need a --board with a CAN bus");
+    } else if session.machine.sys.ethernet.is_some() {
+        if args.mock_bridge.is_some() {
+            let bridge = sim_host::ethernet::PuddlesBridge::new(Time::ZERO);
+            bridge.set_kill(Some(false));
+            session.eth_endpoints.push(Box::new(bridge));
+            log::info!("mock bridge attached over Ethernet (UDP {})", sim_host::ethernet::LINK_PORT);
+        }
+        if let Some(spec) = &args.udp {
+            let (local, peer) = spec.split_once('=').context("--udp LOCAL=PEER")?;
+            let relay = sim_host::ethernet::UdpRelay::bind(local.parse()?, peer.parse()?)
+                .with_context(|| format!("binding {local}"))?;
+            session.eth_endpoints.push(Box::new(relay));
+            log::info!("board UDP relayed: host {local} <-> {peer}");
+        }
+    } else if args.can.is_some() || args.mock_bridge.is_some() || args.udp.is_some() {
+        bail!("--can and --mock-bridge need a --board with a CAN bus (or Ethernet), --udp one with Ethernet");
     }
     session.realtime = args.realtime;
 
@@ -374,6 +481,7 @@ fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.command {
         Command::Run(args) => run(args),
+        Command::Robot(args) => robot(args),
     }
 }
 
