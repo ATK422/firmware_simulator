@@ -168,6 +168,12 @@ impl CanEndpoint for SocketCan {
             log::warn!("{}: write failed: {e}", self.interface);
         }
     }
+
+    /// What host tools write waits for the bus in a bounded queue, as a real interface's `txqueuelen` bounds it
+    /// (vcan itself never refuses a write), so a stuck or flooded bus does not collect it without end.
+    fn tx_queue_limit(&self) -> Option<usize> {
+        Some(sim_devices::can::BRIDGE_TX_QUEUE)
+    }
 }
 
 #[cfg(test)]

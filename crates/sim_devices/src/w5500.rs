@@ -226,7 +226,11 @@ impl W5500 {
             return;
         }
         while let Some(frame) = w.to_device.front() {
-            let dst = &frame[..6.min(frame.len())];
+            // A runt without even a destination address is not a frame
+            let Some(dst) = frame.get(..6) else {
+                w.to_device.pop_front();
+                continue;
+            };
             if filter && dst != mac && dst[0] & 1 == 0 {
                 w.to_device.pop_front();
                 continue;
@@ -442,5 +446,28 @@ mod tests {
         wire.lock().unwrap().to_device.push_back(vec![0xFF; 64]);
         w.update(&mut ctx);
         assert_eq!(read(&mut w, &mut ctx, 1, 0x26, 2), [0, 0]);
+    }
+
+    /// A frame too short to hold a destination address (an empty one from a host endpoint) is skipped, with or
+    /// without MAC filtering, instead of panicking on its first byte.
+    #[test]
+    fn runt_frames_are_skipped() {
+        let mut ctx = TestCtx::default();
+        let wire = wire();
+        let mut w = W5500::new(wire.clone(), 4);
+        init(&mut w, &mut ctx, MAC);
+        let mut bcast = vec![0xFF; 6];
+        bcast.extend([5u8; 20]);
+        wire.lock().unwrap().to_device.extend([Vec::new(), vec![0xFF; 3], bcast.clone()]);
+        w.update(&mut ctx);
+        assert_eq!(read(&mut w, &mut ctx, 1, 0x26, 2), 28u16.to_be_bytes(), "only the broadcast");
+        let rd = u16::from_be_bytes(read(&mut w, &mut ctx, 1, 0x28, 2).try_into().unwrap());
+        assert_eq!(read(&mut w, &mut ctx, 3, rd + 2, 26), bcast);
+        // MACRAW without the filter (MFEN clear)
+        frame(&mut w, &mut ctx, 1, 0x00, true, &[0x04]);
+        wire.lock().unwrap().to_device.push_back(Vec::new());
+        w.update(&mut ctx);
+        assert_eq!(read(&mut w, &mut ctx, 1, 0x26, 2), 28u16.to_be_bytes(), "nothing more");
+        assert!(wire.lock().unwrap().to_device.is_empty());
     }
 }

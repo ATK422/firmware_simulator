@@ -37,6 +37,12 @@ const EPROTO: i32 = -71;
 const ECONNRESET: i32 = -104;
 const ESHUTDOWN: i32 = -108;
 const EINVAL: i32 = -22;
+/// The longest transfer accepted: Linux's usbfs limit (`usbfs_memory_mb`, 16 MiB by default), far beyond anything
+/// the emulated device needs. A longer one is refused with -EINVAL instead of waiting for (and buffering) up to
+/// 4 GiB of OUT data.
+pub const MAX_TRANSFER: usize = 16 << 20;
+/// Isochronous packet descriptors accepted in a request (the controller has no isochronous endpoints anyway).
+const MAX_ISO_PACKETS: usize = 1024;
 
 fn errno(e: &UsbError) -> i32 {
     match e {
@@ -61,6 +67,8 @@ struct Conn {
     tx: Vec<u8>,
     imported: bool,
     pending: Vec<Pending>,
+    /// Bytes still to skip: the data of a refused request.
+    skip: usize,
 }
 
 /// Serves the board's USB device over USB/IP.
@@ -129,7 +137,8 @@ impl UsbIpServer {
         {
             let _ = stream.set_nodelay(true);
             log::info!("USB/IP client {peer} connected");
-            self.conn = Some(Conn { stream, rx: Vec::new(), tx: Vec::new(), imported: false, pending: Vec::new() });
+            self.conn =
+                Some(Conn { stream, rx: Vec::new(), tx: Vec::new(), imported: false, pending: Vec::new(), skip: 0 });
         }
         let Some(conn) = &mut self.conn else { return };
         let mut buf = [0u8; 16384];
@@ -210,6 +219,11 @@ impl UsbIpServer {
     /// Handles one complete message at the start of `conn.rx`. Returns the bytes it used, `Some(0)` to close the
     /// connection, `None` when the message is not complete yet.
     fn handle(conn: &mut Conn, machine: &mut Machine) -> Option<usize> {
+        if conn.skip > 0 {
+            let n = conn.skip.min(conn.rx.len());
+            conn.skip -= n;
+            return (n > 0).then_some(n);
+        }
         let b = &conn.rx;
         if !conn.imported {
             if b.len() < 8 {
@@ -269,6 +283,14 @@ impl UsbIpServer {
                 let packets = be32(b, 32) as i32;
                 let out_len = if dir_in { 0 } else { len };
                 let iso_len = if packets > 0 && packets != -1 { 16 * packets as usize } else { 0 };
+                if ep > 15 || len > MAX_TRANSFER || iso_len > 16 * MAX_ISO_PACKETS {
+                    // Refused without waiting for its data, which is skipped as it arrives
+                    log::warn!("USB/IP: refusing a request for endpoint {ep} of {len} bytes");
+                    let p = Pending { seqnum, id: 0, dir_in, out_len: 0 };
+                    conn.tx.extend(ret_submit_status(&p, EINVAL, Vec::new()));
+                    conn.skip = out_len + iso_len;
+                    return Some(48);
+                }
                 if b.len() < 48 + out_len + iso_len {
                     return None;
                 }

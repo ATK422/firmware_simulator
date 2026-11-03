@@ -1823,6 +1823,31 @@ mod tests {
         assert!(d.tx_request().is_some(), "the queued frame goes out again");
     }
 
+    /// Unplugged after going bus-off, the controller is alone on its stub: the stub is idle (recessive), so it
+    /// recovers after 128 x 11 recessive bits like a node on an idle bus.
+    #[test]
+    fn bus_off_node_recovers_on_its_stub_when_unplugged() {
+        let (mut d, mut c) = configured();
+        queue_frame(&mut d, &mut c, 0x10, &[0], 1);
+        write(&mut d, &mut c, 0x050 + 2, &[3 << 5]);
+        for n in 0..32 {
+            let r = d.tx_request().unwrap();
+            d.tx_error(r.token, Time::from_us(30 * n), BusError::Bit { data_phase: false });
+        }
+        assert_eq!(d.error_counters().state, ErrorState::BusOff);
+        let rates = d.bit_rates().unwrap();
+        let bit = Time::from_ps(1_000_000_000_000 / rates.nominal);
+        let mut bus = crate::can::CanBus::new("can0", rates);
+        let t0 = Time::from_ms(1);
+        bus.set_unplugged(0, true, t0);
+        bus.step(&mut [&mut d], &mut [], t0);
+        bus.step(&mut [&mut d], &mut [], t0 + Time::from_ps(bit.as_ps() * (128 * 11 - 1)));
+        assert_eq!(d.error_counters().state, ErrorState::BusOff, "not yet: 127 sequences");
+        bus.step(&mut [&mut d], &mut [], t0 + Time::from_ps(bit.as_ps() * 128 * 11));
+        assert_eq!(d.error_counters().state, ErrorState::Active, "recovered");
+        assert_ne!(read32(&mut d, &mut c, 0x03C) & 1 << 23, 0, "TXBOERR");
+    }
+
     #[test]
     fn receive_errors_and_recovery_from_error_passive() {
         let (mut d, mut c) = configured();

@@ -240,8 +240,9 @@ pub struct BusFaults {
     /// The bus is held dominant from this time (a transceiver whose TXD is stuck low, CANH shorted to the
     /// supply). Nothing can be sent; every node's error counters climb.
     pub stuck_dominant: Option<Time>,
-    /// Nodes (by index) unplugged from the bus, each alone on its own stub, with when that stub is free.
-    pub unplugged: Vec<(usize, Time)>,
+    /// Nodes (by index) unplugged from the bus, each alone on its own stub, with when that stub is free (its idle
+    /// time is reported to the node up to there) and the idle time left over from that report.
+    pub unplugged: Vec<(usize, Time, Time)>,
     pub floods: Vec<Flood>,
     /// Frames destroyed by injected errors, for tests.
     pub corrupted: u64,
@@ -262,7 +263,7 @@ impl BusFaults {
     }
 
     fn is_unplugged(&self, i: usize) -> bool {
-        self.unplugged.iter().any(|(n, _)| *n == i)
+        self.unplugged.iter().any(|(n, ..)| *n == i)
     }
 
     /// Whether the next frame is hit, and where: the fraction of the frame sent before the error.
@@ -285,6 +286,12 @@ const SUSPEND_TRANSMISSION_BITS: u64 = 8;
 
 /// Default transmit queue length of a Linux CAN interface (`txqueuelen`).
 pub const ENDPOINT_TX_QUEUE: usize = 10;
+
+/// Transmit queue of an endpoint that connects the bus to real host tools in real time (a SocketCAN interface, a
+/// cannelloni tunnel). Their frames come in bursts (a cannelloni peer batches a datagram's worth, a hundred frames
+/// or so, and a real-time run that fell behind collects what the host sent meanwhile), so it is longer than
+/// [`ENDPOINT_TX_QUEUE`]; it still bounds what piles up while the bus is stuck or flooded.
+pub const BRIDGE_TX_QUEUE: usize = 1024;
 
 /// An error flag (6 bits), its delimiter (8) and the intermission (3), sent at the nominal rate after an error.
 const ERROR_FRAME_TAIL_BITS: u64 = 17;
@@ -359,9 +366,9 @@ impl CanBus {
     /// Unplugs node `node` (by its index in the node list [`CanBus::step`] gets) from the bus at `at`, or plugs it
     /// back in. Unplugged, it sends alone on its stub: nobody acknowledges, and it hears nothing.
     pub fn set_unplugged(&mut self, node: usize, unplugged: bool, at: Time) {
-        self.faults.unplugged.retain(|(n, _)| *n != node);
+        self.faults.unplugged.retain(|(n, ..)| *n != node);
         if unplugged {
-            self.faults.unplugged.push((node, at));
+            self.faults.unplugged.push((node, at, Time::ZERO));
         }
     }
 
@@ -403,29 +410,50 @@ impl CanBus {
         }
     }
 
-    /// An unplugged node sends alone: every frame goes unacknowledged on its stub.
+    /// An unplugged node sends alone: every frame goes unacknowledged on its stub. In between, the stub is idle:
+    /// the node sees recessive sequences, as on an idle bus (a bus-off node recovers).
     fn step_unplugged(&mut self, nodes: &mut [&mut dyn CanNode], until: Time) {
         let data_rate = self.rates.data.unwrap_or(self.rates.nominal);
+        let seq = self.bits(11).as_ps().max(1);
         for k in 0..self.faults.unplugged.len() {
-            let (i, mut free) = self.faults.unplugged[k];
+            let (i, mut free, mut carry) = self.faults.unplugged[k];
             if i >= nodes.len() || !self.compatible(i, nodes[i].bit_rates()) {
                 continue;
             }
+            // Reports the idle stub from `free` up to `to`
+            let idle = |node: &mut dyn CanNode, free: &mut Time, carry: &mut Time, to: Time| {
+                if to > *free {
+                    let total = carry.as_ps() + (to - *free).as_ps();
+                    *carry = Time(total % seq);
+                    if total >= seq {
+                        node.recessive_sequences(to, total / seq);
+                    }
+                    *free = to;
+                }
+            };
             // Bounded: each pass either sends or stops; a node can only retry so often per step
             for _ in 0..10_000 {
-                let Some(r) = nodes[i].tx_request() else { break };
+                let Some(r) = nodes[i].tx_request() else {
+                    idle(&mut *nodes[i], &mut free, &mut carry, until);
+                    break;
+                };
                 let start = r.ready_at.max(free);
                 let end = start + r.frame.duration(self.rates.nominal, data_rate) + self.bits(ACK_ERROR_EXTRA_BITS);
+                idle(&mut *nodes[i], &mut free, &mut carry, start.min(until));
                 if end > until {
                     break;
                 }
                 nodes[i].tx_done(r.token, end, false);
+                // The error delimiter and intermission after the ACK error are 11 recessive bits
+                nodes[i].recessive_sequences(end, 1);
                 free = end;
+                carry = Time::ZERO;
                 if nodes[i].error_passive() {
                     free += self.bits(SUSPEND_TRANSMISSION_BITS);
                 }
             }
             self.faults.unplugged[k].1 = free;
+            self.faults.unplugged[k].2 = carry;
         }
     }
 
@@ -438,6 +466,9 @@ impl CanBus {
             let limit = e.tx_queue_limit();
             for f in e.take_tx(until) {
                 if limit.is_some_and(|l| self.endpoint_queue[i].len() >= l) {
+                    if self.endpoint_dropped == 0 {
+                        log::warn!("CAN bus {}: endpoint {i}'s transmit queue is full, dropping its frames", self.name);
+                    }
                     self.endpoint_dropped += 1;
                 } else {
                     self.endpoint_queue[i].push_back(f);
@@ -919,6 +950,22 @@ mod tests {
         }
         // 1 ms of idle bus at 1 Mbit/s: 1000 / 11 sequences, without losing the remainders between steps
         assert_eq!(a.recessive, 90);
+    }
+
+    #[test]
+    fn an_unplugged_node_sees_its_idle_stub() {
+        let mut a = node(&[]);
+        let mut b = node(&[(500, CanFrame::classic(0x10, false, &[1]))]);
+        let mut bus = CanBus::new("can0", FD);
+        bus.set_unplugged(0, true, Time::ZERO);
+        bus.set_unplugged(1, true, Time::ZERO);
+        for t in 1..=10 {
+            bus.step(&mut [&mut a, &mut b], &mut [], Time::from_us(100 * t));
+        }
+        assert_eq!(a.recessive, 90, "as on an idle bus");
+        // The other one sends (unacknowledged) from 500 us; each attempt ends with 11 recessive bits
+        assert!(!b.done.is_empty());
+        assert_eq!(b.recessive, 500 / 11 + b.done.len() as u64);
     }
 
     #[test]

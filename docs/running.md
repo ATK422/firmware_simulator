@@ -294,6 +294,10 @@ firmware_simulator run $FW/puddles_backplane --board boards/mk2/puddles_backplan
     --udp 127.0.0.1:2203=127.0.0.1:2204 --realtime --time 600s
 ```
 
+The relay only passes on datagrams from `PEER`'s IP address (from any port), as the board itself only accepts the
+robot computer's IP and the cannelloni tunnel only its peer's: nobody else on the network can send `titan_link`
+commands (the kill switch among them) to the emulated board. A `PEER` of `0.0.0.0:PORT` accepts every sender.
+
 Puddles in its simulated vehicle is `robots/puddles.toml` ([robots.md](robots.md), [vehicles.md](vehicles.md)).
 
 ## Exit status

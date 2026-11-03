@@ -72,7 +72,8 @@ pub fn encode(frames: &[CanFrame], seq: &mut u8) -> Vec<Vec<u8>> {
     out
 }
 
-/// Unpacks a datagram: its sequence number and frames (error frames are dropped).
+/// Unpacks a datagram: its sequence number and frames (error frames, and CAN FD frames flagged as remote, are
+/// dropped).
 pub fn decode(p: &[u8]) -> Result<(u8, Vec<CanFrame>), String> {
     if p.len() < HEADER_LEN {
         return Err(format!("{} byte datagram", p.len()));
@@ -100,9 +101,11 @@ pub fn decode(p: &[u8]) -> Result<(u8, Vec<CanFrame>), String> {
         if len > if fd { 64 } else { 8 } {
             return Err(format!("{len} byte frame"));
         }
-        let rtr = !fd && id & CAN_RTR_FLAG != 0;
+        // As cannelloni's parser: no data follows any id with the RTR flag, CAN FD or not
+        let rtr = id & CAN_RTR_FLAG != 0;
         let data = if rtr { vec![0; len] } else { take(len)?.to_vec() };
-        if id & CAN_ERR_FLAG != 0 {
+        // CAN FD has no remote frames
+        if id & CAN_ERR_FLAG != 0 || (fd && rtr) {
             continue;
         }
         let extended = id & CAN_EFF_FLAG != 0;
@@ -233,6 +236,12 @@ impl CanEndpoint for Cannelloni {
     fn receive(&mut self, frame: &CanFrame, _at: Time) {
         self.pending.push(frame.clone());
     }
+
+    /// The far side's frames wait for the bus in a bounded queue (the far `vcan` would refuse writes with `ENOBUFS`
+    /// on real hardware), so a stuck or flooded bus does not collect them without end.
+    fn tx_queue_limit(&self) -> Option<usize> {
+        Some(sim_devices::can::BRIDGE_TX_QUEUE)
+    }
 }
 
 /// Connects a SocketCAN interface to a cannelloni peer until the process is stopped: the far end of a tunnel to
@@ -276,7 +285,7 @@ pub fn tunnel(iface: &str, local: SocketAddr, peer: SocketAddr) -> io::Result<()
 #[cfg(test)]
 mod tests {
     use super::*;
-    use sim_devices::can::{CanBus, Monitor};
+    use sim_devices::can::{BRIDGE_TX_QUEUE, CanBus, Monitor};
 
     #[test]
     fn packet_layout() {
@@ -318,6 +327,49 @@ mod tests {
         assert_eq!(decode(&err_frame).unwrap().1, vec![], "error frames are dropped");
         assert!(Cannelloni::parse_spec("127.0.0.1:1,127.0.0.1:2").is_ok());
         assert!(Cannelloni::parse_spec("127.0.0.1:1").is_err());
+    }
+
+    /// cannelloni's parser reads no data for any id with `CAN_RTR_FLAG`, CAN FD or not (and its encoder writes
+    /// none), so the frames after such a one are where cannelloni put them. CAN FD has no remote frames: that one
+    /// is dropped.
+    #[test]
+    fn an_fd_frame_with_the_rtr_flag_carries_no_data() {
+        #[rustfmt::skip]
+        let p = [
+            2, 0, 0, 0, 2,
+            0x40, 0, 0x01, 0x23, 0x88, 0x01,
+            0, 0, 0, 0x6F, 1, 0xC0,
+        ];
+        assert_eq!(decode(&p).unwrap().1, vec![CanFrame::classic(0x6F, false, &[0xC0])]);
+    }
+
+    /// A peer that keeps sending while the bus is stuck: the tunnel's frames wait in a bounded queue, and the bus
+    /// drops (and counts) the newest beyond it, as it does for a mock bridge, instead of queueing without bound.
+    #[test]
+    fn a_stuck_bus_bounds_the_tunnel_queue() {
+        let peer = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let mut t = Cannelloni::bind("127.0.0.1:0".parse().unwrap(), peer.local_addr().unwrap()).unwrap();
+        let to = t.local_addr().unwrap();
+        let rates = crate::board::bus_rates("internal").unwrap();
+        let mut bus = CanBus::new("a", rates);
+        let mut mon = Monitor::default();
+        bus.set_stuck_dominant(true, Time::ZERO);
+        let frames: Vec<CanFrame> =
+            (0..3000).map(|i| CanFrame::classic(0x100, false, &(i as u16).to_be_bytes())).collect();
+        let mut seq = 0;
+        for (k, chunk) in frames.chunks(500).enumerate() {
+            for p in encode(chunk, &mut seq) {
+                peer.send_to(&p, to).unwrap();
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            bus.step(&mut [], &mut [&mut mon, &mut t], Time::from_ms(k as u64 + 1));
+        }
+        assert_eq!(t.rx_frames, 3000);
+        assert_eq!(bus.endpoint_dropped, 3000 - BRIDGE_TX_QUEUE as u64);
+        bus.set_stuck_dominant(false, Time::from_ms(10));
+        bus.step(&mut [], &mut [&mut mon, &mut t], Time::from_secs(1));
+        assert_eq!(mon.received.len(), BRIDGE_TX_QUEUE, "the oldest go out once the bus is free");
+        assert_eq!(mon.received[BRIDGE_TX_QUEUE - 1].1, frames[BRIDGE_TX_QUEUE - 1]);
     }
 
     /// Two buses joined by a tunnel over loopback: what is sent on one arrives on the other, both ways.

@@ -240,8 +240,10 @@ pub struct Vehicle {
     pub water: Water,
     pub thrusters: Vec<Thruster>,
     pub state: State,
-    /// Seconds simulated.
+    /// Seconds simulated: `steps * dt`, so it does not drift the way a running sum of `dt` does.
     pub time: f64,
+    /// Steps taken.
+    steps: u64,
     /// Integration step, s.
     pub dt: f64,
     /// Each thruster's thrust in the last step, N (negative is reverse).
@@ -261,6 +263,7 @@ impl Vehicle {
             thrusters,
             state,
             time: 0.0,
+            steps: 0,
             dt: 1e-3,
             accel: ([0.0; 3], [0.0; 3]),
         }
@@ -340,7 +343,8 @@ impl Vehicle {
         };
         self.accel = (scale(sub(s.velocity, s0.velocity), 1.0 / dt), scale(sub(s.rate, s0.rate), 1.0 / dt));
         self.state = s;
-        self.time += dt;
+        self.steps += 1;
+        self.time = self.steps as f64 * dt;
     }
 
     /// Steps until `t` seconds (to the last whole step before it), with RPMs from `rpm` at the start of each step.
@@ -689,6 +693,17 @@ mod tests {
             v.state
         };
         assert_eq!(go(), go());
+    }
+
+    /// Summing `dt` step by step drifts: after 2256.698 s of 1 ms steps the sum is 1 ns past the step's end, more
+    /// than the margin `advance_to` allows, so from then on the step ending on a millisecond came one call late.
+    #[test]
+    fn long_runs_take_every_step_on_time() {
+        let mut v = vehicle(1.0, &[]);
+        let n = v.advance_to(2256.698, |_| Vec::new());
+        assert_eq!(n, 2_256_698, "every step up to the end, the last one included");
+        assert!((v.time - 2256.698).abs() < 1e-12, "{}", v.time);
+        assert_eq!(v.advance_to(2256.699, |_| Vec::new()), 1);
     }
 
     #[test]
