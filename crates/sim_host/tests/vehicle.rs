@@ -190,3 +190,62 @@ fn shipped_robot_files_load_their_vehicles() {
         assert_eq!(v.vehicle.floating_depth(), Some(v.vehicle.state.position[2]));
     }
 }
+
+/// The first-generation IVC boards of `robots/ivc_pool.toml` still talk when Talos's board rides on a vehicle that
+/// a current carries towards the surface vehicle: its projector and hydrophone move with the hull. (At 0.5 m/s
+/// the first byte fails its CRC, exactly as with a scripted `Trajectory::Linear` at that speed.)
+#[test]
+fn ivc_boards_talk_from_a_drifting_vehicle() {
+    use titan_link::{DeviceToHost, HostToDevice};
+    if common::titan_elf("ivc_board").is_none() {
+        return;
+    }
+    let path = common::repo().join("robots/ivc_pool.toml");
+    let mut spec: RobotSpec = toml::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+    spec.board[0].position_m = None;
+    spec.vehicle.push(
+        toml::from_str(
+            r#"
+name = "talos"
+file = "../vehicles/talos.toml"
+position_m = [5.0, 6.0, 1.5]
+water = { current_mps = [0.2, 0.0, 0.0] }
+transducer = [{ board = "talos_ivc", mount_m = [0.0, 0.0, 0.0] }]
+"#,
+        )
+        .unwrap(),
+    );
+    let mut r = Robot::from_spec(&spec, path.parent().unwrap()).unwrap();
+    // Trimmed neutral, and already moving with the water
+    let v = &mut r.vehicles[0].vehicle;
+    v.params.volume_m3 = v.params.mass_kg / v.water.density_kg_m3;
+    v.state.velocity = [v.water.current_mps[0], 0.0, 0.0];
+    let mut bridges = Vec::new();
+    for b in r.buses.iter_mut() {
+        let br = sim_host::mock_bridge::MockBridge::new(8, true, Time::ZERO);
+        br.set_kill(Some(false));
+        b.endpoints.push(Box::new(br.clone()));
+        bridges.push(br);
+    }
+    r.run_until(Time::from_ms(600));
+    for b in [0x5A, 0xC3] {
+        bridges[0].send(HostToDevice::Ivc(titan_link::ivc::HostToDevice::Tx(b)));
+    }
+    r.run_until(Time::from_ms(4000));
+    let got: Vec<u8> = bridges[1]
+        .state()
+        .received
+        .iter()
+        .filter_map(|(_, m)| match m {
+            DeviceToHost::Ivc(titan_link::ivc::DeviceToHost::Rx(b)) => Some(*b),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(got, [0x5A, 0xC3]);
+    // Talos's transducer went 0.8 m closer, and that is where the surface board hears it from
+    let p = r.vehicles[0].vehicle.state.position;
+    assert!((p[0] - 5.8).abs() < 0.01 && (p[2] - 1.5).abs() < 0.01, "{p:?}");
+    let medium = r.medium.as_ref().unwrap().lock().unwrap();
+    let at = medium.projectors[0].trajectory.at(4.0);
+    assert!((at[0] - p[0]).abs() < 1e-6, "{at:?}");
+}

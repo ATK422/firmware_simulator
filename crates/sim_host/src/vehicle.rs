@@ -92,7 +92,8 @@ pub struct ThrusterWiring {
 #[serde(deny_unknown_fields)]
 pub struct SensorMount {
     pub board: String,
-    /// The board's input that takes the absolute pressure in pascals (an MS5837's `<name>.pressure_pa`).
+    /// The board's input that takes the absolute pressure in pascals (an MS5837's `<name>.pressure_pa`: the
+    /// camera cage's and the Puddles backplane's `depth.pressure_pa`, PoHalf's `water_depth.pressure_pa`).
     pub input: String,
     /// Where the port is, body frame from the centre of gravity, m.
     pub mount_m: Vec3,

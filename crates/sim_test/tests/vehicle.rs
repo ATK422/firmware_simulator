@@ -124,3 +124,26 @@ fn a_depth_controller_through_the_firmware_reaches_and_holds_the_target() {
     assert!((truth - target).abs() < 0.03, "{truth}");
     assert!(v.state.world_velocity()[2].abs() < 0.02);
 }
+
+#[test]
+fn puddles_runs_reproduce_exactly() {
+    if sim_test::titan_rs("puddles_backplane").is_none() {
+        return;
+    }
+    // Firmware, DShot, motors and vehicle: the same commands give the same motion, to the last bit
+    let go = || {
+        let (mut r, bridge) = puddles().unwrap();
+        r.run_until(Time::from_ms(5000));
+        for i in 0..40 {
+            let t = 100 * (i % 7) as i16 - 300;
+            bridge.send(HostToDevice::PuddlesBackplane(pb::HostToDevice::Dshot([t, -t, 50, 0, 200, 210, 190, t])));
+            r.run_for(Time::from_ms(20));
+        }
+        let v = r.robot.vehicle("puddles").unwrap().vehicle.clone();
+        (v.state, v.thrust_n, reported_depths(&bridge))
+    };
+    let (a, b) = (go(), go());
+    assert!(a.0.position[2] > 0.2, "{:?}", a.0);
+    assert!(a.0.attitude.euler()[2].abs() > 1e-3, "turning: {:?}", a.0);
+    assert_eq!(a, b);
+}
