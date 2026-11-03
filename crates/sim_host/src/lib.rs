@@ -12,6 +12,7 @@ pub mod rtt;
 pub mod session;
 pub mod socketcan;
 pub mod target;
+pub mod upload;
 
 pub use session::Session;
 pub use target::TargetMemory;

@@ -122,6 +122,16 @@ struct RunArgs {
     /// Write what the board's SSD1306 shows to this PNG file at the end.
     #[arg(long)]
     screenshot: Option<PathBuf>,
+    /// Boot through the bootrom and boot2 (real flash path) instead of starting the image directly.
+    #[arg(long)]
+    rom_boot: bool,
+    /// Keep the flash in this file: loaded (if it exists) before the image is written over it, saved at the end.
+    #[arg(long)]
+    flash_file: Option<PathBuf>,
+    /// Carry out the bootrom's flash functions directly (high-level emulation) instead of running them against the
+    /// QSPI flash model.
+    #[arg(long)]
+    hle_flash: bool,
 }
 
 fn parse_input(s: &str) -> Result<(String, f64), String> {
@@ -224,8 +234,20 @@ fn run(args: RunArgs) -> Result<()> {
         bail!("--input and --environment need a --board");
     }
     machine.load(&image).map_err(anyhow::Error::msg)?;
-    let vtor = machine.direct_boot().map_err(anyhow::Error::msg)?;
-    log::info!("direct boot: VTOR {vtor:#010x}, entry {:#010x}", machine.cores[0].pc());
+    machine.hle_enabled = args.hle_flash;
+    if let Some(f) = &args.flash_file {
+        if machine.load_flash_file(f).with_context(|| format!("reading {}", f.display()))? {
+            log::info!("flash contents from {}", f.display());
+        }
+        machine.load(&image).map_err(anyhow::Error::msg)?;
+    }
+    if args.rom_boot {
+        machine.rom_boot().map_err(anyhow::Error::msg)?;
+        log::info!("booting through the bootrom");
+    } else {
+        let vtor = machine.direct_boot().map_err(anyhow::Error::msg)?;
+        log::info!("direct boot: VTOR {vtor:#010x}, entry {:#010x}", machine.cores[0].pc());
+    }
 
     let mut session = Session::new(machine, &image);
     session.keep_logs = false;
@@ -288,6 +310,9 @@ fn run(args: RunArgs) -> Result<()> {
     session.flush_uarts();
     for (ch, bytes) in session.rtt_text.drain(..) {
         print!("[rtt{ch}] {}", String::from_utf8_lossy(&bytes));
+    }
+    if let Some(f) = &args.flash_file {
+        session.machine.save_flash_file(f).with_context(|| format!("writing {}", f.display()))?;
     }
     if let Some(path) = &args.screenshot {
         match session.machine.sys.i2c_device::<sim_devices::ssd1306::Ssd1306>() {

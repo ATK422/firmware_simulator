@@ -95,6 +95,8 @@ pub struct Machine {
     last_ran: usize,
     /// Vector table used by direct boot, reused after resets.
     boot_vtor: Option<u32>,
+    /// Boot through the bootrom and boot2 (see [`Machine::rom_boot`]) rather than directly.
+    rom_boot: bool,
     /// Number of chip resets since power-on.
     pub resets: u32,
     /// Trapped ROM functions by entry address (see [`crate::hle`]).
@@ -144,10 +146,11 @@ impl Machine {
             stop_requested: false,
             last_ran: 1,
             boot_vtor: None,
+            rom_boot: false,
             resets: 0,
             external_fired: Vec::new(),
             hle: BTreeMap::new(),
-            hle_enabled: true,
+            hle_enabled: false,
             usb_boot_requested: false,
             skip_breakpoint: [false; 2],
             trace_instructions: false,
@@ -200,8 +203,27 @@ impl Machine {
             .find(|&base| self.looks_like_vector_table(base))
             .ok_or("no vector table found at 0x10000100, 0x10000000 or 0x20000000")?;
         self.boot_vtor = Some(vtor);
+        self.rom_boot = false;
         self.reboot();
         Ok(vtor)
+    }
+
+    /// Starts both cores in the bootrom, as after power-on: the bootrom loads boot2 from flash through the SSI and
+    /// the QSPI flash model, boot2 sets up XIP and enters the application. Needs the bootrom mapped. Resets reboot
+    /// the same way.
+    pub fn rom_boot(&mut self) -> Result<(), String> {
+        if !self.has_bootrom() {
+            return Err("ROM boot needs the bootrom".into());
+        }
+        self.rom_boot = true;
+        self.boot_vtor = None;
+        self.reboot();
+        Ok(())
+    }
+
+    /// Whether the machine boots through the bootrom.
+    pub fn boots_from_rom(&self) -> bool {
+        self.rom_boot
     }
 
     /// Whether a bootrom with a plausible vector table is mapped.
@@ -318,6 +340,70 @@ impl Machine {
         self.reboot();
     }
 
+    /// Loads the flash contents from a file (a raw image of the whole flash), if it exists. Returns whether it did.
+    pub fn load_flash_file(&mut self, path: &std::path::Path) -> std::io::Result<bool> {
+        match std::fs::read(path) {
+            Ok(data) => {
+                let n = data.len().min(self.sys.flash.len());
+                self.sys.flash[..n].copy_from_slice(&data[..n]);
+                Ok(true)
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Writes the flash contents to a file.
+    pub fn save_flash_file(&self, path: &std::path::Path) -> std::io::Result<()> {
+        std::fs::write(path, &self.sys.flash)
+    }
+
+    /// Removes power and applies it again: every block resets, including the watchdog's scratch registers and
+    /// REASON, CHIP_RESET reports a power-on reset, and SRAM comes up with arbitrary contents. The flash keeps its
+    /// data and its non-volatile status bits; attached devices stay attached.
+    pub fn power_cycle(&mut self) {
+        self.chip_reset(crate::periph::sysctl::ChipResetCause::PowerOn);
+    }
+
+    /// Pulls the RUN pin low and releases it: a chip reset like power-on, except that SRAM keeps its contents.
+    pub fn run_pin_reset(&mut self) {
+        self.chip_reset(crate::periph::sysctl::ChipResetCause::RunPin);
+    }
+
+    fn chip_reset(&mut self, cause: crate::periph::sysctl::ChipResetCause) {
+        use crate::periph::sysctl::ChipResetCause;
+        let t = self.clocks[0].now.max(self.clocks[1].now).max(self.now);
+        log::info!("[{t}] chip reset ({cause:?})");
+        self.resets += 1;
+        self.sys.watchdog_reset(t);
+        let ref_hz = self.sys.freqs.clk_ref;
+        self.sys.watchdog = crate::periph::timer::Watchdog::new(ref_hz);
+        self.sys.timer.restart(&self.sys.watchdog.tick, t);
+        self.sys.vreg.record(cause);
+        self.sys.ssi.chip.power_up();
+        self.sys.refresh_xip();
+        if cause == ChipResetCause::PowerOn {
+            // Arbitrary but reproducible power-up contents
+            let mut x = 0x9E37_79B9_7F4A_7C15u64 ^ t.as_ps();
+            for b in self.sys.sram.iter_mut().chain(self.sys.xip_sram.iter_mut()) {
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                *b = x as u8;
+            }
+        }
+        self.clk_sys = self.sys.clk_sys;
+        self.sys.clk_sys_changed = false;
+        self.now = t;
+        for c in 0..2 {
+            let log = self.cores[c].log_exceptions;
+            self.cores[c] = CortexM0Plus::new();
+            self.cores[c].log_exceptions = log;
+            self.clocks[c] = CycleClock::new(t);
+        }
+        self.reboot();
+    }
+
     /// Carries out a trapped ROM function for core `c` and returns to its caller.
     fn run_hle(&mut self, c: usize, f: RomFn) -> StepOutcome {
         let cpu = &self.cores[c];
@@ -344,6 +430,7 @@ impl Machine {
             RomFn::ConnectInternalFlash | RomFn::FlashExitXip => {
                 // Leave the SSI as the ROM does, so firmware can send its own commands (pico-sdk's flash_do_cmd)
                 self.sys.ssi.enter_command_mode();
+                self.sys.refresh_xip();
                 Time::from_us(2)
             }
             RomFn::FlashFlushCache | RomFn::FlashEnterCmdXip => Time::from_us(2),
@@ -362,7 +449,12 @@ impl Machine {
         let log = self.cores[c].log_exceptions;
         self.cores[c] = CortexM0Plus::new();
         self.cores[c].log_exceptions = log;
-        if c == 0 {
+        if c == 0 && self.rom_boot {
+            let mut trace = NullSink;
+            let now = self.clocks[0].now;
+            let mut bus = CoreBus { sys: &mut self.sys, trace: &mut trace, core: 0, now };
+            self.cores[0].reset(&mut bus, 0);
+        } else if c == 0 {
             if let Some(vtor) = self.boot_vtor {
                 let mut trace = NullSink;
                 let now = self.clocks[0].now;
@@ -376,6 +468,24 @@ impl Machine {
 
     /// Starts the cores again after a reset.
     fn reboot(&mut self) {
+        if self.rom_boot {
+            // Every block starts in reset; the bootrom releases what it needs. Both cores run the bootrom; core 1
+            // parks itself waiting for the launch sequence.
+            self.sys.resets = crate::periph::sysctl::Resets::power_on();
+            let now = self.now;
+            for c in 0..2 {
+                let mut trace = NullSink;
+                let mut bus = CoreBus { sys: &mut self.sys, trace: &mut trace, core: c as u8, now };
+                self.cores[c].reset(&mut bus, 0);
+                self.clocks[c] = CycleClock::new(now.max(self.clocks[c].now));
+            }
+            self.core_enabled = [true, true];
+            return;
+        }
+        if self.boot_vtor.is_some() {
+            // As if the bootrom and boot2 had run
+            self.sys.preset_xip();
+        }
         match self.boot_vtor {
             Some(vtor) => {
                 let mut trace = NullSink;

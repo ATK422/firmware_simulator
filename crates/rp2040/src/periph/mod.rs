@@ -7,6 +7,7 @@ pub mod gpio;
 pub mod i2c;
 pub mod pio;
 pub mod pwm;
+pub mod qspi_flash;
 pub mod sio;
 pub mod spi;
 pub mod ssi;

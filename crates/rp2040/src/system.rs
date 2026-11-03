@@ -28,7 +28,7 @@ use crate::periph::pio::{self, Pio};
 use crate::periph::pwm::Pwm;
 use crate::periph::sio::Sio;
 use crate::periph::spi::Spi;
-use crate::periph::ssi::Ssi;
+use crate::periph::ssi::{IoQspi, Ssi};
 use crate::periph::sysctl::{self, Psm, Resets, Vreg, bit, psm};
 use crate::periph::timer::{Timer, Watchdog, WatchdogReset};
 use crate::periph::uart::Uart;
@@ -95,6 +95,12 @@ pub struct System {
     pub pwm: Pwm,
     pub uart: [Uart; 2],
     pub ssi: Ssi,
+    pub io_qspi: IoQspi,
+    /// Cached [`Ssi::xip_config`] and chip busy time, checked on every flash access.
+    xip_config: Result<(), &'static str>,
+    xip_busy_until: Time,
+    /// An XIP failure was reported since the last time XIP worked.
+    xip_failed: bool,
     pub spi: [Spi; 2],
     pub dma: Dma,
     /// Devices on the SPI buses.
@@ -182,6 +188,10 @@ impl System {
             pwm: Pwm::default(),
             uart: [Uart::new(0), Uart::new(1)],
             ssi: Ssi::default(),
+            io_qspi: IoQspi::default(),
+            xip_config: Err("the SSI is disabled"),
+            xip_busy_until: Time::ZERO,
+            xip_failed: false,
             spi: [Spi::new(0), Spi::new(1)],
             dma: Dma::default(),
             spi_devices: Vec::new(),
@@ -227,6 +237,12 @@ impl System {
         self.timer = Timer::new();
         self.timer.restart(&self.watchdog.tick, now);
         self.gpio.reset_io(false);
+        // The SSI and IO_QSPI reset; the flash chip is outside the RP2040 and keeps its state
+        let chip = std::mem::take(&mut self.ssi.chip);
+        self.ssi = Ssi::default();
+        self.ssi.chip = chip;
+        self.io_qspi = IoQspi::default();
+        self.refresh_xip();
         self.sio = Sio::default();
         let observed = self.pwm.observed;
         self.pwm = Pwm { observed, ..Pwm::default() };
@@ -251,6 +267,37 @@ impl System {
         self.update_clocks(now);
         self.irq_dirty = true;
         self.reset_request = None;
+    }
+
+    /// Recomputes the cached XIP state after the SSI, IO_QSPI or the flash chip changed.
+    pub fn refresh_xip(&mut self) {
+        self.xip_config = self.ssi.xip_config();
+        self.xip_busy_until = self.ssi.chip.busy_until();
+    }
+
+    /// Leaves the SSI and flash as boot2 does, for direct boot.
+    pub fn preset_xip(&mut self) {
+        self.ssi.preset_boot2_xip();
+        self.refresh_xip();
+    }
+
+    /// Whether a memory-mapped flash access at `now` works (see [`Ssi::xip_ready`]); reports the first failure.
+    #[inline]
+    fn xip_check(&mut self, now: Time, addr: u32) -> Result<(), BusFault> {
+        if self.xip_config.is_ok() && now >= self.xip_busy_until {
+            self.xip_failed = false;
+            return Ok(());
+        }
+        // XIP_NOCACHE_NOALLOC and friends hit the same flash
+        let reason = self.ssi.xip_ready(now).err().unwrap_or("");
+        if reason.is_empty() {
+            return Ok(());
+        }
+        if !self.xip_failed {
+            self.xip_failed = true;
+            log::warn!("[{now}] XIP access to {addr:#010x} while {reason}: bus fault");
+        }
+        Err(BusFault::Unmapped(addr))
     }
 
     #[inline]
@@ -1088,7 +1135,7 @@ impl System {
                 self.pio_advance(trace, now);
             }
             let gpio_in = self.gpio.inputs();
-            if let Some(v) = self.sio.read(core, addr - SIO_BASE, gpio_in, 0) {
+            if let Some(v) = self.sio.read(core, addr - SIO_BASE, gpio_in, self.io_qspi.levels()) {
                 self.irq_dirty = true;
                 return v;
             }
@@ -1114,7 +1161,12 @@ impl System {
             WATCHDOG_BASE => self.watchdog.read(now, off),
             ROSC_BASE => self.clocks.rosc.read(off),
             VREG_AND_CHIP_RESET_BASE => self.vreg.read(off),
-            XIP_SSI_BASE => self.ssi.read(off),
+            XIP_SSI_BASE => {
+                let v = self.ssi.read(off, now, &mut self.flash);
+                self.refresh_xip();
+                v
+            }
+            IO_QSPI_BASE => self.io_qspi.read(off),
             SPI0_BASE | SPI1_BASE => {
                 let n = (base == SPI1_BASE) as usize;
                 let v = self.spi[n].read(off);
@@ -1175,7 +1227,8 @@ impl System {
         let mode = alias_mode(addr);
         if self.in_reset(base) {
             let b = base_reset_bit(base).unwrap();
-            if self.warned_in_reset & (1 << b) == 0 {
+            if self.warned_in_reset & (1 << b) == 0 && b != bit::SYSCFG {
+                // (The bootrom writes SYSCFG's NMI mask before releasing it; that one is expected)
                 self.warned_in_reset |= 1 << b;
                 log::warn!(
                     "[{now}] core{core} write to {} while the block is held in RESETS; ignored",
@@ -1249,7 +1302,18 @@ impl System {
                 self.reschedule_watchdog(now);
             }),
             VREG_AND_CHIP_RESET_BASE => self.vreg.write(off, value, mode).then_some(()),
-            XIP_SSI_BASE => self.ssi.write(off, value, WriteMode::Normal).then_some(()),
+            XIP_SSI_BASE => {
+                let ok = self.ssi.write(off, value, WriteMode::Normal, now, &mut self.flash);
+                self.refresh_xip();
+                ok.then_some(())
+            }
+            IO_QSPI_BASE => {
+                let ok = self.io_qspi.write(off, value, mode);
+                let o = self.io_qspi.cs_override();
+                self.ssi.set_cs_override(o, now, &mut self.flash);
+                self.refresh_xip();
+                ok.then_some(())
+            }
             SPI0_BASE | SPI1_BASE => {
                 let n = (base == SPI1_BASE) as usize;
                 let ok = self.spi[n].write(off, value, mode);
@@ -1316,7 +1380,10 @@ impl System {
                 }
             }
             0x1 => match addr >> 24 {
-                0x10..=0x13 => Ok(mem::read(&self.flash, self.flash_offset(addr), size)),
+                0x10..=0x13 => {
+                    self.xip_check(now, addr)?;
+                    Ok(mem::read(&self.flash, self.flash_offset(addr), size))
+                }
                 0x15 if ((addr & 0x00FF_FFFF) as usize) < XIP_SRAM_SIZE => {
                     Ok(mem::read(&self.xip_sram, (addr & 0x3FFF) as usize, size))
                 }
@@ -1721,6 +1788,7 @@ impl Bus for CoreBus<'_> {
         // Fast paths for the places code runs from
         match addr >> 28 {
             0x1 if addr >> 24 <= 0x13 => {
+                self.sys.xip_check(self.now, addr)?;
                 let off = self.sys.flash_offset(addr);
                 Ok(u16::from_le_bytes([self.sys.flash[off], self.sys.flash[off + 1]]))
             }
@@ -1774,6 +1842,9 @@ mod tests {
         assert_eq!(sys.read(&mut t, 0, Time::ZERO, SRAM_BASE + 9, Size::Byte), Ok(0xCC));
         assert_eq!(bus_rw(&mut sys, SRAM_END - 2, Size::Half, 0x1234), 0x1234);
         assert_eq!(sys.read(&mut t, 0, Time::ZERO, SRAM_END, Size::Byte), Err(BusFault::Unmapped(SRAM_END)));
+        // XIP faults until the SSI is set up (by boot2, here preset)
+        assert_eq!(sys.read(&mut t, 0, Time::ZERO, XIP_BASE, Size::Word), Err(BusFault::Unmapped(XIP_BASE)));
+        sys.preset_xip();
         // Flash reads as erased, writes to XIP are ignored, every alias reads the same flash
         assert_eq!(sys.read(&mut t, 0, Time::ZERO, XIP_BASE, Size::Word), Ok(0xFFFF_FFFF));
         sys.poke(XIP_BASE + 4, Size::Word, 0x1122_3344);
