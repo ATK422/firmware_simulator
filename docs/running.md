@@ -20,6 +20,7 @@ firmware_simulator run $FW/power_board --board boards/mk2/power_board.toml --moc
 - [Profiles, waveforms, dashboard and JSON logs](#profiles-waveforms-dashboard-and-json-logs)
 - [Debugging with GDB](#debugging-with-gdb)
 - [USB: BOOTSEL, PICOBOOT, UF2 and CDC](#usb-bootsel-picoboot-uf2-and-cdc)
+- [Several micro-ROS boards at once](#several-micro-ros-boards-at-once)
 - [Puddles: Ethernet](#puddles-ethernet)
 - [Exit status](#exit-status)
 
@@ -34,7 +35,7 @@ logs).
 |---|---|
 | titan_firmware_rs boards (`power_board`, `esc_board`, `ivc_board2`, `puddles_backplane`, `template`, ...) | `cd external/titan_firmware_rs/firmware && cargo build --workspace --release`; they land in `external/titan_firmware_rs/firmware/target/thumbv6m-none-eabi/release/` |
 | C titan_firmware (`basic_template`, the Titan bootloader, a small OTA app) | `scripts/build_c_firmware.sh` (needs `gcc-arm-none-eabi`, `cmake`, `ninja` and titan_firmware's pico-sdk submodule) into `build/c/` |
-| Hand-written test programs (`test_programs/*.elf`, `embassy_blinky.elf`, `pico/*.elf`, `c_dual_usb`, `c_ivc_modem`) | committed; `make -C test_programs` (Thumb and embassy), `make -C test_programs pico`, `make -C test_programs c_dual_usb`, `make -C test_programs c_ivc_modem` (the C IVCBoard2 modem from titan_firmware's `blake/ivc`) rebuild them |
+| Hand-written test programs (`test_programs/*.elf`, `embassy_blinky.elf`, `pico/*.elf`, `c_dual_usb`, `c_ivc_modem`, `c_ivc_pinger`) | committed; `make -C test_programs` (Thumb and embassy), `make -C test_programs pico`, `make -C test_programs c_dual_usb`, `make -C test_programs c_ivc_modem` and `c_ivc_pinger` (the C IVCBoard2 modem and its pinger mode from titan_firmware's `blake/ivc`) rebuild them |
 
 The C titan_firmware board applications need titan_firmware's prebuilt micro-ROS library (built in Docker), so the
 script does not build them; the C programs the tests run are the template, the bootloader and its test app.
@@ -61,7 +62,9 @@ core1 249575205 cycles, pc 0x00000176, Some(Wfe)
   with the ELF's `.defmt` table; RTT text that is not defmt is printed at the end as `[rtt0] ...`.
 * `[0.006337s] uart0: AB Hello, UART!` is a complete line from a UART (pico-sdk stdio, the C logger).
 * The last lines give the stop reason, both cores' cycle counts and PCs (with symbols) and the wall time taken,
-  then a table of every unmodelled register the firmware touched (see `--unmodelled`).
+  then a table of every unmodelled register the firmware touched (see `--unmodelled`), and, for a board in an
+  acoustic environment whose hydrophone signal clipped at the receive chain's rails, how much of it did
+  ([acoustics.md](acoustics.md#what-the-pinger-amplitude-does-with-distance-and-why)).
 
 Virtual time starts at power-on; the firmware's own timestamps start when its timer does, so the two columns
 differ by roughly the boot time.
@@ -83,7 +86,7 @@ differ by roughly the boot time.
 | `--environment FILE` | | Puts the board's `[transducer]` in an acoustic environment ([acoustics.md](acoustics.md)) |
 | `--position X,Y,Z` | `0,0,1` | Where the transducer is in the environment, metres (z is depth) |
 | `--screenshot FILE` | | Writes what the board's SSD1306 shows to a PNG at the end (and prints it as text) |
-| `--realtime` | off | Paces virtual time to the wall clock (needed with host tools); warns when the emulation falls behind |
+| `--realtime` | off | Paces virtual time to the wall clock (needed with host tools); warns when the emulation falls behind ([below](#options)) |
 | `--uart0`, `--uart1` | `stdout` | `stdout` (lines with their virtual time), `pty` (a pseudo terminal, input too) or `none` |
 | `--rom-boot` | off | Boots through the bootrom and boot2 instead of directly ([below](#boot-modes-and-the-flash)) |
 | `--flash-file FILE` | | Keeps the flash in a file between runs |
@@ -97,12 +100,23 @@ differ by roughly the boot time.
 | `--vcd FILE`, `--vcd-pins SPEC`, `--vcd-events` | all pins | Writes a VCD waveform of the GPIOs, optionally with decoded traffic |
 | `--dashboard ADDR`, `--dashboard-hold`, `--dashboard-pause-at T` | | Serves a live dashboard with fault, input and pause controls |
 | `--log-json FILE` | | Writes every log line, UART and USB line, CAN frame and fault as JSON lines |
-| `--unmodelled MODE` | `first` | Logging of registers the emulator does not model: `first` access to each, `every` access, or `off` |
+| `--unmodelled MODE` | `summary` | Logging of registers the emulator does not model: `summary` (one note at the first access, the table at the end), `first` (a warning at the first access to each, and the table), `every` (a warning at every access) or `off` (nothing) |
 | `--quantum N` | 16 | Instructions a core runs before the other gets a turn (1 for lockstep debugging) |
 | `--stop-on-bkpt` | off | A `BKPT` stops the run instead of escalating to HardFault |
+| `--stop-on-lockup` | off | A lockup stops the run, instead of the board running on (locked up) until the watchdog resets it ([faults.md](faults.md#what-the-models-do)) |
 | `--gdb ADDR` | | Waits for GDB on this address before running ([below](#debugging-with-gdb)) |
 
 `firmware_simulator run --help` has the same list.
+
+**Virtual time and the wall clock.** Without `--realtime` the emulator runs as fast as it can, which is not
+necessarily faster than real time: a board that mostly sleeps runs far ahead of the wall clock (the template about
+60x), a busy one can fall behind it (the ESC board runs at about 1.1x on its own, Talos as a whole at about 0.4x
+on one core, a C image that is busy in its main loop may run below 1x). A host tool talking to the board through a
+pty, socket or vcan (the micro-ROS agent, `titan_bridge`, `picocom`) then sees the firmware's time run faster or
+slower than its own, so give its timeouts plenty of room, several times what hardware needs, or use `--realtime`.
+With `--realtime` virtual time never runs ahead of the wall clock; when the emulation cannot keep up, `run` and
+`robot` warn, at most every 5 s, by how much it is behind (`real-time mode: emulation is 1.23s behind the wall
+clock`), and replies from host tools then reach the firmware late by about that much.
 
 ## Boot modes and the flash
 
@@ -123,7 +137,7 @@ afterwards (pico-sdk's `flash_do_cmd` behind `pico_unique_id`, boot2) keeps work
 (`crates/sim_host/tests/hle.rs`).
 
 `--flash-file FILE` loads the flash from `FILE` (if it exists) before the image is written over it and saves it
-at the end, so what the firmware writes (a flash recorder, crash data, or an application the C Titan bootloader
+at the end (also after a lockup, and when Ctrl-C or SIGTERM ends the run: see [Exit status](#exit-status)), so what the firmware writes (a flash recorder, crash data, or an application the C Titan bootloader
 flashed) persists between runs. Without an image (`--bootsel`) the flash is the file's contents or blank.
 `run` needs an image otherwise, so there is no way to boot a flash file's contents alone: pass the image again
 (it is written over the same place) or reflash it with `picoboot load`.
@@ -192,9 +206,11 @@ firmware_simulator run --bootsel --time 300ms --trace device
 #   [0.127046s] usb: configured 2e8a:0003 Raspberry Pi RP2 Boot (serial E0C91200A4A1), 2 interface(s)
 ```
 
-Unmodelled registers are also logged as warnings on first access (`--unmodelled`), and summarised at the end:
-writes are stored and reads return the stored or SVD reset value, so firmware that only configures a block keeps
-running, but the warning says the emulator is guessing.
+Unmodelled registers are also counted and listed at the end of the run, with one note in the log at the first
+access (`--unmodelled first` warns at the first access to each register, `every` at every access, `off` says
+nothing): writes are stored and reads return the stored or SVD reset value, so firmware that only configures a
+block keeps running, but the table says where the emulator is guessing. A pico-sdk image touches a handful of them
+(`TBMAN.PLATFORM`, the QSPI pads, `XIP_CTRL.FLUSH` when it writes the flash).
 
 ## Profiles, waveforms, dashboard and JSON logs
 
@@ -224,7 +240,9 @@ firmware_simulator run $FW/power_board --board boards/mk2/power_board.toml --moc
 Coding agents get the same through `firmware_simulator mcp`, an MCP server whose tools start runs, read their
 state, logs and CAN frames, and inject faults ([tools.md](tools.md#mcp-server)).
 
-None of them changes what a single-core program does; with both cores running, the profiler's extra cuts can
+`--log-json`, `--trace-file` and `--candump-log` are flushed every 100 ms of wall time and stdout line by line, so
+`tail -f` (or a script waiting for a line) can follow a run while it goes on. None of them changes what a
+single-core program does; with both cores running, the profiler's extra cuts can
 shift how their instructions interleave, as a different `--quantum` would. They combine with each other and with
 `--trace`. With `picoboot load`, the profile names the functions of the image that was flashed.
 
@@ -277,6 +295,45 @@ Firmware that asks for BOOTSEL (pico-sdk's `reset_usb_boot`, its reset interface
 Not modelled: the controller's host mode, isochronous endpoints, low speed devices, bit-level errors. The
 RP2040-E5 erratum is not modelled (pico-sdk's workaround runs and works).
 
+## Several micro-ROS boards at once
+
+The C boards' micro-ROS clients choose their DDS domain themselves: titan_firmware calls
+`rclc_support_init(&support, 0, NULL, &allocator)` (e.g. `talos/IVCBoard2/src/ros.c` on `blake/ivc`) with the
+default init options, so each client asks its agent for domain 0, and `ROS_DOMAIN_ID` on the agent's side changes
+nothing. Two emulator runs, each with its own agent, therefore publish the same topics (`/talos/ivc/rx_new`, ...)
+on the same domain, and a test that listens on one sees both. Separate ports or pty paths per run only keep the
+serial links apart; the DDS traffic still meets. Ways to keep runs apart:
+
+* **One Fast DDS discovery server per run** (what the test campaign did): every participant of a run (its agent,
+  its `ros2` tools, the test) is pointed at that run's server and discovers only the others pointed at it. Fast DDS
+  reads `ROS_DISCOVERY_SERVER` itself, so this works for the agent too.
+* **A network namespace or container per run** (`docker run --network none` with the pty paths mounted, or
+  `unshare --net`): DDS discovery cannot cross it. Mind that Fast DDS's shared memory transport is per host, so
+  keep `/dev/shm` separate as well (a container does).
+* **Patching the firmware** to set a domain id in its init options, which is a firmware change, not an emulator one.
+
+A run with its own discovery server, for each run with another port, server id and pty paths (**to verify
+locally**: written from the Fast DDS 2.x and micro-ROS documentation, with no ROS 2 here to run it):
+
+```bash
+PORT=11811                     # 11812, 11813, ... for the other runs
+fastdds discovery --server-id 0 --ip-address 127.0.0.1 --port $PORT &
+export ROS_DISCOVERY_SERVER=127.0.0.1:$PORT
+firmware_simulator run $TITAN_FIRMWARE_DIR/talos/IVCBoard2/build/IVCBoard2_with_bl.uf2 \
+    --board boards/talos/ivc_board.toml --rom-boot --usb-cdc pty:/tmp/run1-log --usb-cdc2 pty:/tmp/run1-ros \
+    --log-json run1.jsonl --time 600s &
+ros2 run micro_ros_agent micro_ros_agent serial --dev /tmp/run1-ros &
+ros2 topic echo /talos/ivc/rx_new             # this run's tools, with the same ROS_DISCOVERY_SERVER
+```
+
+A discovery client only learns about the topics it uses, so `ros2 topic echo` of a known topic works, but
+`ros2 topic list` and the `ros2` daemon need to be a super client: `ROS_SUPER_CLIENT=TRUE` with a recent Fast DDS,
+or a `FASTRTPS_DEFAULT_PROFILES_FILE` with a `SUPER_CLIENT` participant profile in Humble's (the ROS 2 "Using Fast
+DDS Discovery Server" tutorial has one). Restart the daemon (`ros2 daemon stop`) after changing
+`ROS_DISCOVERY_SERVER`. Give the agent and the tools generous timeouts: a
+run that is busy may be slower than real time ([Options](#options)). Several runs in parallel are otherwise
+independent: eight IVCBoard2 runs on a 20-core machine kept up fine in the test campaign.
+
 ## Puddles: Ethernet
 
 The Puddles backplane talks to the robot computer over a W5500 in MACRAW mode instead of CAN. On a board with a
@@ -308,6 +365,16 @@ Puddles in its simulated vehicle is `robots/puddles.toml` ([robots.md](robots.md
 ## Exit status
 
 `run` exits with 0 when it reached `--time` (or stopped at a breakpoint, a `BKPT` with `--stop-on-bkpt`, or a
-deadlock: every core asleep with nothing scheduled, reported on stderr), and with an error when a core locked up,
-an option does not fit the board (`--input` of an input the board does not have, `--mock-bridge` without a bus) or a
+deadlock: every core asleep with nothing scheduled, reported on stderr), also when a core locked up on the way and
+the watchdog reset the chip (the end says how often: `2 lockup(s), 1 chip reset(s)`); with an error when a core
+locked up and nothing can end it (the watchdog not running; any lockup with `--stop-on-lockup`,
+[faults.md](faults.md#what-the-models-do)), when an option does not fit the board (`--input` of an input the board does not have, `--mock-bridge` without a bus) or a
 fault could not be applied.
+
+SIGINT (Ctrl-C) or SIGTERM (`kill`, `timeout`) ends a `run` or `robot` cleanly: the emulator stops at the next
+slice boundary (within 100 µs of virtual time) and does everything the end of `--time` does: it saves
+`--flash-file`, writes the JSON log's `end` record (`"reason":"Interrupted"`), the waveform, the profile and the
+candump log, and prints the stop line, `stopped at 12.345678s (Interrupted); ...`. It then exits with 128 plus the
+signal's number (130 for SIGINT, 143 for SIGTERM), as a shell expects of a process a signal ended. A second signal
+quits at once without any of that, and so does a signal while `--dashboard-hold` keeps the dashboard up after the
+run.

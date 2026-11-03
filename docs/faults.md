@@ -104,6 +104,33 @@ firmware resets them when it reboots).
 **Chip.** A hang during the first ~130 ms of boot, before the safety code starts the watchdog, hangs for good,
 as on hardware.
 
+**Lockups.** A fault inside HardFault (or NMI), or one HardFault cannot be entered for, locks a Cortex-M0+ core up:
+on a real RP2040 it stops executing (its PC reads `0xfffffffe`; the emulator reports the PC of the instruction
+that faulted) while the other core, the peripherals and the watchdog go on. So `run` and `robot` keep a
+locked-up board running: the core stays stopped, and if the watchdog is counting down it resets the chip when it
+runs out, which boots again as any watchdog reset does (through the real bootrom with `--rom-boot`, or directly
+again after a direct boot; [running.md](running.md#boot-modes-and-the-flash)). A scheduled `brownout` or
+`watchdog` fault restarts the chip too, so the run waits for it. Each lockup is logged
+(`core0 locked up at ...: it stays stopped until the watchdog resets the chip at 0.010001s`), and the end of the
+run says how many there were (`3 lockup(s), 2 chip reset(s); core0 is locked up now`). The run stops with an error
+only when nothing can end the lockup: the watchdog is not running, no such fault is scheduled, and the other core
+is off, locked up too or asleep in the bootrom (core 1 never launched). `--stop-on-lockup` stops at the first
+lockup, as before. In code, `Session::stop_on_lockup` (true by default, so tests see `StopReason::Lockup`) and
+`Machine::lockup_is_final`; `test_programs/lockup.S` and `crates/rp2040/tests/m6_resets.rs` show it.
+
+Modelled: the core stopping, the other core and the peripherals running on, the watchdog reset ending it, the
+lockup counted per board. Not modelled: the debug halt a connected debugger would make of a lockup (with
+`--gdb` the core simply stays locked up), the `LOCKUP` signal the RP2040 routes to the watchdog's
+`WDSEL`/`PSM` lockup reset options (unused by pico-sdk and embassy) and whatever the chip does with
+`CTRL.PAUSE_DBG0/1` while a core is locked up (the emulator does not pause the watchdog). What happens after the
+reset is the real bootrom's doing with `--rom-boot`: if the flash is still busy programming or erasing (a
+multi-second erase was interrupted by the watchdog), the chip ignores the bootrom's reads of boot2, and after
+about half a second of trying the bootrom falls back to USB boot (BOOTSEL) and stays there
+(`a_rom_boot_while_the_flash_is_erasing_falls_back_to_usb_boot`). A direct boot (the default) skips the bootrom:
+the core fetches from the busy flash at once, faults, and the HardFault handler, in flash too, locks it up for
+good (the watchdog reset left the watchdog off). Run firmware that erases or programs the flash with
+`--rom-boot` to see what a board would do.
+
 ## Firmware findings so far
 
 Behaviour of the firmware (not the emulator) that looks wrong, each pinned down by a test asserting today's
@@ -127,7 +154,13 @@ when the submodule moves to them. Unless noted, the tests are in
 
 Observations not pinned down by a test: in a Talos run IVCBoard2's CANmore heartbeat comes every 523 ms and its
 link heartbeat every 105 ms instead of 500/100 ms like the other boards (deterministic, so either the firmware's
-timing on IVCBoard2 or an emulation effect).
+timing on IVCBoard2 or an emulation effect). From a test campaign with the C IVCBoard2 (titan_firmware `blake/ivc`, with micro-ROS, not
+in this repository's tests): `storage_init(true)` erases the top 512 KiB of the flash (`flash_range_erase`: eight 64 KiB
+block erases, about 1.2 s at the flash model's typical 150 ms each, up to 16 s at the datasheet's maximum) with interrupts disabled, while the safety code's
+watchdog runs with a 250 ms timeout, so the watchdog resets the chip in the middle of the erase. With the default
+direct boot the board then locks up for good (see [Lockups](#what-the-models-do)); on hardware, as with
+`--rom-boot`, it should end up in USB boot until power-cycled. Either way it is a firmware bug: the erase needs the
+watchdog fed (or paused) around it, or erasing sector by sector between feeds.
 
 **To verify locally**: the CAN error model against a real MCP2517FD/MCP2518FD (bus-off reporting, recovery timing,
 what TXAT exhaustion does: finding 1 depends on it); findings 1 and 3 on a real board; `--fault` with the real

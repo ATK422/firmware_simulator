@@ -456,6 +456,22 @@ impl Machine {
         std::fs::write(path, &self.sys.flash)
     }
 
+    /// Whether a core is locked up ([`StopReason::Lockup`]) and nothing on the chip can bring it back: the watchdog
+    /// is not counting down to a reset, and no other core runs firmware that could still reset the chip (each is
+    /// off, locked up too, or asleep in the bootrom, e.g. core 1 waiting to be launched). On a real RP2040 a
+    /// locked-up core stops while everything else goes on, so a chip whose watchdog is armed resets and boots
+    /// again; one where this is true stays as it is until something outside resets it or cycles its power.
+    pub fn lockup_is_final(&self) -> bool {
+        let locked = |c: usize| self.core_enabled[c] && self.cores[c].is_locked_up();
+        if !(locked(0) || locked(1)) || self.sys.watchdog.timeout_due(self.now).is_some() {
+            return false;
+        }
+        (0..2).all(|c| {
+            let in_rom_asleep = self.cores[c].is_sleeping() && (self.cores[c].pc() as usize) < ROM_SIZE;
+            !self.core_enabled[c] || self.cores[c].is_locked_up() || in_rom_asleep
+        })
+    }
+
     /// Removes power and applies it again: every block resets, including the watchdog's scratch registers and
     /// REASON, CHIP_RESET reports a power-on reset, and SRAM comes up with arbitrary contents. The flash keeps its
     /// data and its non-volatile status bits; attached devices stay attached.

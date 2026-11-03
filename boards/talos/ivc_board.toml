@@ -43,7 +43,11 @@ tx_pin = 7
 # ---- boards/overlays/talos/ivc_board.toml
 # The IVC transducer (the plan's example numbers) and its receive chain. The hydrophone signal reaches ADC 1
 # (GPIO 27) through one of two analog paths picked by GPIO 3: assumed here to be a 40-60 kHz band-pass (comms,
-# GPIO 3 low) and a 60 kHz low-pass (GPIO 3 high, "low pass filtered transducer output" in the firmware).
+# GPIO 3 low) and a 60 kHz low-pass (GPIO 3 high, "low pass filtered transducer output" in the firmware). Both the
+# C (blake/ivc tx_init) and the Rust IVCBoard2 drive GPIO 3 high from boot on and never change it, so they hear
+# everything, comms tones and pinger alike, through the low-pass: flat from 20 to 50 kHz, 40 dB of gain. With that
+# gain a 180 dB pinger clips the chain at every distance in a 25 m pool (docs/acoustics.md, "What the pinger
+# amplitude does with distance and why"); the gain is a guess too.
 [transducer]
 tvr = { resonance_hz = 51_000, q = 8, peak_db = 140 }
 rvs_db = -190

@@ -278,3 +278,110 @@ fn ivc2_interop_robot_takes_the_c_image_from_titan_firmware_dir() {
     let err = String::from_utf8_lossy(&out.stderr);
     assert!(!out.status.success() && err.contains("TITAN_FIRMWARE_DIR is not set"), "{err}");
 }
+
+/// By default a pico-sdk program's unmodelled registers get one note and the end-of-run table, not a warning each;
+/// `first`, `every` and `off` are still there, for `run` and `robot`.
+#[test]
+fn unmodelled_registers_are_summarised_by_default() {
+    let elf = repo().join("test_programs/pico/flash_program.elf");
+    let run = |extra: &[&str]| {
+        let out = Command::new(env!("CARGO_BIN_EXE_firmware_simulator"))
+            .args(["run", path(&elf), "--time", "300ms", "--uart0", "none"])
+            .args(extra)
+            .output()
+            .unwrap();
+        assert!(out.status.success());
+        String::from_utf8_lossy(&out.stderr).into_owned()
+    };
+    let lines = |err: &str, what: &str| err.lines().filter(|l| l.contains(what)).count();
+    let default = run(&[]);
+    assert_eq!(lines(&default, "rp2040::unmodelled"), 1, "one note:\n{default}");
+    assert_eq!(lines(&default, "WARN"), 0, "{default}");
+    assert!(
+        default.contains("unmodelled registers touched:\n") && default.contains("  PADS_QSPI.GPIO_QSPI_SD0 "),
+        "{default}"
+    );
+    let first = run(&["--unmodelled", "first"]);
+    let registers = first.lines().skip_while(|l| !l.starts_with("unmodelled registers touched:")).skip(1).count();
+    assert!(registers > 1, "{first}");
+    assert_eq!(lines(&first, "WARN  rp2040::unmodelled"), registers, "one per register:\n{first}");
+    assert!(lines(&run(&["--unmodelled", "every"]), "WARN  rp2040::unmodelled") > 5);
+    let off = run(&["--unmodelled", "off"]);
+    assert!(!off.contains("unmodelled"), "nothing:\n{off}");
+
+    let robot = temp("unmodelled.toml");
+    let board = repo().join("boards/mk2/power_board.toml");
+    std::fs::write(&robot, format!("[[board]]\nname = \"fp\"\nboard = {:?}\nelf = {:?}\n", path(&board), path(&elf)))
+        .unwrap();
+    let out = sim(&["robot", path(&robot), "--time", "300ms"]);
+    assert_eq!(lines(&out, "rp2040::unmodelled"), 1, "{out}");
+    let summary = out.lines().find(|l| l.starts_with("fp: unmodelled registers touched: ")).expect(&out);
+    assert!(summary.contains(" PADS_QSPI.GPIO_QSPI_SD0 ("), "{summary}");
+    let off = sim(&["robot", path(&robot), "--time", "300ms", "--unmodelled", "off"]);
+    assert!(!off.contains("unmodelled"), "{off}");
+}
+
+/// Runs the CLI; its exit status and stderr.
+fn sim_status(args: &[&str]) -> (bool, String) {
+    let out =
+        Command::new(env!("CARGO_BIN_EXE_firmware_simulator")).args(args).env("RUST_BACKTRACE", "0").output().unwrap();
+    (out.status.success(), String::from_utf8_lossy(&out.stderr).into_owned())
+}
+
+/// `test_programs/lockup.S` locks up with the watchdog armed on its first two boots and without it on the third:
+/// `run` keeps the board running through the first two lockups as the chip does (the watchdog resets it, the
+/// program boots again), and stops at the third, which nothing can end; `--stop-on-lockup` stops at the first. A
+/// scheduled power cycle can end a lockup too, so the run waits for it.
+#[test]
+fn a_lockup_lasts_until_the_watchdog_resets_the_board() {
+    let elf = repo().join("test_programs/lockup.elf");
+    let run = |extra: &[&str]| {
+        let mut args = vec!["run", path(&elf), "--unmodelled", "off"];
+        args.extend_from_slice(extra);
+        sim_status(&args)
+    };
+    let (ok, err) = run(&["--time", "15ms"]);
+    assert!(ok, "{err}");
+    assert!(err.contains("stopped at 0.015000s (TimeLimit)"), "{err}");
+    assert!(err.contains("2 lockup(s), 1 chip reset(s); core0 is locked up now"), "{err}");
+    assert!(err.contains("until the watchdog resets the chip at 0.010001s"), "{err}");
+
+    let (ok, err) = run(&["--time", "100ms"]);
+    assert!(!ok, "a lockup nothing can end is still an error:\n{err}");
+    assert!(err.contains("with nothing to reset the chip (the watchdog is not running)"), "{err}");
+    assert!(err.contains("3 lockup(s), 2 chip reset(s)"), "{err}");
+    let t: f64 = err.split("stopped at ").nth(1).unwrap().split('s').next().unwrap().parse().unwrap();
+    assert!((0.020..0.0205).contains(&t), "stops just after the third boot's lockup: {t}\n{err}");
+
+    let (ok, err) = run(&["--time", "100ms", "--stop-on-lockup"]);
+    assert!(!ok);
+    assert!(err.contains("stopped at 0.000000s (Lockup {"), "the old behaviour:\n{err}");
+    assert!(!err.contains("chip reset(s)"), "{err}");
+
+    // A brownout at 30 ms restarts the chip (the boot count with it): three more boots, two watchdog resets
+    let (ok, err) = run(&["--time", "100ms", "--fault", "30ms@brownout:1ms"]);
+    assert!(!ok);
+    assert!(err.contains("stays locked up until a fault restarts it") && err.contains("6 lockup(s)"), "{err}");
+
+    // The robot command does the same per board, the others running on
+    let robot = temp("lockup.toml");
+    let board = repo().join("boards/mk2/power_board.toml");
+    let blink = repo().join("test_programs/blink.elf");
+    std::fs::write(
+        &robot,
+        format!(
+            "[[board]]\nname = \"lk\"\nboard = {b:?}\nelf = {l:?}\n\n[[board]]\nname = \"bl\"\nboard = {b:?}\nelf = {e:?}\n",
+            b = path(&board),
+            l = path(&elf),
+            e = path(&blink)
+        ),
+    )
+    .unwrap();
+    let (ok, err) = sim_status(&["robot", path(&robot), "--time", "15ms"]);
+    assert!(ok, "{err}");
+    assert!(err.contains("lk: 2 lockup(s), 1 chip reset(s); core0 is locked up now"), "{err}");
+    let (ok, err) = sim_status(&["robot", path(&robot), "--time", "100ms"]);
+    assert!(!ok && err.contains("lk stopped: Lockup"), "{err}");
+    let (ok, err) = sim_status(&["robot", path(&robot), "--time", "100ms", "--stop-on-lockup"]);
+    assert!(!ok && err.contains("lk stopped: Lockup") && err.contains("stopped at 0.000000s;"), "{err}");
+}

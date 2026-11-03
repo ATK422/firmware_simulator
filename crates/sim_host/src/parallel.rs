@@ -36,7 +36,7 @@ use std::time::{Duration, Instant};
 use rp2040::StopReason;
 use sim_core::time::Time;
 
-use crate::robot::{Robot, end_slice, pace, power_on_by};
+use crate::robot::{Robot, end_slice, power_on_by};
 use crate::session::Session;
 
 /// Threads for `threads` = 0: one per core.
@@ -275,7 +275,7 @@ impl Shared<'_> {
             let mut board = lock(board);
             let start = Instant::now();
             // A panic goes on on the calling thread, once every thread is done with the slice
-            match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| board.run_machine(until))) {
+            match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| board.run_machine_through_lockups(until))) {
                 Ok(StopReason::TimeLimit) => {}
                 Ok(other) => lock(&self.stops).push((i, other)),
                 Err(panic) => {
@@ -329,7 +329,9 @@ impl Drop for Crew<'_, '_> {
 /// slice's end, the others have still run to it, and the one with the lowest index is returned.
 pub(crate) fn run_until(robot: &mut Robot, end: Time) -> Option<(usize, StopReason)> {
     let max_threads = max_threads(robot);
-    let Robot { boards, buses, board_bus, power_on, vehicles, slice, now, realtime, pacing, balance, .. } = robot;
+    let Robot {
+        boards, buses, board_bus, power_on, vehicles, slice, now, realtime, pacing, balance, stop_flag, ..
+    } = robot;
     let n = boards.len();
     balance.fit(n, max_threads);
     let shared = Shared {
@@ -354,7 +356,7 @@ pub(crate) fn run_until(robot: &mut Robot, end: Time) -> Option<(usize, StopReas
         // Wall clock since the last regrouping, and the time spent pacing in it
         let mut window = Instant::now();
         let mut paced = Duration::ZERO;
-        while *now < end {
+        while *now < end && !crate::signal::is_set(*stop_flag) {
             let t = (*now + *slice).min(end);
             slice_no += 1;
             busy.fill(false);
@@ -396,7 +398,7 @@ pub(crate) fn run_until(robot: &mut Robot, end: Time) -> Option<(usize, StopReas
             *now = t;
             if *realtime {
                 let start = Instant::now();
-                pace(pacing, *now);
+                pacing.pace(*now);
                 paced += start.elapsed();
             }
             since_regroup += 1;

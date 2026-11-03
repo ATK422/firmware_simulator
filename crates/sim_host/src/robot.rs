@@ -96,10 +96,13 @@ pub struct Robot {
     pub power_on: Vec<(Time, bool)>,
     /// Simulated vehicles moved by the boards' thrusters, stepped after every slice.
     pub vehicles: Vec<VehicleSim>,
-    /// Real-time pacing: the wall clock and virtual time it started from.
-    pub(crate) pacing: Option<(std::time::Instant, Time)>,
+    /// Real-time pacing, warning when the robot falls behind the wall clock.
+    pub(crate) pacing: crate::session::Pacing,
     /// How the boards were spread over threads last time, and what they cost (see [`crate::parallel`]).
     pub(crate) balance: crate::parallel::Balance,
+    /// When this is set, [`Robot::run_until`] returns at the next slice boundary, before `end` (the command
+    /// line's [`crate::signal::STOP`], set by SIGINT or SIGTERM).
+    pub stop_flag: Option<&'static std::sync::atomic::AtomicBool>,
 }
 
 impl Default for Robot {
@@ -122,8 +125,9 @@ impl Default for Robot {
             realtime: false,
             power_on: Vec::new(),
             vehicles: Vec::new(),
-            pacing: None,
+            pacing: Default::default(),
             balance: Default::default(),
+            stop_flag: None,
         }
     }
 }
@@ -173,6 +177,7 @@ impl Robot {
     }
 
     /// Runs every board until `end`. Returns the first board that stopped for another reason, with the reason.
+    /// Returns `None` early, at a slice boundary with [`Robot::now`] before `end`, once [`Robot::stop_flag`] is set.
     pub fn run_until(&mut self, end: Time) -> Option<(usize, StopReason)> {
         // The sensors see a vehicle moved since the last run (a scenario putting it elsewhere) from the start
         for v in &self.vehicles {
@@ -181,13 +186,13 @@ impl Robot {
         if crate::parallel::worth_it(self, end) {
             return crate::parallel::run_until(self, end);
         }
-        while self.now < end {
+        while self.now < end && !crate::signal::is_set(self.stop_flag) {
             let t = (self.now + self.slice).min(end);
             for (i, b) in self.boards.iter_mut().enumerate() {
                 if !power_on_by(b, &mut self.power_on[i], t) {
                     continue;
                 }
-                match b.run_machine(t) {
+                match b.run_machine_through_lockups(t) {
                     StopReason::TimeLimit => {}
                     other => return Some((i, other)),
                 }
@@ -199,7 +204,7 @@ impl Robot {
             end_slice(&mut self.buses, &self.board_bus, &mut boards, &mut self.vehicles, t);
             self.now = t;
             if self.realtime {
-                pace(&mut self.pacing, self.now);
+                self.pacing.pace(self.now);
             }
         }
         None
@@ -279,7 +284,7 @@ impl Robot {
 
     /// Starts real-time pacing afresh from now (after virtual time was held, e.g. paused from the dashboard).
     pub fn reset_pacing(&mut self) {
-        self.pacing = None;
+        self.pacing.reset();
     }
 
     /// Puts board `i`'s transducer (projector and hydrophone) on `trajectory`, e.g. at another range between runs
@@ -369,8 +374,9 @@ impl Robot {
             realtime: self.realtime,
             power_on: self.power_on.clone(),
             vehicles,
-            pacing: None,
+            pacing: Default::default(),
             balance: self.balance.clone(),
+            stop_flag: None,
         }
     }
 
@@ -569,16 +575,6 @@ pub(crate) fn end_slice(
     }
     for v in vehicles {
         v.advance(t, boards);
-    }
-}
-
-/// Real-time pacing: sleeps while virtual time `now` is ahead of the wall clock, counted from where pacing started
-/// (`pacing`), across calls, so runs in short pieces keep real time too.
-pub(crate) fn pace(pacing: &mut Option<(std::time::Instant, Time)>, now: Time) {
-    let (wall, start) = *pacing.get_or_insert((std::time::Instant::now(), now));
-    let ahead = (now - start).as_secs_f64() - wall.elapsed().as_secs_f64();
-    if ahead > 0.002 {
-        std::thread::sleep(std::time::Duration::from_secs_f64(ahead));
     }
 }
 

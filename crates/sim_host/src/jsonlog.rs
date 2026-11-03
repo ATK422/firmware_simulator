@@ -62,8 +62,12 @@ impl JsonLog {
         Ok(JsonLog::new(Box::new(std::io::BufWriter::new(f))))
     }
 
+    /// A log written to `out`, flushed every [`crate::flush::FLUSH_PERIOD`] so tools reading the file while the
+    /// run goes on see each line promptly.
     pub fn new(out: Box<dyn Write + Send>) -> JsonLog {
-        JsonLog(Arc::new(Mutex::new(out)))
+        let out = Arc::new(Mutex::new(out));
+        crate::flush::flush_periodically(&out, crate::flush::FLUSH_PERIOD, crate::flush::flush_mutex);
+        JsonLog(out)
     }
 
     /// Writes one record.
@@ -198,5 +202,18 @@ mod tests {
         assert_eq!(lines[0]["candump"], "123#0102AB");
         assert_eq!((&lines[1]["ok"], &lines[1]["error"]), (&Value::from(false), &Value::from("nope")));
         assert_eq!(lines[2]["reason"], "TimeLimit");
+    }
+
+    #[test]
+    fn a_record_reaches_the_file_while_the_run_goes_on() {
+        let path = crate::flush::tests::temp_path("log.jsonl");
+        let log = JsonLog::create(&path).unwrap();
+        log.fault(Time::from_ms(5), "esc0", "can-stuck", &Ok(()));
+        // No finish, no further records: a tool tailing the file still gets the line
+        let text = crate::flush::tests::wait_for_file(&path, |t| t.ends_with('\n'));
+        let v: Value = serde_json::from_str(text.trim()).unwrap();
+        assert_eq!(v["fault"], "can-stuck");
+        drop(log);
+        std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
     }
 }

@@ -59,10 +59,21 @@ pub struct Session {
     pub eth_loss: Option<crate::fault::PacketLoss>,
     /// Keep virtual time from running ahead of the wall clock.
     pub realtime: bool,
-    pacing: Option<(std::time::Instant, Time)>,
-    behind_warned: std::time::Instant,
+    pacing: Pacing,
     /// A sampling profiler of the firmware (see [`crate::profile`]); `None` runs the machine directly.
     pub profiler: Option<crate::profile::Profiler>,
+    /// When this is set, [`Session::run_until`] returns [`StopReason::Requested`] at the next slice boundary (the
+    /// command line's [`crate::signal::STOP`], set by SIGINT or SIGTERM).
+    pub stop_flag: Option<&'static std::sync::atomic::AtomicBool>,
+    /// Whether [`Session::run_until`] (and [`Session::run_machine_through_lockups`]) return
+    /// [`StopReason::Lockup`] as soon as a core locks up (the default, for tests), or keep the board running as
+    /// the chip does, until the watchdog resets it, and return it only when nothing on the chip can
+    /// ([`Machine::lockup_is_final`]).
+    pub stop_on_lockup: bool,
+    /// Lockups the board went through without stopping (`stop_on_lockup` off).
+    pub lockups: u64,
+    /// The current lockup was returned as final (it is returned once; running on, the board stays locked up).
+    final_lockup_reported: bool,
 }
 
 /// Callback for complete lines of text: `(virtual time, line)`.
@@ -107,9 +118,12 @@ impl Session {
             eth_endpoints: Vec::new(),
             eth_loss: None,
             realtime: false,
-            pacing: None,
-            behind_warned: std::time::Instant::now(),
+            pacing: Pacing::default(),
             profiler: None,
+            stop_flag: None,
+            stop_on_lockup: true,
+            lockups: 0,
+            final_lockup_reported: false,
         }
     }
 
@@ -158,9 +172,12 @@ impl Session {
             eth_endpoints: Vec::new(),
             eth_loss: self.eth_loss.clone(),
             realtime: self.realtime,
-            pacing: None,
-            behind_warned: std::time::Instant::now(),
+            pacing: Pacing::default(),
             profiler: None,
+            stop_flag: None,
+            stop_on_lockup: self.stop_on_lockup,
+            lockups: self.lockups,
+            final_lockup_reported: self.final_lockup_reported,
         }
     }
 
@@ -341,11 +358,15 @@ impl Session {
         }
     }
 
-    /// Runs until virtual time `end`, polling RTT every [`Session::slice`].
+    /// Runs until virtual time `end`, polling RTT every [`Session::slice`]. Returns [`StopReason::Requested`] at
+    /// a slice boundary once [`Session::stop_flag`] is set.
     pub fn run_until(&mut self, end: Time) -> StopReason {
         loop {
+            if crate::signal::is_set(self.stop_flag) {
+                return StopReason::Requested;
+            }
             let target = (self.machine.now + self.slice).min(end);
-            let reason = self.run_machine(target);
+            let reason = self.run_machine_through_lockups(target);
             self.step_can();
             self.poll_rtt();
             if let Some(u) = &mut self.usbip {
@@ -370,6 +391,53 @@ impl Session {
         }
     }
 
+    /// [`Session::run_machine`], going on past a lockup unless [`Session::stop_on_lockup`] is set: the locked-up
+    /// core stays stopped, the other core and the peripherals (the watchdog among them) go on, as on the chip.
+    /// Returns [`StopReason::Lockup`] once when the lockup is final ([`Machine::lockup_is_final`]: nothing on the
+    /// chip can end it), which is checked at the lockup and at `end`; called again, it runs on with the core locked
+    /// up (until something outside, a power cycle, restarts the chip).
+    pub fn run_machine_through_lockups(&mut self, end: Time) -> StopReason {
+        loop {
+            let reason = self.run_machine(end);
+            if self.stop_on_lockup {
+                return reason;
+            }
+            match reason {
+                StopReason::Lockup { core, pc } => {
+                    self.lockups += 1;
+                    self.final_lockup_reported = self.machine.lockup_is_final();
+                    if self.final_lockup_reported {
+                        return reason;
+                    }
+                    let wd = match self.machine.sys.watchdog.timeout_due(self.machine.now) {
+                        Some(t) => format!(" until the watchdog resets the chip at {t}"),
+                        None => String::new(),
+                    };
+                    log::warn!(
+                        "[{}] core{core} locked up at {pc:#010x}: it stays stopped{wd}; the rest of the chip runs on",
+                        self.machine.now
+                    );
+                }
+                StopReason::TimeLimit => {
+                    // The chip may have run out of ways to end a lockup since (the watchdog stopped, the other
+                    // core went to sleep in the bootrom)
+                    let locked = (0..2).find(|&c| self.machine.core_enabled[c] && self.machine.cores[c].is_locked_up());
+                    match locked {
+                        None => self.final_lockup_reported = false,
+                        Some(c) if !self.final_lockup_reported && self.machine.lockup_is_final() => {
+                            self.final_lockup_reported = true;
+                            let pc = sim_core::cpu::Cpu::pc(&self.machine.cores[c]);
+                            return StopReason::Lockup { core: c as u8, pc };
+                        }
+                        Some(_) => {}
+                    }
+                    return reason;
+                }
+                other => return other,
+            }
+        }
+    }
+
     /// Starts profiling the firmware with a sample every `interval` (on average).
     pub fn start_profile(&mut self, interval: Time) {
         self.profiler = Some(crate::profile::Profiler::new(&self.machine, interval));
@@ -383,25 +451,91 @@ impl Session {
     /// Starts pacing afresh from now (after virtual time was held, e.g. paused from the dashboard), so the run does
     /// not race to catch up with the wall clock.
     pub fn reset_pacing(&mut self) {
-        self.pacing = None;
+        self.pacing.reset();
     }
 
     /// Sleeps until the wall clock catches up with virtual time; warns when the emulation falls behind.
     fn pace(&mut self) {
-        let now = self.machine.now;
-        let (wall0, virt0) = *self.pacing.get_or_insert((std::time::Instant::now(), now));
-        let virt = std::time::Duration::from_nanos((now - virt0).as_ns());
-        let wall = wall0.elapsed();
-        if virt > wall {
-            std::thread::sleep(virt - wall);
-        } else if wall - virt > std::time::Duration::from_millis(50) && self.behind_warned.elapsed().as_secs() >= 5 {
-            self.behind_warned = std::time::Instant::now();
-            log::warn!("real-time mode: emulation is {:?} behind the wall clock", wall - virt);
-        }
+        self.pacing.pace(self.machine.now);
     }
 
     /// Whether any log line so far contains `text`.
     pub fn logged(&self, text: &str) -> bool {
         self.logs.iter().any(|(_, l)| l.message.contains(text))
+    }
+}
+
+/// Real-time pacing (`--realtime`) of a board or a robot: keeps virtual time from running ahead of the wall clock,
+/// counted from where pacing started, across calls (so runs in short pieces keep real time too), and warns when
+/// the emulation cannot keep up.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct Pacing {
+    /// The wall clock and virtual time pacing started from.
+    start: Option<(std::time::Instant, Time)>,
+    /// When the last "behind the wall clock" warning was given.
+    warned: Option<std::time::Instant>,
+}
+
+impl Pacing {
+    /// Virtual time ahead of the wall clock by less than this is not slept away (there is one call per slice).
+    const MIN_SLEEP: std::time::Duration = std::time::Duration::from_millis(2);
+    /// Falling behind by more than this is warned about...
+    const WARN_BEHIND: std::time::Duration = std::time::Duration::from_millis(100);
+    /// ...at most this often.
+    const WARN_EVERY: std::time::Duration = std::time::Duration::from_secs(5);
+
+    /// Sleeps while virtual time `now` is ahead of the wall clock. While it is behind by more than
+    /// [`Pacing::WARN_BEHIND`], warns (at most every [`Pacing::WARN_EVERY`]) and returns how far behind it is.
+    pub(crate) fn pace(&mut self, now: Time) -> Option<std::time::Duration> {
+        let (wall0, virt0) = *self.start.get_or_insert((std::time::Instant::now(), now));
+        let virt = std::time::Duration::from_nanos((now - virt0).as_ns());
+        let wall = wall0.elapsed();
+        if virt > wall {
+            if virt - wall > Self::MIN_SLEEP {
+                std::thread::sleep(virt - wall);
+            }
+            return None;
+        }
+        let behind = wall - virt;
+        if behind > Self::WARN_BEHIND && self.warned.is_none_or(|w| w.elapsed() >= Self::WARN_EVERY) {
+            self.warned = Some(std::time::Instant::now());
+            log::warn!("real-time mode: emulation is {behind:.2?} behind the wall clock");
+            return Some(behind);
+        }
+        None
+    }
+
+    /// Starts afresh from the next call (virtual time was held, e.g. paused from the dashboard).
+    pub(crate) fn reset(&mut self) {
+        self.start = None;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn pacing_warns_when_behind_the_wall_clock_at_most_every_five_seconds() {
+        let second_ago = Instant::now().checked_sub(Duration::from_secs(1)).unwrap();
+        let mut p = Pacing { start: Some((second_ago, Time::ZERO)), warned: None };
+        // 100 ms of virtual time in a second of wall time
+        let behind = p.pace(Time::from_ms(100)).expect("a warning");
+        assert!((Duration::from_millis(890)..Duration::from_millis(1500)).contains(&behind), "{behind:?}");
+        assert_eq!(p.pace(Time::from_ms(110)), None, "not again so soon");
+        p.warned = Instant::now().checked_sub(Duration::from_secs(6));
+        assert!(p.pace(Time::from_ms(120)).is_some(), "again after five seconds");
+    }
+
+    #[test]
+    fn pacing_sleeps_while_ahead() {
+        let mut p = Pacing::default();
+        let t0 = Instant::now();
+        assert_eq!(p.pace(Time::ZERO), None, "the first call starts the clock");
+        assert_eq!(p.pace(Time::from_ms(30)), None);
+        assert!(t0.elapsed() >= Duration::from_millis(28), "{:?}", t0.elapsed());
+        // A little behind is no reason for a warning
+        assert_eq!(p.pace(Time::from_ms(30)), None);
     }
 }

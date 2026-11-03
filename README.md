@@ -291,7 +291,7 @@ Milestones M0 to M7 of [PLAN.md](PLAN.md) are implemented, followed by performan
 not modelled or not yet trusted:
 
 * **Peripherals**: no SPI/I2C slave modes, USB host mode or isochronous endpoints, sleep/dormant modes, RTC or
-  SYSCFG (unmodelled registers are stored, and logged on first access); the MPU is stored, not enforced
+  SYSCFG (unmodelled registers are stored, and listed at the end of a run); the MPU is stored, not enforced
   ([the table](docs/internals.md#peripherals-and-their-modelling-status)).
 * **Physics are assumptions**: the acoustic numbers (transducers, filters) and every vehicle parameter are
   plausible values, not calibrated against recordings, CAD or tank data. Use them to compare and catch

@@ -102,15 +102,20 @@ as `[t] NAME uart0: ...`); the run ends with the stop time, the wall time and ea
 | `--fault TIME@BOARD:FAULT` | | A fault on one board, e.g. `1.5s@camera_cage:can-unplug` (repeatable; bridge faults act on the first mock bridge on the board's bus; [faults.md](faults.md)) |
 | `--noise-db L` | | Replaces every hydrophone's ambient noise with white noise at `L` dB re 1 µPa²/Hz |
 | `--vehicle-csv FILE` | | Writes each vehicle's state every 10 ms (`NAME` in the file name for several vehicles) |
-| `--realtime` | off | Paces virtual time to the wall clock |
+| `--realtime` | off | Paces virtual time to the wall clock; warns when the robot falls behind it ([running.md](running.md#options)) |
 | `--threads N` | 0 | Runs the boards on up to `N` threads (0: up to one per core; 1: in turn on one) ([below](#how-a-robot-runs)) |
 | `--trace KINDS`, `--trace-board NAMES`, `--trace-file FILE` | | Traces the boards ([below](#traces-profiles-waveforms-and-the-dashboard)) |
 | `--profile-dir DIR`, `--profile-interval T` | `10us` | Profiles every board's firmware |
 | `--vcd FILE`, `--vcd-pins SPEC`, `--vcd-events` | all pins | A VCD waveform with a scope per board (and per bus) |
 | `--dashboard ADDR`, `--dashboard-hold`, `--dashboard-pause-at T` | | A live dashboard of all boards, buses and vehicles |
 | `--log-json FILE` | | Every log line, UART line, CAN frame and fault as JSON lines |
+| `--unmodelled MODE` | `summary` | Registers the emulator does not model, as for `run` ([running.md](running.md#traces)): one note, then a line per board at the end listing them; `first`, `every` or `off` |
 
-It exits with an error if a board stops (a lockup, say) before `--time`.
+A board whose core locks up runs on until its watchdog resets it, as on the chip (`--stop-on-lockup` stops the
+robot at the first lockup instead; [faults.md](faults.md#what-the-models-do)). It exits with an error if a board
+stops before `--time` (a lockup nothing can end, say). Ctrl-C or SIGTERM ends the run cleanly
+at the next slice boundary, as for `run` ([running.md](running.md#exit-status)): logs, waveform, profiles, candump
+log and vehicle CSV are written, and the stop line says `(Interrupted)`.
 
 ### USB on robot boards
 
@@ -188,7 +193,10 @@ time, and at about 0.72x on three or four threads (1.7x faster; 0.63x on two). T
 slowest board sets the pace of every slice, and the two ESC boards each need about 0.95 s of host time per
 virtual second, in bursts that do not line up between them, so `--realtime` with all of Talos does not keep up.
 The template runs about 60x faster than real time, IVCBoard2 about 3.4x and the ESC board about 1.1x on its own.
-`cargo run --release -p sim_test --example bench` measures it ([internals.md](internals.md#performance)).
+`cargo run --release -p sim_test --example bench` measures it ([internals.md](internals.md#performance)). Without
+`--realtime` a robot runs as fast as it can, so a host tool next to it (titan_bridge, a micro-ROS agent) needs
+timeouts with room for a robot slower than real time; with `--realtime` the robot warns
+(`real-time mode: emulation is 1.23s behind the wall clock`, at most every 5 s) when it cannot keep up.
 
 ## Mock bridges
 
@@ -229,7 +237,8 @@ These options work with `run` (a board's own bus) and `robot` (every bus).
 `--candump-log FILE` writes the traffic in `candump -l` format: every acknowledged frame (what a listening
 interface would receive), stamped with the virtual time its last bit was sent, with the bus name as the
 interface. Unacknowledged frames (sent before anyone else was up) are counted and left out. The file is flushed
-every 0.5 s of wall time, so a Ctrl-C'd real-time run leaves a usable log.
+every 100 ms of wall time, so it can be followed while the run goes on, and a Ctrl-C'd run ends cleanly with the
+log complete.
 
 ```
 (0000000000.135357) can 06F#C0

@@ -385,7 +385,12 @@ user running the client: options such as `--vcd` and `--flash-file` write files.
 
 ```bash
 jq -c 'select(.kind == "log" and .level == "error")' talos.jsonl
+tail -f talos.jsonl | jq -c 'select(.kind == "log")'     # while the run goes on
 ```
+
+The file can be followed while the run goes on: it is written through a buffer and flushed every 100 ms of wall
+time, so a line is in the file at most 100 ms after it happened (the same goes for `--trace-file` and
+`--candump-log`; what goes to stdout, the firmware's lines among it, is written line by line).
 
 ## Robot traces
 
