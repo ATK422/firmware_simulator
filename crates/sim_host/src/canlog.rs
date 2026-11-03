@@ -504,7 +504,8 @@ impl Replay {
                 dropped += 1;
                 continue;
             };
-            let mut at = opts.offset + Time::from_ns(rel);
+            // Saturating: a log spanning more than the ~213 days a `Time` holds replays the rest at the end of time
+            let mut at = opts.offset + Time::from_ps(rel.saturating_mul(1_000));
             if let Some(r) = opts.rates {
                 at = at.saturating_sub(lf.frame.duration(r.nominal, r.data.unwrap_or(r.nominal)));
             }
@@ -804,6 +805,20 @@ mod tests {
         // An origin after some frames drops them
         let late = Replay::from_log(&log, &ReplayOptions { origin_ns: Some(100_200_000_000), ..Default::default() });
         assert_eq!((late.remaining(), late.dropped), (2, 2));
+    }
+
+    /// A log spanning more than the ~213 days of picoseconds a `Time` holds (untimed lines among Unix-time ones,
+    /// an early origin): the frames beyond are replayed at the end of time, after everything else, instead of
+    /// wrapping round to an unrelated earlier time.
+    #[test]
+    fn replay_times_past_the_end_of_time_saturate() {
+        let log = parse("(1.000000) can0 06F#C0\n(20000000.000000) can0 123#00\n(19.000000) can0 124#00\n").unwrap();
+        let mut r = Replay::from_log(&log, &ReplayOptions::default());
+        assert_eq!(r.first_time(), Some(Time::ZERO));
+        assert_eq!(r.last_time(), Some(Time::MAX), "231 days after the origin");
+        let sent: Vec<u32> = r.take_tx(Time::from_secs(100)).iter().map(|(_, f)| f.id).collect();
+        assert_eq!(sent, [0x6F, 0x124]);
+        assert_eq!(r.remaining(), 1);
     }
 
     #[test]
