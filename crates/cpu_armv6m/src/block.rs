@@ -3,13 +3,18 @@
 //!
 //! A block is decoded from the memory the bus fetches instructions from without checks ([`Bus::code_at`]) and
 //! starts at any address the PC reaches. Conditional branches leave it when taken. It ends after any other branch,
-//! an instruction left to the interpreter
-//! ([`K::Step`]: exception entry and return, system registers, sleep, `SEV`, `BKPT`, undefined encodings, anything
-//! that reads the PC), [`MAX_OPS`] instructions or the end of that memory. A block keeps the halfwords it was decoded
-//! from and is only used while memory still holds them, which is checked each time it is looked up, so nothing has
-//! to tell the cache about writes (SRAM, flash programming, a new image). Within a block, a store that reaches the
-//! block's own code or an access that went anywhere but plain memory ([`Bus::take_slow_access`]) ends it, and the
-//! next lookup looks at the code again.
+//! an instruction left to the interpreter ([`K::Step`]: exception entry and return, system registers, sleep, `SEV`,
+//! `BKPT`, undefined encodings, anything that reads the PC), [`MAX_OPS`] instructions or the end of that memory.
+//! A batch that stops in the middle of a block (its step limit) goes on there with the same block.
+//!
+//! A block keeps the code it was decoded from and is only used while memory still holds it, which is checked each
+//! time it is looked up, so nothing has to tell the cache about writes (SRAM, flash programming, a new image).
+//! Within a block, a store that may reach the block's own code or an access that went anywhere but plain memory
+//! ([`Bus::take_slow_access`]) ends it, and the next lookup looks at the code again.
+//!
+//! Blocks run in [`CortexM0Plus::run_blocks`] without the interpreter loop's checks before each instruction while
+//! no step limit or cycle budget can end the batch before a block's last op (see `Entry::lead`); otherwise
+//! `run_batch` runs the block op by op with those checks.
 //!
 //! Executing an op does exactly what [`CortexM0Plus::execute`] does for its encoding: same results, flags, cycles,
 //! accesses in the same order, faults (the `tests` module checks every 16-bit encoding against it).
@@ -26,8 +31,8 @@ const MAX_BYTES: usize = 2 * MAX_OPS;
 /// Cache entries per core (direct mapped).
 const ENTRIES: usize = 4096;
 
-/// What an op does. The ops before [`K::Ldr`] neither access the bus nor change anything but registers, flags and
-/// the PC; the ones from [`K::B`] on end a block.
+/// What an op does. The ops before [`K::Ldr`] neither access the bus nor change anything but registers and flags;
+/// the ones from [`K::BCond`] on set the PC, and from [`K::B`] on end a block.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 #[repr(u8)]
 pub(crate) enum K {
