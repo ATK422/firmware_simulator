@@ -92,6 +92,12 @@ each board got. Boards do not see each other within a slice, so they can run on 
 (`Robot::threads`, `sim_host::parallel`) with identical results, except in an acoustic medium where a hydrophone
 can hear another board within the slice.
 
+Both run their machines through `Session::run_machine`, which goes through the session's sampling profiler when
+it has one (the profiler cuts the run at its sample times; a robot's worker thread takes the board's profiler with
+its machine). The waveform writer, the dashboard and the JSON log only observe: trace events (shared through
+`sim_core::trace::MultiSink`), the sessions' line and frame callbacks, and state read between slices. See
+[tools.md](tools.md).
+
 The CAN bus (`sim_devices::can::CanBus`) arbitrates by identifier, times each frame at the nominal and data rates
 (stuff bits estimated), needs an acknowledging node, and models error frames, stuck-dominant buses,
 unplugged nodes and floods. Nodes are the CAN controllers of the boards on it (`CanNode`); host endpoints
@@ -185,6 +191,9 @@ benchmark fingerprints rely on it.
 * Events at the same time fire in scheduling order; keep it that way when changing the scheduler.
 * Threads must not change results: robot boards only run in parallel within a slice where they cannot see each
   other, and sweeps run independent snapshots.
+* Observers must not steer the machine: a trace sink only receives events, and only instruction and exception
+  tracing turn batched execution off (GPIO and device traces, and so waveforms, leave it on). Cutting a run at
+  any time, as the profiler does, must give the same single-core run (`crates/rp2040/tests/busy_wait.rs`).
 * Optimisations must leave behaviour and timing exactly as they were: run the benchmark before and after and
   compare fingerprints.
 

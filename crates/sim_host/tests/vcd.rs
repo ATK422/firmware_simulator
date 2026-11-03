@@ -121,6 +121,8 @@ fn esc_board_dshot_waveform_and_events() {
     vcd.attach(0, &mut s);
     s.run_for(Time::from_ms(400));
     vcd.finish(s.machine.now).unwrap();
+    // A GPIO waveform leaves batched execution on: core 1's timer busy-waits are still skipped (only batches can)
+    assert!(s.machine.spin_skipped > 100_000, "{} instructions skipped", s.machine.spin_skipped);
     let p = parse(&std::fs::read_to_string(&path).unwrap()).unwrap();
     let dshot = p.signal("esc", "gpio6_esc1_pwm").expect("named after the board's pin");
     let seg = segments(dshot);

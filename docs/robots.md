@@ -7,6 +7,7 @@ and replay, log comparison, UDP tunnels, and the real host tools.
 
 - [Robot files](#robot-files)
 - [The `robot` command](#the-robot-command)
+- [Traces, profiles, waveforms and the dashboard](#traces-profiles-waveforms-and-the-dashboard)
 - [How a robot runs](#how-a-robot-runs)
 - [Mock bridges](#mock-bridges)
 - [CAN logs: recording, replaying, comparing](#can-logs-recording-replaying-comparing)
@@ -89,8 +90,44 @@ as `[t] NAME uart0: ...`); the run ends with the stop time, the wall time and ea
 | `--vehicle-csv FILE` | | Writes each vehicle's state every 10 ms (`NAME` in the file name for several vehicles) |
 | `--realtime` | off | Paces virtual time to the wall clock |
 | `--threads N` | 1 | Runs the boards on `N` threads within each slice (0: one per core) |
+| `--trace KINDS`, `--trace-board NAMES`, `--trace-file FILE` | | Traces the boards ([below](#traces-profiles-waveforms-and-the-dashboard)) |
+| `--profile-dir DIR`, `--profile-interval T` | `10us` | Profiles every board's firmware |
+| `--vcd FILE`, `--vcd-pins SPEC`, `--vcd-events` | all pins | A VCD waveform with a scope per board (and per bus) |
+| `--dashboard ADDR`, `--dashboard-hold` | | A live dashboard of all boards, buses and vehicles |
+| `--log-json FILE` | | Every log line, UART line, CAN frame and fault as JSON lines |
 
 It exits with an error if a board stops (a lockup, say) before `--time`.
+
+## Traces, profiles, waveforms and the dashboard
+
+The developer tools of `run` work on robots too ([tools.md](tools.md) has their formats and how they work):
+
+| Option | Default | What it does |
+|---|---|---|
+| `--trace KINDS` | | Trace categories as for `run` (`instr`, `exc`, `gpio`, `unmodelled`, `device`; [running.md](running.md#traces)), each line prefixed with the board's name |
+| `--trace-board NAMES` | all boards | Only trace these boards (comma separated) |
+| `--trace-file FILE` | stderr | Where the trace goes |
+| `--profile-dir DIR` | | Profiles every board: `DIR/BOARD.txt` (functions by time per core) and `DIR/BOARD.folded` (folded stacks) |
+| `--profile-interval T` | `10us` | Mean virtual time between samples |
+| `--vcd FILE` | | One VCD file: a scope per board with its GPIOs, wires named after each board's `[pins]` |
+| `--vcd-pins SPEC` | `all` | Pins to record on every board: numbers, ranges, pin names |
+| `--vcd-events` | off | Adds each board's logs, UART lines, CAN frames and device reports, and a scope per bus with its frames |
+| `--dashboard ADDR` | | Serves the live dashboard: every board, every bus's traffic and load, the mock bridges' decoded firmware status, the vehicles; faults and inputs are posted per board |
+| `--dashboard-hold` | off | Keeps serving after the run ends |
+| `--log-json FILE` | | JSON lines with each record's board or bus |
+
+```bash
+firmware_simulator robot robots/talos.toml --mock-bridge internal:1 --time 5s --log-json talos.jsonl \
+    --trace gpio --trace-board led --trace-file led.trace
+firmware_simulator robot robots/talos.toml --mock-bridge internal:1 --time 3s --profile-dir prof/
+firmware_simulator robot robots/talos.toml --mock-bridge internal:1 --time 2s --vcd talos.vcd --vcd-pins 0-15
+firmware_simulator robot robots/talos.toml --mock-bridge internal:1 --realtime --time 600s --dashboard 127.0.0.1:8080
+```
+
+Trace lines of one board are in time order; boards take turns every 100 µs slice, so lines of different boards
+are ordered only to within a slice (with `--threads`, in any order within it). Profiles, waveforms and the JSON log
+come out the same with any `--threads`. With a dashboard the robot runs in 10 ms pieces of virtual time, which
+leaves its slices, and so the run, as they were.
 
 ## How a robot runs
 

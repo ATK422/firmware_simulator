@@ -69,6 +69,18 @@ fn run_writes_a_profile_a_waveform_and_a_json_log() {
     assert_eq!((&end["kind"], &end["reason"]), (&"end".into(), &"TimeLimit".into()));
 }
 
+/// `picoboot load FILE --profile`: the machine booted a blank flash, so the profile names what was flashed.
+#[test]
+fn a_profile_after_picoboot_load_names_the_flashed_image() {
+    let prof = temp("picoboot.txt");
+    let elf = repo().join("test_programs/pico/hello_uart.elf");
+    let out = sim(&["picoboot", "load", path(&elf), "--time", "100ms", "--profile", path(&prof)]);
+    assert!(out.contains("uart0: AB Hello, UART!"), "{out}");
+    let table = std::fs::read_to_string(&prof).unwrap();
+    assert!(table.starts_with("# hello_uart.elf:"), "{table}");
+    assert!(table.contains(" _reset_handler\n") && table.contains(" xosc_init\n"), "{table}");
+}
+
 #[test]
 fn robot_traces_chosen_boards_and_profiles_and_records_every_board() {
     let blink = repo().join("test_programs/blink.elf");

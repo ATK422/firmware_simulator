@@ -17,6 +17,7 @@ firmware_simulator run $FW/power_board --board boards/mk2/power_board.toml --moc
 - [Boot modes and the flash](#boot-modes-and-the-flash)
 - [Board files, inputs and CAN](#board-files-inputs-and-can)
 - [Traces](#traces)
+- [Profiles, waveforms, dashboard and JSON logs](#profiles-waveforms-dashboard-and-json-logs)
 - [Debugging with GDB](#debugging-with-gdb)
 - [USB: BOOTSEL, PICOBOOT, UF2 and CDC](#usb-bootsel-picoboot-uf2-and-cdc)
 - [Puddles: Ethernet](#puddles-ethernet)
@@ -92,6 +93,10 @@ differ by roughly the boot time.
 | `--bootsel`, `--usb`, `--usb-cdc stdout\|pty`, `--picoboot-load FILE`, `--load-via picoboot\|drive`, `--usbip ADDR` | | USB ([below](#usb-bootsel-picoboot-uf2-and-cdc)) |
 | `--trace KINDS` | | Comma separated: `instr`, `exc`, `gpio`, `unmodelled`, `device` ([below](#traces)) |
 | `--trace-file FILE` | stderr | Where the trace goes |
+| `--profile FILE`, `--profile-interval T` | `10us` | Profiles the firmware: functions by time per core to `FILE`, folded stacks next to it ([below](#profiles-waveforms-dashboard-and-json-logs)) |
+| `--vcd FILE`, `--vcd-pins SPEC`, `--vcd-events` | all pins | Writes a VCD waveform of the GPIOs, optionally with decoded traffic |
+| `--dashboard ADDR`, `--dashboard-hold` | | Serves a live dashboard with fault, input and pause controls |
+| `--log-json FILE` | | Writes every log line, UART and USB line, CAN frame and fault as JSON lines |
 | `--unmodelled MODE` | `first` | Logging of registers the emulator does not model: `first` access to each, `every` access, or `off` |
 | `--quantum N` | 16 | Instructions a core runs before the other gets a turn (1 for lockstep debugging) |
 | `--stop-on-bkpt` | off | A `BKPT` stops the run instead of escalating to HardFault |
@@ -190,6 +195,34 @@ firmware_simulator run --bootsel --time 300ms --trace device
 Unmodelled registers are also logged as warnings on first access (`--unmodelled`), and summarised at the end:
 writes are stored and reads return the stored or SVD reset value, so firmware that only configures a block keeps
 running, but the warning says the emulator is guessing.
+
+## Profiles, waveforms, dashboard and JSON logs
+
+The developer tools ([tools.md](tools.md) has their output formats and how they work):
+
+| Option | Default | What it does |
+|---|---|---|
+| `--profile FILE` | | Samples both cores and writes a table of functions by time per core (running and sleeping apart, time per exception handler) to `FILE`, and folded stacks for flame graph tools to `FILE` with the extension `.folded` |
+| `--profile-interval T` | `10us` | Mean virtual time between samples (jittered by ±50 %) |
+| `--vcd FILE` | | Writes the GPIO levels as a VCD file (1 ns steps) for GTKWave, Surfer or PulseView, whatever drives the pins: SIO, PWM, PIO, devices, faults |
+| `--vcd-pins SPEC` | `all` | Pins to record: numbers, ranges and the board file's `[pins]` names, e.g. `0-7,25,status_ledr` |
+| `--vcd-events` | off | Adds string variables with defmt logs, UART lines, CAN frames and device reports (GTKWave and Surfer show them) |
+| `--dashboard ADDR` | | Serves a live page on `ADDR` (`127.0.0.1:8080`): cores, logs, firmware status, CAN traffic, pins, LEDs, inputs; controls inject faults, set inputs and pause. No authentication: bind it to loopback |
+| `--dashboard-hold` | off | Keeps serving after the run ends |
+| `--log-json FILE` | | One JSON object per line for every defmt log line, UART and USB serial line, CAN frame, injected fault and the end of the run, with virtual times |
+
+```bash
+firmware_simulator run $FW/esc_board --board boards/mk2/esc_board.toml --mock-bridge 2 --time 3s --profile esc.txt
+inferno-flamegraph < esc.folded > esc.svg
+firmware_simulator run $FW/esc_board --board boards/mk2/esc_board.toml --mock-bridge 2 --time 1s \
+    --vcd esc.vcd --vcd-pins esc1_pwm,esc1_telem,status_ledg --vcd-events
+firmware_simulator run $FW/power_board --board boards/mk2/power_board.toml --mock-bridge 1 --realtime --time 600s \
+    --dashboard 127.0.0.1:8080 --log-json power.jsonl
+```
+
+None of them changes what a single-core program does; with both cores running, the profiler's extra cuts can
+shift how their instructions interleave, as a different `--quantum` would. They combine with each other and with
+`--trace`. With `picoboot load`, the profile names the functions of the image that was flashed.
 
 ## Debugging with GDB
 

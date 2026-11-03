@@ -12,12 +12,13 @@ CI. The design and milestones are in [PLAN.md](PLAN.md).
 | | |
 |---|---|
 | [Quick start](docs/README.md#quick-start) | Build the firmware, run a board, see its logs, run a test |
-| [Running a board](docs/running.md) | `run`: images, boot modes, logs, traces, GDB, flash, USB, Ethernet |
+| [Running a board](docs/running.md) | `run`: images, boot modes, logs, traces, profiles, waveforms, GDB, flash, USB, Ethernet |
 | [Board files](docs/boards.md) | Every device table, overlays, inputs |
 | [Robots](docs/robots.md) | Robot files, mock bridges, CAN logs, replay and `can-diff`, `bridges`, vcan and titan_bridge |
 | [Acoustics](docs/acoustics.md) | Environments, transducers, IVC links and sweeps |
 | [Vehicles](docs/vehicles.md) | Thrusters moving the robot, sensors following it |
 | [Testing](docs/testing.md) | `sim_test`, the test suites, CI |
+| [Developer tools](docs/tools.md) | Firmware profiler, VCD waveforms, live dashboard, JSON logs |
 | [Faults](docs/faults.md) | Fault injection and the firmware findings |
 | [Internals](docs/internals.md) | Architecture, adding peripherals and devices, determinism, performance |
 

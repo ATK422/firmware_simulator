@@ -188,7 +188,9 @@ impl Writer {
 
     /// Writes the pending changes before `t` in time order.
     fn flush_before(&mut self, t: u64) {
-        self.pending.sort_by_key(|p| (p.0, p.1));
+        // Changes at the same time go by variable (then in the order they came), so boards running on several
+        // threads, whose changes arrive in any order within a slice, still give the same file
+        self.pending.sort_by_key(|p| (p.0, p.2, p.1));
         let n = self.pending.partition_point(|p| p.0 < t);
         let batch: Vec<_> = self.pending.drain(..n).collect();
         for (time, _, var, value) in batch {

@@ -155,3 +155,37 @@ fn masked_hang_is_skipped_up_to_the_watchdog_reset() {
         assert_eq!(trace, trace_ref, "skip {skip} batched {batched}");
     }
 }
+
+/// The profiler (`sim_host::profile`) cuts runs at jittered sample times, every few microseconds. A busy-wait cut
+/// that often is skipped less, but the run must stay the same as one in the sessions' 100 µs slices.
+#[test]
+fn cutting_runs_at_sample_times_changes_nothing() {
+    for alarm in [false, true] {
+        let (trace_ref, state_ref, _) = run(alarm, true);
+        let (mut m, sink) = machine(alarm, true);
+        let mut rng = 0x2545_F491_4F6C_DD1Du64;
+        let mut t = Time::ZERO;
+        let end = Time::from_ms(20);
+        while t < end {
+            rng ^= rng << 13;
+            rng ^= rng >> 7;
+            rng ^= rng << 17;
+            t = (t + Time::from_ns(500 + rng % 15_000)).min(end);
+            assert_eq!(m.run_until(t), StopReason::TimeLimit);
+        }
+        let trace: Vec<String> = sink.take().into_iter().map(|(t, e)| format!("[{t}] {e}")).collect();
+        let c = &m.cores[0];
+        let regs: Vec<u32> = (0..c.num_regs()).map(|r| c.read_reg(r)).collect();
+        let state = format!(
+            "{} {} {} {} {regs:08x?} counter {}",
+            m.now,
+            m.core_time(0),
+            c.cycles(),
+            c.instructions(),
+            m.sys.peek(COUNTER, Size::Word).unwrap()
+        );
+        assert!(m.spin_skipped > 1_000, "alarm {alarm}: {} instructions skipped", m.spin_skipped);
+        assert_eq!(state, state_ref, "alarm {alarm}");
+        assert_eq!(trace, trace_ref, "alarm {alarm}");
+    }
+}

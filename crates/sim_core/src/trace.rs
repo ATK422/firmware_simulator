@@ -170,7 +170,9 @@ impl<W: std::io::Write + Send> TraceSink for WriterSink<W> {
         self.categories.contains(&category)
     }
     fn event(&mut self, time: Time, event: TraceEvent) {
-        let _ = writeln!(self.out, "{}[{time}] {event}", self.prefix);
+        // One write per line, so lines of boards on several threads sharing a writer do not mix
+        let line = format!("{}[{time}] {event}\n", self.prefix);
+        let _ = self.out.write_all(line.as_bytes());
     }
 }
 

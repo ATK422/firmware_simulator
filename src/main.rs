@@ -508,6 +508,10 @@ impl std::io::Write for SharedWriter {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
         self.0.lock().unwrap().write(buf)
     }
+    /// Under one lock: each trace line is one `write_all`, and stays whole with boards on several threads.
+    fn write_all(&mut self, buf: &[u8]) -> std::io::Result<()> {
+        self.0.lock().unwrap().write_all(buf)
+    }
     fn flush(&mut self) -> std::io::Result<()> {
         self.0.lock().unwrap().flush()
     }
