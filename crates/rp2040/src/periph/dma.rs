@@ -222,7 +222,8 @@ impl Dma {
             1 => bytes.iter().for_each(|&b| *d = crc32_byte(*d, b.reverse_bits())),
             2 => bytes.iter().for_each(|&b| *d = crc16_ccitt_byte(*d, b)),
             3 => bytes.iter().for_each(|&b| *d = crc16_ccitt_byte(*d, b.reverse_bits())),
-            0xE => bytes.iter().for_each(|&b| *d ^= b as u32),
+            // XOR reduction: the parity of every bit sniffed
+            0xE => *d ^= (value & size.mask()).count_ones() & 1,
             0xF => *d = d.wrapping_add(value & size.mask()),
             _ => {}
         }
@@ -641,5 +642,24 @@ mod tests {
         d.write(0x0C, ctrl(0, true, false, dreq::PERMANENT, 0) | CTRL_SNIFF_EN, WriteMode::Normal);
         d.service(&mut b);
         assert_eq!(d.read(0x438), Some(0x0376_E6E7));
+    }
+
+    #[test]
+    fn sniff_xor_reduction_is_parity() {
+        // CALC 0xE: "XOR reduction over all data. == 1 if the total 1 population count is odd" (datasheet 2.5.5.2)
+        let mut d = Dma::default();
+        let mut b = bus();
+        d.write(0x434, 1 | 0xE << 5, WriteMode::Normal);
+        d.write(0x00, 0x2000_0001, WriteMode::Normal); // bytes 0x01, 0x02: two ones
+        d.write(0x04, 0x4000_0000, WriteMode::Normal);
+        d.write(0x08, 2, WriteMode::Normal);
+        d.write(0x0C, ctrl(0, true, false, dreq::PERMANENT, 0) | CTRL_SNIFF_EN, WriteMode::Normal);
+        d.service(&mut b);
+        assert_eq!(d.read(0x438), Some(0), "even population count");
+        d.write(0x00, 0x2000_0007, WriteMode::Normal); // byte 0x07: three ones
+        d.write(0x08, 1, WriteMode::Normal);
+        d.write(0x0C, ctrl(0, true, false, dreq::PERMANENT, 0) | CTRL_SNIFF_EN, WriteMode::Normal);
+        d.service(&mut b);
+        assert_eq!(d.read(0x438), Some(1), "odd population count");
     }
 }
