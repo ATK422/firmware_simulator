@@ -109,19 +109,20 @@ pub fn rom_functions(rom: &[u8]) -> BTreeMap<u32, RomFn> {
 /// Erases `count` bytes at flash offset `offset` the way `flash_range_erase` does (whole sectors, or 64 KiB blocks
 /// when the caller asks for them and alignment allows). Returns the time it takes.
 pub fn erase(flash: &mut [u8], offset: u32, count: u32, block_size: u32) -> Time {
+    // (In 64 bits: a range may end at 2^32)
+    let (sector, block) = (SECTOR_SIZE as u64, BLOCK_SIZE as u64);
     let mut t = Time::ZERO;
-    let mut addr = offset & !(SECTOR_SIZE - 1);
-    let end = offset.saturating_add(count);
+    let mut addr = offset as u64 & !(sector - 1);
+    let end = offset as u64 + count as u64;
     while addr < end {
-        let (size, cost) = if block_size == BLOCK_SIZE && addr.is_multiple_of(BLOCK_SIZE) && end - addr >= BLOCK_SIZE {
-            (BLOCK_SIZE, BLOCK_ERASE)
+        let (size, cost) = if block_size == BLOCK_SIZE && addr.is_multiple_of(block) && end - addr >= block {
+            (block, BLOCK_ERASE)
         } else {
-            (SECTOR_SIZE, SECTOR_ERASE)
+            (sector, SECTOR_ERASE)
         };
-        for i in addr..addr + size {
-            if let Some(b) = flash.get_mut(i as usize) {
-                *b = 0xFF;
-            }
+        let len = flash.len() as u64;
+        if addr < len {
+            flash[addr as usize..(addr + size).min(len) as usize].fill(0xFF);
         }
         t += cost;
         addr += size;
@@ -136,9 +137,9 @@ pub fn program(flash: &mut [u8], offset: u32, data: &[u8]) -> Time {
             *b &= d;
         }
     }
-    let first_page = offset / PAGE_SIZE;
-    let last_page = (offset + data.len().max(1) as u32 - 1) / PAGE_SIZE;
-    Time(PAGE_PROGRAM.as_ps() * (last_page - first_page + 1) as u64)
+    let first_page = offset as u64 / PAGE_SIZE as u64;
+    let last_page = (offset as u64 + data.len().max(1) as u64 - 1) / PAGE_SIZE as u64;
+    Time(PAGE_PROGRAM.as_ps() * (last_page - first_page + 1))
 }
 
 #[cfg(test)]
@@ -178,5 +179,22 @@ mod tests {
         let mut flash = vec![0u8; 2 * BLOCK_SIZE as usize];
         assert_eq!(erase(&mut flash, 0, BLOCK_SIZE, BLOCK_SIZE), BLOCK_ERASE);
         assert_eq!(erase(&mut flash, 0, BLOCK_SIZE, SECTOR_SIZE), Time(SECTOR_ERASE.as_ps() * 16));
+    }
+
+    /// Offsets and counts are the guest's: a range reaching the end of the 32-bit space is erased (where it is in
+    /// flash) and timed like any other, without the address wrapping around.
+    #[test]
+    fn ranges_at_the_end_of_the_address_space() {
+        let mut flash = vec![0u8; SECTOR_SIZE as usize];
+        // The last sector (sector sized, so the loop's next address is 2^32); offsets past the chip touch nothing
+        assert_eq!(erase(&mut flash, 0xFFFF_F000, SECTOR_SIZE, BLOCK_SIZE), SECTOR_ERASE);
+        assert_eq!(erase(&mut flash, 0xFFFF_0000, BLOCK_SIZE, BLOCK_SIZE), BLOCK_ERASE);
+        assert!(flash.iter().all(|&b| b == 0));
+        // Two pages, the second one past 2^32
+        assert_eq!(program(&mut flash, 0xFFFF_FFF0, &[0; 32]), Time(PAGE_PROGRAM.as_ps() * 2));
+        // Everything: a sector at a time, as the bootrom would
+        let n = (u32::MAX / SECTOR_SIZE + 1) as u64;
+        assert_eq!(erase(&mut flash, 0, u32::MAX, SECTOR_SIZE), Time(SECTOR_ERASE.as_ps() * n));
+        assert!(flash.iter().all(|&b| b == 0xFF));
     }
 }
