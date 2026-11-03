@@ -580,7 +580,11 @@ impl Machine {
                 self.cores[0].reset(&mut bus, vtor);
             }
         } else {
+            // Core 1 comes out of reset in the bootrom, as when its PSM force-off is released, and waits there for
+            // the launch sequence
             self.core_enabled[1] = false;
+            let t = self.clocks[1].now.max(self.now);
+            self.sys.sched.schedule(Event::Core1Boot, t + CORE1_RELEASE_LATENCY);
         }
     }
 

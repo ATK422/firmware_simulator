@@ -83,3 +83,46 @@ fn sleeping_core_systick_counts_while_the_other_core_runs() {
     assert!(n.abs_diff(expect) <= 1, "{n} SysTick calls on core 1, expected {expect}");
     assert!(n.abs_diff(asleep) <= 1, "{n} vs {asleep} with core 0 asleep");
 }
+
+/// AIRCR.SYSRESETREQ resets only the requesting core's PSM domain. Core 1 then comes out of reset in the bootrom,
+/// as after its PSM force-off is released, and waits there for the launch sequence on the FIFO (so that core 0
+/// can launch it again); it is not switched off for good.
+#[test]
+fn core1_sysresetreq_restarts_it_in_the_bootrom() {
+    let mut m = Machine::new(MachineConfig { bootrom: Some(rp2040::BOOTROM_B1.to_vec()), ..Default::default() });
+    m.sys.unmodelled.log_mode = rp2040::unmodelled::LogMode::Off;
+    let words = [
+        (0x00, 0x2000_2000),
+        (0x04, SRAM_BASE + 0x121), // core 0: b .
+        (0x400, 0x2000_3000),
+        (0x404, SRAM_BASE + 0x131), // core 1: SYSRESETREQ
+        (0x138, 0xE000_ED0C),       // AIRCR
+        (0x13C, 0x05FA_0004),       // VECTKEY | SYSRESETREQ
+    ];
+    for (off, v) in words {
+        assert!(m.sys.poke(SRAM_BASE + off, Size::Word, v));
+    }
+    let code: [(u32, u16); 5] = [
+        (0x120, 0xE7FE), // b .
+        (0x130, 0x4801), // ldr r0, =AIRCR
+        (0x132, 0x4902), // ldr r1, =0x05FA0004
+        (0x134, 0x6001), // str r1, [r0]
+        (0x136, 0xE7FE), // b .
+    ];
+    for (off, hw) in code {
+        assert!(m.sys.poke(SRAM_BASE + off, Size::Half, hw as u32));
+    }
+    m.direct_boot().unwrap();
+    // Core 1 launched at its vector table in SRAM
+    let mut trace = NullSink;
+    let mut bus = CoreBus { sys: &mut m.sys, trace: &mut trace, core: 1, now: Time::ZERO };
+    m.cores[1].reset(&mut bus, SRAM_BASE + 0x400);
+    m.core_enabled[1] = true;
+    assert_eq!(m.run_until(Time::from_us(500)), StopReason::TimeLimit);
+    assert!(m.core_enabled[1], "core 1 runs again after its reset");
+    let pc = m.cores[1].pc();
+    assert!(pc < 0x4000, "core 1 is in the bootrom, at {pc:#010x}");
+    assert!(m.cores[1].sleep_state().is_some(), "waiting for the launch sequence");
+    assert_eq!(m.resets, 0, "no chip reset");
+    assert_eq!(m.cores[0].pc(), SRAM_BASE + 0x120, "core 0 runs on undisturbed");
+}
