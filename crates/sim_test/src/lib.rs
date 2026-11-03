@@ -392,13 +392,15 @@ impl RobotBench {
 }
 
 /// Runs `scenario` once per point, each from its own snapshot of `base`, on up to `threads` threads at a time.
-/// Results come back in the order of `points`.
+/// Results come back in the order of `points`. A robot with a vehicle driving sensor inputs runs one point at a
+/// time, since its snapshots share those inputs (see [`Robot::snapshot`]).
 pub fn sweep<P: Sync, R: Send>(
     base: &RobotBench,
     points: &[P],
     threads: usize,
     scenario: impl Fn(RobotBench, &P) -> R + Sync,
 ) -> Vec<R> {
+    let threads = if base.robot.vehicles.iter().any(|v| v.has_sensors()) { 1 } else { threads };
     let mut results: Vec<Option<R>> = (0..points.len()).map(|_| None).collect();
     for (chunk_points, chunk_results) in points.chunks(threads.max(1)).zip(results.chunks_mut(threads.max(1))) {
         let benches: Vec<RobotBench> = chunk_points.iter().map(|_| base.snapshot()).collect();

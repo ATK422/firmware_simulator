@@ -145,6 +145,10 @@ impl Robot {
     pub fn run_until(&mut self, end: Time) -> Option<(usize, StopReason)> {
         let wall = std::time::Instant::now();
         let start = self.now;
+        // The sensor inputs may have been set by a snapshot of this robot since (they are shared)
+        for v in &self.vehicles {
+            v.update_outputs();
+        }
         while self.now < end {
             let t = (self.now + self.slice).min(end);
             for (i, b) in self.boards.iter_mut().enumerate() {
@@ -227,8 +231,8 @@ impl Robot {
     /// hydrophones and projectors use the copy's medium. Host endpoints are not copied (they are often handles to
     /// shared state, like a mock bridge); give the copy its own. Physical inputs stay shared: setting one affects
     /// the original and the copy, so set them after restoring, before running. That includes the pressure inputs
-    /// a vehicle drives, so robots with a vehicle that are copies of each other must not run at the same time
-    /// (each would see the other's depth for up to a slice).
+    /// a vehicle drives: copies of a robot with a vehicle can take turns (each run starts by writing its own
+    /// vehicle's pressures), but must not run at the same time.
     pub fn snapshot(&self) -> Robot {
         let medium = self.medium.as_ref().map(|m| Arc::new(std::sync::Mutex::new(m.lock().unwrap().clone())));
         let mut boards: Vec<Session> = self.boards.iter().map(Session::snapshot).collect();
@@ -310,7 +314,8 @@ impl Robot {
             if robot.vehicles.iter().any(|o| o.vehicle.name == v.name) {
                 return Err(format!("two vehicles called {}", v.name));
             }
-            robot.vehicles.push(VehicleSim::new(v, dir)?);
+            let env = robot.medium.as_ref().map(|m| m.lock().unwrap().env.clone());
+            robot.vehicles.push(VehicleSim::new(v, dir, env.as_deref())?);
         }
         for b in &spec.board {
             let board_file = dir.join(&b.board);

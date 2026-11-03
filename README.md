@@ -129,6 +129,56 @@ cargo run --release -- run path/to/puddles_backplane --board boards/mk2/puddles_
     --udp 127.0.0.1:2203=127.0.0.1:2204 --realtime
 ```
 
+### Vehicles: thrusters move the robot, sensors see it
+
+A robot file's `[[vehicle]]` puts its boards in a simulated vehicle (`sim_physics`): a rigid body in six degrees
+of freedom with its mass and inertia, added mass, linear and quadratic drag per axis, gravity, and buoyancy acting
+above the centre of gravity (so it rights itself in roll and pitch). Near the surface only part of the hull is in
+the water, so a positively buoyant vehicle floats instead of flying, and a thruster in the air pushes nothing; in a
+pool or lake environment it comes to rest on the bottom. A uniform current can be given. It is integrated with RK4
+at 1 ms on the robot's virtual clock after every slice, so runs stay deterministic.
+
+Each thruster (position and direction on the hull, thrust `k rpm |rpm|` with separate forward and reverse curves)
+is wired to a DShot ESC of a board and spins at that ESC's motor-model RPM, so the thrust comes from the firmware's
+actual DShot frames. Pressure sensor inputs (`depth.pressure_pa` of an MS5837) get the absolute pressure at their
+port on the hull, and transducers carried by the vehicle follow it through the acoustic medium (what other boards
+hear moves with it, Doppler included).
+
+```toml
+[[vehicle]]
+name = "talos"
+file = "../vehicles/talos.toml"     # body and thruster geometry
+position_m = [5.0, 6.0, 0.0]        # north, east, depth of the centre of gravity
+floating = true                     # start at the depth where it floats
+thrusters = [{ thruster = "heave_fwd_stbd", board = "esc1", esc = "esc1" }]   # ... one per thruster
+
+[[vehicle.sensor]]
+board = "camera_cage"
+input = "depth.pressure_pa"
+mount_m = [0.30, 0.0, 0.10]         # body frame: forward, starboard, down
+
+# [[vehicle.transducer]]            # in an acoustic environment
+# board = "ivc"
+# mount_m = [-0.2, 0.0, 0.15]
+```
+
+`vehicles/talos.toml` and `vehicles/puddles.toml` hold assumed parameters (no CAD or tank data yet: a 32 kg open
+frame for Talos, BlueROV2 Heavy numbers from the literature for Puddles, T200 thrust curves); `robots/talos.toml`
+and `robots/puddles.toml` wire them up. `--vehicle-csv` writes the vehicle's state every 10 ms, and the robot command
+can attach a mock bridge or a UDP relay to an Ethernet board:
+
+```bash
+cargo run --release -- robot robots/puddles.toml --eth-mock-bridge backplane --time 10s --vehicle-csv puddles.csv
+cargo run --release -- robot robots/puddles.toml --udp backplane:127.0.0.1:2203=127.0.0.1:2204 --realtime
+```
+
+The physics is in its own crate, [`sim_physics`](crates/sim_physics) (no board knowledge, like `sim_acoustics`), with
+unit tests for each behaviour (neutral buoyancy, rising and sinking at the drag-limited speed, thrust, turning,
+righting moments, the surface and the bottom). With the firmware in the loop, `sim_test/tests/vehicle.rs` dives
+Puddles on UDP thruster commands and closes a depth controller through the backplane's own depth readings, and
+`tests/vehicle_talos.rs` dives and turns Talos on its two ESC boards' commands while the camera cage reports the
+depth.
+
 ### Flash, the bootloader and resets
 
 A watchdog reset (timeout or forced) restarts every block except the watchdog's scratch registers, the flash and

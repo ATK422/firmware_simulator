@@ -28,7 +28,8 @@ quadratic_drag = [120.0, 190.0, 280.0, 3.0, 5.0, 5.0]
 thruster_model = { forward_n = 51.5, reverse_n = 40.2, at_rpm = 3800.0 }
 
 # ESC board 0 (thrusters 1-4): the horizontal thrusters at the corners, angled 45 degrees so that all four ahead
-# drive the vehicle forward. Opposite corners pushing together turn it.
+# drive the vehicle forward. The starboard pair ahead and the port pair astern turn it to port; diagonally
+# opposite corners together push it sideways and forward.
 [[thruster]]
 name = "fwd_stbd"
 position_m = [0.33, 0.24, 0.0]

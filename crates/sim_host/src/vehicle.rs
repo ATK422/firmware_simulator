@@ -124,11 +124,22 @@ impl VehicleSim {
     /// Loads the vehicle file of `spec` (relative to `dir`) and puts the vehicle at its starting pose. Its wiring
     /// comes later ([`VehicleSim::wire`]), once the boards exist; the paths of the transducers it carries come
     /// first ([`VehicleSim::carries`]), since the boards need them to be placed in the water.
-    pub fn new(spec: &VehicleSpec, dir: &Path) -> Result<VehicleSim, String> {
+    ///
+    /// In an acoustic environment with a bottom (a tank, a lake), the vehicle rests on that bottom unless `water`
+    /// says otherwise.
+    pub fn new(spec: &VehicleSpec, dir: &Path, env: Option<&sim_acoustics::Environment>) -> Result<VehicleSim, String> {
         let file = VehicleFile::load(&dir.join(&spec.file))?;
         let rpy = spec.rpy_deg.map(f64::to_radians);
         let mut state = State::at_rest(spec.position_m, rpy);
-        let mut vehicle = Vehicle::new(&file, spec.water.clone(), state);
+        let mut water = spec.water.clone();
+        if water.bottom_m.is_none() {
+            water.bottom_m = match env.map(|e| &e.boundaries) {
+                Some(sim_acoustics::geometry::Boundaries::Tank { size }) => Some(size[2]),
+                Some(sim_acoustics::geometry::Boundaries::Lake { depth }) => Some(*depth),
+                _ => None,
+            };
+        }
+        let mut vehicle = Vehicle::new(&file, water, state);
         if spec.floating {
             let depth = vehicle
                 .floating_depth()
@@ -239,7 +250,13 @@ impl VehicleSim {
         }
     }
 
-    fn update_outputs(&self) {
+    /// Whether the vehicle drives any board inputs (which robot snapshots share, see [`crate::robot::Robot::snapshot`]).
+    pub fn has_sensors(&self) -> bool {
+        !self.sensors.is_empty()
+    }
+
+    /// Writes the pressure at each sensor's port to its input.
+    pub fn update_outputs(&self) {
         for (h, mount) in &self.sensors {
             *h.lock().unwrap() = self.vehicle.pressure_at(*mount);
         }

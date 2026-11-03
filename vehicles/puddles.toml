@@ -23,7 +23,8 @@ quadratic_drag = [141.0, 217.0, 190.0, 1.2, 0.5, 1.5]
 # T200 at 16 V: about 5.25 kgf forward, 4.1 kgf reverse near 3800 RPM
 thruster_model = { forward_n = 51.5, reverse_n = 40.2, at_rpm = 3800.0 }
 
-# Thrusters 1-4 (backplane GPIO 25-22): horizontal, at 45 degrees, all four ahead drive it forward
+# Thrusters 1-4 (backplane GPIO 25-22): horizontal, at 45 degrees, all four ahead drive it forward; the starboard
+# pair (1, 3) ahead and the port pair (2, 4) astern turn it to port
 [[thruster]]
 name = "t1"
 position_m = [0.156, 0.111, 0.085]

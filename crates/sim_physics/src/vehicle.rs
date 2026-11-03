@@ -18,7 +18,9 @@
 //!   rises through the last `height_m / 2`, and a positively buoyant vehicle floats with part of it out of the water;
 //! * drag on the velocity through the water, linear plus quadratic per body axis (`-(D_l + D_q |v|) v`), scaled
 //!   by the fraction under water;
-//! * the thrusters' forces at their mounting points.
+//! * the thrusters' forces at their mounting points;
+//! * the bottom, if the water has one (`bottom_m`): once the hull (taken as `height_m / 2` below the centre of
+//!   gravity) reaches it, a stiff spring and damper hold it up and friction stops it sliding.
 //!
 //! The state is integrated with fixed-step fourth-order Runge-Kutta (1 ms by default), the thrust held constant
 //! over the step, so a run is a pure function of its inputs and reproduces exactly.
@@ -39,11 +41,19 @@ pub struct Water {
     pub surface_pa: f64,
     /// A uniform current (world frame, m/s): drag acts on the velocity through the water.
     pub current_mps: Vec3,
+    /// Depth of the bottom (none: bottomless). A robot in an acoustic environment takes its pool or lake depth.
+    pub bottom_m: Option<f64>,
 }
 
 impl Default for Water {
     fn default() -> Self {
-        Water { density_kg_m3: 997.0, gravity_mps2: 9.80665, surface_pa: 101_325.0, current_mps: [0.0; 3] }
+        Water {
+            density_kg_m3: 997.0,
+            gravity_mps2: 9.80665,
+            surface_pa: 101_325.0,
+            current_mps: [0.0; 3],
+            bottom_m: None,
+        }
     }
 }
 
@@ -343,7 +353,29 @@ fn environment_wrench(p: &Params, w: &Water, s: &State) -> Wrench {
         force: [drag(0, through_water[0]), drag(1, through_water[1]), drag(2, through_water[2])],
         torque: [drag(3, s.rate[0]), drag(4, s.rate[1]), drag(5, s.rate[2])],
     };
-    Wrench::at(weight, [0.0; 3]).add(&Wrench::at(buoyancy, p.cob_m)).add(&damping)
+    let total = Wrench::at(weight, [0.0; 3]).add(&Wrench::at(buoyancy, p.cob_m)).add(&damping);
+    match w.bottom_m {
+        Some(bottom) => total.add(&bottom_contact(p, s, bottom)),
+        None => total,
+    }
+}
+
+/// The bottom pushing back on the hull: a spring and damper (natural frequency 20 rad/s, damping ratio 0.7, so
+/// the hull sinks in by about `m g / k`, 2.5 cm per unit of weight in water) and friction that stops a sliding
+/// vehicle within a second, at the centre of gravity so it doesn't tip the vehicle.
+fn bottom_contact(p: &Params, s: &State, bottom: f64) -> Wrench {
+    let penetration = s.position[2] + p.height_m / 2.0 - bottom;
+    if penetration <= 0.0 {
+        return Wrench::default();
+    }
+    let m = p.mass_kg + p.added_mass[2];
+    let k = m * 400.0;
+    let c = 2.0 * 0.7 * (k * m).sqrt();
+    let v = s.world_velocity();
+    let up = (k * penetration + c * v[2]).max(0.0);
+    let friction = 2.0 * (p.mass_kg + p.added_mass[0]);
+    let world = [-friction * v[0], -friction * v[1], -up];
+    Wrench::at(s.attitude.rotate_inv(world), [0.0; 3])
 }
 
 fn deriv(p: &Params, w: &Water, s: &State, thrust: &Wrench) -> Deriv {
@@ -558,6 +590,25 @@ mod tests {
             highest = highest.min(v.state.position[2]);
         }
         assert!(highest > -0.3, "{highest}");
+    }
+
+    #[test]
+    fn a_sinking_vehicle_comes_to_rest_on_the_bottom() {
+        let mut v = vehicle(0.95, &[([0.0; 3], [1.0, 0.0, 0.0])]);
+        v.water.bottom_m = Some(3.0);
+        v.state.velocity = [0.3, 0.0, 0.0];
+        run(&mut v, 30.0, &[]);
+        // Resting with the hull pressed in just enough for the contact spring to carry its 15 N of weight in water
+        let weight = 0.05 * 30.0 * G;
+        let k = 60.0 * 400.0;
+        let expected = 3.0 - 0.2 + weight / k;
+        assert!((v.state.position[2] - expected).abs() < 1e-4, "{} vs {expected}", v.state.position[2]);
+        assert!(norm(v.state.velocity) < 1e-4, "{:?}", v.state.velocity);
+        // Friction slows it more than the water alone would, but full thrust still drives it along the bottom
+        let x = v.state.position[0];
+        run(&mut v, 5.0, &[4000.0]);
+        assert!(v.state.position[0] - x > 1.0, "{}", v.state.position[0] - x);
+        assert!(v.state.position[2] < 3.0);
     }
 
     #[test]
