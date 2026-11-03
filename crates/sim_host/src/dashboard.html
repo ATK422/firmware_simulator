@@ -5,102 +5,303 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>firmware_simulator</title>
 <style>
+/* Layout rule for this page: nothing may change size while values update. Every value that changes lives in a
+   box whose size does not depend on it (fixed widths with tabular digits, one-line boxes with ellipsis, panes
+   of fixed height that scroll), and the page updates its nodes in place. */
 :root {
-  --bg: #f6f7f9; --card: #ffffff; --fg: #1d2330; --muted: #667085; --line: #d9dde5;
-  --accent: #2563eb; --ok: #15803d; --warn: #b45309; --bad: #b91c1c; --hi: #16a34a; --lo: #cbd2dc;
-  --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  color-scheme: light;
+  --bg: #eef1f5; --panel: #ffffff; --inset: #f6f8fa; --fg: #1b2230; --fg2: #3d4757; --muted: #687385;
+  --line: #dce1e8; --line2: #e8ecf1; --accent: #2563eb; --accent-fg: #ffffff;
+  --ok: #15803d; --ok-bg: #dcfce7; --warn: #b45309; --warn-bg: #fef3c7; --bad: #b91c1c; --bad-bg: #fee2e2;
+  --idle: #475569; --idle-bg: #e2e8f0;
+  --hi: #16a34a; --hi-fg: #ffffff; --lo: #e3e7ed; --lo-fg: #4b5563;
+  --uart: #1d4ed8; --debug: #6b7280;
+  --shadow: 0 1px 2px rgba(16, 24, 40, .06);
+  --mono: ui-monospace, "SF Mono", SFMono-Regular, "Cascadia Mono", "JetBrains Mono", Menlo, Consolas, monospace;
+  --sans: system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+  --lbl: 3.6rem;
+  --row: 22px;
 }
 @media (prefers-color-scheme: dark) {
-  :root { --bg: #11151c; --card: #1a202a; --fg: #e6e9ef; --muted: #98a2b3; --line: #2c3442;
-          --accent: #60a5fa; --ok: #4ade80; --warn: #fbbf24; --bad: #f87171; --hi: #4ade80; --lo: #3a4352; }
+  :root {
+    color-scheme: dark;
+    --bg: #0c1016; --panel: #151a22; --inset: #0f131a; --fg: #e6eaf0; --fg2: #c2c9d4; --muted: #8b95a7;
+    --line: #262e3b; --line2: #1e2530; --accent: #3b82f6; --accent-fg: #ffffff;
+    --ok: #4ade80; --ok-bg: rgba(74, 222, 128, .12); --warn: #fbbf24; --warn-bg: rgba(251, 191, 36, .12);
+    --bad: #f87171; --bad-bg: rgba(248, 113, 113, .13); --idle: #9aa4b5; --idle-bg: rgba(148, 163, 184, .12);
+    --hi: #22c55e; --hi-fg: #04160a; --lo: #232b37; --lo-fg: #8b95a7;
+    --uart: #7cb4ff; --debug: #7d8797;
+    --shadow: none;
+  }
 }
 * { box-sizing: border-box; }
-body { margin: 0; background: var(--bg); color: var(--fg); font: 14px/1.4 system-ui, sans-serif; }
-header { position: sticky; top: 0; z-index: 2; background: var(--card); border-bottom: 1px solid var(--line);
-         padding: 8px 16px; display: flex; flex-wrap: wrap; gap: 8px 20px; align-items: center; }
-header h1 { font-size: 16px; margin: 0 8px 0 0; }
-.stat b { font-variant-numeric: tabular-nums; }
-main { padding: 12px 16px; display: grid; gap: 12px; }
-section h2 { font-size: 14px; margin: 4px 0 8px; color: var(--muted); text-transform: uppercase; letter-spacing: .04em; }
-.grid { display: grid; gap: 12px; grid-template-columns: repeat(auto-fill, minmax(min(100%, 420px), 1fr)); }
-.card { background: var(--card); border: 1px solid var(--line); border-radius: 8px; padding: 10px 12px; min-width: 0; }
-.card h3 { margin: 0 0 6px; font-size: 15px; display: flex; gap: 8px; align-items: baseline; flex-wrap: wrap; }
-.muted { color: var(--muted); }
+html, body { margin: 0; }
+body { background: var(--bg); color: var(--fg); font: 13px/1.45 var(--sans); -webkit-font-smoothing: antialiased;
+       overflow-x: hidden; }
+.num, .mono, b, input, select { font-variant-numeric: tabular-nums; }
 .mono { font-family: var(--mono); font-size: 12px; }
-.badge { display: inline-block; padding: 0 6px; border-radius: 10px; font-size: 12px; border: 1px solid var(--line); }
+.muted { color: var(--muted); }
 .ok { color: var(--ok); } .warn { color: var(--warn); } .bad { color: var(--bad); }
-table { border-collapse: collapse; width: 100%; }
-td, th { padding: 2px 6px 2px 0; text-align: left; vertical-align: top; }
-th { color: var(--muted); font-weight: normal; }
-.pins { display: grid; grid-template-columns: repeat(15, 1fr); gap: 2px; margin: 4px 0; }
-.pin { font: 10px var(--mono); text-align: center; border-radius: 3px; padding: 2px 0; background: var(--lo); color: var(--fg); }
-.pin.h { background: var(--hi); color: #fff; }
-.pin.in { opacity: .55; }
-.dot { display: inline-block; width: 10px; height: 10px; border-radius: 50%; background: var(--lo); vertical-align: middle; }
-.dot.on { background: var(--hi); box-shadow: 0 0 6px var(--hi); }
-.strip span { display: inline-block; width: 14px; height: 14px; border: 1px solid var(--line); margin-right: 1px; }
-.log { height: 180px; overflow: auto; background: var(--bg); border: 1px solid var(--line); border-radius: 4px;
-       padding: 4px; white-space: pre-wrap; word-break: break-all; }
-.log .error, .log .err { color: var(--bad); } .log .warn { color: var(--warn); } .log .uart0, .log .uart1 { color: var(--accent); }
-.bar { height: 8px; background: var(--lo); border-radius: 4px; overflow: hidden; position: relative; min-width: 60px; }
-.bar i { position: absolute; top: 0; bottom: 0; background: var(--accent); }
-form { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; margin: 4px 0; }
-input, select, button { font: inherit; color: var(--fg); background: var(--bg); border: 1px solid var(--line);
-                        border-radius: 4px; padding: 3px 6px; min-width: 0; }
-button { cursor: pointer; background: var(--accent); color: #fff; border-color: var(--accent); }
-button.secondary { background: var(--bg); color: var(--fg); border-color: var(--line); }
-#msg { min-height: 1.4em; }
-.frames { max-height: 160px; overflow: auto; }
+.ell { overflow: hidden; white-space: nowrap; text-overflow: ellipsis; min-width: 0; }
+[hidden] { display: none !important; }
+
+/* Top bar */
+.topbar { position: sticky; top: 0; z-index: 5; background: var(--panel); border-bottom: 1px solid var(--line);
+          box-shadow: var(--shadow); }
+.topbar-in { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 20px; padding: 10px 20px;
+             max-width: 2400px; margin: 0 auto; }
+.brand { display: flex; align-items: center; gap: 10px; margin-right: 4px; }
+.logo { width: 22px; height: 22px; border-radius: 6px; flex: none;
+        background: linear-gradient(135deg, var(--accent), var(--hi)); }
+.brand h1 { font-size: 15px; font-weight: 650; margin: 0; letter-spacing: .01em; white-space: nowrap; }
+.stats { display: flex; gap: 4px 18px; flex-wrap: wrap; }
+.stat { display: flex; align-items: baseline; gap: 6px; white-space: nowrap; }
+.stat .k { font-size: 11px; text-transform: uppercase; letter-spacing: .06em; color: var(--muted); }
+.stat b { font: 600 13px var(--mono); display: inline-block; text-align: right; }
+#time, #wall { width: 11ch; } #speed { width: 7ch; }
+.badge { display: inline-block; height: 22px; line-height: 20px; padding: 0 10px; border-radius: 11px; font-size: 12px;
+         font-weight: 550; border: 1px solid transparent; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+#mode { width: 11.5rem; text-align: center; }
+.badge.ok { background: var(--ok-bg); } .badge.warn { background: var(--warn-bg); } .badge.bad { background: var(--bad-bg); }
+.spacer { flex: 1 1 0; }
+.conn { display: inline-flex; align-items: center; gap: 6px; width: 7.5rem; font-size: 12px; color: var(--muted);
+        white-space: nowrap; overflow: hidden; }
+.conn::before { content: ""; width: 8px; height: 8px; border-radius: 50%; background: var(--ok); flex: none; }
+.conn.off::before { background: var(--bad); }
+#conn:empty::before { content: "Live"; }
+.conn.off { color: var(--bad); }
+
+/* Controls */
+input, select, button { font: inherit; font-size: 13px; color: var(--fg); background: var(--inset);
+                        border: 1px solid var(--line); border-radius: 6px; height: 30px; padding: 0 8px; min-width: 0; }
+input:focus, select:focus, button:focus-visible { outline: 2px solid var(--accent); outline-offset: -1px; }
+button { cursor: pointer; background: var(--accent); color: var(--accent-fg); border-color: var(--accent);
+         font-weight: 550; padding: 0 12px; white-space: nowrap; }
+button:hover { filter: brightness(1.08); }
+button.secondary { background: var(--inset); color: var(--fg); border-color: var(--line); }
+#pause { width: 6.5rem; }
+
+main { padding: 16px 20px 32px; display: grid; gap: 20px; max-width: 2400px; margin: 0 auto; }
+section > h2 { display: flex; align-items: baseline; gap: 8px; font-size: 12px; font-weight: 650; margin: 0 0 10px;
+               color: var(--muted); text-transform: uppercase; letter-spacing: .07em; }
+section > h2 .count { font-weight: 500; letter-spacing: 0; text-transform: none; }
+
+.grid { display: grid; gap: 14px; grid-template-columns: repeat(auto-fill, minmax(min(100%, 25rem), 1fr)); }
+.grid > *, .card > * { min-width: 0; }
+.card { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; box-shadow: var(--shadow);
+        display: flex; flex-direction: column; min-width: 0; overflow: hidden; }
+.card-head { display: flex; align-items: center; gap: 8px; height: 40px; padding: 0 14px; flex: none;
+             border-bottom: 1px solid var(--line2); }
+.card-head h3 { font-size: 14px; font-weight: 650; margin: 0; white-space: nowrap; flex: none; max-width: 50%;
+                overflow: hidden; text-overflow: ellipsis; }
+.card-head .sub { flex: 1 1 0; min-width: 0; color: var(--muted); }
+.card-body { padding: 10px 14px 12px; display: flex; flex-direction: column; gap: 4px; flex: 1 1 auto; min-height: 0; }
+.chip { display: inline-flex; align-items: center; gap: 5px; height: 20px; padding: 0 7px; border-radius: 10px;
+        font-size: 11.5px; border: 1px solid var(--line); color: var(--fg2); background: var(--inset);
+        white-space: nowrap; flex: none; }
+.chip.ok { color: var(--ok); background: var(--ok-bg); border-color: transparent; }
+.chip.warn { color: var(--warn); background: var(--warn-bg); border-color: transparent; }
+.chip.bad { color: var(--bad); background: var(--bad-bg); border-color: transparent; }
+.resets { width: 5.8rem; justify-content: center; }
+.power { width: 2.9rem; justify-content: center; }
+
+/* Label column rows inside cards */
+.row { display: grid; grid-template-columns: var(--lbl) minmax(0, 1fr); column-gap: 10px; align-items: start; }
+.row > .lbl { height: var(--row); line-height: var(--row); font-size: 10.5px; font-weight: 600; color: var(--muted);
+              text-transform: uppercase; letter-spacing: .06em; white-space: nowrap; overflow: hidden; }
+.row > .val { min-height: var(--row); line-height: var(--row); min-width: 0; }
+.line { height: var(--row); line-height: var(--row); overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
+.sep { height: 1px; background: var(--line2); margin: 4px 0; flex: none; }
+
+/* Cores */
+.core { display: grid; grid-template-columns: 5.4rem minmax(0, 1fr) auto; align-items: center; column-gap: 8px;
+        height: var(--row); }
+.state { height: 18px; line-height: 16px; border-radius: 4px; font-size: 11px; font-weight: 600; text-align: center;
+         border: 1px solid transparent; overflow: hidden; white-space: nowrap; }
+.state.running { color: var(--ok); background: var(--ok-bg); }
+.state.sleeping, .state.off { color: var(--idle); background: var(--idle-bg); }
+.state.locked { color: var(--bad); background: var(--bad-bg); }
+.state.other { color: var(--warn); background: var(--warn-bg); }
+.fn { font: 12px var(--mono); overflow: hidden; white-space: nowrap; text-overflow: ellipsis; color: var(--fg); }
+.fn.pc { color: var(--muted); }
+.off { font: 12px var(--mono); color: var(--muted); white-space: nowrap; width: 7ch; height: 16px; line-height: 16px; text-align: right; overflow: hidden; }
+
+/* LEDs and strips */
+.chips { display: flex; flex-wrap: wrap; gap: 4px; padding: 1px 0; }
+.led i { width: 8px; height: 8px; border-radius: 50%; background: var(--lo); box-shadow: inset 0 0 0 1px var(--line); }
+.led.on { color: var(--fg); }
+.led.on i { background: var(--hi); box-shadow: 0 0 5px var(--hi); }
+.sw { width: 10px; height: 10px; border-radius: 2px; box-shadow: inset 0 0 0 1px rgba(127, 127, 127, .35); }
+.swatches { display: inline-flex; gap: 2px; }
+
+/* GPIO: 30 pins as a fixed 15 x 2 grid */
+.pins { display: grid; grid-template-columns: repeat(15, minmax(0, 1fr)); gap: 3px; padding: 2px 0; }
+.pin { height: 19px; line-height: 17px; border-radius: 4px; text-align: center; font: 10px var(--mono);
+       background: var(--lo); color: var(--lo-fg); border: 1px solid transparent; overflow: hidden; }
+.pin.h { background: var(--hi); color: var(--hi-fg); font-weight: 600; }
+.pin.in { background: transparent; border-color: var(--line); }
+.pin.in.h { background: transparent; border-color: var(--hi); color: var(--hi); }
+.legend { display: flex; gap: 10px; font-size: 11px; color: var(--muted); height: var(--row); align-items: center;
+          white-space: nowrap; overflow: hidden; }
+.legend span { display: inline-flex; align-items: center; gap: 4px; }
+.legend i { width: 10px; height: 10px; border-radius: 3px; background: var(--lo); border: 1px solid transparent; }
+.legend i.h { background: var(--hi); } .legend i.in { background: transparent; border-color: var(--line); }
+
+/* Key/value tables */
+table.kv { width: 100%; border-collapse: collapse; table-layout: fixed; }
+table.kv th, table.kv td { height: var(--row); padding: 0; font-weight: 400; vertical-align: middle;
+                           white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+table.kv th { text-align: left; color: var(--fg2); padding-right: 10px; }
+table.kv td { text-align: right; font: 12px var(--mono); }
+table.kv td.v { width: 11ch; }
+table.kv td.u { width: 4.5ch; text-align: left; padding-left: 5px; color: var(--muted); }
+table.kv tr + tr th, table.kv tr + tr td { border-top: 1px solid var(--line2); }
+table.kv.left td { text-align: left; font-family: var(--sans); font-size: 13px; }
+table.kv.left th { width: 7.5rem; color: var(--muted); }
+
+/* Panes that scroll: logs and recent frames */
+.pane-wrap { position: relative; flex: 1 1 auto; display: flex; flex-direction: column; min-height: 0; margin-top: 6px; }
+.pane-head { display: flex; align-items: center; justify-content: space-between; height: 20px; font-size: 10.5px;
+             font-weight: 600; color: var(--muted); text-transform: uppercase; letter-spacing: .06em; }
+.pane-head .num { font-weight: 500; letter-spacing: 0; text-transform: none; font-size: 11px; }
+.pane { flex: 1 1 auto; height: 0; min-height: 150px; overflow-y: auto; overflow-x: hidden; overflow-anchor: none;
+        background: var(--inset); border: 1px solid var(--line2); border-radius: 6px; padding: 5px 8px;
+        font: 11.5px/1.5 var(--mono); scrollbar-width: thin; }
+.pane:empty::before { content: attr(data-empty); color: var(--muted); font-family: var(--sans); font-size: 12px; }
+.log > div { white-space: pre-wrap; overflow-wrap: anywhere; padding-left: 9ch; text-indent: -9ch; }
+.log .t, .frames .t { color: var(--muted); }
+.log .ts { color: var(--muted); }
+.log .lv { font-weight: 600; }
+.log .k-error, .log .lv-error { color: var(--bad); }
+.log .k-warn, .log .lv-warn { color: var(--warn); }
+.log .lv-info { color: var(--ok); }
+.log .k-debug, .log .k-trace { color: var(--debug); }
+.log .k-uart0, .log .k-uart1 { color: var(--uart); }
+.log .tag { color: var(--muted); }
+.frames > div { display: flex; gap: 8px; white-space: nowrap; }
+.frames .f { overflow: hidden; text-overflow: ellipsis; min-width: 0; }
+.frames .f.na { color: var(--warn); }
+.jump { position: absolute; right: 12px; bottom: 8px; height: 24px; padding: 0 10px; border-radius: 12px; font-size: 12px;
+        box-shadow: 0 2px 8px rgba(0, 0, 0, .25); }
+
+/* Metric tiles (buses) */
+.tiles { display: grid; grid-template-columns: repeat(5, minmax(0, 1fr)); gap: 6px; }
+.tile { background: var(--inset); border: 1px solid var(--line2); border-radius: 6px; padding: 5px 8px; min-width: 0; }
+.tile .k { font-size: 10.5px; color: var(--muted); text-transform: uppercase; letter-spacing: .05em; white-space: nowrap;
+           overflow: hidden; text-overflow: ellipsis; }
+.tile .v { font: 600 13px var(--mono); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+
+/* Vehicles */
+.vec { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)) 3.5ch; column-gap: 14px; align-items: center; height: var(--row); }
+.vec > span { display: flex; justify-content: space-between; gap: 4px; min-width: 0; white-space: nowrap; }
+.vec .ax { color: var(--muted); font-size: 11.5px; }
+.vec .n { font: 12px var(--mono); }
+.vec .u { color: var(--muted); font-size: 11.5px; }
+.thr { display: grid; grid-template-columns: minmax(0, 1fr) 7ch minmax(0, 1.3fr); column-gap: 10px; align-items: center;
+       height: var(--row); }
+.thr + .thr { border-top: 1px solid var(--line2); }
+.thr .n { font: 12px var(--mono); text-align: right; }
+.bar { height: 8px; background: var(--lo); border-radius: 4px; overflow: hidden; position: relative; }
+.bar::after { content: ""; position: absolute; left: 50%; top: 0; bottom: 0; width: 1px; background: var(--muted); opacity: .6; }
+.bar i { position: absolute; top: 0; bottom: 0; background: var(--accent); border-radius: 4px; }
+.bar i.neg { background: var(--warn); }
+
+/* Controls card */
+.controls .card-body { display: grid; grid-template-columns: minmax(0, 1.2fr) minmax(0, 1fr); gap: 8px 24px; }
+.ctl { display: grid; grid-template-columns: 3.4rem 9rem minmax(0, 1fr) 6.5rem; gap: 8px; align-items: center; margin: 0; }
+.ctl.input { grid-template-columns: 3.4rem 9rem minmax(0, 1fr) 6.5rem 6.5rem; }
+.ctl label { font-size: 11px; font-weight: 600; color: var(--muted); text-transform: uppercase; letter-spacing: .06em; }
+.ctl-left { display: grid; gap: 8px; align-content: start; min-width: 0; }
+#msg { height: var(--row); line-height: var(--row); overflow: hidden; white-space: nowrap; text-overflow: ellipsis;
+       font-size: 12px; }
+.history { display: flex; flex-direction: column; min-width: 0; }
+#faultlog { flex: none; height: 92px; min-height: 0; padding: 3px 8px; }
+#faultlog > div { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+
+@media (max-width: 900px) {
+  .controls .card-body { grid-template-columns: minmax(0, 1fr); }
+}
+@media (max-width: 560px) {
+  .topbar-in, main { padding-left: 12px; padding-right: 12px; }
+  .ctl, .ctl.input { grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); }
+  .ctl label { grid-column: 1 / -1; }
+  .tiles { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+  .spacer { display: none; }
+}
 </style>
 </head>
 <body>
-<header>
-  <h1>firmware_simulator</h1>
-  <span class="stat">virtual <b id="time">-</b></span>
-  <span class="stat">wall <b id="wall">-</b></span>
-  <span class="stat">speed <b id="speed">-</b></span>
+<header class="topbar"><div class="topbar-in">
+  <div class="brand"><span class="logo"></span><h1>firmware_simulator</h1></div>
+  <div class="stats">
+    <span class="stat"><span class="k">Virtual</span><b id="time">-</b></span>
+    <span class="stat"><span class="k">Wall</span><b id="wall">-</b></span>
+    <span class="stat"><span class="k">Speed</span><b id="speed">-</b></span>
+  </div>
   <span id="mode" class="badge"></span>
+  <span class="spacer"></span>
   <button id="pause" class="secondary" type="button">Pause</button>
-  <span id="conn" class="muted"></span>
-</header>
+  <span id="live" class="conn"><span id="conn"></span></span>
+</div></header>
 <main>
-  <section class="card">
-    <h2>Controls</h2>
-    <form id="faultform">
-      <select id="fboard" aria-label="board"></select>
-      <input id="fault" list="faults" placeholder="fault, e.g. can-stuck" size="24" aria-label="fault">
-      <datalist id="faults"></datalist>
-      <button type="submit">Inject fault</button>
-    </form>
-    <form id="inputform">
-      <select id="iboard" aria-label="board"></select>
-      <select id="iname" aria-label="input"></select>
-      <input id="ivalue" placeholder="value" size="10" aria-label="value">
-      <button type="submit">Set input</button>
-    </form>
-    <div id="msg" class="muted"></div>
-    <div id="faultlog" class="mono muted"></div>
+  <section class="card controls">
+    <div class="card-head"><h3>Controls</h3></div>
+    <div class="card-body">
+      <div class="ctl-left">
+        <form id="faultform" class="ctl">
+          <label for="fault">Fault</label>
+          <select id="fboard" aria-label="board"></select>
+          <input id="fault" list="faults" placeholder="e.g. can-stuck, gpio:3:high" aria-label="fault" autocomplete="off">
+          <datalist id="faults"></datalist>
+          <button type="submit">Inject</button>
+        </form>
+        <form id="inputform" class="ctl input">
+          <label for="ivalue">Input</label>
+          <select id="iboard" aria-label="board"></select>
+          <select id="iname" aria-label="input"></select>
+          <input id="ivalue" placeholder="value" aria-label="value" inputmode="decimal" autocomplete="off">
+          <button type="submit">Set</button>
+        </form>
+        <div id="msg" class="muted">Faults use the --fault syntax; inputs take a number.</div>
+      </div>
+      <div class="history">
+        <div class="pane-head"><span>Fault history</span><span id="faultcount" class="num"></span></div>
+        <div id="faultlog" class="pane mono" data-empty="No faults injected yet"></div>
+      </div>
+    </div>
   </section>
-  <section id="vehicles-section" hidden><h2>Vehicles</h2><div id="vehicles" class="grid"></div></section>
-  <section id="buses-section" hidden><h2>CAN buses and bridges</h2><div id="buses" class="grid"></div></section>
-  <section><h2>Boards</h2><div id="boards" class="grid"></div></section>
+  <section id="system-section" hidden>
+    <h2 id="system-title">Vehicles and buses</h2>
+    <div class="grid"><div id="vehicles" style="display: contents"></div><div id="buses" style="display: contents"></div></div>
+  </section>
+  <section><h2>Boards <span id="boardcount" class="count"></span></h2><div id="boards" class="grid"></div></section>
 </main>
 <script>
 "use strict";
-// Plain DOM code, polling /api/state twice a second. Every value from the emulator is inserted as text.
+// Plain DOM code, polling /api/state twice a second. Every value from the emulator is inserted as text. Cards are
+// built once and then updated in place, so nothing flickers, loses its scroll position or changes size.
 const $ = (id) => document.getElementById(id);
-let state = null, logSeen = {}, cards = {};
+const LOG_KEEP = 500;
+let state = null;
+const cards = {}, sysCards = {};
 
 function el(tag, attrs, ...kids) {
   const e = document.createElement(tag);
   for (const [k, v] of Object.entries(attrs || {})) {
-    if (k === "class") e.className = v; else if (k === "text") e.textContent = v; else e.setAttribute(k, v);
+    if (k === "class") e.className = v; else if (k === "text") e.textContent = v; else if (k === "title") e.title = v;
+    else e.setAttribute(k, v);
   }
   for (const k of kids) e.append(k);
   return e;
 }
+// Writes only what changed: unchanged nodes are left alone
+function setText(e, v) { v = String(v); if (e.textContent !== v) e.textContent = v; }
+function setClass(e, v) { if (e.className !== v) e.className = v; }
+function setTitle(e, v) { if (e.title !== v) e.title = v; }
 function fmt(x, d) { return (x === null || x === undefined) ? "-" : Number(x).toFixed(d); }
 function secs(x) { return fmt(x, 3) + " s"; }
+function bin(x) { return x.toString(2) + "b"; }
+function same(a, b) { return JSON.stringify(a) === JSON.stringify(b); }
 
 async function post(path, body) {
   try {
@@ -108,6 +309,7 @@ async function post(path, body) {
     const j = await r.json();
     $("msg").textContent = j.ok ? j.message : ("error: " + j.error);
     $("msg").className = j.ok ? "ok" : "bad";
+    $("msg").title = $("msg").textContent;
   } catch (e) { $("msg").textContent = "error: " + e; $("msg").className = "bad"; }
   poll();
 }
@@ -132,115 +334,360 @@ function fillInputs() {
   fillSelect($("iname"), b ? b.inputs.map((i) => i.name) : []);
 }
 
-function boardCard(b) {
-  const c = el("div", { class: "card" });
-  c.head = el("h3", {}, el("span", { text: b.name }));
-  c.sub = el("span", { class: "muted mono" });
-  c.head.append(c.sub);
-  c.cores = el("div", { class: "mono" });
-  c.status = el("div");
-  c.leds = el("div");
-  c.pins = el("div", { class: "pins" });
-  c.extra = el("div");
-  c.logs = el("div", { class: "log mono" });
-  c.append(c.head, c.cores, c.status, c.leds, c.pins, c.extra, c.logs);
-  return c;
+// "<embassy_executor::platform::thread::Executor>::run::<sbc_board::__cortex_m_rt_main::{closure#0}>+0xba" is
+// shown as "Executor::run<__cortex_m_rt_main>" and "+0xba": paths cut to their last segment, closures and
+// turbofish dropped. The full symbol is in the tooltip.
+function splitOffset(f) { const m = /^(.*?)(\+0x[0-9a-fA-F]+)$/.exec(f); return m ? [m[1], m[2]] : [f, ""]; }
+function shortName(name) {
+  let s = name.replace(/::\{closure#\d+\}/g, "").replace(/\{closure#\d+\}/g, "closure");
+  s = s.replace(/\b(?:[A-Za-z_][A-Za-z0-9_]*::)+(?=[A-Za-z_])/g, "").replace(/::</g, "<");
+  if (s.startsWith("<")) {
+    let depth = 0, i = 0;
+    for (; i < s.length; i++) { if (s[i] === "<") depth++; else if (s[i] === ">" && --depth === 0) break; }
+    if (s.startsWith("::", i + 1)) {
+      const inner = s.slice(1, i), as = inner.lastIndexOf(" as ");
+      s = (as >= 0 ? inner.slice(as + 4) : inner) + s.slice(i + 1);
+    }
+  }
+  // Generic arguments name tasks and entry points: "__cortex_m_rt_main" is "main", "__rx_task_task" is "rx_task"
+  s = s.replace(/<([^<>]*)>/g, (m, a) => "<" + a.replace(/\b_+/g, "").replace(/_inner_function\b/g, "")
+    .replace(/_task_task\b/g, "_task").replace(/^cortex_m_rt_main$/, "main") + ">");
+  return s || name;
 }
 
-function statusLines(link) {
-  const out = el("div", { class: "mono" });
-  if (!link) return out;
+function row(label, ...kids) { return el("div", { class: "row" }, el("div", { class: "lbl", text: label }), el("div", { class: "val" }, ...kids)); }
+
+// One-line summaries of a mock bridge and the FirmwareStatus it decoded: [text, class] each
+function linkLines(link) {
   const s = link.status;
   const kill = link.kill === null ? "not forwarded" : (link.kill ? "asserting kill" : "enabled");
-  out.append(el("div", { class: link.running ? "" : "warn",
-    text: `bridge ${link.running ? "running" : "stopped"}, client ${link.client ?? "-"}, kill switch ${kill}, ` +
-          `${link.heartbeats} heartbeats` + (link.last_heartbeat_age_s !== null ? ` (last ${fmt(link.last_heartbeat_age_s, 2)} s ago)` : "") }));
+  const hb = `${link.heartbeats} heartbeats` + (link.last_heartbeat_age_s !== null ? ` (${fmt(link.last_heartbeat_age_s, 2)} s ago)` : "");
+  const out = { bridge: [`${link.running ? "running" : "stopped"} · client ${link.client ?? "-"} · ${hb} · kill switch ${kill}`, link.running ? "" : "warn"] };
   if (s) {
     const ks = s.kill_switches;
-    out.append(el("div", { text: `${s.board_name} ${s.version}, up ${fmt(s.uptime_s, 1)} s, status ${fmt(s.age_s, 1)} s old` }));
-    out.append(el("div", { class: s.faults.length ? "bad" : "ok",
-      text: s.faults.length ? "faults: " + s.faults.join(", ") : "no faults" }));
-    out.append(el("div", { class: ks.asserting_kill || ks.timed_out ? "warn" : "muted",
-      text: `kill switches enabled ${ks.enabled.toString(2)}b, asserting ${ks.asserting_kill.toString(2)}b, timed out ${ks.timed_out.toString(2)}b` }));
+    out.status = [`${s.board_name} ${s.version} · up ${fmt(s.uptime_s, 1)} s · status ${fmt(s.age_s, 1)} s old`, ""];
+    out.faults = [s.faults.length ? s.faults.join(", ") : "none", s.faults.length ? "bad" : "ok"];
+    out.kill = [`enabled ${bin(ks.enabled)} · asserting ${bin(ks.asserting_kill)} · timed out ${bin(ks.timed_out)}`,
+      ks.asserting_kill || ks.timed_out ? "warn" : "muted"];
   } else {
-    out.append(el("div", { class: "muted", text: "no firmware status yet" }));
+    out.status = ["no firmware status yet", "muted"];
+    out.faults = ["-", "muted"];
+    out.kill = ["-", "muted"];
   }
   return out;
 }
 
-function updateBoard(b) {
-  let c = cards[b.name];
-  if (!c) { c = cards[b.name] = boardCard(b); $("boards").append(c); logSeen[b.name] = 0; }
-  c.sub.textContent = `${b.image}  ${b.powered ? "" : "(off) "}resets ${b.resets}`;
-  c.cores.replaceChildren(...b.cores.map((k, i) => el("div", {
-    class: k.state === "locked up" ? "bad" : (k.state === "running" ? "" : "muted"),
-    text: `core${i} ${k.state.padEnd(9)} ${k.function || k.pc}` })));
-  c.status.replaceChildren(statusLines(b.link));
-  const leds = b.leds.map((l) => el("span", { title: `GPIO ${l.pin}` }, el("span", { class: "dot" + (l.on ? " on" : "") }), " " + l.name + "  "));
-  const strips = b.strips.map((s) => el("div", { class: "strip", title: `${s.name} (GPIO ${s.pin})` },
-    s.name + " ", ...s.colors.map((col) => { const x = el("span"); x.style.background = "#" + col; return x; })));
-  c.leds.replaceChildren(...leds, ...strips);
-  const g = b.gpio;
-  c.pins.replaceChildren(...g.labels.map((lab, p) => el("div", {
-    class: "pin" + ((g.level >>> p) & 1 ? " h" : "") + ((g.oe >>> p) & 1 ? "" : " in"),
-    title: `${lab}: ${(g.level >>> p) & 1 ? "high" : "low"}, ${g.funcs[p] || "-"}${(g.oe >>> p) & 1 ? ", output" : ", input"}`,
-    text: String(p) })));
-  const rows = [];
-  for (const i of b.inputs) rows.push(el("tr", {}, el("th", { text: i.name }), el("td", { class: "mono", text: fmt(i.value, 3) })));
-  for (const e of b.escs) rows.push(el("tr", {}, el("th", { text: e.name + " rpm" }), el("td", { class: "mono", text: fmt(e.rpm, 0) })));
-  c.extra.replaceChildren(rows.length ? el("table", {}, ...rows) : "");
-  const atBottom = c.logs.scrollTop + c.logs.clientHeight >= c.logs.scrollHeight - 4;
-  for (const l of b.logs) {
-    if (l.seq <= logSeen[b.name]) continue;
-    logSeen[b.name] = l.seq;
-    c.logs.append(el("div", { class: l.kind, text: `[${fmt(l.t, 6)}] ${l.kind.startsWith("uart") ? l.kind + ": " : ""}${l.text}` }));
+function logLine(l) {
+  const kind = String(l.kind || "").replace(/[^a-z0-9]/gi, "");
+  const d = el("div", { class: "k-" + kind }, el("span", { class: "t", text: fmt(l.t, 6) }), " ");
+  if (kind.startsWith("uart")) d.append(el("span", { class: "tag", text: kind + " " }), l.text);
+  else {
+    const m = /^(\d+\.\d+)\s+(TRACE|DEBUG|INFO|WARN|ERROR)\s+([\s\S]*)$/.exec(l.text);
+    if (m) d.append(el("span", { class: "ts", text: m[1] + " " }), el("span", { class: "lv lv-" + m[2].toLowerCase(), text: m[2].padEnd(5) + " " }), m[3]);
+    else d.append(l.text);
   }
-  while (c.logs.childNodes.length > 500) c.logs.firstChild.remove();
-  if (atBottom) c.logs.scrollTop = c.logs.scrollHeight;
+  return d;
 }
 
+// A pane of lines with its own scroll that follows new lines unless the user has scrolled up
+function logPane(title, empty) {
+  const p = { seen: 0, stick: true, unseen: 0 };
+  p.count = el("span", { class: "num" });
+  p.pane = el("div", { class: "pane log", "data-empty": empty });
+  p.jump = el("button", { class: "jump", type: "button", text: "Latest" });
+  p.jump.hidden = true;
+  p.jump.onclick = () => { p.stick = true; p.unseen = 0; p.jump.hidden = true; p.pane.scrollTop = p.pane.scrollHeight; };
+  p.pane.onscroll = () => {
+    p.stick = p.pane.scrollTop + p.pane.clientHeight >= p.pane.scrollHeight - 4;
+    if (p.stick) { p.unseen = 0; p.jump.hidden = true; }
+  };
+  p.root = el("div", { class: "pane-wrap" }, el("div", { class: "pane-head" }, el("span", { text: title }), p.count), p.pane, p.jump);
+  return p;
+}
+function feedPane(p, lines) {
+  const fresh = [];
+  for (const l of lines) {
+    if (l.seq <= p.seen) continue;
+    p.seen = l.seq;
+    fresh.push(logLine(l));
+  }
+  if (!fresh.length) return;
+  const L = p.pane;
+  L.append(...fresh);
+  const extra = L.childNodes.length - LOG_KEEP;
+  if (extra > 0) {
+    const before = L.scrollHeight;
+    for (let i = 0; i < extra; i++) L.firstChild.remove();
+    if (!p.stick) L.scrollTop -= before - L.scrollHeight;
+  }
+  setText(p.count, `${L.childNodes.length} lines`);
+  if (p.stick) L.scrollTop = L.scrollHeight;
+  else { p.unseen += fresh.length; setText(p.jump, `${p.unseen} new ↓`); p.jump.hidden = false; }
+}
+
+// Board cards: the sections are built from the board's shape (cores, LEDs, pins, inputs), which does not change
+function boardCard(b) {
+  const c = { shape: null };
+  c.name = el("h3", { text: b.name, title: b.name });
+  c.image = el("span", { class: "sub mono ell" });
+  c.bus = el("span", { class: "chip" });
+  c.power = el("span", { class: "chip power" });
+  c.resets = el("span", { class: "chip resets num" });
+  c.body = el("div", { class: "card-body" });
+  c.root = el("article", { class: "card board" },
+    el("div", { class: "card-head" }, c.name, c.image, c.bus, c.power, c.resets), c.body);
+  c.log = logPane("Log", "No log output yet");
+  return c;
+}
+
+function buildBoard(c, b) {
+  c.cores = b.cores.map(() => {
+    const k = { state: el("span", { class: "state" }), fn: el("span", { class: "fn" }), off: el("span", { class: "off" }) };
+    k.line = el("div", { class: "core" }, k.state, k.fn, k.off);
+    return k;
+  });
+  const rows = c.cores.map((k, i) => row("core" + i, k.line));
+  c.link = null;
+  if (b.link) {
+    c.link = {};
+    for (const [key, label] of [["bridge", "Bridge"], ["status", "Status"], ["faults", "Faults"], ["kill", "Kill sw"]]) {
+      c.link[key] = el("div", { class: "line" });
+      rows.push(row(label, c.link[key]));
+    }
+  }
+  rows.push(el("div", { class: "sep" }));
+  c.leds = b.leds.map((l) => { const dot = el("i"); return { chip: el("span", { class: "chip led", title: `${l.name}: GPIO ${l.pin}` }, dot, l.name) }; });
+  c.strips = b.strips.map((s) => {
+    const sw = s.colors.map(() => el("span", { class: "sw" }));
+    return { sw, chip: el("span", { class: "chip", title: `${s.name} (GPIO ${s.pin})` }, s.name, el("span", { class: "swatches" }, ...sw)) };
+  });
+  if (c.leds.length || c.strips.length) rows.push(row("LEDs", el("div", { class: "chips" }, ...c.leds.map((l) => l.chip), ...c.strips.map((s) => s.chip))));
+  c.pins = b.gpio.labels.map((lab, p) => el("div", { class: "pin", text: String(p) }));
+  rows.push(row("GPIO", el("div", { class: "pins" }, ...c.pins)));
+  rows.push(row("", el("div", { class: "legend" },
+    el("span", {}, el("i", { class: "h" }), "high"), el("span", {}, el("i"), "low"), el("span", {}, el("i", { class: "in" }), "input"))));
+  c.inputs = b.inputs.map((i) => ({ v: el("td", { class: "v" }), tr: null, name: i.name }));
+  c.escs = b.escs.map((e) => ({ v: el("td", { class: "v" }), name: e.name }));
+  if (c.inputs.length || c.escs.length) rows.push(el("div", { class: "sep" }));
+  if (c.inputs.length) {
+    rows.push(row("Inputs", el("table", { class: "kv" }, ...c.inputs.map((i) =>
+      el("tr", {}, el("th", { text: i.name, title: i.name }), i.v, el("td", { class: "u" }))))));
+  }
+  if (c.escs.length) {
+    rows.push(row("ESCs", el("table", { class: "kv" }, ...c.escs.map((e) =>
+      el("tr", {}, el("th", { text: e.name }), e.v, el("td", { class: "u", text: "rpm" }))))));
+  }
+  c.body.replaceChildren(...rows, c.log.root);
+}
+
+function shapeOf(b) {
+  return [b.cores.length, !!b.link, b.leds.map((l) => l.name), b.strips.map((s) => [s.name, s.colors.length]),
+    b.gpio.labels.length, b.inputs.map((i) => i.name), b.escs.map((e) => e.name)];
+}
+
+function updateBoard(b) {
+  let c = cards[b.name];
+  if (!c) { c = cards[b.name] = boardCard(b); $("boards").append(c.root); }
+  const shape = shapeOf(b);
+  if (!same(shape, c.shape)) { c.shape = shape; buildBoard(c, b); }
+  setText(c.image, b.image); setTitle(c.image, b.image);
+  c.bus.hidden = !b.bus; setText(c.bus, b.bus || "");
+  setText(c.power, b.powered ? "on" : "off"); setClass(c.power, "chip power " + (b.powered ? "ok" : "warn"));
+  setText(c.resets, `resets ${b.resets}`); setClass(c.resets, "chip resets num" + (b.resets ? " warn" : ""));
+  b.cores.forEach((k, i) => {
+    const r = c.cores[i];
+    const st = k.state === "locked up" ? "locked" : (["running", "sleeping", "off"].includes(k.state) ? k.state : "other");
+    setText(r.state, k.state); setClass(r.state, "state " + st);
+    const exc = k.exception ? ` (exception ${k.exception})` : "";
+    if (k.function) {
+      const [name, off] = splitOffset(k.function);
+      setText(r.fn, (k.exception ? `[exc ${k.exception}] ` : "") + shortName(name)); setClass(r.fn, "fn"); setText(r.off, off);
+    } else { setText(r.fn, k.pc); setClass(r.fn, "fn pc"); setText(r.off, ""); }
+    setTitle(r.line, `core${i} ${k.state} at ${k.pc}${exc}${k.function ? "\n" + k.function : ""}`);
+  });
+  if (c.link && b.link) {
+    const ll = linkLines(b.link);
+    for (const key of Object.keys(c.link)) {
+      const [text, cls] = ll[key];
+      setText(c.link[key], text); setClass(c.link[key], "line " + cls); setTitle(c.link[key], text);
+    }
+  }
+  b.leds.forEach((l, i) => setClass(c.leds[i].chip, "chip led" + (l.on ? " on" : "")));
+  b.strips.forEach((s, i) => s.colors.forEach((col, j) => {
+    const v = "#" + col;
+    if (c.strips[i].sw[j].style.background !== v) c.strips[i].sw[j].style.background = v;
+  }));
+  const g = b.gpio;
+  g.labels.forEach((lab, p) => {
+    const hi = (g.level >>> p) & 1, out = (g.oe >>> p) & 1;
+    setClass(c.pins[p], "pin" + (hi ? " h" : "") + (out ? "" : " in"));
+    setTitle(c.pins[p], `${lab}: ${hi ? "high" : "low"}, ${g.funcs[p] || "no function"}, ${out ? "output" : "input"}`);
+  });
+  b.inputs.forEach((x, i) => setText(c.inputs[i].v, fmt(x.value, 3)));
+  b.escs.forEach((x, i) => setText(c.escs[i].v, fmt(x.rpm, 0)));
+  feedPane(c.log, b.logs);
+}
+
+// Vehicle, bus and bridge cards share one grid
+function sysCard(key, make) {
+  let c = sysCards[key];
+  if (!c) c = sysCards[key] = make();
+  c.used = true;
+  return c;
+}
+function vecRow(axes, unit) {
+  const n = axes.map(() => el("span", { class: "n" }));
+  const cells = axes.map((a, i) => el("span", {}, el("span", { class: "ax", text: a }), n[i]));
+  while (cells.length < 3) cells.push(el("span"));
+  return { n, el: el("div", { class: "vec" }, ...cells, el("span", { class: "u", text: unit })) };
+}
+function scalarRow(unit) {
+  const n = [el("span", { class: "n" })];
+  return { n, el: el("div", { class: "vec" }, el("span", {}, el("span", { class: "ax" }), n[0]), el("span", { class: "u", text: unit }), el("span"), el("span")) };
+}
+function vehicleCard(v) {
+  const c = { kind: "vehicle", thr: {} };
+  c.depth = scalarRow("m");
+  c.speed = scalarRow("m/s");
+  c.pos = vecRow(["N", "E", "D"], "m");
+  c.rpy = vecRow(["roll", "pitch", "yaw"], "°");
+  c.vel = vecRow(["surge", "sway", "heave"], "m/s");
+  c.rate = vecRow(["roll", "pitch", "yaw"], "°/s");
+  c.thrBox = el("div");
+  c.body = el("div", { class: "card-body" },
+    row("Depth", c.depth.el), row("Speed", c.speed.el),
+    row("Position", c.pos.el), row("Attitude", c.rpy.el), row("Velocity", c.vel.el), row("Rates", c.rate.el),
+    el("div", { class: "sep" }), row("Thrust", c.thrBox));
+  c.title = el("h3");
+  c.root = el("article", { class: "card" }, el("div", { class: "card-head" }, c.title, el("span", { class: "sub", text: "vehicle" })), c.body);
+  return c;
+}
+function updateVehicle(c, v) {
+  setText(c.title, v.name);
+  setText(c.depth.n[0], fmt(v.depth_m, 3)); setText(c.speed.n[0], fmt(v.speed_mps, 3));
+  v.position_m.forEach((x, i) => setText(c.pos.n[i], fmt(x, 2)));
+  v.rpy_deg.forEach((x, i) => setText(c.rpy.n[i], fmt(x, 1)));
+  v.velocity_mps.forEach((x, i) => setText(c.vel.n[i], fmt(x, 3)));
+  (v.rate_dps || [null, null, null]).forEach((x, i) => setText(c.rate.n[i], fmt(x, 1)));
+  const names = v.thrusters.map((t) => t.name);
+  if (!same(names, c.thrNames)) {
+    c.thrNames = names;
+    c.thr = v.thrusters.map((t) => { const i = el("i"); return { n: el("span", { class: "n" }), i, row: null, name: t.name }; });
+    c.thrBox.replaceChildren(...c.thr.map((t) => el("div", { class: "thr" }, el("span", { class: "ell", text: t.name, title: t.name }), t.n, el("div", { class: "bar" }, t.i))));
+  }
+  const max = Math.max(1000, ...v.thrusters.map((t) => Math.abs(t.rpm)));
+  v.thrusters.forEach((t, k) => {
+    const x = c.thr[k], w = 50 * Math.abs(t.rpm) / max;
+    setText(x.n, fmt(t.rpm, 0));
+    x.i.style.left = (t.rpm >= 0 ? 50 : 50 - w) + "%"; x.i.style.width = w + "%";
+    setClass(x.i, t.rpm < 0 ? "neg" : "");
+  });
+}
+
+function tile(k) { const v = el("div", { class: "v" }); return { v, el: el("div", { class: "tile" }, el("div", { class: "k", text: k }), v) }; }
+function busCard(b) {
+  const c = { kind: "bus", rows: [] };
+  c.tiles = { frames: tile("Frames"), rate: tile("Rate /s"), load: tile("Load"), errors: tile("Errors"), unacked: tile("No ACK") };
+  c.frames = el("div", { class: "pane frames", "data-empty": "No frames yet" });
+  c.title = el("h3");
+  c.root = el("article", { class: "card" }, el("div", { class: "card-head" }, c.title, el("span", { class: "sub", text: "CAN bus" })),
+    el("div", { class: "card-body" }, el("div", { class: "tiles" }, ...Object.values(c.tiles).map((t) => t.el)),
+      el("div", { class: "pane-wrap" }, el("div", { class: "pane-head" }, el("span", { text: "Recent frames" }), el("span", { class: "num", text: "newest first" })), c.frames)));
+  return c;
+}
+function updateBus(c, b) {
+  setText(c.title, b.name);
+  setText(c.tiles.frames.v, b.frames); setText(c.tiles.rate.v, fmt(b.rate_fps, 1));
+  setText(c.tiles.load.v, fmt(100 * b.load, 1) + "%");
+  setText(c.tiles.errors.v, b.errors); setClass(c.tiles.errors.v, "v" + (b.errors ? " bad" : ""));
+  setText(c.tiles.unacked.v, b.unacked); setClass(c.tiles.unacked.v, "v" + (b.unacked ? " warn" : ""));
+  setTitle(c.root, `${b.frames} frames, ${fmt(b.rate_fps, 1)} frames/s, load ${fmt(100 * b.load, 1)}%, ${b.errors} destroyed by errors, ${b.unacked} without ACK`);
+  while (c.rows.length < b.recent.length) {
+    const r = { t: el("span", { class: "t" }), f: el("span", { class: "f" }) };
+    r.el = el("div", {}, r.t, r.f); c.rows.push(r); c.frames.append(r.el);
+  }
+  while (c.rows.length > b.recent.length) { c.rows.pop(); c.frames.firstChild.remove(); }
+  b.recent.forEach((f, i) => {
+    const r = c.rows[i];
+    setText(r.t, fmt(f.t, 6)); setText(r.f, f.frame); setTitle(r.f, f.frame);
+    setClass(r.f, "f" + (f.frame.includes("no ACK") ? " na" : ""));
+  });
+}
+function linkCard() {
+  const c = { kind: "link", v: {} };
+  const rows = [["bridge", "Bridge"], ["client", "Client"], ["kill", "Kill switch"], ["hb", "Heartbeats"], ["pings", "Pings"],
+    ["decode", "Decode errors"], ["fw", "Firmware"], ["uptime", "Uptime"], ["age", "Status age"], ["faults", "Faults"],
+    ["ks", "Kill switches"]];
+  for (const [k] of rows) c.v[k] = el("td");
+  c.title = el("h3");
+  c.sub = el("span", { class: "sub", text: "mock bridge" });
+  c.root = el("article", { class: "card" }, el("div", { class: "card-head" }, c.title, c.sub),
+    el("div", { class: "card-body" }, el("table", { class: "kv left" }, ...rows.map(([k, label]) => el("tr", {}, el("th", { text: label }), c.v[k])))));
+  return c;
+}
+function updateLink(c, l) {
+  setText(c.title, `${l.kind === "ethernet" ? "Ethernet" : "CAN"} bridge${l.bus ? " on " + l.bus : ""}`);
+  setText(c.sub, l.board ? l.board : "mock bridge");
+  const s = l.status, ks = s && s.kill_switches;
+  const kill = l.kill === null ? "not forwarded" : (l.kill ? "asserting kill" : "enabled");
+  const vals = {
+    bridge: [l.running ? "running" : "stopped", l.running ? "ok" : "warn"],
+    client: [l.client ?? "-", ""],
+    kill: [kill, l.kill ? "warn" : ""],
+    hb: [`${l.heartbeats}` + (l.last_heartbeat_age_s !== null ? `, last ${fmt(l.last_heartbeat_age_s, 2)} s ago` : ""), ""],
+    pings: [l.pings ?? "-", ""],
+    decode: [l.decode_errors ?? "-", l.decode_errors ? "bad" : ""],
+    fw: s ? [`${s.board_name} ${s.version}`, ""] : ["no firmware status yet", "muted"],
+    uptime: [s ? fmt(s.uptime_s, 1) + " s" : "-", ""],
+    age: [s ? fmt(s.age_s, 1) + " s" : "-", ""],
+    faults: s ? [s.faults.length ? s.faults.join(", ") : "none", s.faults.length ? "bad" : "ok"] : ["-", "muted"],
+    ks: ks ? [`enabled ${bin(ks.enabled)}, asserting ${bin(ks.asserting_kill)}, timed out ${bin(ks.timed_out)}`, ks.asserting_kill || ks.timed_out ? "warn" : ""] : ["-", "muted"],
+  };
+  for (const [k, [text, cls]] of Object.entries(vals)) { setText(c.v[k], text); setClass(c.v[k], cls); setTitle(c.v[k], String(text)); }
+}
+
+function updateSystem(s) {
+  for (const c of Object.values(sysCards)) c.used = false;
+  const vs = s.vehicles.map((v) => { const c = sysCard("v:" + v.name, vehicleCard); updateVehicle(c, v); return c.root; });
+  const bs = s.buses.map((b) => { const c = sysCard("b:" + b.name, busCard); updateBus(c, b); return c.root; });
+  const ls = s.links.filter((l) => !l.board || s.boards.length > 1).map((l, i) => {
+    const c = sysCard(`l:${l.bus}:${l.client}:${i}`, linkCard); updateLink(c, l); return c.root;
+  });
+  for (const [k, c] of Object.entries(sysCards)) if (!c.used) delete sysCards[k];
+  // Only re-attach when the set of cards changed
+  const vk = $("vehicles"), bk = $("buses"), want = [...bs, ...ls];
+  if (vk.childNodes.length !== vs.length || vs.some((x, i) => vk.childNodes[i] !== x)) vk.replaceChildren(...vs);
+  if (bk.childNodes.length !== want.length || want.some((x, i) => bk.childNodes[i] !== x)) bk.replaceChildren(...want);
+  $("system-section").hidden = !vs.length && !want.length;
+  setText($("system-title"), [s.vehicles.length ? "Vehicles" : "", s.buses.length ? "CAN buses" : "", ls.length ? "bridges" : ""]
+    .filter((x) => x).join(", ").replace(/, ([^,]*)$/, " and $1"));
+}
+
+let faultKey = "";
 function render(s) {
-  $("time").textContent = secs(s.time_s);
-  $("wall").textContent = fmt(s.wall_s, 1) + " s";
-  $("speed").textContent = fmt(s.speed, 2) + "x";
-  $("mode").textContent = s.finished ? ("finished: " + s.finished) : (s.paused ? "paused" : (s.realtime ? "real time" : "as fast as possible"));
-  $("mode").className = "badge " + (s.finished ? "warn" : (s.paused ? "warn" : "ok"));
-  $("pause").textContent = s.paused ? "Resume" : "Pause";
+  setText($("time"), secs(s.time_s));
+  setText($("wall"), fmt(s.wall_s, 1) + " s");
+  setText($("speed"), fmt(s.speed, 2) + "x");
+  const mode = s.finished ? ("finished: " + s.finished) : (s.paused ? "paused" : (s.realtime ? "real time" : "as fast as possible"));
+  setText($("mode"), mode); setTitle($("mode"), mode);
+  setClass($("mode"), "badge " + (s.finished || s.paused ? "warn" : "ok"));
+  setText($("pause"), s.paused ? "Resume" : "Pause");
   const names = s.boards.map((b) => b.name);
   fillSelect($("fboard"), names); fillSelect($("iboard"), names); fillInputs();
   const dl = $("faults");
   if (!dl.options.length) dl.replaceChildren(...s.fault_help.map((f) => el("option", { value: f.fault, text: f.help })));
-  $("faultlog").replaceChildren(...s.faults.slice(-8).reverse().map((f) => el("div", { class: f.ok ? "" : "bad",
-    text: `[${fmt(f.t, 3)}] ${f.board}: ${f.fault} ${f.ok ? "applied" : "failed: " + f.error} (${f.from})` })));
+  const fk = s.faults.length + ":" + JSON.stringify(s.faults.at(-1) || null);
+  if (fk !== faultKey) {
+    faultKey = fk;
+    $("faultlog").replaceChildren(...s.faults.slice(-50).reverse().map((f) => {
+      const text = `${fmt(f.t, 3)} s  ${f.board}: ${f.fault} ${f.ok ? "applied" : "failed: " + f.error} (${f.from})`;
+      return el("div", { class: f.ok ? "" : "bad", text, title: text });
+    }));
+    setText($("faultcount"), s.faults.length ? `${s.faults.length} total` : "");
+  }
   s.boards.forEach(updateBoard);
-
-  $("vehicles-section").hidden = !s.vehicles.length;
-  $("vehicles").replaceChildren(...s.vehicles.map((v) => {
-    const max = Math.max(1000, ...v.thrusters.map((t) => Math.abs(t.rpm)));
-    const thr = v.thrusters.map((t) => {
-      const bar = el("div", { class: "bar" }); const i = el("i");
-      const w = 50 * Math.abs(t.rpm) / max;
-      i.style.left = (t.rpm >= 0 ? 50 : 50 - w) + "%"; i.style.width = w + "%"; bar.append(i);
-      return el("tr", {}, el("th", { text: t.name }), el("td", { class: "mono", text: fmt(t.rpm, 0) }), el("td", { style: "width:40%" }, bar));
-    });
-    const p = v.position_m, r = v.rpy_deg, u = v.velocity_mps;
-    return el("div", { class: "card" }, el("h3", { text: v.name }),
-      el("div", { class: "mono", text: `depth ${fmt(v.depth_m, 3)} m   speed ${fmt(v.speed_mps, 3)} m/s` }),
-      el("div", { class: "mono", text: `position N ${fmt(p[0], 2)} E ${fmt(p[1], 2)} D ${fmt(p[2], 2)} m` }),
-      el("div", { class: "mono", text: `roll ${fmt(r[0], 1)} pitch ${fmt(r[1], 1)} yaw ${fmt(r[2], 1)} deg` }),
-      el("div", { class: "mono", text: `velocity surge ${fmt(u[0], 3)} sway ${fmt(u[1], 3)} heave ${fmt(u[2], 3)} m/s` }),
-      el("table", {}, ...thr));
-  }));
-
-  $("buses-section").hidden = !s.buses.length && !s.links.length;
-  const busCards = s.buses.map((b) => el("div", { class: "card" },
-    el("h3", { text: b.name }),
-    el("div", { class: "mono", text: `${b.frames} frames, ${fmt(b.rate_fps, 1)} frames/s, load ${fmt(100 * b.load, 1)}%` }),
-    el("div", { class: "mono " + (b.errors ? "bad" : "muted"), text: `${b.errors} destroyed by errors, ${b.unacked} without ACK` }),
-    el("div", { class: "frames mono" }, ...b.recent.map((f) => el("div", { text: `[${fmt(f.t, 6)}] ${f.frame}` })))));
-  const linkCards = s.links.filter((l) => !l.board || s.boards.length > 1).map((l) => el("div", { class: "card" },
-    el("h3", { text: `mock bridge${l.bus ? " on " + l.bus : ""}${l.board ? " (" + l.board + ")" : ""}` }), statusLines(l)));
-  $("buses").replaceChildren(...busCards, ...linkCards);
+  setText($("boardcount"), `${s.boards.length}`);
+  updateSystem(s);
 }
 
 let inFlight = false;
@@ -252,8 +699,12 @@ async function poll() {
     state = await r.json();
     if (state.boards) render(state);
     $("conn").textContent = "";
+    $("live").className = "conn";
+    $("live").title = "connected";
   } catch (e) {
-    $("conn").textContent = "not connected (the run may be over)";
+    $("conn").textContent = "Offline";
+    $("live").className = "conn off";
+    $("live").title = "not connected (the run may be over): " + e;
   } finally { inFlight = false; }
 }
 poll();

@@ -191,6 +191,15 @@ load, errors, missing ACKs and recent frames. Per vehicle: position, depth, roll
 RPMs. The header has virtual time, wall time and the emulation speed. Its controls inject a fault, set an input
 and pause virtual time.
 
+The layout holds still while values update: one card per board in a grid (cards in a row share a height), each
+with the same sections in the same order (cores, bridge status, LEDs, the 30 GPIOs as a 15 × 2 grid, inputs and ESCs,
+log). Long symbols are cut to one line, with paths, closures and macro noise dropped
+(`<embassy_executor::platform::thread::Executor>::run::<sbc_board::__cortex_m_rt_main::{closure#0}>+0xba` shows as
+`Executor::run<main>` and `+0xba`); hover for the full symbol, PC and exception. Numbers use fixed-width digits in
+fixed-width cells. The log and frame panes have a fixed height and scroll on their own; a log follows new lines
+unless scrolled up, when a button offers to jump back to the latest. The page follows the system's light or dark
+theme.
+
 **There is no authentication**: bind it to a loopback address.
 
 ### API
