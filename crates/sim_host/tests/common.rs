@@ -49,3 +49,18 @@ pub fn c_elf(rel: &str) -> Option<PathBuf> {
         None
     }
 }
+
+/// Boots an image through the bootrom and boot2 (the real flash path), as after power-on.
+pub fn boot_rom(path: &std::path::Path) -> Session {
+    let image = Image::load(path).unwrap();
+    let mut m = Machine::new(MachineConfig { bootrom: Some(rp2040::BOOTROM_B1.to_vec()), ..Default::default() });
+    m.sys.unmodelled.log_mode = rp2040::unmodelled::LogMode::Off;
+    m.load(&image).unwrap();
+    m.rom_boot().unwrap();
+    Session::new(m, &image)
+}
+
+/// A file built by `scripts/build_c_firmware.sh` under build/c, if present.
+pub fn built(rel: &str) -> Option<PathBuf> {
+    c_elf(rel)
+}

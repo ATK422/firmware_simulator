@@ -16,3 +16,8 @@ cmake -G Ninja -S $TF/talos/LEDBoard -B build/c/LEDBoard
 ninja -C build/c/LEDBoard titan_bootloader
 echo "built:"
 ls build/c/basic_template/template_project.elf build/c/*/titan_lib/titan_bootloader/src/titan_bootloader-build/titan_bootloader.elf
+# An over-the-air application behind the bootloader, in two versions, for the upload test
+cmake -G Ninja -S test_programs/c_bl_app -B build/c/bl_app_v0 -DAPP_MINOR=0
+ninja -C build/c/bl_app_v0
+cmake -G Ninja -S test_programs/c_bl_app -B build/c/bl_app_v1 -DAPP_MINOR=1
+ninja -C build/c/bl_app_v1

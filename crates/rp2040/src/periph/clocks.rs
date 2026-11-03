@@ -32,6 +32,8 @@ pub struct Xosc {
     /// When the oscillator becomes stable, if enabled.
     stable_at: Option<Time>,
     badwrite: bool,
+    /// Enabled: off after reset; a write of DISABLE turns it off, ENABLE or any invalid code turns it on.
+    on: bool,
 }
 
 impl Xosc {
@@ -44,11 +46,12 @@ impl Xosc {
             count: 0,
             stable_at: None,
             badwrite: false,
+            on: false,
         }
     }
 
     pub fn enabled(&self) -> bool {
-        (self.ctrl >> 12) & 0xFFF == XOSC_ENABLE
+        self.on
     }
 
     pub fn is_stable(&self, now: Time) -> bool {
@@ -90,8 +93,10 @@ impl Xosc {
                 mode.update(&mut self.ctrl, value, 0x00FF_FFFF);
                 let en = (self.ctrl >> 12) & 0xFFF;
                 if en != XOSC_ENABLE && en != XOSC_DISABLE {
+                    // "An invalid setting will enable the oscillator"
                     self.badwrite = true;
                 }
+                self.on = en != XOSC_DISABLE;
                 match (was, self.enabled()) {
                     (false, true) => {
                         // DELAY counts 256 crystal cycles; X4 multiplies by four
@@ -606,5 +611,20 @@ mod tests {
         c.write(Time::ZERO, 0, CTRL_ENABLE | 10 << 5, WriteMode::Normal); // GPOUT0 = clk_ref
         c.write(Time::ZERO, 4, 2 << 8, WriteMode::Normal);
         assert_eq!(c.freqs(Time::ZERO).gpout[0], ROSC_HZ / 2);
+    }
+
+    #[test]
+    fn xosc_invalid_enable_code_keeps_it_running() {
+        // pico-sdk's xosc_init writes CTRL with ENABLE = 0 before setting ENABLE: the crystal must keep running
+        let mut x = Xosc::new(12_000_000);
+        assert!(!x.enabled(), "off after reset");
+        x.write(Time::ZERO, 0x00, XOSC_ENABLE << 12 | 0xAA0, WriteMode::Normal);
+        let t = Time::from_ms(10);
+        assert_eq!(x.hz(t), 12_000_000);
+        x.write(t, 0x00, 0xAA0, WriteMode::Normal);
+        assert_eq!(x.hz(t), 12_000_000, "an invalid code enables");
+        assert_ne!(x.read(t, 0x04).unwrap() & (1 << 24), 0, "BADWRITE");
+        x.write(t, 0x00, XOSC_DISABLE << 12 | 0xAA0, WriteMode::Normal);
+        assert_eq!(x.hz(t), 0);
     }
 }
