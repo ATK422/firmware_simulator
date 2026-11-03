@@ -125,7 +125,7 @@ fn posted_faults_and_inputs_take_effect() {
             request(addr, "POST", "/api/input", r#"{"board": "blink", "name": "vbat", "value": "x"}"#),
             request(addr, "POST", "/api/fault", "not json"),
         ];
-        std::thread::sleep(std::time::Duration::from_millis(20));
+        // Answers come once the state shows what was done
         r.push(request(addr, "GET", "/api/state", ""));
         r
     });

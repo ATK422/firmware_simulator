@@ -473,6 +473,7 @@ impl Dashboard {
 
     /// Between slices of a single board's run: applies what was posted and publishes the state when due.
     pub fn service_session(&mut self, s: &mut Session) {
+        let mut replies = Vec::new();
         while let Ok(cmd) = self.commands.try_recv() {
             match cmd {
                 Command::Fault { board, fault, spec, reply } => {
@@ -486,31 +487,37 @@ impl Dashboard {
                         board.clone()
                     };
                     self.record_fault(s.machine.now, &name, &spec, &r);
-                    let _ = reply.send(r.map(|_| format!("{spec} applied to {name}")));
+                    replies.push((reply, r.map(|_| format!("{spec} applied to {name}"))));
                 }
                 Command::Input { board, name, value, reply } => {
                     let r = self.set_input(&board, &name, value);
-                    let _ = reply.send(r);
+                    replies.push((reply, r));
                 }
                 Command::Pause { paused, reply } => {
                     self.paused = paused;
                     if !paused {
                         s.reset_pacing();
                     }
-                    let _ = reply.send(Ok(if paused { "paused" } else { "running" }.into()));
+                    replies.push((reply, Ok(if paused { "paused" } else { "running" }.into())));
                 }
             }
-            self.last_publish = None;
         }
-        if self.due() {
+        // Publish what the commands did before answering them, so a client that reads the state after its
+        // answer sees their effect
+        if !replies.is_empty() || self.due() {
+            self.last_publish = Some(Instant::now());
             let state = self.session_state(s);
             self.shared.lock().unwrap().state = state.to_string();
+        }
+        for (reply, r) in replies {
+            let _ = reply.send(r);
         }
     }
 
     /// Between slices of a robot's run: applies what was posted and publishes the state when due. `bridges` are the
     /// mock bridges fault injection uses per bus (the first on each, as for `--fault`).
     pub fn service_robot(&mut self, r: &mut Robot, bridges: &[Option<MockBridge>]) {
+        let mut replies = Vec::new();
         while let Ok(cmd) = self.commands.try_recv() {
             match cmd {
                 Command::Fault { board, fault, spec, reply } => {
@@ -525,24 +532,27 @@ impl Dashboard {
                         crate::fault::robot_target(r, i, ctl).apply(&fault)
                     });
                     self.record_fault(r.now, &board, &spec, &res);
-                    let _ = reply.send(res.map(|_| format!("{spec} applied to {board}")));
+                    replies.push((reply, res.map(|_| format!("{spec} applied to {board}"))));
                 }
                 Command::Input { board, name, value, reply } => {
-                    let _ = reply.send(self.set_input(&board, &name, value));
+                    replies.push((reply, self.set_input(&board, &name, value)));
                 }
                 Command::Pause { paused, reply } => {
                     self.paused = paused;
                     if !paused {
                         r.reset_pacing();
                     }
-                    let _ = reply.send(Ok(if paused { "paused" } else { "running" }.into()));
+                    replies.push((reply, Ok(if paused { "paused" } else { "running" }.into())));
                 }
             }
-            self.last_publish = None;
         }
-        if self.due() {
+        if !replies.is_empty() || self.due() {
+            self.last_publish = Some(Instant::now());
             let state = self.robot_state(r);
             self.shared.lock().unwrap().state = state.to_string();
+        }
+        for (reply, res) in replies {
+            let _ = reply.send(res);
         }
     }
 

@@ -115,13 +115,23 @@ fn double_name(f: &str) -> String {
 impl Symbolizer {
     /// From an image's symbol table and the bootrom mapped at address 0 (empty if none).
     pub fn new(image: &Image, rom: &[u8]) -> Symbolizer {
+        // Assembly labels often have no size: they run up to the next symbol (at most 4 KiB)
+        let mut starts: Vec<u32> = image.symbols.iter().filter(|s| s.is_function).map(|s| s.addr & !1).collect();
+        starts.sort_unstable();
+        starts.dedup();
         let mut functions: Vec<(u32, u32, String)> = image
             .symbols
             .iter()
             .filter(|s| s.is_function)
             .map(|s| {
                 let start = s.addr & !1;
-                (start, start + s.size.max(2), demangle(&s.name))
+                let end = if s.size > 0 {
+                    start + s.size
+                } else {
+                    let i = starts.partition_point(|&a| a <= start);
+                    starts.get(i).copied().filter(|&n| n - start <= 0x1000).unwrap_or(start + 2)
+                };
+                (start, end, demangle(&s.name))
             })
             .collect();
         functions.sort_by_key(|f| (f.0, std::cmp::Reverse(f.1)));
@@ -698,6 +708,13 @@ mod tests {
         };
         let s = Symbolizer::new(&image, &[]);
         assert_eq!(s.name(s.function(0x1000_0110)), "foo::bar");
+        // A label without a size runs to the next symbol
+        let label = sim_core::image::Symbol { name: "divmod".into(), addr: 0x1000_0181, size: 0, is_function: true };
+        let mut with_label = image.clone();
+        with_label.symbols.insert(1, label);
+        let l = Symbolizer::new(&with_label, &[]);
+        assert_eq!(l.name(l.function(0x1000_01f0)), "divmod");
+        assert_eq!(l.name(l.function(0x1000_0204)), "main");
         assert_eq!(s.name(s.function(0x1000_0208)), "main");
         // Between functions: the address itself
         assert_eq!(s.name(s.function(0x1000_0180)), "0x10000180");
