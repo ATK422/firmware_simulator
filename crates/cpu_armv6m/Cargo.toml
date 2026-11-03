@@ -1,0 +1,10 @@
+[package]
+name = "cpu_armv6m"
+description = "Cortex-M0+ (ARMv6-M) interpreter with NVIC, SysTick and SCB"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+sim_core.workspace = true
+log.workspace = true

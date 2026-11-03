@@ -1,0 +1,10 @@
+[package]
+name = "sim_devices"
+description = "Behavioural models of external chips attached to SoC buses and pins"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+sim_core.workspace = true
+log.workspace = true

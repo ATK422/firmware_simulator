@@ -1,0 +1,3 @@
+# Same line length as the C firmware's clang-format
+max_width = 120
+use_small_heuristics = "Max"

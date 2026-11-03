@@ -1,0 +1,14 @@
+[package]
+name = "rp2040"
+description = "RP2040 SoC model: memory map, bus fabric, peripherals and Machine"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+sim_core.workspace = true
+cpu_armv6m.workspace = true
+log.workspace = true
+
+[build-dependencies]
+roxmltree = "0.20"
