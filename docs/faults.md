@@ -91,7 +91,10 @@ stays at the head of the TXQ. Local errors seen by only one receiver are not mod
 
 **Mock bridge queue.** The mock bridge queues at most 10 frames, Linux's default `txqueuelen`; titan_bridge drops a
 ping its SocketCAN write refuses (`ENOBUFS`). Without that, a stuck or flooded bus made the mock bridge pile up
-hundreds of pings that then overflowed the board's RX FIFO, which a real bridge would not do.
+hundreds of pings that then overflowed the board's RX FIFO, which a real bridge would not do. A SocketCAN
+interface or a cannelloni tunnel queues at most 1024 frames (`BRIDGE_TX_QUEUE`: room for the bursts a batching
+cannelloni peer or a lagging real-time run delivers). Beyond the limit the bus drops the newest frames, counts them
+in `CanBus::endpoint_dropped` and logs the first.
 
 **Parts.** `FaultyI2c` wraps any I2C device (on the controllers or bit-banged) and `FaultyAnalog` any ADC
 source; repaired, they pass everything through. Their random numbers are seeded and copied with snapshots, so
