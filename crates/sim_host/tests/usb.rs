@@ -387,3 +387,53 @@ fn cable_pulled_and_plugged_back_in() {
     let from = s.usb_cdc_text.len();
     assert!(cdc_wait(&mut s, from, "echo k (1)\r\n", Time::from_secs(2)), "{:?}", s.usb_cdc_text);
 }
+
+/// CMD_UNLINK for a request that the device already answered (its RET_SUBMIT not yet sent: the transfer finished
+/// in the same slice the unlink arrived in) must not throw the answer away: usbip-host then sends the RET_SUBMIT and
+/// a RET_UNLINK with status 0, and the client keeps the data (USB/IP protocol, "USBIP_RET_UNLINK").
+#[test]
+fn usbip_unlink_of_a_finished_request_keeps_its_answer() {
+    let mut m = bootsel_board();
+    sim_host::usb::wait_for_device(&mut m, Time::from_secs(1), |_| true).unwrap();
+    let mut s = Session::new(m, &Image::default());
+    let server = sim_host::usbip::UsbIpServer::bind("127.0.0.1:0").unwrap();
+    let addr = server.local_addr().unwrap();
+    s.usbip = Some(server);
+    let sock = std::net::TcpStream::connect(addr).unwrap();
+    sock.set_nonblocking(true).unwrap();
+    sock.set_nodelay(true).unwrap();
+    let mut c = UsbIpClient { sock, seq: 0, rx: Vec::new() };
+    let mut imp = vec![0x01, 0x11, 0x80, 0x03, 0, 0, 0, 0];
+    let mut busid = b"1-1".to_vec();
+    busid.resize(32, 0);
+    imp.extend(busid);
+    c.send(&imp);
+    c.read_exact(&mut s, 8 + 312);
+    // The server takes the request, then the machine runs (without the server looking) until the device answered
+    let poll = |s: &mut Session| {
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        s.usbip.as_mut().unwrap().poll(&mut s.machine);
+    };
+    let seq = c.submit(0, true, [0x80, 6, 0, 1, 0, 0, 18, 0], 18, &[]);
+    poll(&mut s);
+    s.machine.run_for(Time::from_ms(20));
+    // The client gives up on it just as the answer comes in
+    c.seq += 1;
+    let unlink_seq = c.seq;
+    let mut msg = Vec::new();
+    for w in [2, unlink_seq, 0x0001_0002, 0, 0, seq] {
+        msg.extend(u32::to_be_bytes(w));
+    }
+    msg.resize(48, 0);
+    c.send(&msg);
+    poll(&mut s);
+    let h = c.read_exact(&mut s, 48);
+    let w = |i: usize| u32::from_be_bytes(h[i..i + 4].try_into().unwrap());
+    assert_eq!((w(0), w(4)), (3, seq), "the finished request's RET_SUBMIT first");
+    assert_eq!((w(20), w(24)), (0, 18));
+    let data = c.read_exact(&mut s, 18);
+    assert_eq!(&data[8..12], &[0x8A, 0x2E, 0x03, 0x00]);
+    let h = c.read_exact(&mut s, 48);
+    let w = |i: usize| u32::from_be_bytes(h[i..i + 4].try_into().unwrap());
+    assert_eq!((w(0), w(4), w(20)), (4, unlink_seq, 0), "RET_UNLINK, status 0: nothing was unlinked");
+}

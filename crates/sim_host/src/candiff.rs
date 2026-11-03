@@ -443,7 +443,9 @@ fn auto_offset(a: &BTreeMap<&str, Vec<&Event>>, b: &BTreeMap<&str, Vec<&Event>>,
         }
     }
     let mut cands: Vec<(u64, i64)> = votes.values().map(|v| (v.0, (v.1 / v.2.max(1) as i128) as i64)).collect();
-    cands.sort_by(|x, y| y.0.cmp(&x.0).then(x.1.abs().cmp(&y.1.abs())));
+    // Fully ordered (the votes come out of a hash map in no particular order): most votes, then the smallest
+    // offset, then the earlier one
+    cands.sort_by(|x, y| y.0.cmp(&x.0).then(x.1.abs().cmp(&y.1.abs())).then(x.1.cmp(&y.1)));
     cands.truncate(24);
     // Score each candidate by the events it pairs over every stream
     let mut best = (0usize, 0i64, 0usize);
@@ -1020,6 +1022,18 @@ mod tests {
         assert_eq!(variant_path("Heartbeat"), "Heartbeat");
         assert_eq!(variant_path("Power(ElectricalReadings(ElectricalReadings { a: 1 }))"), "Power::ElectricalReadings");
         assert_eq!(variant_path("Led(SetColor(1, 2))"), "Led::SetColor");
+    }
+
+    #[test]
+    fn auto_alignment_is_the_same_every_run() {
+        // One event in A, two equally good partners in B, 100 ms either side: the search must not pick between
+        // them by hash map order (which differs between runs and between maps)
+        let ev = |t_ns: i64| Event { t_ns, stream: "s".into(), payload: "p".into(), detail: "p".into() };
+        let a = Decoded { events: vec![ev(1_000_000_000)], ..Default::default() };
+        let b = Decoded { events: vec![ev(900_000_000), ev(1_100_000_000)], ..Default::default() };
+        let opts = DiffOptions { align: Align::Auto, ..Default::default() };
+        let offsets: Vec<i64> = (0..32).map(|_| diff(&a, &b, &opts).offset_ns).collect();
+        assert!(offsets.iter().all(|&o| o == offsets[0]), "{offsets:?}");
     }
 
     #[test]

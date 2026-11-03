@@ -619,8 +619,10 @@ impl Usb {
         self.set_word(off, w);
     }
 
+    /// DPRAM offset of buffer `b`. BUFFER_ADDRESS has more bits than the 4 KiB DPRAM decodes: they wrap. (The
+    /// offset is 64 byte aligned, so a 64 byte packet never runs past the end.)
     fn buffer_offset(cfg: &EpConfig, b: u8) -> usize {
-        cfg.buffer + 64 * b as usize
+        (cfg.buffer + 64 * b as usize) % DPRAM_SIZE
     }
 
     /// A buffer was handed back to the CPU: advance the selector, raise BUFF_STATUS as configured.
@@ -872,6 +874,25 @@ mod tests {
         assert_eq!(u.in_token(Time::ZERO, 0, 0), InReply::Nak);
         u.write(EP_STALL_ARM, 1, WriteMode::Normal);
         assert_eq!(u.in_token(Time::ZERO, 0, 0), InReply::Stall);
+    }
+
+    #[test]
+    fn buffer_addresses_past_the_dpram_wrap_instead_of_panicking() {
+        // BUFFER_ADDRESS is a 16-bit field but the DPRAM is 4 KiB: firmware that writes an offset past it (or puts
+        // a double buffered endpoint's second buffer at 0x1000) gets the DPRAM's address decoding, not a crash
+        let mut u = device();
+        let ctrl = ep_ctrl::ENABLE | ep_ctrl::DOUBLE_BUFFERED | ep_ctrl::INT_PER_BUFF;
+        w(&mut u, 0x14, ctrl | 0xFFC0); // EP2 OUT, buffers at 0xFFC0 and 0x10000
+        let b0 = 8 | buf_ctrl::AVAILABLE | buf_ctrl::RESET;
+        let b1 = 8 | buf_ctrl::AVAILABLE | buf_ctrl::DATA1;
+        w(&mut u, 0x80 + 2 * 8 + 4, b0 | b1 << 16);
+        assert_eq!(u.out(Time::ZERO, 0, 2, Pid::Data0, &[1; 8]), Handshake::Ack);
+        assert_eq!(&u.dpram[0xFC0..0xFC8], &[1; 8]);
+        assert_eq!(u.out(Time::ZERO, 0, 2, Pid::Data1, &[2; 8]), Handshake::Ack);
+        assert_eq!(&u.dpram[0..8], &[2; 8]);
+        w(&mut u, 0x08, ctrl | 0x1000); // EP1 IN at 0x1000: the start of the DPRAM again
+        w(&mut u, 0x88, 4 | buf_ctrl::AVAILABLE | buf_ctrl::FULL | buf_ctrl::RESET);
+        assert_eq!(u.in_token(Time::ZERO, 0, 1), InReply::Data(Pid::Data0, vec![2; 4]));
     }
 
     #[test]

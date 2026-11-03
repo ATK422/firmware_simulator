@@ -107,11 +107,17 @@ fn parse_timestamp(ts: &str) -> Result<u64, String> {
             let ymd: Vec<i64> = d.split('-').map(|x| x.parse().map_err(|_| bad())).collect::<Result<_, _>>()?;
             let hms: Vec<u64> = whole.split(':').map(|x| x.parse().map_err(|_| bad())).collect::<Result<_, _>>()?;
             let (&[y, m, day], &[h, min, s]) = (&ymd[..], &hms[..]) else { return Err(bad()) };
-            let days = days_from_civil(y, m, day);
-            u64::try_from(days).map_err(|_| bad())? * 86_400 + h * 3600 + min * 60 + s
+            // (Years this far out are past what the nanoseconds below hold anyway; this keeps the day count in
+            // range)
+            if y.abs() > 1_000_000_000 || m.abs() > 1_000_000_000 || day.abs() > 1_000_000_000 {
+                return Err(bad());
+            }
+            let days = u64::try_from(days_from_civil(y, m, day)).map_err(|_| bad())?;
+            let parts = [(days, 86_400), (h, 3600), (min, 60), (s, 1)];
+            parts.iter().try_fold(0u64, |acc, &(v, k)| v.checked_mul(k)?.checked_add(acc)).ok_or_else(bad)?
         }
     };
-    Ok(secs * 1_000_000_000 + frac_ns)
+    secs.checked_mul(1_000_000_000).and_then(|ns| ns.checked_add(frac_ns)).ok_or_else(bad)
 }
 
 /// Days since 1970-01-01 of a proleptic Gregorian date (Howard Hinnant's algorithm).
@@ -198,6 +204,9 @@ fn parse_long(tokens: &[&str]) -> Result<Option<CanFrame>, String> {
     let n: usize = digits.parse().map_err(|_| format!("bad length {len:?}"))?;
     // candump prints a CAN FD length with two digits, a classic one with one
     let fd = digits.len() == 2;
+    if n > if fd { 64 } else { 8 } {
+        return Err(format!("{n} bytes in a {} frame", if fd { "CAN FD" } else { "classic" }));
+    }
     if !fd && rest.first() == Some(&"remote") {
         let mut f = CanFrame::classic(id, extended, &vec![0; n.min(8)]);
         f.rtr = true;
@@ -642,6 +651,17 @@ mod tests {
         assert!(parse("(1.0 can0 06F#C0").is_err(), "unterminated timestamp");
         assert!(parse("(1.0) can0 06F#001122334455667788").is_err(), "nine bytes in a classic frame");
         assert!(parse("(1.0) can0 06F  [2]  01").is_err(), "short data");
+        // candump's text output is held to the same limits as `-l` lines (a 65 byte frame would overrun a SocketCAN
+        // frame's 64 byte buffer when replayed onto a bridged interface)
+        let bytes = |n: usize| vec!["00"; n].join(" ");
+        assert!(parse(&format!("(1.0) can0 06F  [65]  {}", bytes(65))).is_err(), "65 bytes in a CAN FD frame");
+        assert!(parse(&format!("(1.0) can0 06F  [9]  {}", bytes(9))).is_err(), "nine bytes in a classic frame");
+        assert!(parse(&format!("(1.0) can0 06F  [64]  {}", bytes(64))).is_ok());
+        // Timestamps past what nanoseconds in a u64 hold are errors, not wrapped (or, with overflow checks, a panic)
+        assert!(parse("(18446744074.000000) can0 06F#C0").is_err(), "584 years of nanoseconds");
+        assert!(parse("(18446744073.709551) can0 06F#C0").is_ok());
+        assert!(parse("(2023-11-14 5124095576030432:00:00.0) can0 06F#C0").is_err(), "hours");
+        assert!(parse("(9223372036854775807-01-01 00:00:00.0) can0 06F#C0").is_err(), "years");
     }
 
     #[test]
