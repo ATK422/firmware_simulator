@@ -113,6 +113,10 @@ pub struct Machine {
     /// Watchdog ticks each core's SysTick has counted, while it counts the reference clock (see
     /// [`Machine::sync_systick_reference`]).
     systick_ref: [Option<u64>; 2],
+    /// The cycle budget a quantum ended with: `(core, limit, clock, period, cycles)`, the cycles core `core` still
+    /// needed from `clock` to reach `limit` (saves recomputing it, a division, when the next quantum is the same
+    /// core's with the same limit).
+    budget_carry: Option<(usize, Time, CycleClock, ClockPeriod, u64)>,
 }
 
 /// A snapshot of a machine: everything except the trace sink.
@@ -159,6 +163,7 @@ impl Machine {
             skip_breakpoint: [false; 2],
             trace_instructions: false,
             systick_ref: [None; 2],
+            budget_carry: None,
         };
         m.clk_sys = m.sys.clk_sys;
         m.sys.clk_sys_changed = false;
@@ -814,8 +819,16 @@ impl Machine {
             self.last_ran = c;
             let limit = next_event.min(end);
             let mut left = self.quantum;
-            // Cycles until core c reaches `limit`, carried from one batch to the next while nothing else moved it
-            let mut budget = None;
+            // Cycles until core c reaches `limit`, carried from one batch to the next (and one quantum to the next)
+            // while nothing else moved its clock
+            let mut budget = match self.budget_carry {
+                Some((core, l, clock, period, b))
+                    if core == c && l == limit && clock == self.clocks[c] && period == self.clk_sys =>
+                {
+                    Some(b)
+                }
+                _ => None,
+            };
             while left > 0 {
                 if self.can_batch(c) {
                     let b = self.run_batch(c, left, limit, &mut budget);
@@ -867,6 +880,8 @@ impl Machine {
                     break;
                 }
             }
+
+            self.budget_carry = budget.map(|b| (c, limit, self.clocks[c], self.clk_sys, b));
 
             // Fire events every running core has reached
             let mut horizon = Time::MAX;
@@ -932,6 +947,7 @@ impl Machine {
             skip_breakpoint: self.skip_breakpoint,
             trace_instructions: false,
             systick_ref: self.systick_ref,
+            budget_carry: None,
         }
     }
 

@@ -8,7 +8,8 @@
 //! `talos_mt` is Talos with its boards on four threads (`--threads 4`); its fingerprint matches `talos`'s.
 //!
 //! For each case: the virtual time run, the best wall time over the repeats, virtual/wall (above 1 keeps up with
-//! `--realtime`), instructions executed by both cores and the emulated MIPS. The fingerprint hashes what the run
+//! `--realtime`), the CPU time of that run (less disturbed than the wall clock by a busy machine), instructions
+//! executed by both cores and the emulated MIPS. The fingerprint hashes what the run
 //! produced (log lines and when they were read, every message the mock bridges received, UART and RTT text, final
 //! CPU registers, cycle counts and SRAM) so a change to the emulator can be checked to leave behaviour and timing
 //! exactly as they were: the fingerprints before and after must match. They are also checked to match between the
@@ -50,6 +51,8 @@ const CASES: &[Case] = &[
 
 struct Outcome {
     wall: Duration,
+    /// CPU time the process used (all threads), when the OS tells.
+    cpu: Option<Duration>,
     instructions: u64,
     fingerprint: u64,
 }
@@ -84,22 +87,22 @@ fn run(case: &Case, time: Time) -> Result<Outcome, String> {
         Kind::Board { elf, board, client } => {
             let elf = sim_test::titan_rs(elf).ok_or("image not built")?;
             let mut b = Bench::builder(&elf).board(board).bridge(client).boot()?;
-            let wall = Instant::now();
+            let (wall, cpu) = (Instant::now(), cpu_time());
             b.run_until(time).map_err(|e| format!("stopped at {}: {e:?}", b.now()))?;
-            let wall = wall.elapsed();
+            let (wall, cpu) = (wall.elapsed(), cpu_time().zip(cpu).map(|(b, a)| b - a));
             hash_session(&mut h, &b.session);
             for (t, m) in b.messages() {
                 t.hash(&mut h);
                 format!("{m:?}").hash(&mut h);
             }
-            Ok(Outcome { wall, instructions: instructions(&b.session), fingerprint: h.finish() })
+            Ok(Outcome { wall, cpu, instructions: instructions(&b.session), fingerprint: h.finish() })
         }
         Kind::Robot { file, bridges, threads } => {
             let mut r = RobotBench::load(file, bridges, |_| {})?;
             r.robot.threads = threads;
-            let wall = Instant::now();
+            let (wall, cpu) = (Instant::now(), cpu_time());
             r.run_until(time);
-            let wall = wall.elapsed();
+            let (wall, cpu) = (wall.elapsed(), cpu_time().zip(cpu).map(|(b, a)| b - a));
             for s in &r.robot.boards {
                 hash_session(&mut h, s);
             }
@@ -110,9 +113,21 @@ fn run(case: &Case, time: Time) -> Result<Outcome, String> {
                 }
             }
             let instructions = r.robot.boards.iter().map(instructions).sum();
-            Ok(Outcome { wall, instructions, fingerprint: h.finish() })
+            Ok(Outcome { wall, cpu, instructions, fingerprint: h.finish() })
         }
     }
+}
+
+/// User + system CPU time of the process so far (Linux: `/proc/self/stat`, in clock ticks of 10 ms). Less
+/// affected than the wall clock by other processes on a busy machine.
+fn cpu_time() -> Option<Duration> {
+    let stat = std::fs::read_to_string("/proc/self/stat").ok()?;
+    // Fields after the command name (which is in parentheses and may contain spaces): utime and stime are the
+    // 12th and 13th of them
+    let rest = &stat[stat.rfind(')')? + 2..];
+    let f: Vec<&str> = rest.split_whitespace().collect();
+    let ticks: u64 = f.get(11)?.parse::<u64>().ok()? + f.get(12)?.parse::<u64>().ok()?;
+    Some(Duration::from_millis(ticks * 10))
 }
 
 fn parse_time(s: &str) -> Time {
@@ -144,8 +159,8 @@ fn main() {
         }
     }
     println!(
-        "{:<11} {:>8} {:>9} {:>9} {:>14} {:>8}  fingerprint",
-        "case", "virtual", "wall", "virt/wall", "instructions", "MIPS"
+        "{:<11} {:>8} {:>9} {:>9} {:>8} {:>14} {:>8}  fingerprint",
+        "case", "virtual", "wall", "virt/wall", "cpu", "instructions", "MIPS"
     );
     for case in CASES {
         if only.as_ref().is_some_and(|o| !o.iter().any(|n| n == case.name)) {
@@ -169,12 +184,14 @@ fn main() {
         }
         let Some(b) = best else { continue };
         let wall = b.wall.as_secs_f64();
+        let cpu = b.cpu.map_or("-".to_string(), |c| format!("{:.2}s", c.as_secs_f64()));
         println!(
-            "{:<11} {:>8} {:>8.3}s {:>9.2} {:>14} {:>8.1}  {:016x}",
+            "{:<11} {:>8} {:>8.3}s {:>9.2} {:>8} {:>14} {:>8.1}  {:016x}",
             case.name,
             time.to_string(),
             wall,
             time.as_secs_f64() / wall,
+            cpu,
             b.instructions,
             b.instructions as f64 / wall / 1e6,
             b.fingerprint

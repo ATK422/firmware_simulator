@@ -146,7 +146,7 @@ impl ClockPeriod {
 }
 
 /// Accumulates cycles of a clock into virtual time without losing the fractional picoseconds.
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct CycleClock {
     /// Current time.
     pub now: Time,
