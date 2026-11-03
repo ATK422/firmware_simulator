@@ -1,0 +1,9 @@
+# Assembled by pioasm from test_programs/pio/uart_tx.pio (scripts/assemble_pio.py)
+program uart_tx
+wrap_target 0
+wrap 3
+sideset 2 1 0
+instr 9fa0
+instr f727
+instr 6001
+instr 0642

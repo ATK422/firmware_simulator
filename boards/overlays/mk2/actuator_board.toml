@@ -1,0 +1,19 @@
+# V2 actuators: two Dynamixel XL430-W250 on the TTL bus on GPIO 10, 57600 baud. The torpedo/marker cam (ID 2)
+# starts at its home position; the claw (ID 3) runs in extended position mode and starts closed, above one turn,
+# where the firmware counts it as homed.
+[[dynamixel]]
+pin = 10
+id = 2
+position = 2048
+
+[[dynamixel]]
+pin = 10
+id = 3
+position = 6144
+operating_mode = 4
+
+# Status strip on GPIO 12
+[[ws2812]]
+pin = 12
+leds = 12
+name = "status strip"

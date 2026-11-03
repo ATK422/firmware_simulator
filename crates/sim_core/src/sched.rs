@@ -6,14 +6,33 @@
 
 use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashMap};
-use std::hash::Hash;
+use std::hash::{BuildHasherDefault, Hash, Hasher};
+
+/// FNV-1a: the scheduler's keys are small, and SipHash's DoS resistance buys nothing here.
+#[derive(Default)]
+pub struct Fnv(u64);
+
+impl Hasher for Fnv {
+    fn finish(&self) -> u64 {
+        self.0
+    }
+    fn write(&mut self, bytes: &[u8]) {
+        let mut h = if self.0 == 0 { 0xcbf2_9ce4_8422_2325 } else { self.0 };
+        for &b in bytes {
+            h = (h ^ b as u64).wrapping_mul(0x100_0000_01b3);
+        }
+        self.0 = h;
+    }
+}
+
+type FnvMap<K, V> = HashMap<K, V, BuildHasherDefault<Fnv>>;
 
 use crate::time::Time;
 
 #[derive(Clone, Debug)]
 pub struct Scheduler<K: Copy + Eq + Hash> {
     heap: BinaryHeap<Reverse<(Time, u64, KeyOrd<K>)>>,
-    pending: HashMap<K, (Time, u64)>,
+    pending: FnvMap<K, (Time, u64)>,
     seq: u64,
 }
 
@@ -45,7 +64,7 @@ impl<K: Copy + Eq + Hash> Default for Scheduler<K> {
 
 impl<K: Copy + Eq + Hash> Scheduler<K> {
     pub fn new() -> Self {
-        Scheduler { heap: BinaryHeap::new(), pending: HashMap::new(), seq: 0 }
+        Scheduler { heap: BinaryHeap::new(), pending: FnvMap::default(), seq: 0 }
     }
 
     /// Schedules `key` at `time`, replacing any pending event with the same key.

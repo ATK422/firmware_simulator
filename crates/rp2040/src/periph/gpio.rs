@@ -131,7 +131,7 @@ impl Gpio {
     /// level changed.
     pub fn evaluate(&mut self, mut drive: impl FnMut(u32, usize) -> Drive) -> u32 {
         let old_level = self.level;
-        let old_irq: Vec<bool> = (0..NUM_GPIOS).map(|p| self.irq_level(p)).collect();
+        let old_irq: [bool; NUM_GPIOS] = std::array::from_fn(|p| self.irq_level(p));
         let mut level = 0;
         let (mut ofp, mut oefp, mut otp, mut oetp) = (0, 0, 0, 0);
         for pin in 0..NUM_GPIOS {
@@ -198,7 +198,8 @@ impl Gpio {
 
     /// Whether IO_IRQ_BANK0 is asserted for `core`.
     pub fn irq(&self, core: usize) -> bool {
-        (0..4).any(|i| self.ints(core, i) != 0)
+        // Only words with something enabled or forced can assert the line
+        (0..4).any(|i| (self.inte[core][i] != 0 || self.intf[core][i] != 0) && self.ints(core, i) != 0)
     }
 
     fn status(&self, pin: usize) -> u32 {

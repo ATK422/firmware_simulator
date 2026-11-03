@@ -12,3 +12,8 @@ channels = [
     { name = "rail_3v3", volts = 3.3, divider_ohms = [10_000, 10_000] },
     { name = "rail_balanced", volts = 15.5, divider_ohms = [10_000, 1_000] },
 ]
+
+# The torpedo/dropper Hiwonder bus servo (ID 1) on the half-duplex PIO UART on GPIO 27
+[[hiwonder]]
+pin = 27
+id = 1

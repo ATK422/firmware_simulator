@@ -11,3 +11,9 @@ bus = 0
 device = "sht41"
 temperature_c = 35.0
 humidity_rh = 20.0
+
+# The cage's status strip on GPIO 9 (12 pixels, `status_strip::NUM_LEDS`)
+[[ws2812]]
+pin = 9
+leds = 12
+name = "status strip"
