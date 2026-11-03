@@ -79,8 +79,8 @@ pub struct Robot {
     /// The water the boards' transducers are in.
     pub medium: Option<SharedMedium>,
     pub slice: Time,
-    /// Threads the boards run on within a slice (1, the default: the calling thread; 0: one per core). Boards in
-    /// an acoustic medium always take turns on one (see [`crate::parallel`]).
+    /// Threads the boards may run on (1, the default: the calling thread only; 0: one per core). Boards in an
+    /// acoustic medium always take turns on one (see [`crate::parallel`]).
     pub threads: usize,
     pub now: Time,
     /// Pace virtual time to the wall clock.
@@ -90,7 +90,9 @@ pub struct Robot {
     /// Simulated vehicles moved by the boards' thrusters, stepped after every slice.
     pub vehicles: Vec<VehicleSim>,
     /// Real-time pacing: the wall clock and virtual time it started from.
-    pacing: Option<(std::time::Instant, Time)>,
+    pub(crate) pacing: Option<(std::time::Instant, Time)>,
+    /// How the boards were spread over threads last time, and what they cost (see [`crate::parallel`]).
+    pub(crate) balance: crate::parallel::Balance,
 }
 
 impl Default for Robot {
@@ -113,6 +115,7 @@ impl Default for Robot {
             power_on: Vec::new(),
             vehicles: Vec::new(),
             pacing: None,
+            balance: Default::default(),
         }
     }
 }
@@ -166,73 +169,45 @@ impl Robot {
         for v in &self.vehicles {
             v.update_outputs();
         }
+        if crate::parallel::worth_it(self, end) {
+            return crate::parallel::run_until(self, end);
+        }
         while self.now < end {
             let t = (self.now + self.slice).min(end);
-            if self.medium.is_none() {
-                // Nothing couples the boards within a slice: they can run side by side
-                if let Some(stop) = crate::parallel::run_boards(&mut self.boards, &mut self.power_on, t, self.threads) {
-                    return Some(stop);
+            for (i, b) in self.boards.iter_mut().enumerate() {
+                if !power_on_by(b, &mut self.power_on[i], t) {
+                    continue;
                 }
-            } else {
-                for (i, b) in self.boards.iter_mut().enumerate() {
-                    let (on_at, on) = &mut self.power_on[i];
-                    if !*on {
-                        if t <= *on_at {
-                            continue;
-                        }
-                        b.machine.power_on_at(*on_at);
-                        *on = true;
-                    }
-                    match b.run_machine(t) {
-                        StopReason::TimeLimit => {}
-                        other => return Some((i, other)),
-                    }
-                    if let Some(m) = &self.medium {
-                        m.lock().unwrap().progress(i, t);
-                    }
+                match b.run_machine(t) {
+                    StopReason::TimeLimit => {}
+                    other => return Some((i, other)),
+                }
+                if let Some(m) = &self.medium {
+                    m.lock().unwrap().progress(i, t);
                 }
             }
-            for (j, rb) in self.buses.iter_mut().enumerate() {
-                let mut nodes: Vec<&mut dyn CanNode> = Vec::new();
-                for (b, on) in self.boards.iter_mut().zip(&self.board_bus) {
-                    if *on == Some(j) {
-                        nodes.extend(b.machine.can_nodes());
-                    }
-                }
-                let mut eps: Vec<&mut dyn CanEndpoint> =
-                    rb.endpoints.iter_mut().map(|e| &mut **e as &mut dyn CanEndpoint).collect();
-                let before = rb.bus.record.as_ref().map_or(0, |r| r.len());
-                rb.bus.step(&mut nodes, &mut eps, t);
-                if let (Some(rec), Some(hook)) = (&mut rb.bus.record, &mut rb.on_can) {
-                    for r in &rec[before..] {
-                        hook(r);
-                    }
-                    // The callback has seen the history; keep memory bounded on long runs (`--candump-log`)
-                    if rec.len() > 100_000 {
-                        rec.drain(..50_000);
-                    }
-                }
-            }
-            for b in self.boards.iter_mut() {
-                b.step_ethernet();
-                b.machine.update_devices();
-                b.poll_rtt();
-                b.poll_uarts();
-            }
+            let mut boards: Vec<&mut Session> = self.boards.iter_mut().collect();
+            end_slice(&mut self.buses, &self.board_bus, &mut boards, &mut self.vehicles, t);
             self.now = t;
-            for v in &mut self.vehicles {
-                v.advance(t, &self.boards);
-            }
             if self.realtime {
-                // Paced from where pacing started, across calls, so runs in short pieces keep real time too
-                let (wall, start) = *self.pacing.get_or_insert((std::time::Instant::now(), self.now));
-                let ahead = (self.now - start).as_secs_f64() - wall.elapsed().as_secs_f64();
-                if ahead > 0.002 {
-                    std::thread::sleep(std::time::Duration::from_secs_f64(ahead));
-                }
+                pace(&mut self.pacing, self.now);
             }
         }
         None
+    }
+
+    /// The thread each board ran on in the last run on threads (0: the calling thread; see [`crate::parallel`]).
+    pub fn thread_of_boards(&self) -> Vec<usize> {
+        let mut t = self.balance.threads().to_vec();
+        t.resize(self.boards.len(), 0);
+        t
+    }
+
+    /// Runs board `i` on thread `thread[i]` (0: the calling thread) whenever the boards run on threads, instead of
+    /// spreading them by what they cost (tests, experiments). Needs `threads` above every thread number given (or 0
+    /// with enough cores); otherwise, or when boards are added, the boards are spread by cost again.
+    pub fn fix_threads(&mut self, thread: Vec<usize>) {
+        self.balance.fix(thread);
     }
 
     /// Starts real-time pacing afresh from now (after virtual time was held, e.g. paused from the dashboard).
@@ -327,6 +302,7 @@ impl Robot {
             power_on: self.power_on.clone(),
             vehicles,
             pacing: None,
+            balance: self.balance.clone(),
         }
     }
 
@@ -445,6 +421,70 @@ impl Robot {
             v.wire(s, &robot.names, &robot.boards, &robot.inputs)?;
         }
         Ok(robot)
+    }
+}
+
+/// Switches `board` on if it is due by `t` (`power_on`: when, and whether it has been); whether it is on.
+pub(crate) fn power_on_by(board: &mut Session, power_on: &mut (Time, bool), t: Time) -> bool {
+    let (on_at, on) = power_on;
+    if !*on {
+        if t <= *on_at {
+            return false;
+        }
+        board.machine.power_on_at(*on_at);
+        *on = true;
+    }
+    true
+}
+
+/// What happens at the end of every slice, once every board has reached `t`: each bus arbitrates and delivers
+/// what its boards and host endpoints sent, the boards' host sides and devices catch up, and the vehicles step.
+pub(crate) fn end_slice(
+    buses: &mut [RobotBus],
+    board_bus: &[Option<usize>],
+    boards: &mut [&mut Session],
+    vehicles: &mut [VehicleSim],
+    t: Time,
+) {
+    for (j, rb) in buses.iter_mut().enumerate() {
+        let mut nodes: Vec<&mut dyn CanNode> = Vec::new();
+        for (b, on) in boards.iter_mut().zip(board_bus) {
+            if *on == Some(j) {
+                nodes.extend(b.machine.can_nodes());
+            }
+        }
+        let mut eps: Vec<&mut dyn CanEndpoint> =
+            rb.endpoints.iter_mut().map(|e| &mut **e as &mut dyn CanEndpoint).collect();
+        let before = rb.bus.record.as_ref().map_or(0, |r| r.len());
+        rb.bus.step(&mut nodes, &mut eps, t);
+        if let (Some(rec), Some(hook)) = (&mut rb.bus.record, &mut rb.on_can) {
+            for r in &rec[before..] {
+                hook(r);
+            }
+            // The callback has seen the history; keep memory bounded on long runs (`--candump-log`)
+            if rec.len() > 100_000 {
+                rec.drain(..50_000);
+            }
+        }
+    }
+    for b in boards.iter_mut() {
+        b.step_ethernet();
+        b.machine.update_devices();
+        b.poll_rtt();
+        b.poll_uarts();
+    }
+    for v in vehicles {
+        v.advance(t, boards);
+    }
+}
+
+/// Real-time pacing: sleeps while virtual time `now` is ahead of the wall clock, counted from where pacing started
+/// (`pacing`), across calls, so runs in short pieces keep real time too.
+pub(crate) fn pace(pacing: &mut Option<(std::time::Instant, Time)>, now: Time) {
+    let (wall, start) = *pacing.get_or_insert((std::time::Instant::now(), now));
+    let ahead = (now - start).as_secs_f64() - wall.elapsed().as_secs_f64();
+    if ahead > 0.002 {
+        std::thread::sleep(std::time::Duration::from_secs_f64(ahead));
     }
 }
 

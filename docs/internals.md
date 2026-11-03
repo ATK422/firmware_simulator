@@ -103,9 +103,24 @@ channels as a debug probe would, decoding defmt with the ELF's table), the UARTs
 
 `sim_host::robot::Robot` runs several sessions to the same time in 100 µs slices; after each slice every bus
 arbitrates and delivers what its nodes and endpoints sent, vehicles step, and the acoustic medium learns how far
-each board got. Boards do not see each other within a slice, so they can run on worker threads
+each board got. Boards do not see each other within a slice, so they can run on several threads
 (`Robot::threads`, `sim_host::parallel`) with identical results, except in an acoustic medium where a hydrophone
 can hear another board within the slice.
+
+**Threads** (`sim_host::parallel`). For each `Robot::run_until` of at least 8 slices, scoped threads start once
+and each runs a fixed group of boards in place: each board sits behind a `Mutex` that only one thread wants at a
+time, so nothing moves and there is no `unsafe`. Per slice the calling thread publishes the slice's end and wakes
+the workers that have boards (a per-worker slice number), runs its own group, waits for the others (spinning
+50 µs, then yielding, then parking until the last worker unparks it), and then does the end of the slice alone,
+in the same order as in turn (`robot::end_slice`: buses, Ethernet, devices, RTT and UARTs, vehicles). This costs
+about 0.4-0.7 µs per slice. Every board's host time is measured, and every 64 slices `Balance::regroup` spreads
+the boards again: for each thread count, costliest board first onto the least loaded thread, counting 3 µs per
+slice for each extra thread, taking the best only if it beats the current grouping by 5 %, and keeping boards on
+the thread they were on where it can (warm caches). If the slices took more than 90 % of the boards' added-up
+cost on the wall clock (the threads did not pay, e.g. the cores are busy with other programs), every board runs on
+the calling thread for 8 regroupings, twice as many each time in a row, up to 512. The grouping is kept between
+calls. A board stopping for another reason than the slice's end is reported after the slice, lowest index first,
+with the others run to the end of the slice; a panic on a worker goes on on the calling thread.
 
 Both run their machines through `Session::run_machine`, which goes through the session's sampling profiler when
 it has one (the profiler cuts the run at its sample times; a robot's worker thread takes the board's profiler with
@@ -230,8 +245,9 @@ copy's hydrophones and projectors to the copy's acoustic medium and its vehicles
 cargo run --release -p sim_test --example bench -- --time 2s --repeat 3 --only esc_board,talos
 ```
 
-runs the template, ESC and IVCBoard2 images on their boards and the Talos (also on four threads, `talos_mt`) and
-IVC2 pool robots for 2 s of virtual time, and prints the best wall time, virtual/wall (above 1 keeps up with
+runs the template, ESC and IVCBoard2 images on their boards and the Talos (also on up to two, three, four and six
+threads: `talos_t2`, `talos_t3`, `talos_mt`, `talos_t6`; `--threads N` sets `talos_mt`'s and prints the grouping)
+and IVC2 pool robots for 2 s of virtual time, and prints the best wall time, virtual/wall (above 1 keeps up with
 `--realtime`), CPU time, instructions executed, the share skipped in busy-waits, emulated MIPS, and a fingerprint
 of everything the run produced (log lines and their times, bridge messages, UART/RTT text, CPU registers, cycle
 counts, SRAM). The fingerprint must not change when the emulator is made faster. Wall time is noisy on a shared
@@ -239,7 +255,11 @@ machine: compare the best of several repeats, or the instruction counts under `v
 `--repeat 1`.
 
 Measured on a shared 4-core machine (CPU time for 2 s of virtual time): template 0.03 s, ESC board 1.8 s,
-IVCBoard2 0.6 s, Talos 4.7 s, IVC2 pool 2.2 s. Under callgrind, advancing the PIO blocks (on register reads and
+IVCBoard2 0.6 s, Talos 4.7 s, IVC2 pool 2.2 s. Talos on threads (wall time, the machine otherwise idle): 4.65 s on
+one, 3.19 s on two, 2.76 s on three, 2.68 s on four. Per slice the ESC boards take about 95 µs each on average
+but 30 µs or 200-280 µs in turn (busy-wait skipped, or a DShot frame), out of step with each other, so the
+slowest board of each slice adds up to 2.73 s: that is the floor with any number of threads. The other seven
+boards take about 50 µs per slice together, the end of the slice 3.2 µs. Under callgrind, advancing the PIO blocks (on register reads and
 their 1 µs event) still takes about 22 % of the ESC board's time: the DShot state machines' clock recovery is
 ticked cycle by cycle. At boot, embassy's clock setup polls the XOSC status register for its 128 ms start-up
 delay (on the ring oscillator); that wait is skipped as a busy-wait (a three-instruction loop, so over three

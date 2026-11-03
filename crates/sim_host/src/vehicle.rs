@@ -34,6 +34,7 @@
 //! mount_m = [-0.2, 0.0, 0.15]
 //! ```
 
+use std::borrow::Borrow;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
@@ -221,18 +222,18 @@ impl VehicleSim {
     }
 
     /// Each thruster's propeller speed (signed mechanical RPM) at `now`; 0 for one that isn't wired.
-    pub fn rpms(&self, boards: &[Session], now: Time) -> Vec<f64> {
+    pub fn rpms<B: Borrow<Session>>(&self, boards: &[B], now: Time) -> Vec<f64> {
         self.thrusters
             .iter()
             .map(|w| {
-                w.and_then(|(b, k)| boards[b].machine.sys.pin_devices[k].as_any().downcast_ref::<Esc>())
+                w.and_then(|(b, k)| boards[b].borrow().machine.sys.pin_devices[k].as_any().downcast_ref::<Esc>())
                     .map_or(0.0, |e| e.rpm_at(now))
             })
             .collect()
     }
 
     /// Steps the vehicle up to `t` with the ESCs' current speeds, then updates its sensors and transducers.
-    pub fn advance(&mut self, t: Time, boards: &[Session]) {
+    pub fn advance<B: Borrow<Session>>(&mut self, t: Time, boards: &[B]) {
         let end = t.as_secs_f64();
         while self.vehicle.time + self.vehicle.dt <= end + 1e-9 {
             let rpm = self.rpms(boards, Time::from_secs_f64(self.vehicle.time));
