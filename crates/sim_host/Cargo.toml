@@ -7,5 +7,9 @@ license.workspace = true
 
 [dependencies]
 sim_core.workspace = true
+cpu_armv6m.workspace = true
 rp2040.workspace = true
 log.workspace = true
+defmt-decoder = "1.2"
+object.workspace = true
+thiserror.workspace = true

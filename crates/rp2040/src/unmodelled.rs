@@ -108,6 +108,12 @@ impl Unmodelled {
         self.counts.iter().map(|(&a, &(r, w))| (svd::describe(a), r, w)).collect()
     }
 
+    /// Forgets stored values of the block at `base` (it was reset through RESETS).
+    pub fn reset_block(&mut self, base: u32) {
+        let size = if base >= 0x5000_0000 { 0x10_0000 } else { 0x4000 };
+        self.values.retain(|&a, _| !(base..base + size).contains(&a));
+    }
+
     /// Forgets stored values (a chip reset). Access counts are kept.
     pub fn reset(&mut self) {
         self.values.clear();

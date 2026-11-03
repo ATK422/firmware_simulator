@@ -1,7 +1,7 @@
 @ M0 acceptance program: toggles GPIO 25 through SIO forever.
 @
-@ Each half period is a 1000-iteration delay loop (SUBS 1 cycle + taken BNE 2 cycles) plus the loop overhead,
-@ so at 125 MHz the pin toggles about every 24 us.
+@ Each half period is a 1000-iteration delay loop (SUBS 1 cycle + taken BNE 2 cycles) plus the loop overhead:
+@ 3005 cycles. The program does not touch the clocks, so it runs from the ROSC as the bootrom leaves it.
 
     .syntax unified
     .cpu cortex-m0plus
@@ -15,6 +15,15 @@
     .thumb_func
     .global reset
 reset:
+    ldr r0, =0x4000f000         @ RESETS.RESET, atomic clear alias
+    ldr r1, =0x120              @ IO_BANK0 | PADS_BANK0
+    str r1, [r0]
+    ldr r0, =0x4000c008         @ RESETS.RESET_DONE
+wait_reset:
+    ldr r2, [r0]
+    ands r2, r1
+    cmp r2, r1
+    bne wait_reset
     ldr r0, =0x400140cc         @ IO_BANK0.GPIO25_CTRL
     movs r1, #5                 @ FUNCSEL = SIO
     str r1, [r0]
