@@ -278,3 +278,45 @@ fn ivc2_interop_robot_takes_the_c_image_from_titan_firmware_dir() {
     let err = String::from_utf8_lossy(&out.stderr);
     assert!(!out.status.success() && err.contains("TITAN_FIRMWARE_DIR is not set"), "{err}");
 }
+
+/// By default a pico-sdk program's unmodelled registers get one note and the end-of-run table, not a warning each;
+/// `first`, `every` and `off` are still there, for `run` and `robot`.
+#[test]
+fn unmodelled_registers_are_summarised_by_default() {
+    let elf = repo().join("test_programs/pico/flash_program.elf");
+    let run = |extra: &[&str]| {
+        let out = Command::new(env!("CARGO_BIN_EXE_firmware_simulator"))
+            .args(["run", path(&elf), "--time", "300ms", "--uart0", "none"])
+            .args(extra)
+            .output()
+            .unwrap();
+        assert!(out.status.success());
+        String::from_utf8_lossy(&out.stderr).into_owned()
+    };
+    let lines = |err: &str, what: &str| err.lines().filter(|l| l.contains(what)).count();
+    let default = run(&[]);
+    assert_eq!(lines(&default, "rp2040::unmodelled"), 1, "one note:\n{default}");
+    assert_eq!(lines(&default, "WARN"), 0, "{default}");
+    assert!(
+        default.contains("unmodelled registers touched:\n") && default.contains("  PADS_QSPI.GPIO_QSPI_SD0 "),
+        "{default}"
+    );
+    let first = run(&["--unmodelled", "first"]);
+    let registers = first.lines().skip_while(|l| !l.starts_with("unmodelled registers touched:")).skip(1).count();
+    assert!(registers > 1, "{first}");
+    assert_eq!(lines(&first, "WARN  rp2040::unmodelled"), registers, "one per register:\n{first}");
+    assert!(lines(&run(&["--unmodelled", "every"]), "WARN  rp2040::unmodelled") > 5);
+    let off = run(&["--unmodelled", "off"]);
+    assert!(!off.contains("unmodelled"), "nothing:\n{off}");
+
+    let robot = temp("unmodelled.toml");
+    let board = repo().join("boards/mk2/power_board.toml");
+    std::fs::write(&robot, format!("[[board]]\nname = \"fp\"\nboard = {:?}\nelf = {:?}\n", path(&board), path(&elf)))
+        .unwrap();
+    let out = sim(&["robot", path(&robot), "--time", "300ms"]);
+    assert_eq!(lines(&out, "rp2040::unmodelled"), 1, "{out}");
+    let summary = out.lines().find(|l| l.starts_with("fp: unmodelled registers touched: ")).expect(&out);
+    assert!(summary.contains(" PADS_QSPI.GPIO_QSPI_SD0 ("), "{summary}");
+    let off = sim(&["robot", path(&robot), "--time", "300ms", "--unmodelled", "off"]);
+    assert!(!off.contains("unmodelled"), "{off}");
+}

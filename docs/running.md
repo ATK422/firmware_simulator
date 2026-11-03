@@ -97,7 +97,7 @@ differ by roughly the boot time.
 | `--vcd FILE`, `--vcd-pins SPEC`, `--vcd-events` | all pins | Writes a VCD waveform of the GPIOs, optionally with decoded traffic |
 | `--dashboard ADDR`, `--dashboard-hold` | | Serves a live dashboard with fault, input and pause controls |
 | `--log-json FILE` | | Writes every log line, UART and USB line, CAN frame and fault as JSON lines |
-| `--unmodelled MODE` | `first` | Logging of registers the emulator does not model: `first` access to each, `every` access, or `off` |
+| `--unmodelled MODE` | `summary` | Logging of registers the emulator does not model: `summary` (one note at the first access, the table at the end), `first` (a warning at the first access to each, and the table), `every` (a warning at every access) or `off` (nothing) |
 | `--quantum N` | 16 | Instructions a core runs before the other gets a turn (1 for lockstep debugging) |
 | `--stop-on-bkpt` | off | A `BKPT` stops the run instead of escalating to HardFault |
 | `--gdb ADDR` | | Waits for GDB on this address before running ([below](#debugging-with-gdb)) |
@@ -202,9 +202,11 @@ firmware_simulator run --bootsel --time 300ms --trace device
 #   [0.127046s] usb: configured 2e8a:0003 Raspberry Pi RP2 Boot (serial E0C91200A4A1), 2 interface(s)
 ```
 
-Unmodelled registers are also logged as warnings on first access (`--unmodelled`), and summarised at the end:
-writes are stored and reads return the stored or SVD reset value, so firmware that only configures a block keeps
-running, but the warning says the emulator is guessing.
+Unmodelled registers are also counted and listed at the end of the run, with one note in the log at the first
+access (`--unmodelled first` warns at the first access to each register, `every` at every access, `off` says
+nothing): writes are stored and reads return the stored or SVD reset value, so firmware that only configures a
+block keeps running, but the table says where the emulator is guessing. A pico-sdk image touches a handful of them
+(`TBMAN.PLATFORM`, the QSPI pads, `XIP_CTRL.FLUSH` when it writes the flash).
 
 ## Profiles, waveforms, dashboard and JSON logs
 

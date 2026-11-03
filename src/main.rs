@@ -163,6 +163,9 @@ struct RobotArgs {
     /// Write every log line, UART line, CAN frame and fault as one JSON object per line to this file, for tools.
     #[arg(long)]
     log_json: Option<PathBuf>,
+    /// How to log the boards' accesses to registers the emulator does not model.
+    #[arg(long, value_enum, default_value = "summary")]
+    unmodelled: UnmodelledLog,
 }
 
 fn parse_board_udp(s: &str) -> Result<(String, String, String), String> {
@@ -212,6 +215,7 @@ fn robot(args: RobotArgs) -> Result<()> {
     );
     for (i, s) in r.boards.iter_mut().enumerate() {
         let name = r.names[i].clone();
+        s.machine.sys.unmodelled.log_mode = args.unmodelled.mode();
         s.keep_logs = false;
         let n = name.clone();
         s.on_log = Some(Box::new(move |t, line| println!("[{t}] {n}: {line}")));
@@ -480,6 +484,16 @@ fn robot(args: RobotArgs) -> Result<()> {
     if let (Some(l), Some(path)) = (&json_log, &args.log_json) {
         l.finish(r.now, &why).with_context(|| format!("writing {}", path.display()))?;
     }
+    if args.unmodelled != UnmodelledLog::Off {
+        for (s, name) in r.boards.iter().zip(&r.names) {
+            let summary = s.machine.sys.unmodelled.summary();
+            if !summary.is_empty() {
+                let regs: Vec<String> =
+                    summary.iter().map(|(reg, reads, writes)| format!("{reg} ({reads}r/{writes}w)")).collect();
+                eprintln!("{name}: unmodelled registers touched: {}", regs.join(", "));
+            }
+        }
+    }
     for v in &r.vehicles {
         let s = &v.vehicle.state;
         let [roll, pitch, yaw] = s.attitude.euler().map(f64::to_degrees);
@@ -606,9 +620,25 @@ fn open_pty(link: Option<&Path>, what: &str) -> Result<sim_host::pty::Pty> {
 
 #[derive(Clone, Copy, ValueEnum, PartialEq, Eq)]
 enum UnmodelledLog {
+    /// One note at the first access, and a table of every unmodelled register touched at the end.
+    Summary,
+    /// A warning at the first access to each register, and the table.
     First,
+    /// A warning at every access, and the table.
     Every,
+    /// Nothing.
     Off,
+}
+
+impl UnmodelledLog {
+    fn mode(self) -> LogMode {
+        match self {
+            UnmodelledLog::Summary => LogMode::Summary,
+            UnmodelledLog::First => LogMode::FirstAccess,
+            UnmodelledLog::Every => LogMode::Every,
+            UnmodelledLog::Off => LogMode::Off,
+        }
+    }
 }
 
 #[derive(clap::Args)]
@@ -628,8 +658,8 @@ struct RunArgs {
     /// Instructions per core before switching cores.
     #[arg(long, default_value_t = 16)]
     quantum: u32,
-    /// How to log accesses to unmodelled registers.
-    #[arg(long, value_enum, default_value = "first")]
+    /// How to log accesses to registers the emulator does not model.
+    #[arg(long, value_enum, default_value = "summary")]
     unmodelled: UnmodelledLog,
     /// Flash size in bytes (default: the board file's `flash_size`, else 2 MiB).
     #[arg(long)]
@@ -812,11 +842,7 @@ fn run(args: RunArgs) -> Result<()> {
         crystal_hz: args.crystal_hz,
     };
     let mut machine = Machine::new(config);
-    machine.sys.unmodelled.log_mode = match args.unmodelled {
-        UnmodelledLog::First => LogMode::FirstAccess,
-        UnmodelledLog::Every => LogMode::Every,
-        UnmodelledLog::Off => LogMode::Off,
-    };
+    machine.sys.unmodelled.log_mode = args.unmodelled.mode();
     if args.stop_on_bkpt {
         machine.bkpt_policy = BkptPolicy::Stop;
     }
@@ -1156,7 +1182,7 @@ fn run(args: RunArgs) -> Result<()> {
         );
     }
     let summary = machine.sys.unmodelled.summary();
-    if !summary.is_empty() {
+    if !summary.is_empty() && args.unmodelled != UnmodelledLog::Off {
         eprintln!("unmodelled registers touched:");
         for (name, reads, writes) in summary {
             eprintln!("  {name:32} {reads:>8} reads {writes:>8} writes");

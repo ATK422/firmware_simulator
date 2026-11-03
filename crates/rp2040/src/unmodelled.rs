@@ -1,8 +1,9 @@
 //! Fallback for registers the emulator does not model yet.
 //!
-//! Every access is reported (named from the SVD) so silent divergence from hardware shows up in the log. Writes are
-//! stored, honouring the atomic XOR/SET/CLR aliases, and reads return the stored value or the SVD reset value, so
-//! firmware that only configures a block and never depends on its behaviour keeps running.
+//! Every access is counted per register (named from the SVD) for the end-of-run summary, so silent divergence from
+//! hardware shows up; the log gets one note by default, or a warning per register or per access (see [`LogMode`]).
+//! Writes are stored, honouring the atomic XOR/SET/CLR aliases, and reads return the stored value or the SVD reset
+//! value, so firmware that only configures a block and never depends on its behaviour keeps running.
 
 use std::collections::{BTreeMap, HashMap};
 
@@ -12,11 +13,15 @@ use sim_core::trace::{Category, TraceEvent, TraceSink};
 
 use crate::svd;
 
-/// How unmodelled accesses are logged (they are always traced to the `Unmodelled` trace category).
+/// How unmodelled accesses are logged (they are always counted for [`Unmodelled::summary`], and traced to the
+/// `Unmodelled` trace category).
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub enum LogMode {
-    /// A warning the first time each register is touched, plus a summary on request.
+    /// One note (info) at the first unmodelled access of all, then nothing: the summary lists them. A pico-sdk
+    /// image touches a dozen such registers, each a warning in [`LogMode::FirstAccess`].
     #[default]
+    Summary,
+    /// A warning the first time each register is touched.
     FirstAccess,
     /// A warning for every access.
     Every,
@@ -30,6 +35,17 @@ pub struct Unmodelled {
     /// Access counts per register address: (reads, writes).
     counts: BTreeMap<u32, (u64, u64)>,
     pub log_mode: LogMode,
+    /// The [`LogMode::Summary`] note was logged.
+    noted: bool,
+}
+
+/// What the log gets for one access.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Logged {
+    Nothing,
+    /// [`LogMode::Summary`]'s one note.
+    Note,
+    Warning,
 }
 
 /// The register an address refers to, with alias bits removed where the block has aliases.
@@ -63,20 +79,37 @@ impl Unmodelled {
         } else {
             entry.0 += 1;
         }
-        let log_it = match self.log_mode {
-            LogMode::FirstAccess => first,
-            LogMode::Every => true,
-            LogMode::Off => false,
-        };
-        if log_it || trace.wants(Category::Unmodelled) {
+        let logged = self.what_to_log(first);
+        if logged != Logged::Nothing || trace.wants(Category::Unmodelled) {
             let name = svd::describe(addr);
-            if log_it {
-                let dir = if write { "write" } else { "read" };
-                log::warn!("[{now}] core{core} unmodelled {dir} {name} ({addr:#010x}) = {value:#010x}");
+            let dir = if write { "write" } else { "read" };
+            match logged {
+                Logged::Nothing => {}
+                Logged::Note => log::info!(
+                    "[{now}] core{core} {dir} {name} ({addr:#010x}), a register the emulator does not model (stored, \
+                     not acted on); it and any others are listed at the end of the run (`--unmodelled first` logs each)"
+                ),
+                Logged::Warning => {
+                    log::warn!("[{now}] core{core} unmodelled {dir} {name} ({addr:#010x}) = {value:#010x}")
+                }
             }
             if trace.wants(Category::Unmodelled) {
                 trace.event(now, TraceEvent::Unmodelled { core, write, addr, value, name });
             }
+        }
+    }
+
+    /// What to log for an access, `first` if the first to its register.
+    fn what_to_log(&mut self, first: bool) -> Logged {
+        match self.log_mode {
+            LogMode::Summary if !self.noted => {
+                self.noted = true;
+                Logged::Note
+            }
+            LogMode::Summary | LogMode::Off => Logged::Nothing,
+            LogMode::FirstAccess if first => Logged::Warning,
+            LogMode::FirstAccess => Logged::Nothing,
+            LogMode::Every => Logged::Warning,
         }
     }
 
@@ -153,5 +186,27 @@ mod tests {
         u.write(&mut t, Time::ZERO, 1, 0x4003_C000, 7);
         let ev = sink.take();
         assert_eq!(ev[0].1.to_string(), "core1 unmodelled write SPI0.SSPCR0 (4003c000) = 00000007");
+    }
+
+    /// Two accesses each to two registers, in each mode: what the log got.
+    fn logged(mode: LogMode) -> Vec<Logged> {
+        let mut u = Unmodelled { log_mode: mode, ..Default::default() };
+        let mut out = Vec::new();
+        for addr in [0x4006_C000, 0x4006_C000, 0x4003_C000, 0x4003_C000] {
+            let first = !u.counts.contains_key(&canonical(addr));
+            u.counts.insert(canonical(addr), (1, 0));
+            out.push(u.what_to_log(first));
+        }
+        out
+    }
+
+    #[test]
+    fn the_default_logs_one_note_and_leaves_the_rest_to_the_summary() {
+        use Logged::*;
+        assert_eq!(LogMode::default(), LogMode::Summary);
+        assert_eq!(logged(LogMode::Summary), [Note, Nothing, Nothing, Nothing]);
+        assert_eq!(logged(LogMode::FirstAccess), [Warning, Nothing, Warning, Nothing]);
+        assert_eq!(logged(LogMode::Every), [Warning; 4]);
+        assert_eq!(logged(LogMode::Off), [Nothing; 4]);
     }
 }

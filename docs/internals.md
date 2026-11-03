@@ -157,8 +157,10 @@ transmit queue.
 | SYSCFG, BUSCTRL, RTC, TBMAN, PADS_QSPI, XIP_CTRL, XIP_AUX | Not modelled: accesses go to the unmodelled fallback (stored, logged; reads return the stored or SVD reset value) |
 | Sleep/dormant modes | Not modelled beyond `WFI`/`WFE` |
 
-The unmodelled fallback is on by default and logs the first access to each register (`--unmodelled`), so silent
-divergence from hardware shows up.
+The unmodelled fallback is on by default and counts every access per register, so silent divergence from hardware
+shows up: by default (`--unmodelled summary`) the log gets one note at the first unmodelled access and `run` ends
+with a table of them all (`robot` with a line per board); `first` warns at each register's first access, `every`
+at every access (`LogMode` in code).
 
 ## External device models
 
