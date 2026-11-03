@@ -11,6 +11,7 @@
 //! * [`geometry`]: positions, boundaries and the image method
 //! * [`env`]: environment files and propagation paths
 //! * [`hydrophone`]: a hydrophone in an environment, driving an ADC input
+//! * [`medium`]: water shared by several boards, their projectors driven by pins, moving vehicles
 //! * [`wav`]: WAV reading and writing
 //!
 //! See "Acoustic environments (IVC)" in `PLAN.md`.
@@ -19,6 +20,7 @@ pub mod chain;
 pub mod env;
 pub mod geometry;
 pub mod hydrophone;
+pub mod medium;
 pub mod noise;
 pub mod source;
 pub mod transducer;

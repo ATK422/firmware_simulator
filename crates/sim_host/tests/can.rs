@@ -222,14 +222,14 @@ fn c_and_rust_boards_share_the_bus() {
     for (elf, name) in [(&rust, "mk2/power_board"), (&c, "talos/led_board")] {
         let mut s = common::boot(elf, None);
         board(name).apply(&mut s.machine).unwrap();
-        robot.boards.push(s);
+        robot.add(name, s, Some(0));
     }
     let bridge = MockBridge::new(1, true, Time::ZERO);
     bridge.set_kill(Some(false));
-    robot.endpoints.push(Box::new(bridge.clone()));
+    robot.buses[0].endpoints.push(Box::new(bridge.clone()));
     assert!(robot.run_until(Time::from_ms(2500)).is_none());
 
-    let recs = robot.bus.record.as_ref().unwrap();
+    let recs = robot.buses[0].bus.record.as_ref().unwrap();
     let rust_hb = heartbeats(recs, 1);
     let c_hb = heartbeats(recs, 6);
     assert!(rust_hb.len() >= 4 && c_hb.len() >= 3, "{rust_hb:?} {c_hb:?}");

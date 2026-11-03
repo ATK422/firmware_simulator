@@ -41,6 +41,8 @@ pub struct Session {
     pub can_endpoints: Vec<Box<dyn CanEndpoint + Send>>,
     /// Called with every frame that went over the bus.
     pub on_can: Option<CanCallback>,
+    /// Host participants on the board's Ethernet cable (Puddles), if it has one.
+    pub eth_endpoints: Vec<Box<dyn crate::ethernet::EthEndpoint>>,
     /// Keep virtual time from running ahead of the wall clock.
     pub realtime: bool,
     pacing: Option<(std::time::Instant, Time)>,
@@ -77,7 +79,50 @@ impl Session {
             can_bus: None,
             can_endpoints: Vec::new(),
             on_can: None,
+            eth_endpoints: Vec::new(),
             realtime: false,
+            pacing: None,
+            behind_warned: std::time::Instant::now(),
+        }
+    }
+
+    /// A copy of the session that runs on independently: the machine (see [`Machine::fork`]), the RTT position,
+    /// the logs and UART text so far, and the CAN bus. Hooks, host endpoints and ptys are not copied.
+    pub fn snapshot(&self) -> Session {
+        let mut machine = self.machine.fork();
+        if let Some(old) = &self.machine.sys.ethernet {
+            let o = old.lock().unwrap();
+            let new = std::sync::Arc::new(std::sync::Mutex::new(sim_devices::w5500::WireState {
+                to_device: o.to_device.clone(),
+                from_device: o.from_device.clone(),
+                link_up: o.link_up,
+                dropped: o.dropped,
+            }));
+            for a in machine.sys.spi_devices.iter_mut() {
+                if let Some(w) = a.dev.as_any_mut().and_then(|d| d.downcast_mut::<sim_devices::w5500::W5500>()) {
+                    w.wire = new.clone();
+                }
+            }
+            machine.sys.ethernet = Some(new);
+        }
+        Session {
+            machine,
+            rtt: self.rtt.clone(),
+            defmt: self.defmt.as_ref().map(DefmtDecoder::fresh),
+            logs: self.logs.clone(),
+            rtt_text: self.rtt_text.clone(),
+            on_log: None,
+            slice: self.slice,
+            keep_logs: self.keep_logs,
+            uart_text: self.uart_text.clone(),
+            on_uart_line: None,
+            uart_line: self.uart_line.clone(),
+            uart_pty: [None, None],
+            can_bus: self.can_bus.clone(),
+            can_endpoints: Vec::new(),
+            on_can: None,
+            eth_endpoints: Vec::new(),
+            realtime: self.realtime,
             pacing: None,
             behind_warned: std::time::Instant::now(),
         }
@@ -155,7 +200,11 @@ impl Session {
 
     /// Runs the CAN bus up to the machine's current time and lets the devices react to what arrived.
     pub fn step_can(&mut self) {
-        let Some(bus) = &mut self.can_bus else { return };
+        self.step_ethernet();
+        let Some(bus) = &mut self.can_bus else {
+            self.machine.update_devices();
+            return;
+        };
         let now = self.machine.now;
         let mut eps: Vec<&mut dyn CanEndpoint> =
             self.can_endpoints.iter_mut().map(|e| &mut **e as &mut dyn CanEndpoint).collect();
@@ -172,6 +221,25 @@ impl Session {
             bus.record.as_mut().unwrap().drain(..50_000);
         }
         self.machine.update_devices();
+    }
+
+    /// Carries frames between the board's Ethernet cable and the host endpoints.
+    pub fn step_ethernet(&mut self) {
+        let Some(wire) = &self.machine.sys.ethernet else { return };
+        let now = self.machine.now;
+        let frames = std::mem::take(&mut wire.lock().unwrap().from_device);
+        for (t, f) in &frames {
+            for e in self.eth_endpoints.iter_mut() {
+                e.receive(f, *t);
+            }
+        }
+        let mut w = wire.lock().unwrap();
+        for e in self.eth_endpoints.iter_mut() {
+            w.to_device.extend(e.take_tx(now));
+        }
+        if w.to_device.len() > 1000 {
+            w.to_device.clear();
+        }
     }
 
     /// Runs until virtual time `end`, polling RTT every [`Session::slice`].

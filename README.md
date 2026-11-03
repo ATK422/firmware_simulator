@@ -11,10 +11,10 @@ milestones are in [PLAN.md](PLAN.md).
 | [`sim_core`](crates/sim_core) | Virtual time (picoseconds), keyed event scheduler, `Bus`/`Peripheral`/`Cpu` traits, wires, trace sinks, ELF/UF2 images |
 | [`cpu_armv6m`](crates/cpu_armv6m) | Cortex-M0+ interpreter: full ARMv6-M Thumb, exceptions, NVIC, SysTick, SCB, MPU registers, disassembler |
 | [`rp2040`](crates/rp2040) | The SoC: memory map, bus fabric, peripherals, the two-core `Machine` and its run loop; register tables generated from `rp2040.svd` |
-| [`sim_devices`](crates/sim_devices) | External chip models: SPI/I2C/UART/pin-level device traits, CAN bus, MCP2517FD/MCP2518FD, SHT41, MCP3426/8, MS5837, SSD1306, CD74HC4051, BQ40Z80, WS2812, DShot ESC, Dynamixel and Hiwonder servos |
-| [`sim_acoustics`](crates/sim_acoustics) | Underwater acoustic environments: water, transducers by spec, receive chains, multipath, noise, sources |
-| [`sim_host`](crates/sim_host) | Host bridges: GDB, RTT/defmt, SocketCAN, UDP, UART ptys (from M1) |
-| [`sim_test`](crates/sim_test) | Firmware integration test harness (M7) |
+| [`sim_devices`](crates/sim_devices) | External chip models: SPI/I2C/UART/pin-level device traits, CAN bus, MCP2517FD/MCP2518FD, W5500, SHT41, MCP3426/8, MS5837, SSD1306, CD74HC4051, BQ40Z80, DRV8243, WS2812, DShot ESC, Dynamixel and Hiwonder servos |
+| [`sim_acoustics`](crates/sim_acoustics) | Underwater acoustic environments: water, transducers by spec, receive chains, multipath, noise, sources, and the medium boards share (projectors driven by pins, moving vehicles) |
+| [`sim_host`](crates/sim_host) | Sessions and robots, board files, host bridges: GDB, RTT/defmt, SocketCAN, mock bridges, Ethernet/UDP, UART ptys, the C bootloader upload |
+| [`sim_test`](crates/sim_test) | Firmware integration test harness: benches, robots, snapshots, sweeps |
 | `firmware_simulator` (root) | The command line tool |
 
 ## Usage
@@ -98,6 +98,37 @@ cargo run --release -- run path/to/ivc_board2 --board boards/talos/ivc_board.tom
     --environment environments/pool.toml --position 2,6,1
 ```
 
+### Robots: many boards, buses and the water between them
+
+A robot file (`robots/*.toml`) lists boards with their board file and image, the CAN buses they share, when each is
+switched on, per-board straps and, optionally, an acoustic environment with each board's position or trajectory
+(and a transducer replacing the board file's). Several vehicles go in one file as several buses. All boards run in
+one process in lockstep 100 µs slices; each bus can get mock bridges or a SocketCAN interface:
+
+```bash
+cargo run --release -- robot robots/talos.toml --mock-bridge internal:1 --candump
+cargo run --release -- robot robots/talos.toml --can internal=vcan0 --can external=vcan1 --realtime
+cargo run --release -- robot robots/ivc2_pool.toml --mock-bridge talos:8 --mock-bridge surface:8 --time 15s
+```
+
+In an environment, each board's transducer drive pin (`[transducer.drive]`) feeds a projector: the pin's level
+changes, through the driver's supply and the transducer's TVR, become the pressure it radiates, and every other
+board's hydrophone hears it over the environment's paths (delay, spreading, absorption, reflections, noise). A
+vehicle on a trajectory moves its transducer, which shifts what the others hear (Doppler). `robots/ivc_pool.toml`
+and `robots/ivc2_pool.toml` put two IVCBoards or two IVCBoard2s, one per vehicle, in the pool.
+
+### Puddles: Ethernet
+
+The Puddles backplane's W5500 is modelled in MACRAW mode. `--mock-bridge` on a board with Ethernet attaches a
+scripted bridge on the robot computer's address (192.168.1.22) that speaks the Puddles UDP transport; `--udp
+LOCAL=PEER` relays the board's datagrams through a host socket instead, for `titan_bridge`:
+
+```bash
+cargo run --release -- run path/to/puddles_backplane --board boards/mk2/puddles_backplane.toml --mock-bridge 1
+cargo run --release -- run path/to/puddles_backplane --board boards/mk2/puddles_backplane.toml \
+    --udp 127.0.0.1:2203=127.0.0.1:2204 --realtime
+```
+
 ### Flash, the bootloader and resets
 
 A watchdog reset (timeout or forced) restarts every block except the watchdog's scratch registers, the flash and
@@ -123,8 +154,16 @@ gdb-multiarch -ex "target remote :3333" -ex "break main" -ex continue path/to/fi
 ## Tests
 
 ```bash
-cargo test --workspace
+cargo test --release --workspace
 ```
+
+`crates/sim_test` is the harness for firmware tests: `Bench` boots one image on its board next to a mock bridge,
+sets inputs, injects faults (panics, resets, missing parts) and reads what the bridge received; `RobotBench` does
+the same for a robot file; both snapshot in a few milliseconds, and `sweep` runs a scenario from a snapshot over a
+set of parameters in parallel. Its tests are the smoke test of every board image (`tests/smoke.rs`), the whole of
+Talos on its buses (`tests/robot.rs`), Puddles over UDP (`tests/puddles.rs`), the H-bridge and harness checks
+(`tests/harness.rs`) and the IVC range and noise sweeps (`tests/ivc_sweep.rs`, run with `--nocapture` to see the
+tables). CI (`.github/workflows/ci.yml`) builds titan_firmware_rs and runs all of them.
 
 `test_programs/` holds hand-written Thumb programs and a small embassy firmware used by the tests; the ELFs are
 committed, `make -C test_programs` rebuilds them (`arm-none-eabi-as`, and the `thumbv6m-none-eabi` Rust target).

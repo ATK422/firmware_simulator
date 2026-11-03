@@ -16,6 +16,7 @@
 pub mod bq40z80;
 pub mod can;
 pub mod cd74hc4051;
+pub mod drv8243;
 pub mod dshot;
 pub mod dynamixel;
 pub mod hiwonder;
@@ -30,6 +31,7 @@ pub mod sht41;
 pub mod spi;
 pub mod ssd1306;
 pub mod uart;
+pub mod w5500;
 pub mod ws2812;
 
 use sim_core::time::Time;

@@ -57,6 +57,11 @@ pub struct Board {
     /// Dynamixel servos on a TTL bus pin.
     #[serde(default)]
     pub dynamixel: Vec<DynamixelEntry>,
+    /// DRV8243 H-bridge drivers sharing an nSLEEP line.
+    #[serde(default)]
+    pub drv8243: Vec<Drv8243Entry>,
+    /// A W5500 Ethernet controller (Puddles); its cable is `Machine::sys.ethernet`.
+    pub w5500: Option<W5500Entry>,
     /// I2C/SMBus devices on bit-banged pins.
     #[serde(default)]
     pub soft_i2c: Vec<SoftI2cEntry>,
@@ -117,8 +122,8 @@ pub struct TransducerEntry {
     #[serde(flatten)]
     pub transducer: sim_acoustics::transducer::Transducer,
     pub receive: Option<ReceiveEntry>,
-    /// Projector drive (used from M7): the output pin and the driver's supply.
-    pub drive: Option<toml::Value>,
+    /// Projector drive: the output pin and the driver's supply.
+    pub drive: Option<sim_acoustics::medium::DriveSpec>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -256,6 +261,35 @@ impl Inputs {
         self.0.insert(name, h.clone());
         if ratio == 1.0 { Signal::Shared(h) } else { Signal::func(move |_| *h.lock().unwrap() * ratio) }
     }
+}
+
+/// A W5500 on an SPI bus.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct W5500Entry {
+    pub bus: usize,
+    pub cs: u8,
+    pub int_pin: u8,
+}
+
+/// DRV8243 drivers on one nSLEEP line.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Drv8243Entry {
+    pub nsleep_pin: u8,
+    pub drvoff_pin: Option<u8>,
+    pub bridges: Vec<Drv8243Bridge>,
+}
+
+/// Where one bridge's nFAULT goes: a GPIO, or a named input of an `[[analog]]` entry (a mux input).
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Drv8243Bridge {
+    pub nfault_pin: Option<u8>,
+    pub nfault_input: Option<String>,
+    /// `false` for a bridge that is not fitted (never answers).
+    #[serde(default = "yes")]
+    pub fitted: bool,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -396,6 +430,36 @@ impl Board {
                 (None, None) => return Err(format!("ADC input {}: needs volts or a mux", a.adc)),
             }
         }
+        if let Some(e) = &self.w5500 {
+            let wire = sim_devices::w5500::wire();
+            m.sys.attach_spi(e.bus, e.cs, Box::new(sim_devices::w5500::W5500::new(wire.clone(), e.int_pin)));
+            m.sys.ethernet = Some(wire);
+        }
+        // After the analog inputs: nFAULT lines can feed them
+        for d in &self.drv8243 {
+            let mut bridges = Vec::new();
+            for b in &d.bridges {
+                let out = match (b.nfault_pin, &b.nfault_input) {
+                    (Some(p), None) => {
+                        m.sys.gpio.external[p as usize] = External::Driven(Level::High);
+                        sim_devices::drv8243::Nfault::Pin(p)
+                    }
+                    (None, Some(name)) => {
+                        let h = inputs
+                            .0
+                            .get(name)
+                            .ok_or_else(|| format!("DRV8243 nFAULT: no input {name:?} (name a mux input)"))?
+                            .clone();
+                        *h.lock().unwrap() = 3.3;
+                        sim_devices::drv8243::Nfault::Volts(h)
+                    }
+                    _ => return Err("DRV8243 bridge: give one of nfault_pin and nfault_input".into()),
+                };
+                bridges.push((out, b.fitted));
+            }
+            let dev = sim_devices::drv8243::Drv8243::new(d.nsleep_pin, d.drvoff_pin, bridges);
+            m.sys.attach_pin_device(Box::new(dev));
+        }
         Ok(inputs)
     }
 
@@ -414,6 +478,35 @@ impl Board {
         }
         let h = sim_acoustics::Hydrophone::new(env, position, t.transducer.clone(), rx.chain.clone());
         m.sys.attach_analog(rx.adc, Box::new(h));
+        Ok(())
+    }
+
+    /// Puts the board as board `owner` in a medium shared with other boards, moving along `trajectory`: its
+    /// projector (if the transducer has a `drive`) radiates what its drive pin outputs, and its hydrophone (if it has
+    /// a `receive` chain) hears the environment and the other boards' projectors.
+    pub fn place_in_medium(
+        &self,
+        m: &mut Machine,
+        medium: &sim_acoustics::medium::SharedMedium,
+        owner: usize,
+        trajectory: sim_acoustics::medium::Trajectory,
+    ) -> Result<(), String> {
+        let t = self.transducer.as_ref().ok_or_else(|| format!("{} has no [transducer]", self.name))?;
+        let env = medium.lock().unwrap().env.clone();
+        let start = trajectory.at(0.0);
+        if !env.boundaries.contains(start) {
+            return Err(format!("{:?} is outside the water", start));
+        }
+        if let Some(rx) = &t.receive {
+            let h = sim_acoustics::Hydrophone::new(env, start, t.transducer.clone(), rx.chain.clone())
+                .in_medium(medium.clone(), owner)
+                .moving(trajectory.clone());
+            m.sys.attach_analog(rx.adc, Box::new(h));
+        }
+        if let Some(drive) = &t.drive {
+            let id = medium.lock().unwrap().add_projector(owner, &self.name, t.transducer.clone(), trajectory, drive);
+            m.sys.attach_pin_device(Box::new(crate::acoustic::ProjectorPin::new(medium.clone(), id, drive.pin)));
+        }
         Ok(())
     }
 

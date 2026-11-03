@@ -82,6 +82,27 @@ impl MockBridge {
         self.state().kill = kill;
     }
 
+    /// An independent bridge with a copy of this one's state (for a snapshot of the session it is attached to). A
+    /// message the board was in the middle of sending is not carried over.
+    pub fn fork(&self) -> Self {
+        let s = self.state();
+        MockBridge(Arc::new(Mutex::new(BridgeState {
+            client_id: s.client_id,
+            fd: s.fd,
+            running: s.running,
+            kill: s.kill,
+            received: s.received.clone(),
+            heartbeats: s.heartbeats.clone(),
+            utility: s.utility.clone(),
+            errors: s.errors.clone(),
+            pending: s.pending.clone(),
+            pings: s.pings,
+            last_ping: s.last_ping,
+            next_ping: s.next_ping,
+            decoder: MsgDecoder::new(s.fd),
+        })))
+    }
+
     pub fn send(&self, msg: HostToDevice) {
         self.state().pending.push(msg);
     }

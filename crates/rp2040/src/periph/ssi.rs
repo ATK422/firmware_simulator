@@ -49,6 +49,8 @@ pub struct Ssi {
     ssi_cs: bool,
     /// Enhanced-mode frames collected so far (instruction, address).
     enhanced: Vec<u32>,
+    /// EEPROM read mode (TMOD 3): data frames still to clock in after the command.
+    eeprom_left: u32,
 }
 
 impl Default for Ssi {
@@ -66,6 +68,7 @@ impl Default for Ssi {
             cs_override: CsOverride::Normal,
             ssi_cs: false,
             enhanced: Vec::new(),
+            eeprom_left: 0,
         }
     }
 }
@@ -175,11 +178,20 @@ impl Ssi {
             0x20 => 0, // TXFLR: frames leave at once
             0x24 => self.rx.len() as u32,
             0x28 => {
+                // EEPROM read: the data frames clock in once the command has gone out
+                self.eeprom_fill(now, data);
                 // Software waiting for the SSI to finish: an SSI-driven transaction is over
-                self.end_ssi_transaction(now, data);
+                if self.eeprom_left == 0 {
+                    self.end_ssi_transaction(now, data);
+                }
                 self.sr()
             }
-            0x60..=0x9C => self.rx.pop_front().unwrap_or(0),
+            0x60..=0x9C => {
+                self.eeprom_fill(now, data);
+                let v = self.rx.pop_front().unwrap_or(0);
+                self.eeprom_fill(now, data);
+                v
+            }
             0x00..=0xFC => self.regs[(offset / 4) as usize],
             _ => return None,
         })
@@ -208,6 +220,20 @@ impl Ssi {
         })
     }
 
+    /// Clocks in EEPROM-read data frames while the RX FIFO has room (the SSI stalls the clock when it is full).
+    fn eeprom_fill(&mut self, now: Time, data: &mut [u8]) {
+        let bytes = self.frame_bits().div_ceil(8);
+        while self.eeprom_left > 0 && self.rx.len() < FIFO_DEPTH {
+            let mut reply = 0u32;
+            for _ in 0..bytes {
+                let r = if self.cs_asserted() { self.chip.exchange(0, now, data) } else { 0xFF };
+                reply = reply << 8 | r as u32;
+            }
+            self.rx.push_back(reply);
+            self.eeprom_left -= 1;
+        }
+    }
+
     fn push_rx(&mut self, v: u32) {
         if self.rx.len() < FIFO_DEPTH {
             self.rx.push_back(v);
@@ -229,9 +255,15 @@ impl Ssi {
             reply = reply << 8 | r as u32;
         }
         let tmod = (self.regs[CTRLR0] >> 8) & 3;
-        if tmod != 1 {
-            let mask = if bits >= 32 { u32::MAX } else { (1 << bits) - 1 };
-            self.push_rx(reply & mask);
+        match tmod {
+            // Transmit only
+            1 => {}
+            // EEPROM read: what comes back during the command is dropped; NDF + 1 frames follow it
+            3 => self.eeprom_left = (self.regs[CTRLR1] & 0xFFFF) + 1,
+            _ => {
+                let mask = if bits >= 32 { u32::MAX } else { (1 << bits) - 1 };
+                self.push_rx(reply & mask);
+            }
         }
     }
 
@@ -282,6 +314,7 @@ impl Ssi {
                 if !self.enabled() {
                     self.rx.clear();
                     self.enhanced.clear();
+                    self.eeprom_left = 0;
                     self.end_ssi_transaction(now, data);
                 }
             }
@@ -384,6 +417,29 @@ mod tests {
         s.set_cs_override(CsOverride::High, Time::ZERO, &mut data);
         s.set_cs_override(CsOverride::Normal, Time::ZERO, &mut data);
         assert!(s.xip_ready(Time::ZERO).is_ok(), "standard SPI XIP with the chip idle");
+    }
+
+    #[test]
+    fn eeprom_read_mode_clocks_in_the_data_after_the_command() {
+        // embassy-rp's unique ID read: TMOD 3, NDF = 4 dummy + 8 data - 1, then the command byte 0x4B
+        let mut data = vec![0xFFu8; 2 << 20];
+        let mut s = Ssi::default();
+        w(&mut s, 0x08, 0, &mut data);
+        w(&mut s, 0x00, 7 << 16 | 3 << 8, &mut data);
+        w(&mut s, 0x04, 4 + 8 - 1, &mut data);
+        w(&mut s, 0x08, 1, &mut data);
+        w(&mut s, 0x60, 0x4B, &mut data);
+        assert_eq!(s.peek(0x24), Some(0), "nothing received during the command");
+        let mut got = Vec::new();
+        while got.len() < 12 {
+            if s.read(0x28, Time::ZERO, &mut data).unwrap() & SR_RFNE != 0 {
+                got.push(s.read(0x60, Time::ZERO, &mut data).unwrap() as u8);
+            }
+        }
+        assert_eq!(got[4..], crate::periph::qspi_flash::UNIQUE_ID, "dummy bytes, then the unique ID");
+        assert_eq!(s.peek(0x24), Some(0));
+        s.read(0x28, Time::ZERO, &mut data);
+        assert!(!s.ssi_cs, "the transaction ended");
     }
 
     #[test]

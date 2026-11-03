@@ -9,6 +9,10 @@
 //!
 //! Absorption and the transducer's sensitivity are applied at each source's nominal frequency (a narrowband
 //! approximation); ambient noise is white at the level the noise model gives at the chain's centre frequency.
+//!
+//! In a shared [`Medium`](crate::medium::Medium) the hydrophone also hears the other boards' projectors. When
+//! the hydrophone or a projector moves, every path is recomputed each [`BLOCK_STEPS`] and the delays and gains are
+//! interpolated in between, which produces Doppler shifts.
 
 use std::sync::Arc;
 
@@ -18,6 +22,7 @@ use sim_core::time::Time;
 use crate::chain::{Chain, ChainSpec};
 use crate::env::Environment;
 use crate::geometry::Vec3;
+use crate::medium::{Medium, SharedMedium, Trajectory};
 use crate::noise;
 use crate::transducer::Transducer;
 use crate::wav::Wav;
@@ -25,23 +30,41 @@ use crate::wav::Wav;
 pub const DEFAULT_RATE_HZ: f64 = 1_000_000.0;
 pub const MAX_GAP_STEPS: u64 = 2_000;
 pub const PREROLL_STEPS: u64 = 1_000;
+/// Paths are recomputed this often (grid steps) when something moves.
+pub const BLOCK_STEPS: u64 = 1_000;
 
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Origin {
+    Source(usize),
+    Projector(usize),
+}
+
+/// One propagation path, at the start and the end of the current block.
 #[derive(Clone, Debug)]
 struct Tap {
-    source: usize,
-    delay_s: f64,
+    from: Origin,
+    delay_s: [f64; 2],
     /// Volts at the hydrophone per µPa at 1 m from the source.
-    volts_per_upa: f64,
+    volts_per_upa: [f64; 2],
 }
 
 #[derive(Clone, Debug)]
 pub struct Hydrophone {
     pub env: Arc<Environment>,
+    /// Where it starts.
     pub position: Vec3,
+    pub trajectory: Trajectory,
     pub transducer: Transducer,
     chain: Chain,
     rate: f64,
     taps: Vec<Tap>,
+    /// The shared medium and the board this hydrophone belongs to.
+    medium: Option<(SharedMedium, usize)>,
+    /// Block the taps were computed for, and how many projectors there were.
+    block: Option<(u64, usize)>,
+    moves: bool,
+    /// Centre of the receive chain's band, where the noise level is taken.
+    centre_hz: f64,
     noise_rms_v: f64,
     seed: u64,
     step: Option<u64>,
@@ -72,16 +95,6 @@ impl Hydrophone {
             (None, None) => 30_000.0,
         };
         let chain = Chain::new(chain, rate);
-        let mut taps = Vec::new();
-        for (i, s) in env.sources.iter().enumerate() {
-            let hz = s.nominal_hz();
-            let wavelength = env.sound_speed / hz;
-            let sens = transducer.sensitivity(hz);
-            for p in env.paths(s.position, position, hz) {
-                let beam = transducer.beam_gain(p.arrival, wavelength);
-                taps.push(Tap { source: i, delay_s: p.delay_s, volts_per_upa: p.gain * beam * sens });
-            }
-        }
         let level = env.noise.level_db(centre);
         let noise_rms_v = if level.is_finite() {
             10f64.powf(level / 20.0) * (rate / 2.0).sqrt() * transducer.sensitivity(centre)
@@ -93,16 +106,118 @@ impl Hydrophone {
         Hydrophone {
             env,
             position,
+            trajectory: Trajectory::Fixed(position),
             transducer,
             chain,
             rate,
-            taps,
+            taps: Vec::new(),
+            medium: None,
+            block: None,
+            moves: false,
+            centre_hz: centre,
             noise_rms_v,
             seed,
             step: None,
             last: 0.0,
             recording: None,
         }
+    }
+
+    /// Puts the hydrophone in a shared medium as part of board `owner`: it hears the other boards' projectors (and
+    /// the environment's sources, as before). The medium's environment replaces the one given to `new`.
+    pub fn in_medium(mut self, medium: SharedMedium, owner: usize) -> Self {
+        self.env = medium.lock().unwrap().env.clone();
+        self.medium = Some((medium, owner));
+        self.block = None;
+        self
+    }
+
+    /// The shared medium the hydrophone listens in, if any.
+    pub fn medium(&self) -> Option<&SharedMedium> {
+        self.medium.as_ref().map(|m| &m.0)
+    }
+
+    /// Switches to another medium (a snapshot's copy of the one it was in), keeping its board.
+    pub fn relink(&mut self, medium: SharedMedium) {
+        if let Some(m) = &mut self.medium {
+            m.0 = medium;
+        }
+    }
+
+    /// Replaces the trajectory (a vehicle moved somewhere else between runs).
+    pub fn set_trajectory(&mut self, trajectory: Trajectory) {
+        self.position = trajectory.at(0.0);
+        self.trajectory = trajectory;
+        self.block = None;
+    }
+
+    /// Replaces the ambient noise with white noise of `level_db` re 1 µPa²/Hz (for noise sweeps).
+    pub fn set_noise_db(&mut self, level_db: f64) {
+        self.noise_rms_v =
+            10f64.powf(level_db / 20.0) * (self.rate / 2.0).sqrt() * self.transducer.sensitivity(self.centre_hz);
+    }
+
+    /// Moves the hydrophone along `trajectory`.
+    pub fn moving(mut self, trajectory: Trajectory) -> Self {
+        self.position = trajectory.at(0.0);
+        self.trajectory = trajectory;
+        self.block = None;
+        self
+    }
+
+    /// Paths from `src` at time `t` (s), with the hydrophone's beam and sensitivity at `hz` folded in.
+    fn paths_at(&self, src: Vec3, hz: f64, t: f64, tx: Option<&Transducer>) -> Vec<(f64, f64)> {
+        let rx = self.trajectory.at(t);
+        let wavelength = self.env.sound_speed / hz;
+        let sens = self.transducer.sensitivity(hz);
+        self.env
+            .paths(src, rx, hz)
+            .into_iter()
+            .map(|p| {
+                let beam = self.transducer.beam_gain(p.arrival, wavelength);
+                let tx_beam =
+                    tx.map_or(1.0, |tx| tx.beam_gain([-p.arrival[0], -p.arrival[1], -p.arrival[2]], wavelength));
+                (p.delay_s, p.gain * beam * tx_beam * sens)
+            })
+            .collect()
+    }
+
+    /// Recomputes the taps for the block holding grid step `n`, if needed.
+    fn update_taps(&mut self, n: u64, med: Option<&Medium>) {
+        let block = n / BLOCK_STEPS;
+        let nproj = med.map_or(0, |m| m.projectors.len());
+        match self.block {
+            Some((b, np)) if np == nproj && (b == block || !self.moves) => return,
+            _ => {}
+        }
+        let owner = self.medium.as_ref().map(|m| m.1);
+        self.moves = self.trajectory.moves()
+            || med.is_some_and(|m| m.projectors.iter().any(|p| Some(p.owner) != owner && p.trajectory.moves()));
+        let t0 = (block * BLOCK_STEPS) as f64 / self.rate;
+        let t1 = ((block + 1) * BLOCK_STEPS) as f64 / self.rate;
+        let mut taps = Vec::new();
+        let mut add = |from: Origin, a: Vec<(f64, f64)>, b: Vec<(f64, f64)>| {
+            for (pa, pb) in a.into_iter().zip(b) {
+                taps.push(Tap { from, delay_s: [pa.0, pb.0], volts_per_upa: [pa.1, pb.1] });
+            }
+        };
+        for (i, s) in self.env.sources.iter().enumerate() {
+            let hz = s.nominal_hz();
+            add(Origin::Source(i), self.paths_at(s.position, hz, t0, None), self.paths_at(s.position, hz, t1, None));
+        }
+        if let Some(m) = med {
+            for (i, p) in m.projectors.iter().enumerate().filter(|(_, p)| Some(p.owner) != owner) {
+                let hz = p.nominal_hz;
+                let tx = Some(&p.transducer);
+                add(
+                    Origin::Projector(i),
+                    self.paths_at(p.trajectory.at(t0), hz, t0, tx),
+                    self.paths_at(p.trajectory.at(t1), hz, t1, tx),
+                );
+            }
+        }
+        self.taps = taps;
+        self.block = Some((block, nproj));
     }
 
     /// Starts keeping every ADC sample.
@@ -112,11 +227,19 @@ impl Hydrophone {
     }
 
     /// Hydrophone output (before the chain) at grid step `n`.
-    fn raw(&self, n: u64) -> f64 {
+    fn raw(&mut self, n: u64, mut med: Option<&mut Medium>) -> f64 {
+        self.update_taps(n, med.as_deref());
         let t = n as f64 / self.rate;
+        let f = (n % BLOCK_STEPS) as f64 / BLOCK_STEPS as f64;
         let mut v = 0.0;
         for tap in &self.taps {
-            v += tap.volts_per_upa * self.env.sources[tap.source].pressure(t - tap.delay_s);
+            let delay = tap.delay_s[0] + (tap.delay_s[1] - tap.delay_s[0]) * f;
+            let gain = tap.volts_per_upa[0] + (tap.volts_per_upa[1] - tap.volts_per_upa[0]) * f;
+            let p = match tap.from {
+                Origin::Source(i) => self.env.sources[i].pressure(t - delay),
+                Origin::Projector(i) => med.as_deref_mut().map_or(0.0, |m| m.projectors[i].pressure(t - delay)),
+            };
+            v += gain * p;
         }
         if self.noise_rms_v > 0.0 {
             v += self.noise_rms_v * noise::gaussian(self.seed, n);
@@ -162,8 +285,11 @@ impl Hydrophone {
                 k.saturating_sub(PREROLL_STEPS)
             }
         };
+        let medium = self.medium.as_ref().map(|m| m.0.clone());
+        let mut guard = medium.as_ref().map(|m| m.lock().unwrap());
         for n in from..=k {
-            self.last = self.chain.process(self.raw(n), pins);
+            let raw = self.raw(n, guard.as_deref_mut());
+            self.last = self.chain.process(raw, pins);
         }
         self.step = Some(k);
         if let Some(r) = &mut self.recording {
@@ -217,6 +343,10 @@ impl AnalogSource for Hydrophone {
 
     fn clone_box(&self) -> Box<dyn AnalogSource> {
         Box::new(self.clone())
+    }
+
+    fn as_any_mut(&mut self) -> Option<&mut dyn std::any::Any> {
+        Some(self)
     }
 }
 

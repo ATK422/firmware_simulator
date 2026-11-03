@@ -1,0 +1,69 @@
+# Talos in one process: the boards on the internal CAN FD bus (1/5 Mbit/s) and a smart battery on the external
+# classic bus (250 kbit/s), each running its titan_firmware_rs image.
+#
+#   firmware_simulator robot robots/talos.toml --can internal=vcan0 --can external=vcan1 --realtime
+#
+# The PoAC board takes the power board's place (both are client 1). ESC board 1 has its board ID strap (GPIO 29) high.
+[[bus]]
+name = "internal"
+rates = "internal"
+
+[[bus]]
+name = "external"
+rates = "external"
+
+[[board]]
+name = "poac"
+board = "../boards/talos/poac_board.toml"
+elf = "../external/titan_firmware_rs/firmware/target/thumbv6m-none-eabi/release/poac_board"
+bus = "internal"
+
+[[board]]
+name = "esc0"
+board = "../boards/mk2/esc_board.toml"
+elf = "../external/titan_firmware_rs/firmware/target/thumbv6m-none-eabi/release/esc_board"
+bus = "internal"
+
+[[board]]
+name = "esc1"
+board = "../boards/mk2/esc_board.toml"
+elf = "../external/titan_firmware_rs/firmware/target/thumbv6m-none-eabi/release/esc_board"
+bus = "internal"
+power_on_ms = 3
+gpio = [{ pin = 29, level = "high" }]
+
+[[board]]
+name = "camera_cage"
+board = "../boards/mk2/camera_cage_bb.toml"
+elf = "../external/titan_firmware_rs/firmware/target/thumbv6m-none-eabi/release/camera_cage_bb"
+bus = "internal"
+
+[[board]]
+name = "actuator"
+board = "../boards/mk2/actuator_board.toml"
+elf = "../external/titan_firmware_rs/firmware/target/thumbv6m-none-eabi/release/actuator_board"
+bus = "internal"
+
+[[board]]
+name = "led"
+board = "../boards/talos/led_board.toml"
+elf = "../external/titan_firmware_rs/firmware/target/thumbv6m-none-eabi/release/led_board"
+bus = "internal"
+
+[[board]]
+name = "sbc"
+board = "../boards/talos/sbc_board.toml"
+elf = "../external/titan_firmware_rs/firmware/target/thumbv6m-none-eabi/release/sbc_board"
+bus = "internal"
+
+[[board]]
+name = "ivc"
+board = "../boards/talos/ivc_board.toml"
+elf = "../external/titan_firmware_rs/firmware/target/thumbv6m-none-eabi/release/ivc_board2"
+bus = "internal"
+
+[[board]]
+name = "battery"
+board = "../boards/mk2/sbh_mcu.toml"
+elf = "../external/titan_firmware_rs/firmware/target/thumbv6m-none-eabi/release/smart_battery"
+bus = "external"

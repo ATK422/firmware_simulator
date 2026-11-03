@@ -1,0 +1,49 @@
+# Two vehicles in the competition pool, each with a first-generation IVCBoard (17/19 kHz FSK, 50 ms symbols, ACKed)
+# on its own CAN bus, 5 m apart: Talos, and the surface vehicle ("SSFB" in the firmware), which may only transmit
+# in a window after hearing from Talos.
+#
+# The IVCBoard firmware drives the transducer on GPIO 7 and samples the hydrophone on ADC 0 (GPIO 26, the board
+# header's RX_PIN), unlike IVCBoard2 (ADC 1). Its transducer here is a 18 kHz resonant one with a 12-25 kHz receive
+# band-pass: assumed numbers for the older, lower frequency modem, replacing the board file's 51 kHz transducer.
+#
+#   firmware_simulator robot robots/ivc_pool.toml --mock-bridge talos:8 --mock-bridge surface:8
+[environment]
+file = "../environments/pool.toml"
+
+[[bus]]
+name = "talos"
+
+[[bus]]
+name = "surface"
+
+[[board]]
+name = "talos_ivc"
+board = "../boards/talos/ivc_board.toml"
+elf = "../external/titan_firmware_rs/firmware/target/thumbv6m-none-eabi/release/ivc_board"
+bus = "talos"
+position_m = [5.0, 6.0, 1.5]
+
+[board.transducer]
+tvr = { resonance_hz = 18_000, q = 4, peak_db = 140 }
+rvs_db = -190
+beam = "omni"
+drive = { pin = 7, supply_v = 12.0 }
+receive = { adc = 0, gain_db = 40, bandpass_hz = [12_000, 25_000] }
+
+[[board]]
+name = "surface_ivc"
+board = "../boards/talos/ivc_board.toml"
+elf = "../external/titan_firmware_rs/firmware/target/thumbv6m-none-eabi/release/ivc_board"
+bus = "surface"
+# Switched on a little after Talos
+power_on_ms = 37
+# The board ID pin high: this is the SSFB end, which only answers Talos (Talos sends the heartbeats)
+gpio = [{ pin = 6, level = "high" }]
+position_m = [10.0, 6.0, 1.5]
+
+[board.transducer]
+tvr = { resonance_hz = 18_000, q = 4, peak_db = 140 }
+rvs_db = -190
+beam = "omni"
+drive = { pin = 7, supply_v = 12.0 }
+receive = { adc = 0, gain_db = 40, bandpass_hz = [12_000, 25_000] }

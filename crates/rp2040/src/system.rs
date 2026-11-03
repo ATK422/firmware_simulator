@@ -124,6 +124,10 @@ pub struct System {
     pub wire: WireQueue,
     /// Devices watching and driving pins.
     pub pin_devices: Vec<Box<dyn PinDevice>>,
+    /// PWM slices whose output pins a pin device watches (their edges must be delivered).
+    pub pwm_device_slices: u32,
+    /// The Ethernet cable of an attached Ethernet controller, for the host to carry frames.
+    pub ethernet: Option<sim_devices::w5500::EthWire>,
     /// What drives ADC inputs 0-3 (GPIO 26-29). Unconnected inputs read 0 V.
     pub analog_inputs: [Option<Box<dyn AnalogSource>>; 4],
     /// Die temperature in °C, for the temperature sensor (ADC input 4).
@@ -207,6 +211,8 @@ impl System {
             pio_lines: 0,
             wire: WireQueue::default(),
             pin_devices: Vec::new(),
+            pwm_device_slices: 0,
+            ethernet: None,
             analog_inputs: [None, None, None, None],
             chip_temp_c: Signal::Const(27.0),
             adc_vref: 3.3,
@@ -675,6 +681,12 @@ impl System {
 
     /// Attaches a pin-level device.
     pub fn attach_pin_device(&mut self, dev: Box<dyn PinDevice>) {
+        for pin in 0..30u8 {
+            if dev.watches(pin) {
+                self.pwm_device_slices |= 1 << ((pin as u32 / 2) % 8);
+            }
+        }
+        self.pwm.observed |= self.pwm_device_slices;
         self.pin_devices.push(dev);
     }
 

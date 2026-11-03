@@ -964,10 +964,15 @@ dependencies = [
 name = "sim_test"
 version = "0.1.0"
 dependencies = [
+ "canmore",
  "log",
  "rp2040",
+ "sim_acoustics",
  "sim_core",
+ "sim_devices",
  "sim_host",
+ "titan_link",
+ "toml",
 ]
 
 [[package]]

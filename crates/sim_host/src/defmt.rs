@@ -25,6 +25,7 @@ impl std::fmt::Display for LogLine {
 
 /// Decodes a defmt byte stream (as read from RTT) into log lines.
 pub struct DefmtDecoder {
+    table: &'static Table,
     decoder: Box<dyn StreamDecoder + Send + Sync>,
 }
 
@@ -35,8 +36,13 @@ impl DefmtDecoder {
         Ok(table.map(|t| {
             // The stream decoder borrows the table; one table lives for the whole run
             let table: &'static Table = Box::leak(Box::new(t));
-            DefmtDecoder { decoder: table.new_stream_decoder() }
+            DefmtDecoder { table, decoder: table.new_stream_decoder() }
         }))
+    }
+
+    /// A decoder for the same table with no partial frame buffered (for a snapshot taken between frames).
+    pub fn fresh(&self) -> Self {
+        DefmtDecoder { table: self.table, decoder: self.table.new_stream_decoder() }
     }
 
     /// Feeds bytes and returns every complete frame.

@@ -1,0 +1,28 @@
+# Two vehicles in the competition pool, each with an IVCBoard2 on its own CAN bus: Talos, and a second vehicle
+# 5 m away. They talk acoustically through environments/pool.toml.
+#
+#   firmware_simulator robot robots/ivc2_pool.toml --mock-bridge talos:8 --mock-bridge surface:8
+[environment]
+file = "../environments/pool.toml"
+
+[[bus]]
+name = "talos"
+
+[[bus]]
+name = "surface"
+
+[[board]]
+name = "talos_ivc"
+board = "../boards/talos/ivc_board.toml"
+elf = "../external/titan_firmware_rs/firmware/target/thumbv6m-none-eabi/release/ivc_board2"
+bus = "talos"
+position_m = [5.0, 6.0, 1.5]
+
+[[board]]
+name = "surface_ivc"
+board = "../boards/talos/ivc_board.toml"
+elf = "../external/titan_firmware_rs/firmware/target/thumbv6m-none-eabi/release/ivc_board2"
+bus = "surface"
+# Switched on a little after Talos
+power_on_ms = 37
+position_m = [10.0, 6.0, 1.5]
