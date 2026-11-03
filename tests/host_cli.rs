@@ -73,7 +73,7 @@ fn robot_replay_and_diff() {
     assert!(out.contains("identical"), "{out}");
     assert!(out.contains("external client 21 board->host SmartBattery::BatteryStatus"), "{out}");
     assert!(out.contains("internal client 8 board->host Heartbeat"), "{out}");
-    assert!(out.contains("aligned on timestamps as logged"), "{out}");
+    assert!(out.contains("aligned on their timestamps as logged"), "{out}");
 
     // Without the bridges' traffic the boards never connect: their link messages are missing
     let c = d.join("c.log");

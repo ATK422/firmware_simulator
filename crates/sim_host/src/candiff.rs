@@ -614,14 +614,14 @@ impl Report {
     pub fn render(&self, details: usize) -> String {
         let mut o = String::new();
         let align = match self.align {
-            Align::Start => "first frames",
-            Align::None => "timestamps as logged",
-            Align::Offset(_) => "given offset",
-            Align::Auto => "searched",
+            Align::Start => "on their first frames",
+            Align::None => "on their timestamps as logged",
+            Align::Offset(_) => "by the given offset",
+            Align::Auto => "by searching for the best offset",
         };
         let _ = writeln!(
             o,
-            "frames: A {}, B {}; aligned on {align}: B = A {:+.6} s; compared {} s to {} s of A",
+            "frames: A {}, B {}; aligned {align}: B = A {:+.6} s; compared {} s to {} s of A",
             self.frames.0,
             self.frames.1,
             self.offset_ns as f64 / 1e9,

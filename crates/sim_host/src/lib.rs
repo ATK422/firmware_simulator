@@ -1,4 +1,6 @@
-//! Host bridges: RTT and defmt (M1), the GDB remote protocol (M1), SocketCAN and UDP (M3, M7), UART ptys.
+//! Host bridges: RTT and defmt (M1), the GDB remote protocol (M1), SocketCAN and UDP (M3, M7), UART ptys; and the
+//! host side of CAN testing: candump logs and replay ([`canlog`]), comparing logs ([`candiff`]), tunnels over UDP
+//! ([`cannelloni`]) and titan_bridge command lines for a robot ([`bridges`]).
 //!
 //! Bridges see the target through [`TargetMemory`] (debug-probe style memory access) so they work with any machine.
 

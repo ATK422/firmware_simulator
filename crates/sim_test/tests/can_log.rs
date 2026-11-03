@@ -142,3 +142,73 @@ fn bridge_on_the_far_side_of_a_cannelloni_tunnel() {
     assert!(watch.state().errors.is_empty());
     assert_eq!(far.rx_gaps, 0);
 }
+
+/// candump's text output for a frame (`candump -t a -x can0`): `(1700000000.123456)  can0  RX B -  123  [02]  AA BB`.
+fn candump_text(time_ns: u64, iface: &str, f: &sim_devices::can::CanFrame) -> String {
+    let id = if f.extended { format!("{:08X}", f.id) } else { format!("{:03X}", f.id) };
+    let len = if f.fd { format!("[{:02}]", f.data.len()) } else { format!("[{}]", f.data.len()) };
+    let data: Vec<String> = f.data.iter().map(|b| format!("{b:02X}")).collect();
+    let flags = if f.fd {
+        format!("{} {}", if f.brs { 'B' } else { '-' }, if f.esi { 'E' } else { '-' })
+    } else {
+        "- -".into()
+    };
+    format!(
+        "({}.{:06})  {iface}  RX {flags}  {id}  {len}  {}",
+        time_ns / 1_000_000_000,
+        time_ns % 1_000_000_000 / 1000,
+        data.join(" ")
+    )
+}
+
+/// The workflow against a hardware recording: a log in candump's text format, with Unix timestamps, the board's
+/// frames a little early or late, on `can0`. Its robot computer side is replayed into the emulated board, and the
+/// recording and the emulator's log compare identical once lined up (searched for), apart from that jitter.
+#[test]
+fn hardware_style_recording() {
+    let Some(bench) = power_board(true) else { return };
+    let (_, text) = logged_run(bench, Time::from_ms(3000));
+    let sim = canlog::parse(&text).unwrap();
+    const EPOCH: u64 = 1_700_000_000_000_000_000;
+    let mut seed = 12345u64;
+    let mut hw = String::new();
+    for f in &sim {
+        let board = canmore::id::Fields::decode(f.frame.id, f.frame.extended).direction
+            == canmore::id::Direction::ClientToAgent;
+        seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        // Up to ±150 µs, never reordering frames that were sent back to back
+        let jitter = if board { (seed >> 33) % 300_000 } else { 150_000 };
+        hw.push_str(&candump_text(EPOCH + f.time_ns + jitter - 150_000, "can0", &f.frame));
+        hw.push('\n');
+    }
+    let hw_log = canlog::parse(&hw).unwrap();
+    assert_eq!(hw_log.len(), sim.len());
+    assert!(hw_log.iter().zip(&sim).all(|(a, b)| a.frame == b.frame), "the text format round-trips frames");
+
+    // Replay what the robot computer sent, starting when it did relative to power-on
+    let mut b = power_board(false).unwrap();
+    let rates = b.session.can_bus.as_ref().unwrap().rates;
+    let first = Time::from_ns(sim[0].time_ns);
+    let opts = ReplayOptions {
+        ifaces: vec!["can0".into()],
+        filters: vec![Filter::parse("sender=host").unwrap()],
+        offset: first,
+        rates: Some(rates),
+        ..Default::default()
+    };
+    b.session.can_endpoints.push(Box::new(Replay::from_log(&hw_log, &opts)));
+    let (_, emulated) = logged_run(b, Time::from_ms(3000));
+    let mut emu = canlog::parse(&emulated).unwrap();
+    for f in &mut emu {
+        f.iface = "can0".into();
+    }
+    let opts = DiffOptions { align: candiff::Align::Auto, ..Default::default() };
+    let r = candiff::diff(&candiff::decode(&hw_log, false), &candiff::decode(&emu, false), &opts);
+    eprintln!("{}", r.render(3));
+    assert!(r.identical(), "{}", r.render(5));
+    assert!((r.offset_ns + EPOCH as i64).abs() < 200_000, "offset {}", r.offset_ns);
+    assert!(r.max_abs_skew_ns() < 400_000, "{}", r.max_abs_skew_ns());
+    let hb = r.streams.iter().find(|s| s.name.ends_with("board->host Heartbeat")).unwrap();
+    let jitter = hb.period_a.unwrap().std_ms;
+    assert!(jitter > 0.05 && hb.period_b.unwrap().std_ms < 0.05, "the recording's jitter shows: {jitter}");
+}
