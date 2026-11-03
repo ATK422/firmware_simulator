@@ -1941,16 +1941,20 @@ impl<'a> BatchBus<'a> {
         self.sys.xip_check(now, addr)
     }
 
+    /// Firmware polls the timer constantly (embassy-time, busy waits); reading it changes nothing the batch or the
+    /// machine would have to look at, so it skips the general peripheral path.
+    #[inline(never)]
+    fn timer_read(&mut self, addr: u32, size: Size) -> Result<u32, BusFault> {
+        let now = self.now();
+        match self.sys.timer.read(&self.sys.watchdog.tick, now, addr & 0xFFC) {
+            Some(v) => Ok(mem::lane(v, addr, size)),
+            None => self.slow_read(addr, size),
+        }
+    }
+
     #[inline(never)]
     fn slow_read(&mut self, addr: u32, size: Size) -> Result<u32, BusFault> {
         let now = self.now();
-        // Firmware polls the timer constantly (embassy-time, busy waits); reading it changes nothing the batch or
-        // the machine would have to look at
-        if addr & !0x3FFF == TIMER_BASE
-            && let Some(v) = self.sys.timer.read(&self.sys.watchdog.tick, now, addr & 0xFFC)
-        {
-            return Ok(mem::lane(v, addr, size));
-        }
         let r = self.sys.read(self.trace, self.core, now, addr, size);
         self.after_access(now);
         r
@@ -2007,6 +2011,9 @@ impl Bus for BatchBus<'_> {
         }
         if (addr as usize) < ROM_SIZE {
             return Ok(mem::read(&self.sys.rom, addr as usize, size));
+        }
+        if addr & !0x3FFF == TIMER_BASE {
+            return self.timer_read(addr, size);
         }
         self.slow_read(addr, size)
     }

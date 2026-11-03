@@ -6,29 +6,24 @@
 //! counters are computed lazily from virtual time; alarms and the watchdog timeout are scheduler events.
 
 use sim_core::bus::WriteMode;
+use std::cell::Cell;
+
 use sim_core::time::{ClockPeriod, Time};
 
 /// Derives tick counts from virtual time.
 #[derive(Clone, Debug)]
 pub struct TickGen {
-    pub enabled: bool,
-    pub cycles: u32,
+    enabled: bool,
+    cycles: u32,
     ref_period: ClockPeriod,
     base_time: Time,
     base_ticks: u64,
     /// The last count computed and a span of time known to give the same count (firmware polls the timer far
-    /// more often than it ticks, and each count costs two divisions).
-    cache: std::cell::Cell<TickCache>,
-}
-
-#[derive(Clone, Copy, Debug, Default, PartialEq)]
-struct TickCache {
-    /// The configuration the count was computed under: ENABLE, CYCLES, `clk_ref` and the base.
-    config: (bool, u32, u64, Time, u64),
-    /// Every time in `from..=to` gives `ticks`; empty (`from > to`) when nothing is cached.
-    from: Time,
-    to: Time,
-    ticks: u64,
+    /// more often than it ticks, and each count costs two divisions). Every change of the configuration above
+    /// empties it.
+    cache_from: Cell<Time>,
+    cache_to: Cell<Time>,
+    cache_ticks: Cell<u64>,
 }
 
 impl TickGen {
@@ -40,26 +35,39 @@ impl TickGen {
             ref_period: ClockPeriod::from_hz(clk_ref_hz),
             base_time: Time::ZERO,
             base_ticks: 0,
-            cache: std::cell::Cell::new(TickCache { from: Time::MAX, ..Default::default() }),
+            cache_from: Cell::new(Time::MAX),
+            cache_to: Cell::new(Time::ZERO),
+            cache_ticks: Cell::new(0),
         }
+    }
+
+    /// WATCHDOG.TICK.ENABLE.
+    pub fn enabled(&self) -> bool {
+        self.enabled
+    }
+
+    /// WATCHDOG.TICK.CYCLES: `clk_ref` cycles per tick.
+    pub fn cycles(&self) -> u32 {
+        self.cycles
     }
 
     fn running(&self) -> bool {
         self.enabled && self.cycles != 0 && !self.ref_period.is_stopped()
     }
 
+    /// Empties the count cache (the configuration is about to change).
+    fn forget(&mut self) {
+        self.cache_from.set(Time::MAX);
+        self.cache_to.set(Time::ZERO);
+    }
+
     /// Ticks generated since power-on.
     #[inline]
     pub fn ticks(&self, now: Time) -> u64 {
-        let c = self.cache.get();
-        if c.from <= now && now <= c.to && c.config == self.config() {
-            return c.ticks;
+        if self.cache_from.get() <= now && now <= self.cache_to.get() {
+            return self.cache_ticks.get();
         }
         self.ticks_uncached(now)
-    }
-
-    fn config(&self) -> (bool, u32, u64, Time, u64) {
-        (self.enabled, self.cycles, self.ref_period.hz(), self.base_time, self.base_ticks)
     }
 
     #[inline(never)]
@@ -72,13 +80,14 @@ impl TickGen {
             _ => now,
         };
         let mut from = now;
-        let config = self.config();
-        let c = self.cache.get();
-        if c.config == config && c.ticks == ticks && c.from <= c.to {
-            from = from.min(c.from);
-            to = to.max(c.to);
+        let (old_from, old_to) = (self.cache_from.get(), self.cache_to.get());
+        if self.cache_ticks.get() == ticks && old_from <= old_to {
+            from = from.min(old_from);
+            to = to.max(old_to);
         }
-        self.cache.set(TickCache { config, from, to, ticks });
+        self.cache_from.set(from);
+        self.cache_to.set(to);
+        self.cache_ticks.set(ticks);
         ticks
     }
 
@@ -105,6 +114,7 @@ impl TickGen {
     pub fn rebase(&mut self, now: Time) {
         self.base_ticks = self.ticks(now);
         self.base_time = now;
+        self.forget();
     }
 
     /// `clk_ref` changed frequency at `now`.
@@ -112,6 +122,7 @@ impl TickGen {
         if self.ref_period.hz() != hz {
             self.rebase(now);
             self.ref_period = ClockPeriod::from_hz(hz);
+            self.forget();
         }
     }
 
@@ -134,6 +145,7 @@ impl TickGen {
         self.rebase(now);
         self.cycles = value & 0x1FF;
         self.enabled = value & (1 << 9) != 0;
+        self.forget();
     }
 }
 
