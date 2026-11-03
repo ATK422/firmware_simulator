@@ -26,6 +26,9 @@ added_mass = [8.0, 25.0, 30.0, 0.5, 1.2, 1.0]
 # of 0.27 (surge), 0.38 (sway) and 0.51 m2 (heave)
 linear_drag = [10.0, 15.0, 20.0, 2.0, 3.0, 3.0]
 quadratic_drag = [120.0, 190.0, 280.0, 3.0, 5.0, 5.0]
+# The potential-flow Munk moment would pitch it over at full speed (heave added mass well above surge); an open
+# frame sheds the flow and feels much less of it
+munk_moment_scale = 0.25
 
 # T200 at 16 V (Blue Robotics' published curve): about 5.25 kgf forward, 4.1 kgf reverse near 3800 RPM
 thruster_model = { forward_n = 51.5, reverse_n = 40.2, at_rpm = 3800.0 }

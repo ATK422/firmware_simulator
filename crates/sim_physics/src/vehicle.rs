@@ -10,7 +10,10 @@
 //! ```
 //!
 //! so the added mass shows up both as inertia and as the Munk moment (`v x p`) that turns a body moving through
-//! water broadside. `F` and `T` are the sum of
+//! water broadside. That moment is the potential-flow value; an open frame sheds the flow and feels much less of
+//! it, so a vehicle file can scale it down (`munk_moment_scale`): at full strength a bluff vehicle whose heave added
+//! mass is well above its surge added mass pitches over at speed unless its buoyancy is far above its weight.
+//! `F` and `T` are the sum of
 //! * gravity, `m g` down at the centre of gravity;
 //! * buoyancy, `rho g V` up at the centre of buoyancy (above the centre of gravity for a stable vehicle, which then
 //!   rights itself in roll and pitch). Near the surface only part of the hull is under water: the vehicle is taken as
@@ -83,6 +86,13 @@ pub struct Params {
     pub linear_drag: [f64; 6],
     /// Quadratic damping per axis: N/(m/s)², N m/(rad/s)².
     pub quadratic_drag: [f64; 6],
+    /// How much of the potential-flow Munk moment acts (1, the default, is all of it).
+    #[serde(default = "one")]
+    pub munk_moment_scale: f64,
+}
+
+fn one() -> f64 {
+    1.0
 }
 
 impl Params {
@@ -389,7 +399,8 @@ fn deriv(p: &Params, w: &Water, s: &State, thrust: &Wrench) -> Deriv {
     let lin = mul(m_lin, s.velocity);
     let ang = mul(m_rot, s.rate);
     let dlin = sub(total.force, cross(s.rate, lin));
-    let dang = sub(sub(total.torque, cross(s.rate, ang)), cross(s.velocity, lin));
+    let munk = scale(cross(s.velocity, lin), p.munk_moment_scale);
+    let dang = sub(sub(total.torque, cross(s.rate, ang)), munk);
     Deriv {
         position: s.attitude.rotate(s.velocity),
         attitude: s.attitude.derivative(s.rate),
@@ -419,6 +430,7 @@ mod tests {
                 added_mass: [10.0, 20.0, 30.0, 0.5, 1.0, 1.0],
                 linear_drag: [20.0, 30.0, 40.0, 3.0, 4.0, 4.0],
                 quadratic_drag: [40.0, 60.0, 80.0, 1.0, 1.0, 1.0],
+                munk_moment_scale: 1.0,
             },
             thruster_model: Some(ThrustCurve { forward_n: 50.0, reverse_n: 40.0, at_rpm: 4000.0 }),
             thruster: thrusters
@@ -615,6 +627,20 @@ mod tests {
         run(&mut v, 5.0, &[4000.0]);
         assert!(v.state.position[0] - x > 1.0, "{}", v.state.position[0] - x);
         assert!(v.state.position[2] < 3.0);
+    }
+
+    #[test]
+    fn the_munk_moment_turns_a_moving_body_broadside() {
+        // Moving ahead and a little upwards relative to the hull (the nose below the path): with 30 kg of heave
+        // added mass against 10 kg in surge, the moment (Z_w' - X_u') u w turns the nose further down
+        let mut v = vehicle(1.0, &[]);
+        v.state.velocity = [1.0, 0.0, -0.05];
+        let d = deriv(&v.params, &v.water, &v.state, &Wrench::default());
+        let expected = -(30.0 - 10.0) * 1.0 * 0.05 / (2.0 + 1.0);
+        assert!((d.rate[1] - expected).abs() < 1e-9, "{} vs {expected}", d.rate[1]);
+        v.params.munk_moment_scale = 0.25;
+        let d = deriv(&v.params, &v.water, &v.state, &Wrench::default());
+        assert!((d.rate[1] - expected / 4.0).abs() < 1e-9);
     }
 
     #[test]

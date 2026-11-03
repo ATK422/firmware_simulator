@@ -4,7 +4,9 @@
 # horizontal and four vertical). The mass, inertia, added mass and drag are the BlueROV2 Heavy's as identified in
 # the literature (e.g. von Benzon et al., "An Open-Source Benchmark Simulator: Control of a BlueROV2 Underwater
 # Robot", JMSE 2022), rounded, with small linear terms added where the identification found none; the thruster
-# positions are the BlueROV2 Heavy frame's. None of it was measured on Puddles.
+# positions are the BlueROV2 Heavy frame's, except that the horizontal thrusters' line of thrust is taken through
+# the centre of gravity (8.5 cm below it, as in that frame, the 13 kg vehicle would pitch tens of degrees at full
+# thrust against its small righting moment). None of it was measured on Puddles.
 #
 # Frames: body x forward, y starboard, z down, from the centre of gravity (m). Thruster `direction` is the way it
 # pushes the vehicle at positive RPM.
@@ -14,11 +16,15 @@ mass_kg = 13.5
 # 1 N of net buoyancy in fresh water
 volume_m3 = 0.0136429
 inertia_kg_m2 = [0.26, 0.23, 0.37]
-cob_m = [0.0, 0.0, -0.02]
+# Buoyancy (the foam on top) 3 cm above the weight
+cob_m = [0.0, 0.0, -0.03]
 height_m = 0.34
 added_mass = [6.4, 7.1, 18.7, 0.19, 0.14, 0.22]
 linear_drag = [13.7, 5.0, 33.0, 0.3, 0.8, 0.5]
 quadratic_drag = [141.0, 217.0, 190.0, 1.2, 0.5, 1.5]
+# The potential-flow Munk moment would pitch it over at speed (its heave added mass is three times the surge one);
+# an open frame sheds the flow and feels much less of it
+munk_moment_scale = 0.25
 
 # T200 at 16 V: about 5.25 kgf forward, 4.1 kgf reverse near 3800 RPM
 thruster_model = { forward_n = 51.5, reverse_n = 40.2, at_rpm = 3800.0 }
@@ -27,22 +33,22 @@ thruster_model = { forward_n = 51.5, reverse_n = 40.2, at_rpm = 3800.0 }
 # pair (1, 3) ahead and the port pair (2, 4) astern turn it to port
 [[thruster]]
 name = "t1"
-position_m = [0.156, 0.111, 0.085]
+position_m = [0.156, 0.111, 0.0]
 direction = [1.0, -1.0, 0.0]
 
 [[thruster]]
 name = "t2"
-position_m = [0.156, -0.111, 0.085]
+position_m = [0.156, -0.111, 0.0]
 direction = [1.0, 1.0, 0.0]
 
 [[thruster]]
 name = "t3"
-position_m = [-0.156, 0.111, 0.085]
+position_m = [-0.156, 0.111, 0.0]
 direction = [1.0, 1.0, 0.0]
 
 [[thruster]]
 name = "t4"
-position_m = [-0.156, -0.111, 0.085]
+position_m = [-0.156, -0.111, 0.0]
 direction = [1.0, -1.0, 0.0]
 
 # Thrusters 5-8 (GPIO 21-18): vertical; positive RPM pushes the vehicle down (dives)
