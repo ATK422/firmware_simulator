@@ -96,7 +96,6 @@ impl<S: Read + Write> Connection<S> {
     }
 
     pub fn send(&mut self, payload: &str) -> io::Result<()> {
-        let sum = payload.bytes().fold(0u8, |a, b| a.wrapping_add(b));
         let mut out = String::with_capacity(payload.len() + 4);
         out.push('$');
         for c in payload.chars() {
@@ -108,6 +107,8 @@ impl<S: Read + Write> Connection<S> {
                 out.push(c);
             }
         }
+        // The checksum is over the packet data as transmitted, escapes included
+        let sum = out.bytes().skip(1).fold(0u8, |a, b| a.wrapping_add(b));
         out.push('#');
         out.push_str(&format!("{sum:02x}"));
         self.stream.write_all(out.as_bytes())?;
@@ -512,10 +513,8 @@ mod tests {
         c.send("OK").unwrap();
         assert!(c.stream.output.ends_with(b"$OK#9a"));
         c.send("a#b").unwrap();
-        assert!(
-            c.stream.output.ends_with(b"$a}\x03b#"[..].as_ref())
-                || String::from_utf8_lossy(&c.stream.output).contains("a}\u{3}b#")
-        );
+        // The checksum covers the packet data as sent, escapes included: 'a' + '}' + 0x03 + 'b' = 0x143
+        assert!(c.stream.output.ends_with(b"$a}\x03b#43"), "{:?}", String::from_utf8_lossy(&c.stream.output));
     }
 
     #[test]
