@@ -254,3 +254,31 @@ fn docker_files_are_consistent() {
         "emulator host docker/emulator/Dockerfile\nrobot_computer host docker/robot_computer/Dockerfile\ntools host -\n"
     );
 }
+
+/// A hardware log's interfaces have to be mapped to the robot's buses.
+#[test]
+fn robot_replay_maps_interfaces() {
+    if !talos_built() {
+        return;
+    }
+    let d = scratch("map");
+    let log = d.join("hw.log");
+    std::fs::write(&log, "(1700000000.000000) can0 070#01\n(1700000000.000100) can1 070#02\n").unwrap();
+    let robot = |extra: &[&str]| {
+        let mut c = exe();
+        c.args(["robot", "robots/talos.toml", "--time", "1ms", "--replay"]).arg(&log).args(extra).current_dir(repo());
+        run(&mut c)
+    };
+    let (code, _, err) = robot(&[]);
+    assert_ne!(code, 0);
+    assert!(err.contains("no bus for interface \"can0\"; map it with --replay-iface can0=BUS"), "{err}");
+    let (code, _, err) = robot(&["--replay-iface", "can0=internal", "--replay-iface", "can1=external"]);
+    assert_eq!(code, 0, "{err}");
+    assert!(err.contains("(can0 -> internal): 1 of 1 frame(s) sent"), "{err}");
+    assert!(err.contains("(can1 -> external): 1 of 1 frame(s) sent"), "{err}");
+    // An interface left out on purpose is skipped with a warning
+    let (code, _, err) = robot(&["--replay-iface", "can0=internal"]);
+    assert_eq!(code, 0, "{err}");
+    assert!(err.contains("frames on can1 are not replayed"), "{err}");
+    let _ = std::fs::remove_dir_all(&d);
+}
