@@ -204,6 +204,9 @@ fn parse_long(tokens: &[&str]) -> Result<Option<CanFrame>, String> {
     let n: usize = digits.parse().map_err(|_| format!("bad length {len:?}"))?;
     // candump prints a CAN FD length with two digits, a classic one with one
     let fd = digits.len() == 2;
+    if n > if fd { 64 } else { 8 } {
+        return Err(format!("{n} bytes in a {} frame", if fd { "CAN FD" } else { "classic" }));
+    }
     if !fd && rest.first() == Some(&"remote") {
         let mut f = CanFrame::classic(id, extended, &vec![0; n.min(8)]);
         f.rtr = true;
@@ -648,6 +651,12 @@ mod tests {
         assert!(parse("(1.0 can0 06F#C0").is_err(), "unterminated timestamp");
         assert!(parse("(1.0) can0 06F#001122334455667788").is_err(), "nine bytes in a classic frame");
         assert!(parse("(1.0) can0 06F  [2]  01").is_err(), "short data");
+        // candump's text output is held to the same limits as `-l` lines (a 65 byte frame would overrun a SocketCAN
+        // frame's 64 byte buffer when replayed onto a bridged interface)
+        let bytes = |n: usize| vec!["00"; n].join(" ");
+        assert!(parse(&format!("(1.0) can0 06F  [65]  {}", bytes(65))).is_err(), "65 bytes in a CAN FD frame");
+        assert!(parse(&format!("(1.0) can0 06F  [9]  {}", bytes(9))).is_err(), "nine bytes in a classic frame");
+        assert!(parse(&format!("(1.0) can0 06F  [64]  {}", bytes(64))).is_ok());
         // Timestamps past what nanoseconds in a u64 hold are errors, not wrapped (or, with overflow checks, a panic)
         assert!(parse("(18446744074.000000) can0 06F#C0").is_err(), "584 years of nanoseconds");
         assert!(parse("(18446744073.709551) can0 06F#C0").is_ok());
