@@ -75,8 +75,8 @@ timing), not a hardware measurement.
 `Session::run_machine` runs the machine through the session's `Profiler` when it has one: the profiler cuts
 `Machine::run_until` at each sample time and records both cores' stacks there. There is no per-instruction hook;
 without a profiler nothing changes. Robots run their boards through the same call, and with `--threads` each
-board's profiler travels to the worker thread with its machine (`sim_host::parallel`), so the samples are the same
-on any number of threads (`crates/sim_host/tests/parallel.rs`).
+board's profiler runs on the thread that runs its board (`sim_host::parallel`), so the samples are the same on any
+number of threads (`crates/sim_host/tests/parallel.rs`).
 
 Cutting a run is what a session's 100 µs slices do anyway, so on one core a profiled program runs exactly as an
 unprofiled one: batched execution stays on and timer busy-waits are still skipped whole quanta at a time, only less
@@ -228,7 +228,7 @@ then `boards` (each with `name`, `image`, `powered`, `resets`, `cores`, `gpio`, 
 The run loop owns the boards; the server threads (std::net, one per connection) never touch them. With a
 dashboard, `run` and `robot` advance in 10 ms pieces of virtual time; between pieces the loop applies posted
 commands, answers them and, when due, builds a fresh state from what is already there (registers, pin levels,
-device models, the mock bridges' records). With `--threads` the boards are back on the loop's thread by then. A
+device models, the mock bridges' records). With `--threads` the worker threads are done with the boards by then. A
 session already runs in 100 µs slices and a robot's slices do not change, so a dashboard does not change the
 run. It works with `--realtime`: pacing carries across the pieces, and resuming after a pause starts pacing afresh
 so the run does not race to catch up.

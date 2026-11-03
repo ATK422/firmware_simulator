@@ -233,8 +233,9 @@ Measured with `cargo run --release -p sim_test --example bench -- --time 2s --re
 | IVC2 pool (two boards in the water) | 2.2 s | about 0.9x |
 | Talos (nine boards) | 4.7 s | about 0.4x |
 
-So single boards run at or above real time, and all of Talos with `--realtime` does not keep up on one core
-(`--threads` can help on an idle multi-core machine). Details: [internals.md](docs/internals.md#performance),
+So single boards run at or above real time. All of Talos with `--realtime` does not keep up: its boards run on
+threads by default (`--threads`), which makes it about 1.7x faster (0.72x real time), but the two ESC boards set
+the pace. Details: [internals.md](docs/internals.md#performance),
 [robots.md](docs/robots.md#how-a-robot-runs).
 
 **Determinism.** The same image, board or robot file, inputs, faults and seeds give the same run, instruction for
