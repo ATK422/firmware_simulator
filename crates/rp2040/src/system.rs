@@ -5,19 +5,24 @@
 //! `+0x1000/+0x2000/+0x3000` reach each model as a [`WriteMode`]. Registers no model claims fall through to the
 //! [`Unmodelled`] fallback, which names them from the SVD.
 
+use sim_core::analog::{AnalogSource, Signal};
 use sim_core::bus::{Bus, BusFault, Size, WriteMode, mem};
 use sim_core::sched::Scheduler;
 use sim_core::time::{ClockPeriod, Time};
 use sim_core::trace::{Category, TraceEvent, TraceSink};
 use sim_core::wire::External;
 use sim_devices::DeviceCtx;
+use sim_devices::i2c::I2cDevice;
 use sim_devices::spi::SpiDevice;
+use sim_devices::uart::UartDevice;
 
 use crate::irq;
 use crate::memmap::*;
+use crate::periph::adc::{self, Adc};
 use crate::periph::clocks::{Clocks, Freqs, Pll};
 use crate::periph::dma::{self, Dma, DmaBus};
 use crate::periph::gpio::{Drive, Gpio, func};
+use crate::periph::i2c::{I2c, Step, StepResult};
 use crate::periph::pwm::Pwm;
 use crate::periph::sio::Sio;
 use crate::periph::spi::Spi;
@@ -42,6 +47,10 @@ pub enum Event {
     UartTx(u8),
     /// UART n received a byte from the host, or its receive timeout expired.
     UartRx(u8),
+    /// I2C n finished a bus step.
+    I2cStep(u8),
+    /// An ADC conversion ends or starts.
+    Adc,
     /// Core 1 comes out of reset after its PSM force-off was released (handled by the machine).
     Core1Boot,
     /// Wakes the run loop at a given time without doing anything (host input, test hooks).
@@ -84,6 +93,22 @@ pub struct System {
     pub dma: Dma,
     /// Devices on the SPI buses.
     pub spi_devices: Vec<SpiAttachment>,
+    /// Devices on the UARTs' TX/RX lines, and how much of each UART's output they have seen.
+    pub uart_devices: [Option<Box<dyn UartDevice>>; 2],
+    uart_device_seen: [usize; 2],
+    pub i2c: [I2c; 2],
+    /// Devices on the I2C buses.
+    pub i2c_devices: Vec<I2cAttachment>,
+    /// The device addressed by the transfer in progress on each I2C bus (index into `i2c_devices`).
+    i2c_target: [Option<usize>; 2],
+    pub adc: Adc,
+    /// What drives ADC inputs 0-3 (GPIO 26-29). Unconnected inputs read 0 V.
+    pub analog_inputs: [Option<Box<dyn AnalogSource>>; 4],
+    /// Die temperature in °C, for the temperature sensor (ADC input 4).
+    pub chip_temp_c: Signal,
+    /// ADC reference (the boards' 3.3 V rail).
+    pub adc_vref: f64,
+    clk_adc: ClockPeriod,
     /// Pulse-type DMA requests not yet consumed (PWM wraps), by DREQ number.
     pub dreq_pulses: [u32; 64],
     in_dma: bool,
@@ -144,6 +169,16 @@ impl System {
             spi: [Spi::new(0), Spi::new(1)],
             dma: Dma::default(),
             spi_devices: Vec::new(),
+            uart_devices: [None, None],
+            uart_device_seen: [0; 2],
+            i2c: [I2c::new(0), I2c::new(1)],
+            i2c_devices: Vec::new(),
+            i2c_target: [None; 2],
+            adc: Adc::default(),
+            analog_inputs: [None, None, None, None],
+            chip_temp_c: Signal::Const(27.0),
+            adc_vref: 3.3,
+            clk_adc: ClockPeriod::from_hz(freqs.clk_adc),
             dreq_pulses: [0; 64],
             in_dma: false,
             clk_peri: ClockPeriod::from_hz(freqs.clk_peri),
@@ -179,6 +214,11 @@ impl System {
         for s in &mut self.spi {
             s.reset();
         }
+        for i in &mut self.i2c {
+            i.reset();
+        }
+        self.i2c_target = [None; 2];
+        self.adc = Adc::default();
         self.dma = Dma::default();
         self.dreq_pulses = [0; 64];
         self.unmodelled.reset();
@@ -224,6 +264,15 @@ impl System {
         if self.uart[1].irq() {
             lines |= 1 << irq::UART1_IRQ;
         }
+        if self.adc.irq() {
+            lines |= 1 << irq::ADC_IRQ_FIFO;
+        }
+        if self.i2c[0].irq() {
+            lines |= 1 << irq::I2C0_IRQ;
+        }
+        if self.i2c[1].irq() {
+            lines |= 1 << irq::I2C1_IRQ;
+        }
         lines
     }
 
@@ -252,6 +301,11 @@ impl System {
                 self.reschedule_pwm(now);
             }
         }
+        if new.clk_adc != old.clk_adc {
+            self.adc_advance(&mut sim_core::trace::NullSink, now);
+            self.clk_adc = ClockPeriod::from_hz(new.clk_adc);
+            self.adc_advance(&mut sim_core::trace::NullSink, now);
+        }
         if new.clk_peri != old.clk_peri {
             for n in 0..2 {
                 self.uart_advance(n, now);
@@ -264,6 +318,9 @@ impl System {
     /// Advances UART `n` to `now` and schedules its next byte boundary.
     fn uart_advance(&mut self, n: usize, now: Time) {
         let s = self.uart[n].advance(&self.clk_peri, now);
+        if self.uart_devices[n].is_some() {
+            self.uart_feed_device(n, now);
+        }
         match s.tx_done {
             Some(t) => self.sched.schedule(Event::UartTx(n as u8), t),
             None => {
@@ -277,6 +334,40 @@ impl System {
             }
         }
         self.irq_dirty = true;
+    }
+
+    /// Hands bytes UART `n` transmitted since the last call to its device and queues the device's answers.
+    fn uart_feed_device(&mut self, n: usize, now: Time) {
+        let out = &self.uart[n].output;
+        if out.len() < self.uart_device_seen[n] {
+            // The host drained the output buffer
+            self.uart_device_seen[n] = 0;
+        }
+        let new: Vec<u8> = out[self.uart_device_seen[n]..].iter().map(|(_, b)| *b).collect();
+        self.uart_device_seen[n] = out.len();
+        if new.is_empty() {
+            return;
+        }
+        let mut replies = Vec::new();
+        if let Some(dev) = &mut self.uart_devices[n] {
+            let mut ctx = DevPins { now, gpio: &mut self.gpio, freqs: &self.freqs, changed: false };
+            for b in new {
+                replies.extend(dev.receive(&mut ctx, b));
+            }
+        }
+        if !replies.is_empty() {
+            self.uart[n].inject(&replies);
+            let s = self.uart[n].advance(&self.clk_peri, now);
+            if let Some(t) = s.rx_next {
+                self.sched.schedule(Event::UartRx(n as u8), t);
+            }
+        }
+    }
+
+    /// Attaches a device to UART `n`'s TX and RX lines.
+    pub fn attach_uart(&mut self, n: usize, dev: Box<dyn UartDevice>) {
+        self.uart_devices[n] = Some(dev);
+        self.uart_device_seen[n] = self.uart[n].output.len();
     }
 
     /// Queues bytes for UART `n` to receive (from a host pty, a test or a device).
@@ -309,6 +400,16 @@ impl System {
                     self.sched.cancel(Event::SpiFrame(i as u8));
                 }
                 bit::DMA => self.dma = Dma::default(),
+                bit::I2C0 | bit::I2C1 => {
+                    let i = (n - bit::I2C0) as usize;
+                    self.i2c[i].reset();
+                    self.i2c_target[i] = None;
+                    self.sched.cancel(Event::I2cStep(i as u8));
+                }
+                bit::ADC => {
+                    self.adc = Adc::default();
+                    self.sched.cancel(Event::Adc);
+                }
                 bit::UART0 | bit::UART1 => {
                     let i = (n - bit::UART0) as usize;
                     self.uart[i].reset();
@@ -375,7 +476,7 @@ impl System {
         let clk = self.clk_sys;
         let changed = self.gpio.evaluate(|f, pin| match f {
             func::SIO => Drive { out: sio_out & (1 << pin) != 0, oe: sio_oe & (1 << pin) != 0 },
-            func::PWM => Drive { out: pwm.pin_output(&clk, now, pin), oe: true },
+            func::PWM if pwm.drives_pin(pin) => Drive { out: pwm.pin_output(&clk, now, pin), oe: true },
             // SPI: SCK idles at CPOL, TX low, the hardware chip select is low while a frame is on the wire
             func::SPI => {
                 let spi = &spis[(pin >> 3) & 1];
@@ -393,6 +494,9 @@ impl System {
         });
         if changed != 0 {
             self.irq_dirty = true;
+            if self.pwm.input_slices() != 0 {
+                self.update_pwm_inputs(now);
+            }
             if trace.wants(Category::Gpio) {
                 for pin in 0..NUM_GPIOS as u8 {
                     if changed & (1 << pin) != 0 {
@@ -402,6 +506,29 @@ impl System {
             }
             self.update_chip_selects(trace, now);
         }
+    }
+
+    /// Reports B pin levels to PWM slices counting on them.
+    fn update_pwm_inputs(&mut self, now: Time) {
+        let slices = self.pwm.input_slices();
+        if slices == 0 {
+            return;
+        }
+        let inputs = self.gpio.inputs();
+        for slice in 0..8 {
+            if slices & (1 << slice) == 0 {
+                continue;
+            }
+            // B of slice n is on GPIO 2n+1 and 2n+17
+            let pin = [2 * slice + 1, 2 * slice + 17]
+                .into_iter()
+                .find(|&p| p < NUM_GPIOS && self.gpio.funcsel(p) == func::PWM);
+            if let Some(p) = pin {
+                let clk = self.clk_sys;
+                self.pwm.set_input(&clk, now, slice, inputs & (1 << p) != 0);
+            }
+        }
+        self.reschedule_pwm(now);
     }
 
     /// Tells SPI devices about chip select changes; devices may drive pins in response.
@@ -430,6 +557,11 @@ impl System {
             att.dev.update(&mut ctx);
             pins_changed |= ctx.changed;
         }
+        for att in &mut self.i2c_devices {
+            let mut ctx = DevPins { now, gpio: &mut self.gpio, freqs: &self.freqs, changed: false };
+            att.dev.update(&mut ctx);
+            pins_changed |= ctx.changed;
+        }
         if pins_changed {
             self.update_pins(trace, now);
         }
@@ -438,6 +570,168 @@ impl System {
     /// Attaches an SPI device to bus `bus` with its chip select on GPIO `cs_pin` (active low).
     pub fn attach_spi(&mut self, bus: usize, cs_pin: u8, dev: Box<dyn SpiDevice>) {
         self.spi_devices.push(SpiAttachment { bus, cs_pin, cs_active_high: false, selected: false, dev });
+    }
+
+    /// Attaches an I2C device to bus `bus` (I2C0 or I2C1).
+    pub fn attach_i2c(&mut self, bus: usize, dev: Box<dyn I2cDevice>) {
+        self.i2c_devices.push(I2cAttachment { bus, dev });
+    }
+
+    /// The first I2C device model of type `T`.
+    pub fn i2c_device<T: 'static>(&self) -> Option<&T> {
+        self.i2c_devices.iter().find_map(|a| a.dev.as_any().downcast_ref::<T>())
+    }
+
+    /// Connects ADC input `input` (0-3, GPIO 26-29) to an analog source.
+    pub fn attach_analog(&mut self, input: usize, source: Box<dyn AnalogSource>) {
+        self.analog_inputs[input] = Some(source);
+    }
+
+    /// Whether I2C `n` has both SDA and SCL routed to pins.
+    fn i2c_pins_connected(&self, n: usize) -> bool {
+        let mut sda = false;
+        let mut scl = false;
+        for p in 0..NUM_GPIOS {
+            if self.gpio.funcsel(p) == func::I2C && (p >> 1) & 1 == n {
+                if p % 2 == 0 {
+                    sda = true;
+                } else {
+                    scl = true;
+                }
+            }
+        }
+        sda && scl
+    }
+
+    /// Runs I2C `n` up to `now`: finishes the step on the wire, puts the next commands on the bus (performing them
+    /// on the devices) and schedules the next step end.
+    fn i2c_advance(&mut self, trace: &mut dyn TraceSink, n: usize, now: Time) {
+        for _ in 0..64 {
+            let mut progressed = false;
+            if self.i2c[n].finish(now) {
+                progressed = true;
+            }
+            if !self.i2c[n].busy()
+                && let Some(step) = self.i2c[n].next_step()
+            {
+                let at = self.i2c[n].next_event().unwrap_or(now).max(now);
+                let result = self.i2c_perform(trace, n, step, at);
+                let clk = self.clk_sys;
+                self.i2c[n].begin(step, result, &clk, at);
+                progressed = true;
+            }
+            if self.service_dma(trace, now) {
+                progressed = true;
+            }
+            if !progressed || self.i2c[n].next_event().is_some_and(|t| t > now) {
+                break;
+            }
+        }
+        match self.i2c[n].next_event() {
+            Some(t) => self.sched.schedule(Event::I2cStep(n as u8), t.max(now)),
+            None => {
+                self.sched.cancel(Event::I2cStep(n as u8));
+            }
+        }
+        self.irq_dirty = true;
+    }
+
+    /// Performs one bus step on the devices of I2C `n`.
+    fn i2c_perform(&mut self, trace: &mut dyn TraceSink, n: usize, step: Step, at: Time) -> StepResult {
+        let mut r = StepResult { addr_ack: true, data_ack: true, read: 0xFF, stretch: Time::ZERO };
+        let connected = self.i2c_pins_connected(n);
+        let mut ctx = DevPins { now: at, gpio: &mut self.gpio, freqs: &self.freqs, changed: false };
+        if let Some((addr, read)) = step.start {
+            let target = if connected {
+                self.i2c_devices.iter().position(|a| a.bus == n && a.dev.responds_to(addr))
+            } else {
+                None
+            };
+            self.i2c_target[n] = target;
+            r.addr_ack = match target {
+                Some(i) => self.i2c_devices[i].dev.start(&mut ctx, addr, read),
+                None => false,
+            };
+            if trace.wants(Category::Device) {
+                trace.event(
+                    at,
+                    TraceEvent::Device {
+                        source: format!("i2c{n}"),
+                        message: format!(
+                            "{} {addr:#04x} {}",
+                            if step.restart { "Sr" } else { "S" },
+                            if read { "R" } else { "W" }
+                        ) + if r.addr_ack { "" } else { " NAK" },
+                    },
+                );
+            }
+            if !r.addr_ack {
+                if let Some(i) = target {
+                    self.i2c_devices[i].dev.stop(&mut ctx);
+                }
+                self.i2c_target[n] = None;
+                let changed = ctx.changed;
+                if changed {
+                    self.update_pins(trace, at);
+                }
+                return r;
+            }
+        }
+        match self.i2c_target[n] {
+            Some(i) => {
+                let dev = &mut self.i2c_devices[i].dev;
+                r.stretch = dev.stretch(&mut ctx);
+                match step.write {
+                    Some(b) => r.data_ack = dev.write(&mut ctx, b),
+                    None => r.read = dev.read(&mut ctx, step.ack),
+                }
+                if step.stop || (step.write.is_some() && !r.data_ack) {
+                    dev.stop(&mut ctx);
+                    self.i2c_target[n] = None;
+                }
+            }
+            None => r.data_ack = false,
+        }
+        let changed = ctx.changed;
+        if changed {
+            self.update_pins(trace, at);
+        }
+        r
+    }
+
+    /// Voltage on ADC input `input` at `t`.
+    fn analog_voltage(&mut self, input: u8, t: Time) -> f64 {
+        match input {
+            0..=3 => {
+                let pins = self.gpio.level;
+                self.analog_inputs[input as usize].as_mut().map_or(0.0, |s| s.voltage(t, pins))
+            }
+            4 if self.adc.temp_sensor_enabled() => adc::temp_sensor_volts(self.chip_temp_c.at(t)),
+            _ => 0.0,
+        }
+    }
+
+    /// Runs the ADC up to `now`: finishes conversions (sampling their inputs), starts new ones, lets the DMA drain
+    /// the FIFO, and schedules the next conversion.
+    fn adc_advance(&mut self, trace: &mut dyn TraceSink, now: Time) {
+        let clk = self.clk_adc;
+        for _ in 0..10_000 {
+            self.adc.advance(&clk, now);
+            let Some((input, at)) = self.adc.take_due(now) else { break };
+            let v = self.analog_voltage(input, at);
+            let code = adc::code_for(v, self.adc_vref);
+            self.adc.complete(code, &clk, at);
+            if self.adc.dreq() {
+                self.service_dma(trace, at);
+            }
+        }
+        match self.adc.next_event().filter(|_| !clk.is_stopped()) {
+            Some(t) => self.sched.schedule(Event::Adc, t.max(now)),
+            None => {
+                self.sched.cancel(Event::Adc);
+            }
+        }
+        self.irq_dirty = true;
     }
 
     /// Runs SPI `n` up to `now`: completes frames (exchanging them with the selected devices), starts the next
@@ -530,6 +824,11 @@ impl System {
             dma::dreq::UART0_RX => self.uart[0].rx_dreq(),
             dma::dreq::UART1_TX => self.uart[1].tx_dreq(),
             dma::dreq::UART1_RX => self.uart[1].rx_dreq(),
+            dma::dreq::I2C0_TX => self.i2c[0].tx_dreq(),
+            dma::dreq::I2C0_RX => self.i2c[0].rx_dreq(),
+            dma::dreq::I2C1_TX => self.i2c[1].tx_dreq(),
+            dma::dreq::I2C1_RX => self.i2c[1].rx_dreq(),
+            dma::dreq::ADC => self.adc.dreq(),
             24..=31 => self.dreq_pulses[n as usize] > 0,
             _ => false,
         }
@@ -564,6 +863,8 @@ impl System {
                 self.service_dma(trace, t);
             }
             Event::SpiFrame(n) => self.spi_advance(trace, n as usize, t),
+            Event::I2cStep(n) => self.i2c_advance(trace, n as usize, t),
+            Event::Adc => self.adc_advance(trace, t),
             Event::Core1Boot | Event::External(_) => {}
         }
     }
@@ -611,6 +912,19 @@ impl System {
                 v
             }
             DMA_BASE => self.dma.read(off),
+            I2C0_BASE | I2C1_BASE => {
+                let n = (base == I2C1_BASE) as usize;
+                self.i2c_advance(trace, n, now);
+                let v = self.i2c[n].read(off);
+                self.i2c_advance(trace, n, now);
+                v
+            }
+            ADC_BASE => {
+                self.adc_advance(trace, now);
+                let v = self.adc.read(off);
+                self.irq_dirty = true;
+                v
+            }
             UART0_BASE | UART1_BASE => {
                 let n = (base == UART1_BASE) as usize;
                 let v = self.uart[n].read(&self.clk_peri, now, off);
@@ -681,6 +995,7 @@ impl System {
             PWM_BASE => self.pwm.write(&self.clk_sys, now, off, value, mode).then(|| {
                 self.irq_dirty = true;
                 self.update_pins(trace, now);
+                self.update_pwm_inputs(now);
                 self.reschedule_pwm(now);
             }),
             TIMER_BASE => self.timer.write(&self.watchdog.tick, now, off, value, mode).map(|alarms| {
@@ -711,6 +1026,23 @@ impl System {
                 let ok = self.dma.write(off, value, mode);
                 self.irq_dirty = true;
                 self.service_dma(trace, now);
+                ok.then_some(())
+            }
+            I2C0_BASE | I2C1_BASE => {
+                let n = (base == I2C1_BASE) as usize;
+                self.i2c_advance(trace, n, now);
+                let ok = self.i2c[n].write(off, value, mode);
+                if off == crate::periph::i2c::IC_ENABLE && !self.i2c[n].holds_bus() {
+                    self.i2c_target[n] = None;
+                }
+                self.i2c_advance(trace, n, now);
+                ok.then_some(())
+            }
+            ADC_BASE => {
+                self.adc_advance(trace, now);
+                let clk = self.clk_adc;
+                let ok = self.adc.write(&clk, now, off, value, mode);
+                self.adc_advance(trace, now);
                 ok.then_some(())
             }
             UART0_BASE | UART1_BASE => {
@@ -855,6 +1187,8 @@ impl System {
             PLL_USB_BASE => self.clocks.pll_usb.read(now, off),
             TIMER_BASE => self.timer.peek(&self.watchdog.tick, now, off),
             SPI0_BASE | SPI1_BASE => self.spi[(base == SPI1_BASE) as usize].peek(off),
+            I2C0_BASE | I2C1_BASE => self.i2c[(base == I2C1_BASE) as usize].peek(off),
+            ADC_BASE => self.adc.peek(off),
             DMA_BASE => self.dma.read(off),
             WATCHDOG_BASE => self.watchdog.read(now, off),
             VREG_AND_CHIP_RESET_BASE => self.vreg.read(off),
@@ -893,6 +1227,13 @@ pub struct SpiAttachment {
     pub cs_active_high: bool,
     pub selected: bool,
     pub dev: Box<dyn SpiDevice>,
+}
+
+/// An I2C device and the bus it is on.
+#[derive(Clone)]
+pub struct I2cAttachment {
+    pub bus: usize,
+    pub dev: Box<dyn I2cDevice>,
 }
 
 /// What a device sees of the board.
@@ -1278,5 +1619,121 @@ mod tests {
         w(&mut sys, Time::ZERO, PSM_BASE + 4, 1 << psm::SIO | 1 << psm::PROC1);
         assert_eq!(sys.sio.spinlocks, 0, "PSM force-off resets SIO");
         assert_eq!(sys.psm_forced_off, 1 << psm::SIO | 1 << psm::PROC1);
+    }
+
+    /// Fires every event due up to `until`.
+    fn run_events(sys: &mut System, until: Time) {
+        while let Some((t, ev)) = sys.sched.pop_due(until) {
+            sys.fire_event(&mut NullSink, t, ev);
+        }
+    }
+
+    /// Clocks running and every block out of reset, like after `embassy_rp::init`.
+    fn running() -> System {
+        let mut sys = quiet();
+        sys.update_clocks(Time::ZERO);
+        w(&mut sys, Time::ZERO, RESETS_BASE, 0);
+        sys
+    }
+
+    #[test]
+    fn i2c_transfer_reaches_the_device_through_registers() {
+        use sim_devices::mcp342x::Mcp342x;
+        let mut sys = running();
+        sys.attach_i2c(0, Box::new(Mcp342x::mcp3426(1.0, 0.0)));
+        const I2C: u32 = I2C0_BASE;
+        // No pins routed to I2C0 yet: the address is NAKed
+        w(&mut sys, Time::ZERO, I2C + 0x04, 0x68);
+        w(&mut sys, Time::ZERO, I2C + 0x6C, 1);
+        w(&mut sys, Time::ZERO, I2C + 0x10, 0x18 | 1 << 9);
+        run_events(&mut sys, Time::from_ms(1));
+        assert_eq!(r(&mut sys, Time::from_ms(1), I2C + 0x80) & 1, 1, "ABRT_7B_ADDR_NOACK");
+        r(&mut sys, Time::from_ms(1), I2C + 0x54);
+        // GPIO 4/5 to I2C0, then configure continuous 16-bit and read it back 70 ms later
+        w(&mut sys, Time::from_ms(1), IO_BANK0_BASE + 4 * 8 + 4, 3);
+        w(&mut sys, Time::from_ms(1), IO_BANK0_BASE + 5 * 8 + 4, 3);
+        w(&mut sys, Time::from_ms(1), I2C + 0x10, 0x18 | 1 << 9);
+        run_events(&mut sys, Time::from_ms(2));
+        assert_eq!(r(&mut sys, Time::from_ms(2), I2C + 0x80), 0);
+        assert_ne!(r(&mut sys, Time::from_ms(2), I2C + 0x34) & 1 << 9, 0, "STOP_DET");
+        let t = Time::from_ms(80);
+        for i in 0..3 {
+            w(&mut sys, t, I2C + 0x10, 1 << 8 | if i == 2 { 1 << 9 } else { 0 } | if i == 0 { 1 << 10 } else { 0 });
+        }
+        run_events(&mut sys, t + Time::from_ms(1));
+        let now = t + Time::from_ms(1);
+        assert_eq!(r(&mut sys, now, I2C + 0x78), 3);
+        let b: Vec<u32> = (0..3).map(|_| r(&mut sys, now, I2C + 0x10) & 0xFF).collect();
+        assert_eq!(((b[0] << 8) | b[1], b[2]), (16000, 0x18));
+        assert_eq!(sys.i2c_device::<Mcp342x>().unwrap().config_writes, 1, "the NAKed write never reached it");
+    }
+
+    #[test]
+    fn adc_round_robin_into_dma() {
+        use sim_core::analog::Signal;
+        let mut sys = running();
+        sys.attach_analog(0, Box::new(Signal::Const(1.65)));
+        sys.attach_analog(2, Box::new(Signal::ramp(&[(Time::ZERO, 0.0), (Time::from_us(100), 3.3)])));
+        sys.chip_temp_c = Signal::Const(27.0);
+        // With clk_adc stopped nothing converts (and nothing is scheduled)
+        w(&mut sys, Time::ZERO, ADC_BASE, 1 | 1 << 3);
+        assert!(!sys.sched.is_pending(Event::Adc));
+        w(&mut sys, Time::ZERO, ADC_BASE, 0);
+        sys.clk_adc = ClockPeriod::from_hz(48_000_000);
+        // FIFO with DREQ, 8-bit samples; DMA channel 0 reads 8 bytes from the FIFO paced by DREQ_ADC
+        w(&mut sys, Time::ZERO, ADC_BASE + 0x08, 1 | 1 << 1 | 1 << 3 | 1 << 24);
+        w(&mut sys, Time::ZERO, DMA_BASE, ADC_BASE + 0x0C);
+        w(&mut sys, Time::ZERO, DMA_BASE + 4, SRAM_BASE + 0x100);
+        w(&mut sys, Time::ZERO, DMA_BASE + 8, 8);
+        w(&mut sys, Time::ZERO, DMA_BASE + 0xC, 1 | 1 << 5 | dma::dreq::ADC << 15);
+        // Inputs 0, 2 and the temperature sensor (4) round robin
+        w(&mut sys, Time::ZERO, ADC_BASE, 1 | 1 << 1 | 0b10101 << 16 | 1 << 3);
+        run_events(&mut sys, Time::from_us(30));
+        let got: Vec<u8> = (0..8).map(|i| sys.sram[0x100 + i]).collect();
+        // 1.65 V -> 0x80; the ramp at 4 us (0.13 V) and 10 us (0.33 V); the temperature sensor's 0.706 V -> 0x36
+        assert_eq!(got[0], 0x80);
+        assert_eq!(got[2], 0x36);
+        assert_eq!(got[3], 0x80);
+        assert!(got[1] < got[4] && got[4] < got[7], "{got:?}");
+        assert!(!sys.dma.any_busy(), "DMA finished after 8 samples");
+    }
+
+    #[test]
+    fn uart_device_answers() {
+        use sim_devices::uart::Scripted;
+        let mut sys = running();
+        sys.attach_uart(1, Box::new(Scripted::lines(&[("AT", "OK\n")])));
+        // 115200 8N1 at a 48 MHz clk_peri: IBRD/FBRD, then enable TX/RX
+        sys.clk_peri = ClockPeriod::from_hz(48_000_000);
+        let clk = 48_000_000u64;
+        let div = (clk * 4 / 115_200) as u32;
+        w(&mut sys, Time::ZERO, UART1_BASE + 0x24, div >> 6);
+        w(&mut sys, Time::ZERO, UART1_BASE + 0x28, div & 0x3F);
+        w(&mut sys, Time::ZERO, UART1_BASE + 0x2C, 3 << 5 | 1 << 4);
+        w(&mut sys, Time::ZERO, UART1_BASE + 0x30, 1 | 1 << 8 | 1 << 9);
+        for &b in b"AT\n" {
+            w(&mut sys, Time::ZERO, UART1_BASE, b as u32);
+        }
+        run_events(&mut sys, Time::from_ms(2));
+        let mut rx = Vec::new();
+        while r(&mut sys, Time::from_ms(2), UART1_BASE + 0x18) & 1 << 4 == 0 {
+            rx.push(r(&mut sys, Time::from_ms(2), UART1_BASE) as u8);
+        }
+        assert_eq!(rx, b"OK\n");
+    }
+
+    #[test]
+    fn pwm_counts_edges_of_an_external_signal() {
+        let mut sys = running();
+        // GPIO 1 (PWM 0B) to the PWM function, slice 0 counting rising edges
+        w(&mut sys, Time::ZERO, IO_BANK0_BASE + 8 + 4, 4);
+        w(&mut sys, Time::ZERO, PWM_BASE, 1 | 2 << 4);
+        for i in 0..5u64 {
+            sys.gpio.external[1] = External::Driven(sim_core::wire::Level::High);
+            sys.update_pins(&mut NullSink, Time::from_us(10 * i + 5));
+            sys.gpio.external[1] = External::Driven(sim_core::wire::Level::Low);
+            sys.update_pins(&mut NullSink, Time::from_us(10 * i + 10));
+        }
+        assert_eq!(r(&mut sys, Time::from_us(60), PWM_BASE + 8), 5);
     }
 }

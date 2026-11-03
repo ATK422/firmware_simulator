@@ -39,3 +39,25 @@ status_ledb_pin = 15
 status_ledg_pin = 14
 status_ledr_pin = 13
 tx_pin = 7
+
+# ---- boards/overlays/talos/ivc_board.toml
+# The IVC transducer (the plan's example numbers) and its receive chain. The hydrophone signal reaches ADC 1
+# (GPIO 27) through one of two analog paths picked by GPIO 3: assumed here to be a 40-60 kHz band-pass (comms,
+# GPIO 3 low) and a 60 kHz low-pass (GPIO 3 high, "low pass filtered transducer output" in the firmware).
+[transducer]
+tvr = { resonance_hz = 51_000, q = 8, peak_db = 140 }
+rvs_db = -190
+beam = "omni"
+
+[transducer.drive]
+pin = 7
+supply_v = 12.0
+
+[transducer.receive]
+adc = 1
+gain_db = 40
+select_pin = 3
+filters = [
+    { highpass_hz = 40_000, lowpass_hz = 60_000, order = 4 },
+    { lowpass_hz = 60_000, order = 4 },
+]

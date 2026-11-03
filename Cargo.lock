@@ -426,6 +426,7 @@ dependencies = [
  "env_logger",
  "log",
  "rp2040",
+ "sim_acoustics",
  "sim_core",
  "sim_devices",
  "sim_host",
@@ -917,6 +918,9 @@ name = "sim_acoustics"
 version = "0.1.0"
 dependencies = [
  "log",
+ "serde",
+ "sim_core",
+ "toml",
 ]
 
 [[package]]
@@ -948,6 +952,7 @@ dependencies = [
  "object",
  "rp2040",
  "serde",
+ "sim_acoustics",
  "sim_core",
  "sim_devices",
  "thiserror",

@@ -110,6 +110,29 @@ struct RunArgs {
     /// Wait for GDB on this address (e.g. `127.0.0.1:3333`) before running.
     #[arg(long)]
     gdb: Option<String>,
+    /// Set one of the board's physical inputs, e.g. `sht41.temperature_c=31.5` (repeatable).
+    #[arg(long = "input", value_parser = parse_input)]
+    inputs: Vec<(String, f64)>,
+    /// Acoustic environment (environments/*.toml) to put the board's transducer in.
+    #[arg(long)]
+    environment: Option<PathBuf>,
+    /// Position of the board's transducer in the environment, `x,y,z` metres (z is depth).
+    #[arg(long, value_parser = parse_position, default_value = "0,0,1")]
+    position: [f64; 3],
+    /// Write what the board's SSD1306 shows to this PNG file at the end.
+    #[arg(long)]
+    screenshot: Option<PathBuf>,
+}
+
+fn parse_input(s: &str) -> Result<(String, f64), String> {
+    let (k, v) = s.split_once('=').ok_or("expected NAME=VALUE")?;
+    Ok((k.trim().to_string(), v.trim().parse().map_err(|e| format!("{v:?}: {e}"))?))
+}
+
+fn parse_position(s: &str) -> Result<[f64; 3], String> {
+    let v: Vec<f64> =
+        s.split(',').map(|x| x.trim().parse::<f64>()).collect::<Result<_, _>>().map_err(|e| e.to_string())?;
+    v.try_into().map_err(|_| "expected x,y,z".to_string())
 }
 
 /// Parses `10ms`, `2s`, `250us`, `100ns` or a bare number of seconds.
@@ -178,8 +201,27 @@ fn run(args: RunArgs) -> Result<()> {
         None => None,
     };
     if let Some(b) = &board {
-        b.apply(&mut machine).map_err(anyhow::Error::msg)?;
-        log::info!("board {} ({} SPI device(s))", b.name, machine.sys.spi_devices.len());
+        let inputs = b.apply(&mut machine).map_err(anyhow::Error::msg)?;
+        log::info!(
+            "board {} ({} SPI, {} I2C device(s); inputs: {})",
+            b.name,
+            machine.sys.spi_devices.len(),
+            machine.sys.i2c_devices.len(),
+            inputs.0.keys().cloned().collect::<Vec<_>>().join(", ")
+        );
+        for (k, v) in &args.inputs {
+            if !inputs.0.contains_key(k) {
+                bail!("{} has no input {k:?}", b.name);
+            }
+            inputs.set(k, *v);
+        }
+        if let Some(path) = &args.environment {
+            let env = sim_acoustics::Environment::load(path).map_err(anyhow::Error::msg)?;
+            log::info!("{} source(s) in {}", env.sources.len(), path.display());
+            b.place_in(&mut machine, std::sync::Arc::new(env), args.position).map_err(anyhow::Error::msg)?;
+        }
+    } else if !args.inputs.is_empty() || args.environment.is_some() {
+        bail!("--input and --environment need a --board");
     }
     machine.load(&image).map_err(anyhow::Error::msg)?;
     let vtor = machine.direct_boot().map_err(anyhow::Error::msg)?;
@@ -246,6 +288,15 @@ fn run(args: RunArgs) -> Result<()> {
     session.flush_uarts();
     for (ch, bytes) in session.rtt_text.drain(..) {
         print!("[rtt{ch}] {}", String::from_utf8_lossy(&bytes));
+    }
+    if let Some(path) = &args.screenshot {
+        match session.machine.sys.i2c_device::<sim_devices::ssd1306::Ssd1306>() {
+            Some(oled) => {
+                std::fs::write(path, oled.to_png(4)).with_context(|| format!("writing {}", path.display()))?;
+                print!("{}", oled.render_text());
+            }
+            None => eprintln!("no SSD1306 on this board"),
+        }
     }
     let machine = &mut session.machine;
     let where_ = |pc: u32| match machine.symbolize(pc) {

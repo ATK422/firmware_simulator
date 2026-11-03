@@ -1,0 +1,13 @@
+# Board I2C bus (I2C0, GPIO 28/29): the external depth sensor and the cage SHT41
+[[i2c]]
+bus = 0
+device = "ms5837_02ba"
+name = "depth"
+depth_m = 0.0
+temperature_c = 18.0
+
+[[i2c]]
+bus = 0
+device = "sht41"
+temperature_c = 35.0
+humidity_rh = 20.0

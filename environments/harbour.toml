@@ -1,0 +1,16 @@
+# A shallow harbour: 6 m deep over mud, brackish water, busy shipping, snapping shrimp.
+kind = "lake"
+depth_m = 6.0
+bottom = "mud"
+water = { temperature_c = 18.0, salinity_ppt = 28.0 }
+noise = { kind = "wenz", shipping = 1.0, wind_mps = 3.0 }
+shrimp = { rate_hz = 200.0, peak_db_re_upa = 160.0 }
+multipath = { max_order = 4 }
+
+[[source]]
+kind = "pinger"
+position_m = [40.0, 10.0, 4.0]
+frequency_hz = 37_000
+pulse_ms = 4
+period_ms = 2000
+source_level_db = 180

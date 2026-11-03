@@ -1,0 +1,17 @@
+# Board I2C bus (I2C0, GPIO 0 SDA / 1 SCL): the pack's OLED and SHT41. The BQ40Z80 gauge is on GPIO 6/7, driven
+# by a PIO SMBus (attached once PIO is modelled).
+[[i2c]]
+bus = 0
+device = "sht41"
+temperature_c = 24.0
+humidity_rh = 50.0
+
+[[i2c]]
+bus = 0
+device = "ssd1306"
+
+# Board serial number (and CANmore client ID) in the last flash sector, as `smart_battery_id` programs it. It
+# must match the gauge's serial number.
+[[flash]]
+address = 0x101F_F000
+bytes = [21]
