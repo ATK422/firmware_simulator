@@ -21,6 +21,7 @@ Every run is repeatable: the same firmware and inputs give exactly the same resu
 **Full guide: [docs/](docs/README.md)** · Design and milestones: [PLAN.md](PLAN.md)
 
 - [Quick start](#quick-start)
+- [More ways to use it](#more-ways-to-use-it): coding agents (MCP), C firmware with micro-ROS, IVC in the water
 - [What it can do](#what-it-can-do)
 - [Boards, firmware and robots](#boards-firmware-and-robots)
 - [Architecture](#architecture)
@@ -128,6 +129,45 @@ test every_board_boots_and_connects ... ok
 Always test in release mode. Tests whose firmware is not built print `skipping: ...` and **pass**, so check with
 `--nocapture` that a green run really ran the firmware. To write a test, start from
 [the walkthrough](docs/testing.md#a-first-test-step-by-step).
+
+## More ways to use it
+
+**Let a coding agent drive it (MCP).** `firmware_simulator mcp` is an MCP server: an agent can run a board or a
+robot, read logs, board state and CAN frames as JSON, inject faults, set inputs, pause, and wait for a log line,
+without screenshotting the dashboard. Claude Code started at the repository root picks it up from `.mcp.json`
+(build first with `cargo build --release`); from any other project:
+
+```bash
+claude mcp add --scope user firmware_simulator -- $PWD/target/release/firmware_simulator mcp
+```
+
+The tools and an example session are in [tools.md](docs/tools.md#mcp-server).
+
+**Run C firmware with micro-ROS.** titan_firmware's C board apps (for example `talos/IVCBoard2` on the `blake/ivc`
+branch) run as they are: the bootloader UF2 boots, the board comes up as a two-port USB serial device, and a real
+`micro_ros_agent` connects to the second port.
+
+```bash
+firmware_simulator run ~/titan_firmware/build/IVCBoard2/IVCBoard2_with_bl.uf2 --board boards/talos/ivc_board.toml --usb-cdc pty:/tmp/ivc-log --usb-cdc2 pty:/tmp/ivc-ros --time 600s
+```
+
+Then `ros2 run micro_ros_agent micro_ros_agent serial --dev /tmp/ivc-ros`, and the board's topics appear in ROS
+([running.md](docs/running.md#usb-bootsel-picoboot-uf2-and-cdc)). Building the C apps needs titan_firmware's
+micro-ROS library, which is built in Docker (`lib/micro_ros_pico/build.sh`). Several micro-ROS boards at once need
+one DDS discovery server per run, because the client, not the agent, picks the domain.
+
+**Test IVC in the water.** `robots/ivc2_pool.toml` puts two IVCBoard2s 5 m apart in a pool;
+`robots/ivc2_interop.toml` puts the Rust IVCBoard2 next to your build of the C one (set `TITAN_FIRMWARE_DIR`), and
+`--ivc-send 30s@talos_ivc:0x5a` makes a Rust board transmit from the command line. The C and Rust modems exchange
+bytes both ways ([acoustics.md](docs/acoustics.md#c-and-rust-ivcboard2-interop)). The sweeps print delivery
+against range and noise:
+
+```bash
+cargo test --release -p sim_test --test ivc_sweep -- --nocapture
+```
+
+The acoustic front end and water are plausible models, not measurements: use them to compare firmware versions
+and settings, not to predict range in the real pool.
 
 ## What it can do
 
@@ -257,10 +297,14 @@ not modelled or not yet trusted:
   plausible values, not calibrated against recordings, CAD or tank data. Use them to compare and catch
   regressions, not to prove range or dynamics ([acoustics.md](docs/acoustics.md),
   [vehicles.md](docs/vehicles.md#limitations)).
-* **C board applications**: titan_firmware's C board apps need its prebuilt micro-ROS library (built in Docker),
-  so `scripts/build_c_firmware.sh` builds only the template, the Titan bootloader and its test app. The firmware is
-  moving to its own nano-ROS, which needs no Docker; once that builds with the plain toolchain, the board apps can
-  join the build script and get smoke tests like the Rust images.
+* **C board applications in CI**: titan_firmware's C board apps need its prebuilt micro-ROS library (built in
+  Docker), so CI and `scripts/build_c_firmware.sh` build only the template, the Titan bootloader, its test app and
+  `test_programs/c_ivc_modem` (the C IVC modem without ROS). The C IVCBoard2 with micro-ROS has been run locally
+  (USB, agent, pinger, faults). The firmware is moving to its own nano-ROS, which needs no Docker; once that builds
+  with the plain toolchain, the board apps can join CI with smoke tests like the Rust images.
+* **Same firmware, same results**: firmware built with a different Rust compiler gives slightly different code, so
+  bench fingerprints and timing-sensitive IVC results can differ between machines; compare runs built with the
+  same toolchain.
 
 **To verify locally.** The cloud environment this was built in has no vcan module or `CAP_NET_ADMIN`, ROS 2,
 Docker daemon, vhci-hcd module or hardware. These are written and statically checked, but never run for real:
@@ -269,8 +313,11 @@ Docker daemon, vhci-hcd module or hardware. These are written and statically che
   launch file in `riptide-shell` ([robot in a box](docs/robots.md#robot-in-a-box-vcan-titan_bridge-docker)).
 * The `docker/robot_computer` image and compose file.
 * `--usbip` against the kernel's vhci-hcd (tested only with an in-process USB/IP client).
-* The micro-ROS C board images; VCD files in GTKWave/Surfer/PulseView; the dashboard in a real browser
+* VCD files in GTKWave/Surfer/PulseView; the MCP server from Claude Code itself (tested with scripted clients)
   ([tools.md](docs/tools.md#to-verify-locally)).
+
+Run locally by the team so far: the dashboard in a browser, the C IVCBoard2 with micro-ROS over USB, the benchmark
+on an i7-12700H (Talos about 0.73x real time on threads).
 
 **CI** ([`.github/workflows/ci.yml`](.github/workflows/ci.yml)) has three jobs: **test** builds the
 titan_firmware_rs images, runs `cargo fmt --all --check`, `cargo clippy --workspace --all-targets --release -- -D warnings`,
