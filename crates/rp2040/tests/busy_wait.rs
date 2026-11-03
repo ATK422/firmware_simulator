@@ -4,7 +4,7 @@
 //! comparison, toggles a GPIO each time the wait ends, and a timer alarm interrupts it every few ticks. The
 //! machine runs on its reset clocks (ROSC); the timer ticks every 511 of them so that a tick spans many loops.
 
-use rp2040::memmap::{IO_BANK0_BASE, RESETS_BASE, SIO_BASE, SRAM_BASE, TIMER_BASE, WATCHDOG_BASE};
+use rp2040::memmap::{IO_BANK0_BASE, RESETS_BASE, SIO_BASE, SRAM_BASE, TIMER_BASE, WATCHDOG_BASE, XOSC_BASE};
 use rp2040::{Machine, MachineConfig, StopReason};
 use sim_core::bus::Size;
 use sim_core::cpu::Cpu;
@@ -188,4 +188,74 @@ fn cutting_runs_at_sample_times_changes_nothing() {
         assert_eq!(state, state_ref, "alarm {alarm}");
         assert_eq!(trace, trace_ref, "alarm {alarm}");
     }
+}
+
+const XOSC_RESULT: u32 = SRAM_BASE + 0x300;
+
+/// A machine whose core polls XOSC.STATUS until the crystal is stable, as embassy-rp's `start_xosc` does at boot (on
+/// the ring oscillator, for a long time), then stores the timer's count and stops in a `b .`. The loop is three
+/// instructions, so it comes back to a state only every three quanta.
+fn xosc_machine(skip: bool, fast: bool) -> Machine {
+    let mut m = Machine::new(MachineConfig::default());
+    m.skip_spins = skip;
+    m.sys.xosc_fast_reads = fast;
+    let words =
+        [(0x00, 0x2000_2000), (0x04, SRAM_BASE + 0x101), (0x120, XOSC_BASE), (0x124, TIMER_BASE), (0x128, XOSC_RESULT)];
+    for (off, v) in words {
+        assert!(m.sys.poke(SRAM_BASE + off, Size::Word, v));
+    }
+    let code: &[(u32, u16)] = &[
+        (0x100, 0x4807), // ldr r0, =XOSC_BASE
+        (0x102, 0x4A08), // ldr r2, =TIMER_BASE
+        (0x104, 0x4C08), // ldr r4, =XOSC_RESULT
+        (0x106, 0x6841), // wait: ldr r1, [r0, #4] (STATUS)
+        (0x108, 0x2900), // cmp r1, #0
+        (0x10A, 0xDAFC), // bge wait: until STABLE (bit 31)
+        (0x10C, 0x6A93), // ldr r3, [r2, #0x28] (TIMERAWL)
+        (0x10E, 0x6023), // str r3, [r4]
+        (0x110, 0xE7FE), // b .
+    ];
+    for &(off, hw) in code {
+        assert!(m.sys.poke(SRAM_BASE + off, Size::Half, hw as u32));
+    }
+    m.direct_boot().unwrap();
+    let mut w = |addr: u32, v: u32| m.sys.write(&mut NullSink, 0, Time::ZERO, addr, Size::Word, v).unwrap();
+    w(WATCHDOG_BASE + 0x2C, 1 << 9 | 6); // a 1 us tick on the ring oscillator
+    w(RESETS_BASE + 0x3000, 1 << 21); // TIMER out of reset
+    w(XOSC_BASE + 0x0C, 1000); // STARTUP.DELAY: 256 000 crystal cycles (21.3 ms)
+    w(XOSC_BASE, 0xFAB << 12 | 0xAA0); // CTRL: enable
+    m
+}
+
+fn run_xosc(skip: bool, fast: bool) -> (String, u64) {
+    let mut m = xosc_machine(skip, fast);
+    for i in 1..=300 {
+        assert_eq!(m.run_until(Time::from_us(100 * i)), StopReason::TimeLimit);
+    }
+    let c = &m.cores[0];
+    let regs: Vec<u32> = (0..c.num_regs()).map(|r| c.read_reg(r)).collect();
+    let state = format!(
+        "{} {} {} {} {regs:08x?} stable at tick {}",
+        m.now,
+        m.core_time(0),
+        c.cycles(),
+        c.instructions(),
+        m.sys.peek(XOSC_RESULT, Size::Word).unwrap()
+    );
+    (state, m.spin_skipped)
+}
+
+/// XOSC.STATUS reads take a fast path and leave the quantum quiet (`System::xosc_fast_reads`), so the wait for the
+/// crystal is skipped, up to the time the oscillator becomes stable: the loop ends exactly when it does without.
+#[test]
+fn xosc_wait_is_skipped_up_to_stable() {
+    let (state, skipped) = run_xosc(true, true);
+    let (slow, none) = run_xosc(true, false);
+    let (unskipped, zero) = run_xosc(false, true);
+    assert_eq!(zero, 0);
+    // The general path makes the polling quanta noisy: only the final `b .` is skipped
+    assert!(skipped > none + 40_000, "{skipped} instructions skipped ({none} with the general path)");
+    assert!(!state.ends_with("tick 0"), "{state}");
+    assert_eq!(state, unskipped);
+    assert_eq!(state, slow);
 }

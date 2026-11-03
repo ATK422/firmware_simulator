@@ -6,6 +6,8 @@
 //! * Quantum fusing (`Machine::fuse_quanta`, see `Machine::run_until`).
 //! * PIO register reads that change nothing skip the second advance (`System::pio_fast_reads`).
 //! * SIO accesses other than to the FIFOs leave the interrupt lines alone (`System::sio_fast_irqs`).
+//! * XOSC reads skip the general path and leave quanta quiet (`System::xosc_fast_reads`), so that embassy-rp's
+//!   wait for the crystal is skipped as a busy-wait; and busy-wait skipping itself (`Machine::skip_spins`).
 
 use rp2040::Machine;
 use sim_core::cpu::Cpu;
@@ -13,6 +15,11 @@ use sim_test::{Bench, Time};
 
 /// Runs `elf` with `setup` applied to the machine; returns what it did and how many quanta were fused.
 fn run(elf: &str, board: &str, client: u8, setup: impl Fn(&mut Machine)) -> Option<(Vec<String>, u64)> {
+    run_skipped(elf, board, client, setup).map(|(out, fused, _)| (out, fused))
+}
+
+/// [`run`], also returning how many instructions busy-wait skipping skipped.
+fn run_skipped(elf: &str, board: &str, client: u8, setup: impl Fn(&mut Machine)) -> Option<(Vec<String>, u64, u64)> {
     let Some(path) = sim_test::titan_rs(elf) else {
         eprintln!("skipping {elf}: image not built");
         return None;
@@ -37,7 +44,7 @@ fn run(elf: &str, board: &str, client: u8, setup: impl Fn(&mut Machine)) -> Opti
         ));
     }
     out.push(format!("sram {:x}", m.sys.sram.iter().fold(0u64, |h, &b| (h ^ b as u64).wrapping_mul(0x100_0000_01b3))));
-    Some((out, m.quanta_fused))
+    Some((out, m.quanta_fused, m.spin_skipped))
 }
 
 fn compare(elf: &str, a: &[String], b: &[String]) {
@@ -108,4 +115,34 @@ fn sio_fast_irqs() {
     // Critical sections take and release a spinlock; the ESC board runs both cores
     same_sio("esc_board", "mk2/esc_board", 2);
     same_sio("ivc_board2", "talos/ivc_board", 8);
+}
+
+fn same_xosc(elf: &str, board: &str, client: u8) {
+    let Some((a, _, skipped)) = run_skipped(elf, board, client, |_| {}) else { return };
+    let (b, _, general) = run_skipped(elf, board, client, |m| m.sys.xosc_fast_reads = false).unwrap();
+    // embassy-rp's `start_xosc` polls XOSC.STATUS for about 128 ms of the 300 (delay_multiplier 128), on the ring
+    // oscillator: that is skipped only when those reads keep the quanta quiet
+    assert!(skipped > general + 200_000, "{elf}: {skipped} instructions skipped, {general} without");
+    compare(elf, &a, &b);
+}
+
+#[test]
+fn xosc_fast_reads() {
+    same_xosc("esc_board", "mk2/esc_board", 2);
+    same_xosc("template", "mk2/power_board", 1);
+}
+
+fn same_unskipped(elf: &str, board: &str, client: u8) {
+    let Some((a, _, skipped)) = run_skipped(elf, board, client, |_| {}) else { return };
+    let (b, _, none) = run_skipped(elf, board, client, |m| m.skip_spins = false).unwrap();
+    assert_eq!(none, 0);
+    assert!(skipped > 200_000, "{elf}: {skipped} instructions skipped");
+    compare(elf, &a, &b);
+}
+
+#[test]
+fn skipped_as_unskipped() {
+    // The XOSC wait (a loop over several quanta), the control loop's timer busy-waits
+    same_unskipped("esc_board", "mk2/esc_board", 2);
+    same_unskipped("template", "mk2/power_board", 1);
 }

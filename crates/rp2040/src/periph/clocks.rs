@@ -58,6 +58,15 @@ impl Xosc {
         self.stable_at.is_some_and(|t| now >= t)
     }
 
+    /// When the register at `offset` read at `now` would next read differently while nothing writes XOSC: STATUS
+    /// changes when the oscillator becomes stable (`None`: the value holds until a write).
+    pub fn read_changes_at(&self, now: Time, offset: u32) -> Option<Time> {
+        match (offset, self.stable_at) {
+            (0x04, Some(t)) if now < t => Some(t),
+            _ => None,
+        }
+    }
+
     /// Output frequency (0 until stable).
     pub fn hz(&self, now: Time) -> u64 {
         if self.is_stable(now) { self.crystal_hz } else { 0 }
@@ -548,6 +557,24 @@ mod tests {
         assert!(x.read(Time::from_us(1100), 0x04).unwrap() & (1 << 31) != 0);
         x.write(Time::ZERO, 0x00, 0x123 << 12, WriteMode::Normal);
         assert!(x.read(Time::ZERO, 0x04).unwrap() & (1 << 24) != 0, "BADWRITE");
+    }
+
+    #[test]
+    fn xosc_status_changes_when_stable() {
+        let mut x = Xosc::new(12 * MHZ);
+        assert_eq!(x.read_changes_at(Time::ZERO, 0x04), None, "off: holds until a write");
+        x.write(Time::ZERO, 0x0C, 47, WriteMode::Normal); // 47 * 256 crystal cycles
+        x.write(Time::ZERO, 0x00, 0xFAB << 12 | 0xAA0, WriteMode::Normal);
+        let stable = Time::ZERO + sim_core::time::ClockPeriod::from_hz(12 * MHZ).cycles(47 * 256);
+        assert_eq!(x.read_changes_at(Time::from_us(500), 0x04), Some(stable));
+        let before = Time(stable.0 - 1);
+        assert_eq!(x.read_changes_at(before, 0x04), Some(stable));
+        assert_eq!(x.read(before, 0x04).unwrap() >> 31, 0);
+        assert_eq!(x.read(stable, 0x04).unwrap() >> 31, 1, "stable from then on");
+        assert_eq!(x.read_changes_at(stable, 0x04), None);
+        // Other registers only change on writes
+        assert_eq!(x.read_changes_at(Time::ZERO, 0x00), None);
+        assert_eq!(x.read_changes_at(Time::ZERO, 0x0C), None);
     }
 
     #[test]

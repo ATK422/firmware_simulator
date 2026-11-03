@@ -62,7 +62,11 @@ scheduled. Counters (timer, PWM, watchdog) are computed lazily from virtual time
 3. **Busy-wait skipping** (`Machine::skip_spin`). A quantum in which a core only read memory and the timer (seeing
    the same tick each time), wrote nothing and ended in the state it started in would repeat exactly until the
    timer ticks; such quanta are skipped up to the next event, tick or the end of the run, while the other core
-   cannot run. Skipped instructions still count as executed. The ESC board's control loop spends 62 % of its
+   cannot run. A loop whose length does not divide the quantum comes back to a state only after a few quanta:
+   consecutive quiet quanta are compared with the state at the start of a window that doubles up to 16 quanta
+   (`SpinWindow`, Brent's cycle detection), and whole windows are skipped. XOSC reads also keep a quantum quiet
+   (`System::xosc_fast_reads`); the skip then ends before STATUS turns stable, so embassy's wait for the crystal
+   is skipped too. Skipped instructions still count as executed. The ESC board's control loop spends 62 % of its
    instructions in such a loop.
 4. **Quantum fusing** (`Machine::fuse_quanta`). While the other core cannot run, no SysTick counts and the last
    quantum wrote memory and touched nothing else (the core is computing), the next quantum's first batch may run on
@@ -84,7 +88,7 @@ scheduled. Counters (timer, PWM, watchdog) are computed lazily from virtual time
 `crates/rp2040/tests/batching.rs`, `busy_wait.rs`, `fused_quanta.rs`, `crates/sim_test/tests/fast_paths.rs` and
 the PIO tests compare runs with and without them (`fast_paths.rs` also for `System::pio_fast_reads` and
 `System::sio_fast_irqs`, which spares the interrupt-line recomputation after SIO accesses other than to the
-FIFOs).
+FIFOs, `System::xosc_fast_reads` and `Machine::skip_spins`).
 
 Resets go through the same loop: a watchdog reset or `SYSRESETREQ` is a `ResetRequest` the machine carries out
 (`watchdog_reset`, `run_pin_reset`, `power_cycle`, `power_on_at`), with the reset kind reported in
@@ -238,5 +242,5 @@ Measured on a shared 4-core machine (CPU time for 2 s of virtual time): template
 IVCBoard2 0.6 s, Talos 4.7 s, IVC2 pool 2.2 s. Under callgrind, advancing the PIO blocks (on register reads and
 their 1 µs event) still takes about 22 % of the ESC board's time: the DShot state machines' clock recovery is
 ticked cycle by cycle. At boot, embassy's clock setup polls the XOSC status register for its 128 ms start-up
-delay (on the ring oscillator, through the general peripheral path, so not skipped as a busy-wait): about 7 % of
-the first 200 ms of a Talos run.
+delay (on the ring oscillator); that wait is skipped as a busy-wait (a three-instruction loop, so over three
+quanta), which takes the first 200 ms of a Talos run from 0.28 s to 0.25 s of CPU time.

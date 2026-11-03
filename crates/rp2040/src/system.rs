@@ -132,6 +132,9 @@ pub struct System {
     /// SIO accesses other than to the FIFOs leave the interrupt lines alone (on by default; off to check that it
     /// changes nothing).
     pub sio_fast_irqs: bool,
+    /// Reads of XOSC registers skip the general peripheral path and count as quiet for busy-wait skipping, which
+    /// ends where STATUS would change (on by default; off to check that it changes nothing).
+    pub xosc_fast_reads: bool,
     /// PIO IRQ lines after the last advance.
     pio_lines: u8,
     /// Pin drives and wake-ups devices scheduled for later.
@@ -226,6 +229,7 @@ impl System {
             in_pio: false,
             pio_fast_reads: true,
             sio_fast_irqs: true,
+            xosc_fast_reads: true,
             pio_lines: 0,
             wire: WireQueue::default(),
             pin_devices: Vec::new(),
@@ -2032,9 +2036,12 @@ pub struct BatchBus<'a> {
     noisy: bool,
     timer_ticks: Option<u64>,
     ticked: bool,
+    /// The first time a register the batch read quietly (XOSC, see [`BatchBus::holds_until`]) would read
+    /// differently.
+    holds_until: Time,
     /// An access since the last [`Bus::take_slow_access`] went through the general path.
     slow: bool,
-    /// An access in the batch went through the general path or read the timer.
+    /// An access in the batch went through the general path or read the timer or XOSC.
     touched: bool,
     /// End the batch after an access that goes through the general path (a fused batch, see
     /// `Machine::run_until`: such an access may schedule an event or wake the other core, which the machine must
@@ -2045,7 +2052,8 @@ pub struct BatchBus<'a> {
 /// What a batch touched, for busy-wait skipping (see `Machine::run_until`).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Quiet {
-    /// It read memory (SRAM, ROM, flash with XIP working) and nothing else.
+    /// It read memory (SRAM, ROM, flash with XIP working) and nothing else (but XOSC: see
+    /// [`BatchBus::holds_until`]).
     Memory,
     /// It also read the timer, and every read saw this tick count.
     Timer(u64),
@@ -2082,6 +2090,7 @@ impl<'a> BatchBus<'a> {
             noisy: false,
             timer_ticks: None,
             ticked: false,
+            holds_until: Time::MAX,
             slow: false,
             touched: false,
             end_on_slow: false,
@@ -2089,7 +2098,7 @@ impl<'a> BatchBus<'a> {
     }
 
     /// Whether an access in the batch went through the general path (reached a peripheral or found XIP not set
-    /// up) or read the timer.
+    /// up) or read the timer or XOSC.
     pub fn touched(&self) -> bool {
         self.touched
     }
@@ -2103,6 +2112,13 @@ impl<'a> BatchBus<'a> {
             (false, false, None) => Some(Quiet::Memory),
             (false, false, Some(t)) => Some(Quiet::Timer(t)),
         }
+    }
+
+    /// For a quiet batch: the first time a register it read other than memory and the timer (XOSC.STATUS, while
+    /// the oscillator starts) would read differently. Running the batch again gives the same result only if it
+    /// ends before then (`Time::MAX`: nothing it read changes by itself).
+    pub fn holds_until(&self) -> Time {
+        self.holds_until
     }
 
     /// Interrupt lines recomputed during the batch, for cores 0 and 1.
@@ -2165,12 +2181,44 @@ impl<'a> BatchBus<'a> {
                 self.timer_ticks = Some(ticks);
                 Ok(mem::lane(v, addr, size))
             }
-            None => self.slow_read(addr, size),
+            None => self.slow_read_general(addr, size),
+        }
+    }
+
+    /// Firmware polls XOSC.STATUS until the crystal is stable (embassy-rp's `start_xosc`, for a long time on the
+    /// ring oscillator); reading XOSC changes nothing, so it skips the general path like the timer, and the batch
+    /// stays quiet (see [`BatchBus::holds_until`]).
+    #[inline(never)]
+    fn xosc_read(&mut self, addr: u32, size: Size) -> Result<u32, BusFault> {
+        let now = self.now();
+        let off = addr & 0xFFC;
+        match self.sys.clocks.xosc.read(now, off) {
+            Some(v) => {
+                // A fused batch ends here too, as after a timer read: busy-waits poll it
+                self.touched = true;
+                if self.end_on_slow {
+                    self.after |= Self::ATTENTION;
+                }
+                if let Some(t) = self.sys.clocks.xosc.read_changes_at(now, off) {
+                    self.holds_until = self.holds_until.min(t);
+                }
+                Ok(mem::lane(v, addr, size))
+            }
+            None => self.slow_read_general(addr, size),
         }
     }
 
     #[inline(never)]
     fn slow_read(&mut self, addr: u32, size: Size) -> Result<u32, BusFault> {
+        // (Checked here rather than in `read`, which is inlined into the interpreter.)
+        if addr & !0x3FFF == XOSC_BASE && self.sys.xosc_fast_reads {
+            return self.xosc_read(addr, size);
+        }
+        self.slow_read_general(addr, size)
+    }
+
+    #[inline(never)]
+    fn slow_read_general(&mut self, addr: u32, size: Size) -> Result<u32, BusFault> {
         self.noisy = true;
         self.slow = true;
         let now = self.now();
@@ -2349,7 +2397,7 @@ impl Bus for BatchBus<'_> {
         {
             return Ok(v);
         }
-        self.slow_read(addr, Size::Half).map(|v| v as u16)
+        self.slow_read_general(addr, Size::Half).map(|v| v as u16)
     }
 
     #[inline]
@@ -2466,6 +2514,50 @@ mod tests {
         assert_eq!(r(&mut sys, Time::ZERO, SIO_BASE + 4) & (1 << 25), 0, "GPIO_IN follows the pin");
         let mut t = NullSink;
         assert_eq!(sys.read(&mut t, 1, Time::ZERO, SIO_BASE, Size::Word), Ok(1), "CPUID of core 1");
+    }
+
+    /// XOSC reads in a batch take the fast path (`System::xosc_fast_reads`): the same values as the general path,
+    /// a quiet batch, and the time STATUS would change.
+    #[test]
+    fn batch_xosc_reads_are_quiet_until_stable() {
+        for fast in [true, false] {
+            let mut sys = quiet();
+            sys.xosc_fast_reads = fast;
+            w(&mut sys, Time::ZERO, XOSC_BASE + 0x0C, 47);
+            w(&mut sys, Time::ZERO, XOSC_BASE, 0xFAB << 12 | 0xAA0);
+            // (As the machine would have handled it)
+            sys.clk_sys_changed = false;
+            let stable = Time::ZERO + ClockPeriod::from_hz(12_000_000).cycles(47 * 256);
+            let period = ClockPeriod::from_hz(125_000_000);
+            let mut t = NullSink;
+            let mut batch = |at: Time, addrs: &[(u32, Size)]| {
+                let mut reference = sys.clone();
+                let clock = CycleClock::new(at);
+                let mut bus = BatchBus::new(&mut sys, &mut t, 0, clock, period, 0);
+                let values: Vec<u32> = addrs.iter().map(|&(a, size)| bus.read(a, size).unwrap()).collect();
+                let quiet = (bus.quiet(), bus.holds_until(), bus.touched(), bus.take_attention());
+                for (&(a, size), &v) in addrs.iter().zip(&values) {
+                    assert_eq!(reference.read(&mut NullSink, 0, at, a, size), Ok(v), "{a:#x} at {at}");
+                }
+                (values, quiet)
+            };
+            let status = [(XOSC_BASE + 4, Size::Word), (XOSC_BASE + 0x2007, Size::Byte), (XOSC_BASE + 0xC, Size::Half)];
+            let (v, (q, holds, touched, attention)) = batch(Time::from_us(100), &status);
+            assert_eq!(v, [1 << 12, 0, 47]);
+            assert!(touched && !attention);
+            if fast {
+                assert_eq!((q, holds), (Some(Quiet::Memory), stable));
+            } else {
+                assert_eq!((q, holds), (None, Time::MAX));
+            }
+            let (v, (q, holds, _, _)) = batch(stable, &status);
+            assert_eq!(v, [1 << 31 | 1 << 12, 0x80, 47]);
+            assert_eq!(holds, Time::MAX, "stable: holds until a write");
+            assert_eq!(q.is_some(), fast);
+            // An offset XOSC does not have goes through the general path (unmodelled)
+            let (_, (q, _, _, _)) = batch(stable, &[(XOSC_BASE + 0x40, Size::Word)]);
+            assert_eq!(q, None);
+        }
     }
 
     #[test]
