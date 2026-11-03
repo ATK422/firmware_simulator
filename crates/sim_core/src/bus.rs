@@ -63,6 +63,22 @@ pub trait Bus {
         0
     }
 
+    /// Called by a CPU running a batch of instructions (see `CortexM0Plus::run_batch`) before each instruction,
+    /// with the cycles the batch has taken so far, so that accesses can be stamped with the time they happen at.
+    #[inline]
+    fn set_elapsed(&mut self, cycles: u64) {
+        let _ = cycles;
+    }
+
+    /// Whether an access since the last call reached something other than plain memory (a peripheral register),
+    /// after which the machine must look at the system before the CPU goes on: interrupt lines, clocks, resets may
+    /// have changed. A batch of instructions ends after such an access. The default ends every batch after one
+    /// instruction.
+    #[inline]
+    fn take_attention(&mut self) -> bool {
+        true
+    }
+
     /// Reads without side effects, for debuggers and tracing. `None` if the location cannot be peeked.
     fn peek(&mut self, addr: u32, size: Size) -> Option<u32> {
         let _ = (addr, size);
@@ -129,7 +145,7 @@ pub trait Peripheral<Ctx> {
 pub mod mem {
     use super::Size;
 
-    #[inline]
+    #[inline(always)]
     pub fn read(buf: &[u8], off: usize, size: Size) -> u32 {
         match size {
             Size::Byte => buf[off] as u32,
@@ -138,7 +154,7 @@ pub mod mem {
         }
     }
 
-    #[inline]
+    #[inline(always)]
     pub fn write(buf: &mut [u8], off: usize, size: Size, value: u32) {
         match size {
             Size::Byte => buf[off] = value as u8,

@@ -156,6 +156,34 @@ impl CycleClock {
         self.frac = total & ((1 << ClockPeriod::FRAC_BITS) - 1);
     }
 
+    /// The time after `cycles` more cycles of `period`, without advancing ([`CycleClock::advance`] then reading
+    /// `now` gives the same).
+    pub fn time_after(&self, period: &ClockPeriod, cycles: u64) -> Time {
+        if period.is_stopped() {
+            return self.now;
+        }
+        let total = cycles as u128 * period.fixed + self.frac;
+        self.now + Time((total >> ClockPeriod::FRAC_BITS) as u64)
+    }
+
+    /// The fewest cycles of `period` after which `now` is at or past `t`: 0 if it already is, `u64::MAX` if the
+    /// clock is stopped (it never gets there).
+    pub fn cycles_until(&self, period: &ClockPeriod, t: Time) -> u64 {
+        if self.now >= t {
+            return 0;
+        }
+        if period.is_stopped() {
+            return u64::MAX;
+        }
+        // Smallest n with n * fixed + frac >= (t - now) << FRAC_BITS
+        let need = (((t.0 - self.now.0) as u128) << ClockPeriod::FRAC_BITS) - self.frac;
+        if let (Ok(need), Ok(fixed)) = (u64::try_from(need), u64::try_from(period.fixed)) {
+            // The usual case (a short distance, a fast clock): a 64-bit division is much cheaper
+            return need.div_ceil(fixed);
+        }
+        need.div_ceil(period.fixed).min(u64::MAX as u128) as u64
+    }
+
     /// Jumps forward to `t` (no-op if already past it). Drops the fractional part.
     pub fn jump_to(&mut self, t: Time) {
         if t > self.now {
@@ -197,6 +225,33 @@ mod tests {
             c.advance(&p, 1);
         }
         assert!(c.now.as_ps().abs_diff(1_000_000_000_000) < 20, "{:?}", c.now);
+    }
+
+    #[test]
+    fn cycles_until_matches_stepping() {
+        for hz in [125_000_000, 12_000_000, 133_000_000, 48_000_000, 1] {
+            let p = ClockPeriod::from_hz(hz);
+            let mut c = CycleClock::new(Time(12_345));
+            c.advance(&p, 7); // leave a fraction
+            for d in [0u64, 1, 7_999, 8_000, 8_001, 83_333, 83_334, 1_000_000, 123_456_789] {
+                let t = c.now + Time(d);
+                let n = c.cycles_until(&p, t);
+                assert!(c.time_after(&p, n) >= t, "{hz} Hz, {d} ps: {n} cycles");
+                if n > 0 {
+                    assert!(c.time_after(&p, n - 1) < t, "{hz} Hz, {d} ps: {n} cycles is not the fewest");
+                }
+                let mut stepped = c;
+                for _ in 0..n.min(10_000) {
+                    stepped.advance(&p, 1);
+                }
+                if n <= 10_000 {
+                    assert_eq!(stepped.now, c.time_after(&p, n));
+                }
+            }
+        }
+        let stopped = ClockPeriod::from_hz(0);
+        assert_eq!(CycleClock::default().cycles_until(&stopped, Time(5)), u64::MAX);
+        assert_eq!(CycleClock::new(Time(9)).cycles_until(&stopped, Time(5)), 0);
     }
 
     #[test]

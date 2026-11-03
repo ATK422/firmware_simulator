@@ -79,6 +79,17 @@ pub enum Sleep {
     Wfe,
 }
 
+/// What [`CortexM0Plus::run_batch`] did.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct Batch {
+    /// Steps taken: instructions, and a `BKPT`, fault or lockup that ended the batch.
+    pub steps: u32,
+    /// Cycles the steps took (as their [`StepOutcome::Ran`] would have reported).
+    pub cycles: u64,
+    /// The outcome of the last step if it was not [`StepOutcome::Ran`].
+    pub stop: Option<StepOutcome>,
+}
+
 /// Information about the last fault that led to a HardFault, for logging.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct FaultRecord {
@@ -117,6 +128,12 @@ pub struct CortexM0Plus {
     pub(crate) lockup: bool,
     /// Set when the last instruction was `SEV`; the machine forwards the event to the other cores.
     pub(crate) sev_out: bool,
+    /// Something happened that the machine must see before the next instruction, which ends a batch: an access
+    /// to this core's PPB registers (NVIC, SysTick, SCB), `SEV`, or the core went to sleep.
+    pub(crate) batch_break: bool,
+    /// The exception state changed (entry, return, PRIMASK, SysTick pended): a batch checks again whether an
+    /// exception preempts before the next instruction.
+    pub(crate) exc_changed: bool,
     /// CPUID value (`0x410CC601` for r0p1).
     pub cpuid: u32,
     /// Address and encoding of the last executed instruction, for tracing.
@@ -159,6 +176,8 @@ impl CortexM0Plus {
             instructions: 0,
             lockup: false,
             sev_out: false,
+            batch_break: false,
+            exc_changed: false,
             cpuid: 0x410C_C601,
             last_pc: 0,
             last_opcode: 0,
@@ -383,7 +402,7 @@ impl CortexM0Plus {
     }
 
     /// Pushes the stack frame and branches to the handler of `exc`. `return_addr` is stacked as the PC.
-    fn exception_entry(&mut self, bus: &mut dyn Bus, exc: u32, return_addr: u32) -> Result<u32, Fault> {
+    fn exception_entry<B: Bus + ?Sized>(&mut self, bus: &mut B, exc: u32, return_addr: u32) -> Result<u32, Fault> {
         let sp = self.r[13];
         let align = (sp >> 2) & 1;
         let frame = sp.wrapping_sub(0x20) & !4;
@@ -406,6 +425,7 @@ impl CortexM0Plus {
         let vector = self.read_mem(bus, self.scb.vtor.wrapping_add(4 * exc), Size::Word)?;
         self.r[15] = vector & !1;
         self.event_reg = true;
+        self.exc_changed = true;
         if self.log_exceptions {
             self.exception_log.push((true, exc, return_addr));
         }
@@ -414,7 +434,7 @@ impl CortexM0Plus {
     }
 
     /// Handles a branch to an EXC_RETURN value in handler mode.
-    pub(crate) fn exception_return(&mut self, bus: &mut dyn Bus, exc_return: u32) -> Result<u32, Fault> {
+    pub(crate) fn exception_return<B: Bus + ?Sized>(&mut self, bus: &mut B, exc_return: u32) -> Result<u32, Fault> {
         let (to_thread, use_psp) = match exc_return & 0xF {
             0x1 => (false, false),
             0x9 => (true, false),
@@ -451,12 +471,14 @@ impl CortexM0Plus {
         self.event_reg = true;
         if to_thread && self.scb.scr & ppb::SCR_SLEEPONEXIT != 0 && self.preempting(false).is_none() {
             self.sleep = Some(Sleep::Wfi);
+            self.batch_break = true;
         }
+        self.exc_changed = true;
         Ok(3)
     }
 
     /// Escalates a fault to HardFault (or locks up if already in HardFault or NMI).
-    fn take_fault(&mut self, bus: &mut dyn Bus, fault: Fault) -> StepOutcome {
+    fn take_fault<B: Bus + ?Sized>(&mut self, bus: &mut B, fault: Fault) -> StepOutcome {
         let pc = self.r[15];
         self.last_fault = Some(FaultRecord { pc, fault });
         log::debug!("core fault at {pc:#010x}: {fault:?}");
@@ -477,7 +499,7 @@ impl CortexM0Plus {
     }
 
     /// Turns a `BKPT` into a HardFault, as on a core with no debugger attached.
-    pub fn escalate_breakpoint(&mut self, bus: &mut dyn Bus) -> StepOutcome {
+    pub fn escalate_breakpoint<B: Bus + ?Sized>(&mut self, bus: &mut B) -> StepOutcome {
         let imm = (self.last_opcode & 0xFF) as u8;
         self.take_fault(bus, Fault::Breakpoint(imm))
     }
@@ -489,21 +511,29 @@ impl CortexM0Plus {
 
     // ------------------------------------------------------------------ memory
 
-    pub(crate) fn read_mem(&mut self, bus: &mut dyn Bus, addr: u32, size: Size) -> Result<u32, Fault> {
+    pub(crate) fn read_mem<B: Bus + ?Sized>(&mut self, bus: &mut B, addr: u32, size: Size) -> Result<u32, Fault> {
         if addr & (size.bytes() - 1) != 0 {
             return Err(Fault::Unaligned(addr));
         }
         if addr >= ppb::PPB_BASE {
+            self.batch_break = true;
             return Ok(self.ppb_read(addr, size));
         }
         Ok(bus.read(addr, size)?)
     }
 
-    pub(crate) fn write_mem(&mut self, bus: &mut dyn Bus, addr: u32, size: Size, v: u32) -> Result<(), Fault> {
+    pub(crate) fn write_mem<B: Bus + ?Sized>(
+        &mut self,
+        bus: &mut B,
+        addr: u32,
+        size: Size,
+        v: u32,
+    ) -> Result<(), Fault> {
         if addr & (size.bytes() - 1) != 0 {
             return Err(Fault::Unaligned(addr));
         }
         if addr >= ppb::PPB_BASE {
+            self.batch_break = true;
             self.ppb_write(addr, size, v);
             return Ok(());
         }
@@ -512,7 +542,7 @@ impl CortexM0Plus {
 
     /// Debugger memory read: PPB registers come from this core, the rest from `bus` without side effects where
     /// the bus supports peeking.
-    pub fn debug_read(&mut self, bus: &mut dyn Bus, addr: u32, size: Size) -> Option<u32> {
+    pub fn debug_read<B: Bus + ?Sized>(&mut self, bus: &mut B, addr: u32, size: Size) -> Option<u32> {
         if addr >= ppb::PPB_BASE {
             return Some(self.ppb_read(addr, size));
         }
@@ -551,7 +581,89 @@ impl CortexM0Plus {
         }
     }
 
-    fn step_inner(&mut self, bus: &mut dyn Bus) -> StepOutcome {
+    /// Whether any exception is pending at all (cheap test before [`CortexM0Plus::preempting`]).
+    #[inline]
+    fn any_pending(&self) -> bool {
+        self.scb.nmi_pending
+            || self.scb.pendsv_pending
+            || self.scb.systick_pending
+            || self.nvic.pending & self.nvic.enabled != 0
+    }
+
+    /// Runs instructions back to back, as that many [`Cpu::step`] calls would, while nothing needs the machine's
+    /// attention between them. The batch ends:
+    ///
+    /// * before an instruction when the core is locked up or asleep, an exception would be taken, the PC is below
+    ///   `trap_below` (trapped ROM functions) or `max_steps` steps were taken: the next step, if any, is the
+    ///   machine's to make with [`CortexM0Plus::step_on`];
+    /// * after an instruction that reached a peripheral ([`Bus::take_attention`]), this core's PPB registers, executed
+    ///   `SEV`, went to sleep, or brought the batch to `budget` cycles or more;
+    /// * at a `BKPT`, a fault or a lockup (in [`Batch::stop`] unless the fault was taken as a HardFault).
+    ///
+    /// Before each instruction the bus learns how many cycles the batch has taken ([`Bus::set_elapsed`]).
+    pub fn run_batch<B: Bus + ?Sized>(&mut self, bus: &mut B, max_steps: u32, budget: u64, trap_below: u32) -> Batch {
+        let mut b = Batch { steps: 0, cycles: 0, stop: None };
+        if self.lockup || self.sleep.is_some() {
+            return b;
+        }
+        // Whether an exception could preempt only changes with the exception state: IRQ lines are fixed for the
+        // batch and PPB accesses end it
+        self.exc_changed = true;
+        self.batch_break = false;
+        let mut instructions = 0;
+        while b.steps < max_steps {
+            if self.exc_changed {
+                self.exc_changed = false;
+                self.latch_irqs();
+                if self.any_pending() && self.preempting(false).is_some() {
+                    break;
+                }
+            }
+            let pc = self.r[15];
+            if pc < trap_below {
+                break;
+            }
+            bus.set_elapsed(b.cycles);
+            b.steps += 1;
+            match self.execute(bus) {
+                Ok(cycles) => {
+                    let cycles = cycles + bus.take_stall_cycles();
+                    instructions += 1;
+                    self.tick(cycles);
+                    b.cycles += cycles as u64;
+                }
+                Err(Fault::Breakpoint(imm)) => {
+                    self.r[15] = pc;
+                    b.stop = Some(StepOutcome::Breakpoint(imm));
+                    break;
+                }
+                Err(f) => {
+                    self.r[15] = pc;
+                    self.cycles += b.cycles;
+                    self.instructions += instructions;
+                    match self.take_fault(bus, f) {
+                        StepOutcome::Ran(c) => b.cycles += c as u64,
+                        other => b.stop = Some(other),
+                    }
+                    return b;
+                }
+            }
+            if bus.take_attention() || std::mem::take(&mut self.batch_break) || b.cycles >= budget {
+                break;
+            }
+        }
+        self.cycles += b.cycles;
+        self.instructions += instructions;
+        b
+    }
+
+    /// [`Cpu::step`] against a concrete bus type, so a machine's bus accesses can be inlined into the interpreter.
+    #[inline]
+    pub fn step_on<B: Bus + ?Sized>(&mut self, bus: &mut B) -> StepOutcome {
+        self.step_inner(bus)
+    }
+
+    fn step_inner<B: Bus + ?Sized>(&mut self, bus: &mut B) -> StepOutcome {
         if self.lockup {
             return StepOutcome::Lockup;
         }
@@ -610,9 +722,11 @@ impl CortexM0Plus {
         }
     }
 
+    #[inline]
     fn tick(&mut self, cycles: u32) {
         if self.systick.tick_core(cycles as u64) {
             self.scb.systick_pending = true;
+            self.exc_changed = true;
         }
     }
 

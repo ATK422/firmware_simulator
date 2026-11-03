@@ -8,7 +8,7 @@
 use sim_core::analog::{AnalogSource, Signal};
 use sim_core::bus::{Bus, BusFault, Size, WriteMode, mem};
 use sim_core::sched::Scheduler;
-use sim_core::time::{ClockPeriod, Time};
+use sim_core::time::{ClockPeriod, CycleClock, Time};
 use sim_core::trace::{Category, TraceEvent, TraceSink};
 use sim_core::wire::External;
 use sim_devices::DeviceCtx;
@@ -308,7 +308,17 @@ impl System {
 
     #[inline]
     fn flash_offset(&self, addr: u32) -> usize {
-        (addr & 0x00FF_FFFF) as usize % self.flash.len()
+        let len = self.flash.len();
+        let off = (addr & 0x00FF_FFFF) as usize;
+        // Flash sizes are powers of two in practice; a mask is much cheaper than the division
+        if len.is_power_of_two() { off & (len - 1) } else { off % len }
+    }
+
+    /// Whether flash reads at `now` and later work without looking further (the common case: the SSI is set up for
+    /// XIP and the chip is not busy). The same as [`System::xip_check`] succeeding at the first test.
+    #[inline]
+    fn xip_ready_from(&self, now: Time) -> bool {
+        self.xip_config.is_ok() && now >= self.xip_busy_until
     }
 
     /// IRQ lines seen by `core`'s NVIC.
@@ -1813,6 +1823,141 @@ impl Bus for CoreBus<'_> {
             }
             _ => self.read(addr, Size::Half).map(|v| v as u16),
         }
+    }
+
+    fn peek(&mut self, addr: u32, size: Size) -> Option<u32> {
+        self.sys.peek_core(self.core, addr, size)
+    }
+}
+
+/// One core's view of the system bus while it runs a batch of instructions (`CortexM0Plus::run_batch`).
+///
+/// SRAM, ROM and flash (while XIP works) are read and written directly. Everything else goes through
+/// [`System::read`]/[`System::write`] at the exact time of the accessing instruction (the batch's start time plus
+/// the cycles the batch took before it) and raises [`Bus::take_attention`], which ends the batch after that
+/// instruction so the machine can pick up interrupt, clock and reset changes as it does after every single step.
+pub struct BatchBus<'a> {
+    pub sys: &'a mut System,
+    pub trace: &'a mut dyn TraceSink,
+    pub core: u8,
+    /// The core's clock at the start of the batch, and the period it counts.
+    clock: CycleClock,
+    period: ClockPeriod,
+    /// Cycles the batch has taken before the current instruction.
+    elapsed: u64,
+    attention: bool,
+    /// Flash reads need no further checks for the whole batch.
+    xip_ok: bool,
+}
+
+impl<'a> BatchBus<'a> {
+    pub fn new(
+        sys: &'a mut System,
+        trace: &'a mut dyn TraceSink,
+        core: u8,
+        clock: CycleClock,
+        period: ClockPeriod,
+    ) -> Self {
+        // Time only moves forward within the batch, so if XIP works at its start it works throughout (until a
+        // peripheral access, which ends the batch)
+        let xip_ok = sys.xip_ready_from(clock.now);
+        BatchBus { sys, trace, core, clock, period, elapsed: 0, attention: false, xip_ok }
+    }
+
+    /// The start time of the current instruction.
+    #[inline]
+    fn now(&self) -> Time {
+        if self.elapsed == 0 { self.clock.now } else { self.clock.time_after(&self.period, self.elapsed) }
+    }
+
+    #[inline(always)]
+    fn flash(&mut self, addr: u32) -> Result<usize, BusFault> {
+        if self.xip_ok {
+            // What xip_check does when XIP works
+            self.sys.xip_failed = false;
+        } else {
+            self.xip_check(addr)?;
+        }
+        Ok(self.sys.flash_offset(addr))
+    }
+
+    // The slow paths are kept out of line so that the fast ones stay small enough to inline into the interpreter
+
+    #[cold]
+    #[inline(never)]
+    fn xip_check(&mut self, addr: u32) -> Result<(), BusFault> {
+        let now = self.now();
+        self.sys.xip_check(now, addr)
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn slow_read(&mut self, addr: u32, size: Size) -> Result<u32, BusFault> {
+        self.attention = true;
+        let now = self.now();
+        self.sys.read(self.trace, self.core, now, addr, size)
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn slow_write(&mut self, addr: u32, size: Size, value: u32) -> Result<(), BusFault> {
+        self.attention = true;
+        let now = self.now();
+        self.sys.write(self.trace, self.core, now, addr, size, value)
+    }
+}
+
+impl Bus for BatchBus<'_> {
+    #[inline]
+    fn read(&mut self, addr: u32, size: Size) -> Result<u32, BusFault> {
+        let sram = addr.wrapping_sub(SRAM_BASE) as usize;
+        if sram < SRAM_SIZE {
+            return Ok(mem::read(&self.sys.sram, sram, size));
+        }
+        if addr >> 26 == XIP_BASE >> 26 {
+            let off = self.flash(addr)?;
+            return Ok(mem::read(&self.sys.flash, off, size));
+        }
+        if (addr as usize) < ROM_SIZE {
+            return Ok(mem::read(&self.sys.rom, addr as usize, size));
+        }
+        self.slow_read(addr, size)
+    }
+
+    #[inline]
+    fn write(&mut self, addr: u32, size: Size, value: u32) -> Result<(), BusFault> {
+        let sram = addr.wrapping_sub(SRAM_BASE) as usize;
+        if sram < SRAM_SIZE {
+            mem::write(&mut self.sys.sram, sram, size, value);
+            return Ok(());
+        }
+        self.slow_write(addr, size, value)
+    }
+
+    #[inline]
+    fn fetch16(&mut self, addr: u32) -> Result<u16, BusFault> {
+        if addr >> 26 == XIP_BASE >> 26 {
+            let off = self.flash(addr)?;
+            return Ok(u16::from_le_bytes([self.sys.flash[off], self.sys.flash[off + 1]]));
+        }
+        let sram = addr.wrapping_sub(SRAM_BASE) as usize;
+        if sram < SRAM_SIZE {
+            return Ok(u16::from_le_bytes([self.sys.sram[sram], self.sys.sram[sram + 1]]));
+        }
+        if (addr as usize) < ROM_SIZE {
+            return Ok(u16::from_le_bytes([self.sys.rom[addr as usize], self.sys.rom[addr as usize + 1]]));
+        }
+        self.slow_read(addr, Size::Half).map(|v| v as u16)
+    }
+
+    #[inline]
+    fn set_elapsed(&mut self, cycles: u64) {
+        self.elapsed = cycles;
+    }
+
+    #[inline]
+    fn take_attention(&mut self) -> bool {
+        std::mem::take(&mut self.attention)
     }
 
     fn peek(&mut self, addr: u32, size: Size) -> Option<u32> {

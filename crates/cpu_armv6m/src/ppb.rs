@@ -107,6 +107,7 @@ impl SysTick {
     }
 
     /// Core clock cycles (only counted when CLKSOURCE selects the processor clock).
+    #[inline]
     pub fn tick_core(&mut self, cycles: u64) -> bool {
         self.csr & CSR_CLKSOURCE != 0 && self.count(cycles)
     }
