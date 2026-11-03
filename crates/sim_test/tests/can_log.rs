@@ -211,3 +211,73 @@ fn hardware_style_recording() {
     let jitter = hb.period_a.unwrap().std_ms;
     assert!(jitter > 0.05 && hb.period_b.unwrap().std_ms < 0.05, "the recording's jitter shows: {jitter}");
 }
+
+fn boot_c(path: &std::path::Path) -> sim_test::Session {
+    let image = sim_core::image::Image::load(path).unwrap();
+    let mut m = rp2040::Machine::new(rp2040::MachineConfig {
+        bootrom: Some(rp2040::BOOTROM_B1.to_vec()),
+        ..Default::default()
+    });
+    m.sys.unmodelled.log_mode = rp2040::unmodelled::LogMode::Off;
+    m.load(&image).unwrap();
+    m.rom_boot().unwrap();
+    let mut s = sim_test::Session::new(m, &image);
+    let b = sim_test::Board::load(&sim_test::board_file("talos/led_board")).unwrap();
+    b.apply(&mut s.machine).unwrap();
+    let mut bus = CanBus::new("can0", b.can_rates().unwrap());
+    bus.record = Some(Vec::new());
+    s.can_bus = Some(bus);
+    s
+}
+
+/// An upload through the C Titan bootloader (what `upload_tool` does over CAN), recorded and replayed: the host's
+/// side of the session alone reflashes a fresh board the same way, frame for frame, and the comparison shows the
+/// control interface traffic decoded.
+#[test]
+fn replayed_upload_reflashes_the_board() {
+    let (Some(with_bl), Some(ota)) =
+        (sim_test::titan_c("bl_app_v0/bl_app_with_bl.uf2"), sim_test::titan_c("bl_app_v1/bl_app_ota.uf2"))
+    else {
+        return;
+    };
+    let image = sim_core::image::Image::load(&ota).unwrap();
+    let mut a = boot_c(&with_bl);
+    let link = sim_host::upload::CanmoreLink::new(6);
+    a.can_endpoints.push(Box::new(link.clone()));
+    a.run_until(Time::from_ms(1000));
+    a.machine.watchdog_reset(rp2040::periph::timer::WatchdogReset::Force);
+    sim_host::upload::upload_ota(&mut a, &link, &image, Time::from_secs(6)).expect("upload");
+    let end = a.machine.now + Time::from_ms(1500);
+    a.run_until(end);
+    let log_a = canlog::from_records(a.can_bus.as_ref().unwrap().record.as_ref().unwrap(), "can0");
+
+    let mut b = boot_c(&with_bl);
+    let rates = b.can_bus.as_ref().unwrap().rates;
+    let opts = ReplayOptions {
+        filters: vec![Filter::parse("sender=host").unwrap()],
+        origin_ns: Some(0),
+        rates: Some(rates),
+        ..Default::default()
+    };
+    b.can_endpoints.push(Box::new(Replay::from_log(&log_a, &opts)));
+    b.run_until(Time::from_ms(1000));
+    b.machine.watchdog_reset(rp2040::periph::timer::WatchdogReset::Force);
+    b.run_until(end);
+    b.poll_uarts();
+    assert!(b.uart_text[0].contains("Bootloader test app 1.1"), "{}", b.uart_text[0]);
+    for (addr, data) in sim_host::upload::pages(&image) {
+        let o = (addr - 0x1000_0000) as usize;
+        assert_eq!(&b.machine.sys.flash[o..o + 256], &data[..], "{addr:#x}");
+    }
+    let log_b = canlog::from_records(b.can_bus.as_ref().unwrap().record.as_ref().unwrap(), "can0");
+    let r = candiff::diff(&candiff::decode(&log_a, false), &candiff::decode(&log_b, false), &DiffOptions::default());
+    assert!(r.identical(), "{}", r.render(3));
+    let requests =
+        r.streams.iter().find(|s| s.name == "can0 client 6 host->board util ch14 (control interface)").unwrap();
+    assert!(requests.matched > 100, "{}", r.render(0));
+    let events = candiff::decode(&log_a, false).events;
+    let ci: Vec<&str> = events.iter().filter(|e| e.stream.contains("ch14")).map(|e| e.payload.as_str()).collect();
+    assert_eq!(ci[0], "enter bootloader");
+    assert!(ci.iter().any(|p| p.contains("(bulk end)")), "{ci:?}");
+    assert!(ci.iter().any(|p| p.starts_with("ok 0x")), "a register read answered: {ci:?}");
+}
