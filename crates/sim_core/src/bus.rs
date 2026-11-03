@@ -177,8 +177,18 @@ pub mod mem {
     pub fn read(buf: &[u8], off: usize, size: Size) -> u32 {
         match size {
             Size::Byte => buf[off] as u32,
-            Size::Half => u16::from_le_bytes([buf[off], buf[off + 1]]) as u32,
-            Size::Word => u32::from_le_bytes([buf[off], buf[off + 1], buf[off + 2], buf[off + 3]]),
+            // One bounds check and one load (indexing each byte checks each)
+            Size::Half => u16::from_le_bytes(*chunk(buf, off)) as u32,
+            Size::Word => u32::from_le_bytes(*chunk(buf, off)),
+        }
+    }
+
+    /// The `N` bytes at `off`; panics out of range, as indexing does.
+    #[inline(always)]
+    fn chunk<const N: usize>(buf: &[u8], off: usize) -> &[u8; N] {
+        match buf.get(off..).and_then(|b| b.first_chunk::<N>()) {
+            Some(c) => c,
+            None => panic!("{N} bytes at {off} out of range for a slice of {}", buf.len()),
         }
     }
 

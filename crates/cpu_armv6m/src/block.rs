@@ -16,7 +16,7 @@
 
 use sim_core::bus::{Bus, Size};
 
-use crate::exec::{Next, add_with_carry, sext};
+use crate::exec::{Next, sext};
 use crate::{CortexM0Plus, Fault};
 
 /// Most instructions in a block.
@@ -207,6 +207,12 @@ impl Entry {
         &self.ops[..self.n as usize]
     }
 
+    /// Address of the first instruction.
+    #[inline(always)]
+    pub(crate) fn start(&self) -> u32 {
+        self.pc
+    }
+
     /// The cycles the ops before op `i` take.
     #[inline(always)]
     pub(crate) fn lead_cycles(&self, i: usize) -> u64 {
@@ -221,9 +227,11 @@ impl Entry {
 }
 
 /// The decoded block cache of one core. Cloning gives an empty cache (it is only a cache).
-#[derive(Default)]
 pub struct BlockCache {
     entries: Option<Box<[Entry]>>,
+    /// Where the last batch stopped in the middle of a block (at its step limit): the PC, the entry and the op
+    /// there, so that the next batch goes on with that block rather than decode a new one from there.
+    resume: (u32, usize, usize),
 }
 
 impl Clone for BlockCache {
@@ -234,22 +242,56 @@ impl Clone for BlockCache {
 
 impl std::fmt::Debug for BlockCache {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let used = self.entries.as_ref().map_or(0, |e| e.iter().filter(|e| e.pc & 1 == 0).count());
-        write!(f, "BlockCache({used} blocks)")
+        f.write_str("BlockCache")
+    }
+}
+
+impl Default for BlockCache {
+    fn default() -> Self {
+        BlockCache { entries: None, resume: (1, 0, 0) }
     }
 }
 
 impl BlockCache {
-    /// The block starting at `pc` in `code` (the bytes from `pc` on), decoded now unless the cached one was decoded
-    /// from the same bytes.
+    /// The block to run from `pc`, as the entry it is in and the index of the op at `pc`: the block the last
+    /// batch stopped in, or the one starting at `pc`, decoded now unless the cached one was decoded from the same
+    /// bytes. `None` if the bus has no code at `pc` ([`Bus::code_at`]).
     #[inline(always)]
-    pub(crate) fn lookup(&mut self, pc: u32, code: &[u8]) -> &Entry {
+    pub(crate) fn lookup<B: Bus + ?Sized>(&mut self, bus: &mut B, pc: u32) -> Option<(usize, usize)> {
         let entries = self.entries.get_or_insert_with(|| vec![Entry::EMPTY; ENTRIES].into_boxed_slice());
-        let e = &mut entries[(pc.wrapping_mul(0x9E37_79B1) >> (32 - ENTRIES.trailing_zeros())) as usize];
+        let (at, slot, i) = self.resume;
+        if at == pc {
+            self.resume.0 = 1;
+            let e = &entries[slot];
+            if i < e.n as usize
+                && e.pc.wrapping_add(e.ops[i].off as u32) == pc
+                && bus.code_at(e.pc).is_some_and(|code| e.same_code(code))
+            {
+                return Some((slot, i));
+            }
+        }
+        let code = bus.code_at(pc)?;
+        let slot = (pc.wrapping_mul(0x9E37_79B1) >> (32 - ENTRIES.trailing_zeros())) as usize;
+        let e = &mut entries[slot];
         if e.pc != pc || !e.same_code(code) {
             decode_block(e, pc, code);
         }
-        e
+        Some((slot, 0))
+    }
+
+    /// A block [`BlockCache::lookup`] returned.
+    #[inline(always)]
+    pub(crate) fn entry(&self, slot: usize) -> &Entry {
+        match &self.entries {
+            Some(e) => &e[slot],
+            None => &Entry::EMPTY,
+        }
+    }
+
+    /// The batch stops before op `i` of the block in `slot`, at `pc`.
+    #[inline(always)]
+    pub(crate) fn stop_at(&mut self, pc: u32, slot: usize, i: usize) {
+        self.resume = (pc, slot, i);
     }
 }
 
@@ -462,6 +504,15 @@ pub(crate) fn decode16(ins: u32, pc: u32) -> Op {
     }
 }
 
+/// `AddWithCarry` (as `exec::add_with_carry`) without 64-bit arithmetic.
+#[inline(always)]
+pub(crate) fn adc(x: u32, y: u32, carry: bool) -> (u32, bool, bool) {
+    let (r, c1) = x.overflowing_add(y);
+    let (r, c2) = r.overflowing_add(carry as u32);
+    // Signed overflow: both operands have the sign the result does not
+    (r, c1 | c2, ((x ^ r) & (y ^ r)) >> 31 != 0)
+}
+
 /// Why [`CortexM0Plus::run_blocks`] stopped.
 pub(crate) enum Exit {
     /// The next instruction is the interpreter loop's to look at: the step limit was reached, the exception state
@@ -497,23 +548,28 @@ impl CortexM0Plus {
             if pc < trap_below {
                 return (cycles, steps, Exit::Next);
             }
-            let Some(code) = bus.code_at(pc) else {
+            let Some((slot, first)) = cache.lookup(bus, pc) else {
                 return (cycles, steps, Exit::Next);
             };
-            let block = cache.lookup(pc, code);
-            let len = block.len();
-            let ops = block.ops();
+            let block = cache.entry(slot);
+            let (lo, len) = (block.start(), block.len());
+            let ops = &block.ops()[first..];
             let run = &ops[..ops.len().min((max_steps - steps) as usize)];
-            if run.is_empty() || cycles + block.lead_cycles(run.len() - 1) >= budget {
+            if run.is_empty() || cycles + block.lead_cycles(first + run.len() - 1) - block.lead_cycles(first) >= budget
+            {
                 return (cycles, steps, Exit::Next);
             }
+            let cut = run.len() < ops.len();
             let mut leave = false;
             let mut last = run[run.len() - 1];
             let mut ran = run.len();
-            for (i, &op) in run.iter().enumerate() {
-                match self.exec_op(bus, op, pc, len, cycles, &mut leave) {
+            let mut ops = run.iter();
+            while let Some(&op) = ops.next() {
+                // Ops run so far, this one included
+                let i = run.len() - ops.len() - 1;
+                match self.exec_op(bus, op, lo, len, cycles, &mut leave) {
                     Ok(c) => cycles += c as u64,
-                    Err(f) => return (cycles, steps + i as u32 + 1, Exit::Fault(f, pc.wrapping_add(op.off as u32))),
+                    Err(f) => return (cycles, steps + i as u32 + 1, Exit::Fault(f, lo.wrapping_add(op.off as u32))),
                 }
                 if op.kind.uses_bus() {
                     let stall = bus.take_stall_cycles();
@@ -521,7 +577,7 @@ impl CortexM0Plus {
                     let attention = bus.take_attention() || std::mem::take(&mut self.batch_break);
                     if attention || bus.take_slow_access() || leave || stall != 0 {
                         if !op.kind.sets_pc() {
-                            self.r[15] = pc.wrapping_add(op.off as u32 + 2);
+                            self.r[15] = lo.wrapping_add(op.off as u32 + 2);
                         }
                         if attention {
                             return (cycles, steps + i as u32 + 1, Exit::Batch);
@@ -533,7 +589,10 @@ impl CortexM0Plus {
             }
             steps += ran as u32;
             if !last.kind.sets_pc() {
-                self.r[15] = pc.wrapping_add(last.off as u32 + 2);
+                self.r[15] = lo.wrapping_add(last.off as u32 + 2);
+                if cut && ran == run.len() {
+                    cache.stop_at(self.r[15], slot, first + ran);
+                }
             }
             if cycles >= budget {
                 return (cycles, steps, Exit::Batch);
@@ -542,6 +601,52 @@ impl CortexM0Plus {
                 return (cycles, steps, Exit::Next);
             }
         }
+    }
+
+    // The longer ops, out of line so that the loop running blocks stays small
+
+    #[inline(never)]
+    fn op_stm<B: Bus + ?Sized>(&mut self, bus: &mut B, rn: u32, list: u32) -> Result<u32, Fault> {
+        self.stm(bus, rn, list)
+    }
+
+    #[inline(never)]
+    fn op_ldm<B: Bus + ?Sized>(&mut self, bus: &mut B, rn: u32, list: u32) -> Result<u32, Fault> {
+        self.ldm(bus, rn, list)
+    }
+
+    #[inline(never)]
+    fn op_push<B: Bus + ?Sized>(&mut self, bus: &mut B, list: u32) -> Result<u32, Fault> {
+        self.push(bus, list)
+    }
+
+    #[inline(never)]
+    fn op_pop<B: Bus + ?Sized>(&mut self, bus: &mut B, list: u32) -> Result<(Next, u32), Fault> {
+        self.pop(bus, list)
+    }
+
+    #[inline(never)]
+    fn op_pop_pc<B: Bus + ?Sized>(&mut self, bus: &mut B, list: u32) -> Result<u32, Fault> {
+        let (n, c) = self.pop(bus, list)?;
+        if let Next::Branch(t) = n {
+            self.r[15] = t;
+        }
+        Ok(c)
+    }
+
+    #[inline(never)]
+    fn op_bx<B: Bus + ?Sized>(&mut self, bus: &mut B, target: u32) -> Result<u32, Fault> {
+        let (n, c) = self.bx_write_pc(bus, target)?;
+        if let Next::Branch(t) = n {
+            self.r[15] = t;
+        }
+        Ok(2 + c)
+    }
+
+    #[inline(never)]
+    fn op_step<B: Bus + ?Sized>(&mut self, bus: &mut B, pc: u32) -> Result<u32, Fault> {
+        self.r[15] = pc;
+        self.execute::<B, false>(bus)
     }
 
     #[inline(always)]
@@ -586,12 +691,14 @@ impl CortexM0Plus {
                 bus.set_elapsed(elapsed)
             };
         }
-        let a = op.a as usize;
-        let b = op.b as usize;
+        // Register numbers are below 16 (the masks spare the bounds checks)
+        let a = (op.a & 15) as usize;
+        let b = (op.b & 15) as usize;
+        let m = (op.imm & 15) as usize;
         let imm = op.imm;
         macro_rules! arith {
             ($x:expr, $y:expr, $c:expr) => {{
-                let (r, c, v) = add_with_carry($x, $y, $c);
+                let (r, c, v) = adc($x, $y, $c);
                 self.set_nz(r);
                 self.c = c;
                 self.v = v;
@@ -631,8 +738,8 @@ impl CortexM0Plus {
                 self.c = v >> 31 != 0;
                 logic!(((v as i32) >> 31) as u32);
             }
-            K::AddR => self.r[a] = arith!(self.r[b], self.r[imm as usize], false),
-            K::SubR => self.r[a] = arith!(self.r[b], !self.r[imm as usize], true),
+            K::AddR => self.r[a] = arith!(self.r[b], self.r[m], false),
+            K::SubR => self.r[a] = arith!(self.r[b], !self.r[m], true),
             K::AddI3 => self.r[a] = arith!(self.r[b], imm, false),
             K::SubI3 => self.r[a] = arith!(self.r[b], !imm, true),
             K::MovI => logic!(imm),
@@ -721,11 +828,17 @@ impl CortexM0Plus {
             K::Mul => logic!(self.r[a].wrapping_mul(self.r[b])),
             K::Bic => logic!(self.r[a] & !self.r[b]),
             K::Mvn => logic!(!self.r[b]),
-            K::AddHi => self.write_any(a as u32, self.r[a].wrapping_add(self.r[b])),
+            K::AddHi => {
+                let r = self.r[a].wrapping_add(self.r[b]);
+                self.r[a] = if a == 13 { r & !3 } else { r };
+            }
             K::CmpHi => {
                 arith!(self.r[a], !self.r[b], true);
             }
-            K::MovHi => self.write_any(a as u32, self.r[b]),
+            K::MovHi => {
+                let r = self.r[b];
+                self.r[a] = if a == 13 { r & !3 } else { r };
+            }
             K::Set => self.r[a] = imm,
             K::AddSp => self.r[a] = self.r[13].wrapping_add(imm),
             K::SpAdd => self.r[13] = self.r[13].wrapping_add(imm),
@@ -750,49 +863,49 @@ impl CortexM0Plus {
             }
             K::StrR => {
                 timed!();
-                let addr = self.r[b].wrapping_add(self.r[imm as usize]);
+                let addr = self.r[b].wrapping_add(self.r[m]);
                 self.store(bus, addr, (Size::Word, self.r[a]), (lo, len), code)?;
                 return Ok(2);
             }
             K::StrhR => {
                 timed!();
-                let addr = self.r[b].wrapping_add(self.r[imm as usize]);
+                let addr = self.r[b].wrapping_add(self.r[m]);
                 self.store(bus, addr, (Size::Half, self.r[a]), (lo, len), code)?;
                 return Ok(2);
             }
             K::StrbR => {
                 timed!();
-                let addr = self.r[b].wrapping_add(self.r[imm as usize]);
+                let addr = self.r[b].wrapping_add(self.r[m]);
                 self.store(bus, addr, (Size::Byte, self.r[a]), (lo, len), code)?;
                 return Ok(2);
             }
             K::LdrsbR => {
                 timed!();
-                let addr = self.r[b].wrapping_add(self.r[imm as usize]);
+                let addr = self.r[b].wrapping_add(self.r[m]);
                 self.r[a] = sext(self.load(bus, addr, Size::Byte)?, 8);
                 return Ok(2);
             }
             K::LdrR => {
                 timed!();
-                let addr = self.r[b].wrapping_add(self.r[imm as usize]);
+                let addr = self.r[b].wrapping_add(self.r[m]);
                 self.r[a] = self.load(bus, addr, Size::Word)?;
                 return Ok(2);
             }
             K::LdrhR => {
                 timed!();
-                let addr = self.r[b].wrapping_add(self.r[imm as usize]);
+                let addr = self.r[b].wrapping_add(self.r[m]);
                 self.r[a] = self.load(bus, addr, Size::Half)?;
                 return Ok(2);
             }
             K::LdrbR => {
                 timed!();
-                let addr = self.r[b].wrapping_add(self.r[imm as usize]);
+                let addr = self.r[b].wrapping_add(self.r[m]);
                 self.r[a] = self.load(bus, addr, Size::Byte)?;
                 return Ok(2);
             }
             K::LdrshR => {
                 timed!();
-                let addr = self.r[b].wrapping_add(self.r[imm as usize]);
+                let addr = self.r[b].wrapping_add(self.r[m]);
                 self.r[a] = sext(self.load(bus, addr, Size::Half)?, 16);
                 return Ok(2);
             }
@@ -835,24 +948,24 @@ impl CortexM0Plus {
             K::Stm => {
                 timed!();
                 let base = self.r[a];
-                let r = self.stm(bus, a as u32, imm);
+                let r = self.op_stm(bus, a as u32, imm);
                 // Conservatively: any part of the block within the stored words
                 *code |= base.wrapping_sub(lo.wrapping_sub(64)) < len + 64;
                 return r;
             }
             K::Ldm => {
                 timed!();
-                return self.ldm(bus, a as u32, imm);
+                return self.op_ldm(bus, a as u32, imm);
             }
             K::Push => {
                 timed!();
-                let r = self.push(bus, imm);
+                let r = self.op_push(bus, imm);
                 *code |= self.r[13].wrapping_sub(lo.wrapping_sub(64)) < len + 64;
                 return r;
             }
             K::Pop => {
                 timed!();
-                return self.pop(bus, imm).map(|(_, c)| c);
+                return self.op_pop(bus, imm).map(|(_, c)| c);
             }
             K::B => {
                 self.r[15] = imm;
@@ -877,24 +990,15 @@ impl CortexM0Plus {
                 if op.kind == K::Blx {
                     self.r[14] = pc.wrapping_add(2) | 1;
                 }
-                let (n, c) = self.bx_write_pc(bus, target)?;
-                if let Next::Branch(t) = n {
-                    self.r[15] = t;
-                }
-                return Ok(2 + c);
+                return self.op_bx(bus, target);
             }
             K::PopPc => {
                 timed!();
-                let (n, c) = self.pop(bus, imm)?;
-                if let Next::Branch(t) = n {
-                    self.r[15] = t;
-                }
-                return Ok(c);
+                return self.op_pop_pc(bus, imm);
             }
             K::Step => {
                 timed!();
-                self.r[15] = pc;
-                return self.execute::<B, false>(bus);
+                return self.op_step(bus, pc);
             }
         }
         Ok(1)

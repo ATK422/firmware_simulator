@@ -744,10 +744,10 @@ impl CortexM0Plus {
                 }
                 // Op by op, as the interpreter checks after each instruction (the budget is close, or SysTick
                 // counts every cycle)
-                if let Some(code) = bus.code_at(pc) {
-                    let block = cache.lookup(pc, code);
-                    let len = block.len();
-                    let ops = block.ops();
+                if let Some((slot, first)) = cache.lookup(bus, pc) {
+                    let block = cache.entry(slot);
+                    let (lo, len) = (block.start(), block.len());
+                    let ops = &block.ops()[first..];
                     let run = &ops[..ops.len().min((max_steps - steps) as usize)];
                     let mut leave = false;
                     // After `$i` ops, the last of them `$op`: where the PC goes on
@@ -755,16 +755,16 @@ impl CortexM0Plus {
                         ($i:expr, $op:expr) => {{
                             steps += $i as u32;
                             if !$op.kind.sets_pc() {
-                                self.r[15] = pc.wrapping_add($op.off as u32 + 2);
+                                self.r[15] = lo.wrapping_add($op.off as u32 + 2);
                             }
                         }};
                     }
                     for (i, &op) in run.iter().enumerate() {
-                        let mut c = match self.exec_op(bus, op, pc, len, cycles, &mut leave) {
+                        let mut c = match self.exec_op(bus, op, lo, len, cycles, &mut leave) {
                             Ok(c) => c,
                             Err(f) => {
                                 steps += i as u32 + 1;
-                                fault!(f, pc.wrapping_add(op.off as u32))
+                                fault!(f, lo.wrapping_add(op.off as u32))
                             }
                         };
                         let uses_bus = op.kind.uses_bus();

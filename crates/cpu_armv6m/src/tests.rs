@@ -1458,3 +1458,18 @@ fn changed_code_is_decoded_again() {
     rig.cpu.run_batch(&mut CodeBus(&mut rig.bus), 3, u64::MAX, 0);
     assert_eq!((rig.r(0), rig.r(1)), (1, 9));
 }
+
+#[test]
+fn block_add_with_carry_matches_the_reference() {
+    let edges = [0, 1, 2, 0x7FFF_FFFE, 0x7FFF_FFFF, 0x8000_0000, 0x8000_0001, 0xFFFF_FFFE, 0xFFFF_FFFF];
+    let mut rng = XorShift(7);
+    let mut values: Vec<u32> = edges.to_vec();
+    values.extend((0..200).map(|_| rng.next()));
+    for &x in &values {
+        for &y in &values {
+            for c in [false, true] {
+                assert_eq!(crate::block::adc(x, y, c), crate::exec::add_with_carry(x, y, c), "{x:#x} {y:#x} {c}");
+            }
+        }
+    }
+}
