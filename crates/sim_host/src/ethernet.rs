@@ -319,7 +319,8 @@ impl EthEndpoint for PuddlesBridge {
 
 /// Connects the board to a UDP socket on the host: the board's datagrams to the robot computer's port 2203 are sent
 /// to `peer` (where `titan_bridge` listens), and datagrams arriving on the local socket reach the board as if from
-/// the robot computer. Heartbeat broadcasts are forwarded to `peer`'s address on port 2201.
+/// the robot computer. Only datagrams from `peer`'s IP (any port; any sender if it is unspecified, `0.0.0.0`) are
+/// accepted, as cannelloni does. Heartbeat broadcasts are forwarded to `peer`'s address on port 2201.
 pub struct UdpRelay {
     socket: UdpSocket,
     peer: SocketAddr,
@@ -359,7 +360,13 @@ impl EthEndpoint for UdpRelay {
 
     fn take_tx(&mut self, until: Time) -> Vec<Vec<u8>> {
         let mut buf = [0u8; 2048];
-        while let Ok((n, _)) = self.socket.recv_from(&mut buf) {
+        while let Ok((n, from)) = self.socket.recv_from(&mut buf) {
+            // Only the peer talks to the board (from any port), as the board only accepts the robot computer's IP;
+            // an unspecified peer IP accepts every sender
+            if from.ip() != self.peer.ip() && !self.peer.ip().is_unspecified() {
+                log::debug!("UDP relay: ignoring a datagram from {from}");
+                continue;
+            }
             self.host.send(&buf[..n], until);
         }
         std::mem::take(&mut self.host.out)
@@ -420,5 +427,31 @@ mod tests {
             }
             other => panic!("{other:?}"),
         }
+    }
+
+    /// Only the peer's IP may talk to the board through the relay (as the board itself only accepts the robot
+    /// computer's IP), from any port; a datagram from anywhere else on the network is dropped.
+    #[test]
+    fn relay_only_forwards_datagrams_from_the_peer() {
+        let bridge = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let other_port = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let stranger = UdpSocket::bind("127.0.0.2:0").unwrap();
+        let mut relay = UdpRelay::bind("127.0.0.1:0".parse().unwrap(), bridge.local_addr().unwrap()).unwrap();
+        let to = relay.local_addr().unwrap();
+        // The board has sent something: its MAC is known
+        relay.receive(&udp(HOST_MAC, (BOARD_IP, LINK_PORT), (ROBOT_COMPUTER_IP, LINK_PORT), b"TLup"), Time::ZERO);
+        stranger.send_to(b"TLstranger", to).unwrap();
+        bridge.send_to(b"TLbridge", to).unwrap();
+        other_port.send_to(b"TLother port", to).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        let got: Vec<Vec<u8>> = relay
+            .take_tx(Time::from_ms(1))
+            .iter()
+            .map(|f| match parse(f) {
+                Parsed::Udp(u) => u.payload,
+                other => panic!("{other:?}"),
+            })
+            .collect();
+        assert_eq!(got, [b"TLbridge".to_vec(), b"TLother port".to_vec()]);
     }
 }
