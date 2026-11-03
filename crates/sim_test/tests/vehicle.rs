@@ -75,11 +75,15 @@ fn puddles_dives_on_thruster_commands_and_its_depth_sensor_sees_it() {
     assert!(during.windows(2).all(|w| w[1] >= w[0] - 1e-3), "{during:?}");
     let [roll, pitch, yaw] = v.state.attitude.euler();
     assert!(roll.abs() < 0.01 && pitch.abs() < 0.01 && yaw.abs() < 1e-6, "{roll} {pitch} {yaw}");
-    // Thrusters off: the drag stops it and the 1 N of buoyancy slowly brings it back up
+    // The physical kill switch pulled (GPIO 12 left to its pull-up): the backplane stops the thrusters although the
+    // commands keep coming, the drag stops the vehicle and the 1 N of buoyancy slowly brings it back up
+    r.robot.boards[0].machine.sys.gpio.external[12] = sim_core::wire::External::Floating;
     for _ in 0..200 {
-        bridge.send(HostToDevice::PuddlesBackplane(pb::HostToDevice::Dshot([0; 8])));
+        bridge.send(HostToDevice::PuddlesBackplane(pb::HostToDevice::Dshot(dive)));
         r.run_for(Time::from_ms(20));
     }
+    let v = &r.robot.vehicle("puddles").unwrap().vehicle;
+    assert!(v.thrust_n.iter().all(|t| t.abs() < 1e-6), "spun down: {:?}", v.thrust_n);
     let w = r.robot.vehicle("puddles").unwrap().vehicle.state.world_velocity()[2];
     assert!((-0.03..-0.01).contains(&w), "rising: {w}");
 }
