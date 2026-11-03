@@ -1,0 +1,18 @@
+# pico-sdk conformance programs for the emulator, mirroring pico-examples' uart/hello_uart,
+# multicore/hello_multicore and flash/program. Built against titan_firmware's pico-sdk submodule:
+#   cmake -G Ninja -S test_programs/pico -B build/pico && ninja -C build/pico
+cmake_minimum_required(VERSION 3.13)
+set(PICO_SDK_PATH ${CMAKE_CURRENT_LIST_DIR}/../../external/titan_firmware/lib/pico-sdk)
+include(${PICO_SDK_PATH}/pico_sdk_init.cmake)
+project(pico_tests C CXX ASM)
+set(CMAKE_C_STANDARD 11)
+pico_sdk_init()
+
+add_executable(hello_uart hello_uart.c)
+target_link_libraries(hello_uart pico_stdlib)
+
+add_executable(hello_multicore hello_multicore.c)
+target_link_libraries(hello_multicore pico_stdlib pico_multicore hardware_divider hardware_interp hardware_sync)
+
+add_executable(flash_program flash_program.c)
+target_link_libraries(flash_program pico_stdlib hardware_flash)

@@ -42,6 +42,16 @@ enum TraceKind {
 }
 
 #[derive(Clone, Copy, ValueEnum, PartialEq, Eq)]
+enum UartSink {
+    /// Print complete lines on stdout with their virtual time.
+    Stdout,
+    /// Create a pseudo terminal (output and input).
+    Pty,
+    /// Discard.
+    None,
+}
+
+#[derive(Clone, Copy, ValueEnum, PartialEq, Eq)]
 enum UnmodelledLog {
     First,
     Every,
@@ -76,6 +86,12 @@ struct RunArgs {
     /// Stop on BKPT instructions instead of escalating them to HardFault.
     #[arg(long)]
     stop_on_bkpt: bool,
+    /// Where UART0 goes.
+    #[arg(long, value_enum, default_value = "stdout")]
+    uart0: UartSink,
+    /// Where UART1 goes.
+    #[arg(long, value_enum, default_value = "stdout")]
+    uart1: UartSink,
     /// Wait for GDB on this address (e.g. `127.0.0.1:3333`) before running.
     #[arg(long)]
     gdb: Option<String>,
@@ -149,6 +165,19 @@ fn run(args: RunArgs) -> Result<()> {
     let mut session = Session::new(machine, &image);
     session.keep_logs = false;
     session.on_log = Some(Box::new(|t, line| println!("[{t}] {line}")));
+    let sinks = [args.uart0, args.uart1];
+    session.on_uart_line = Some(Box::new(move |t, n, line| {
+        if sinks[n] == UartSink::Stdout {
+            println!("[{t}] uart{n}: {line}")
+        }
+    }));
+    for (n, sink) in sinks.iter().enumerate() {
+        if *sink == UartSink::Pty {
+            let pty = sim_host::pty::Pty::open().context("opening a pty")?;
+            eprintln!("uart{n} on {}", pty.path);
+            session.uart_pty[n] = Some(pty);
+        }
+    }
     if let Some(rtt) = &session.rtt {
         let defmt = if session.has_defmt() { ", decoding defmt" } else { "" };
         log::info!("RTT control block at {:#010x}{defmt}", rtt.addr);
@@ -165,6 +194,7 @@ fn run(args: RunArgs) -> Result<()> {
     }
     let reason = session.run_until(args.time);
     let elapsed = wall.elapsed();
+    session.flush_uarts();
     for (ch, bytes) in session.rtt_text.drain(..) {
         print!("[rtt{ch}] {}", String::from_utf8_lossy(&bytes));
     }
@@ -193,6 +223,14 @@ fn run(args: RunArgs) -> Result<()> {
         where_(machine.cores[0].pc()),
         elapsed
     );
+    if machine.core_enabled[1] {
+        eprintln!(
+            "core1 {} cycles, pc {}, {:?}",
+            machine.cores[1].cycles(),
+            where_(machine.cores[1].pc()),
+            machine.cores[1].sleep_state()
+        );
+    }
     let summary = machine.sys.unmodelled.summary();
     if !summary.is_empty() {
         eprintln!("unmodelled registers touched:");

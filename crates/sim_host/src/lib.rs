@@ -4,6 +4,7 @@
 
 pub mod defmt;
 pub mod gdb;
+pub mod pty;
 pub mod rtt;
 pub mod session;
 pub mod target;
