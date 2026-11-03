@@ -14,6 +14,8 @@ use sim_core::time::Time;
 use sim_core::trace::{Category, WriterSink};
 use sim_host::Session;
 
+mod host_tools;
+
 #[derive(Parser)]
 #[command(version, about = "RP2040 emulator for UWRT titan firmware")]
 struct Cli {
@@ -29,6 +31,13 @@ enum Command {
     Run(RunArgs),
     /// Runs every board of a robot file on their shared CAN buses (and acoustic environment).
     Robot(RobotArgs),
+    /// Compares two CAN logs (hardware vs emulator, or two runs) by CANmore message: missing, extra and changed
+    /// messages, and the timing of each message stream. Exits with 1 if they differ.
+    CanDiff(host_tools::CanDiffArgs),
+    /// Prints the titan_bridge command line for each board of a robot file (or a script or launch file).
+    Bridges(host_tools::BridgesArgs),
+    /// Connects a SocketCAN interface to an emulator's `--cannelloni` tunnel over UDP.
+    CanTunnel(host_tools::TunnelArgs),
 }
 
 #[derive(clap::Args)]
@@ -53,6 +62,8 @@ struct RobotArgs {
     /// Replace the ambient noise every hydrophone hears with white noise at this level, dB re 1 µPa²/Hz.
     #[arg(long)]
     noise_db: Option<f64>,
+    #[command(flatten)]
+    can_host: host_tools::CanHostArgs,
 }
 
 fn parse_bus_client(s: &str) -> Result<(String, u8), String> {
@@ -105,12 +116,14 @@ fn robot(args: RobotArgs) -> Result<()> {
     if let Some(db) = args.noise_db {
         r.set_noise_db(db);
     }
+    let can_host = host_tools::attach_robot(&args.can_host, &mut r, &args.cans)?;
     r.realtime = args.realtime;
     let wall = std::time::Instant::now();
     let stopped = r.run_until(args.time);
     for s in r.boards.iter_mut() {
         s.flush_uarts();
     }
+    can_host.finish()?;
     eprintln!("stopped at {}; {:.2?} wall", r.now, wall.elapsed());
     if let Some((i, why)) = stopped {
         bail!("{} stopped: {why:?}", r.names[i]);
@@ -227,6 +240,8 @@ struct RunArgs {
     /// `127.0.0.1:2203=127.0.0.1:2204` (titan_bridge listening on PEER, sending to LOCAL).
     #[arg(long)]
     udp: Option<String>,
+    #[command(flatten)]
+    can_host: host_tools::CanHostArgs,
 }
 
 fn parse_input(s: &str) -> Result<(String, f64), String> {
@@ -404,6 +419,7 @@ fn run(args: RunArgs) -> Result<()> {
         bail!("--can and --mock-bridge need a --board with a CAN bus (or Ethernet), --udp one with Ethernet");
     }
     session.realtime = args.realtime;
+    let can_host = host_tools::attach_run(&args.can_host, &mut session)?;
 
     let wall = std::time::Instant::now();
     if let Some(addr) = &args.gdb {
@@ -417,6 +433,7 @@ fn run(args: RunArgs) -> Result<()> {
     let reason = session.run_until(args.time);
     let elapsed = wall.elapsed();
     session.flush_uarts();
+    can_host.finish()?;
     for (ch, bytes) in session.rtt_text.drain(..) {
         print!("[rtt{ch}] {}", String::from_utf8_lossy(&bytes));
     }
@@ -484,6 +501,16 @@ fn main() -> Result<()> {
     match cli.command {
         Command::Run(args) => run(args),
         Command::Robot(args) => robot(args),
+        Command::CanDiff(args) => match host_tools::can_diff(args) {
+            Ok(true) => Ok(()),
+            Ok(false) => std::process::exit(1),
+            Err(e) => {
+                eprintln!("error: {e:#}");
+                std::process::exit(2)
+            }
+        },
+        Command::Bridges(args) => host_tools::bridges(args),
+        Command::CanTunnel(args) => host_tools::can_tunnel(args),
     }
 }
 

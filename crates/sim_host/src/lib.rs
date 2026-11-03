@@ -25,6 +25,10 @@ pub fn resolve_image(path: &std::path::Path) -> std::path::PathBuf {
     }
 }
 pub mod board;
+pub mod bridges;
+pub mod candiff;
+pub mod canlog;
+pub mod cannelloni;
 pub mod defmt;
 pub mod ethernet;
 pub mod gdb;
