@@ -292,7 +292,8 @@ pub fn parse_string(desc: &[u8]) -> Option<String> {
     if desc.len() < 2 || desc[1] != desc_type::STRING {
         return None;
     }
-    let n = (desc[0] as usize).min(desc.len());
+    // bLength counts the header; a shorter one (a broken descriptor) is an empty string
+    let n = (desc[0] as usize).clamp(2, desc.len());
     let units: Vec<u16> = desc[2..n].chunks_exact(2).map(|c| u16::from_le_bytes([c[0], c[1]])).collect();
     Some(String::from_utf16_lossy(&units))
 }
@@ -364,6 +365,9 @@ mod tests {
     fn strings() {
         assert_eq!(parse_string(&[8, 3, b'R', 0, b'P', 0, b'2', 0]).as_deref(), Some("RP2"));
         assert_eq!(parse_string(&[4, 2, 0, 0]), None);
+        // A device's bLength below the header's two bytes is an empty string, not a host crash
+        assert_eq!(parse_string(&[0, 3, b'R', 0]).as_deref(), Some(""));
+        assert_eq!(parse_string(&[1, 3]).as_deref(), Some(""));
     }
 
     #[test]
