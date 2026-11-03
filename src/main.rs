@@ -101,6 +101,17 @@ struct RobotArgs {
     /// Mean virtual time between profile samples.
     #[arg(long, default_value = "10us", value_parser = parse_time)]
     profile_interval: Time,
+    /// Write a waveform (VCD, for GTKWave, Surfer or PulseView) of the GPIOs to this file.
+    #[arg(long)]
+    vcd: Option<PathBuf>,
+    /// GPIOs in the waveform: numbers, ranges and names from the board file's `[pins]` table, e.g.
+    /// `0-7,25,status_ledr` (default all).
+    #[arg(long, default_value = "all")]
+    vcd_pins: String,
+    /// Add decoded events to the waveform as string variables: defmt logs, UART lines, CAN frames, device reports
+    /// (GTKWave and Surfer show them; PulseView reads only the pins).
+    #[arg(long)]
+    vcd_events: bool,
 }
 
 fn parse_board_udp(s: &str) -> Result<(String, String, String), String> {
@@ -208,6 +219,33 @@ fn robot(args: RobotArgs) -> Result<()> {
         }
     }
     r.realtime = args.realtime;
+    let vcd = match &args.vcd {
+        Some(path) => {
+            let mut scopes = Vec::new();
+            for (i, name) in r.names.iter().enumerate() {
+                let pins = sim_host::vcd::parse_pins(&args.vcd_pins, &r.pins[i])
+                    .map_err(|e| anyhow::anyhow!("{name}: {e}"))?;
+                let opts = sim_host::vcd::VcdOptions { pins, events: args.vcd_events };
+                scopes.push(sim_host::vcd::Scope::board(name, &r.pins[i], &opts));
+            }
+            if args.vcd_events {
+                scopes.extend(r.bus_names.iter().map(|b| sim_host::vcd::Scope::bus(b)));
+            }
+            let vcd =
+                sim_host::vcd::Vcd::create(path, &scopes).with_context(|| format!("creating {}", path.display()))?;
+            for (i, s) in r.boards.iter_mut().enumerate() {
+                vcd.attach(i, s);
+            }
+            if args.vcd_events {
+                let n = r.boards.len();
+                for (j, rb) in r.buses.iter_mut().enumerate() {
+                    vcd.attach_bus(n + j, rb);
+                }
+            }
+            Some(vcd)
+        }
+        None => None,
+    };
     if let Some(dir) = &args.profile_dir {
         std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
         for s in r.boards.iter_mut() {
@@ -233,6 +271,9 @@ fn robot(args: RobotArgs) -> Result<()> {
         s.flush_uarts();
     }
     eprintln!("stopped at {}; {:.2?} wall", r.now, wall.elapsed());
+    if let (Some(v), Some(path)) = (&vcd, &args.vcd) {
+        finish_vcd(v, path, r.now)?;
+    }
     for v in &r.vehicles {
         let s = &v.vehicle.state;
         let [roll, pitch, yaw] = s.attitude.euler().map(f64::to_degrees);
@@ -423,6 +464,17 @@ struct RunArgs {
     /// Mean virtual time between profile samples.
     #[arg(long, default_value = "10us", value_parser = parse_time)]
     profile_interval: Time,
+    /// Write a waveform (VCD, for GTKWave, Surfer or PulseView) of the GPIOs to this file.
+    #[arg(long)]
+    vcd: Option<PathBuf>,
+    /// GPIOs in the waveform: numbers, ranges and names from the board file's `[pins]` table, e.g.
+    /// `0-7,25,status_ledr` (default all).
+    #[arg(long, default_value = "all")]
+    vcd_pins: String,
+    /// Add decoded events to the waveform as string variables: defmt logs, UART lines, CAN frames, device reports
+    /// (GTKWave and Surfer show them; PulseView reads only the pins).
+    #[arg(long)]
+    vcd_events: bool,
 }
 
 fn parse_input(s: &str) -> Result<(String, f64), String> {
@@ -654,6 +706,20 @@ fn run(args: RunArgs) -> Result<()> {
             .with_context(|| format!("loading {}", path.display()))?;
     }
     let end = if to_load.is_some() { session.machine.now + args.time } else { args.time };
+    let vcd = match &args.vcd {
+        Some(path) => {
+            let named = board.as_ref().map(|b| b.pins.clone()).unwrap_or_default();
+            let pins = sim_host::vcd::parse_pins(&args.vcd_pins, &named).map_err(anyhow::Error::msg)?;
+            let opts = sim_host::vcd::VcdOptions { pins, events: args.vcd_events };
+            let name = board.as_ref().map_or("board", |b| b.name.as_str());
+            let scope = sim_host::vcd::Scope::board(name, &named, &opts);
+            let vcd =
+                sim_host::vcd::Vcd::create(path, &[scope]).with_context(|| format!("creating {}", path.display()))?;
+            vcd.attach(0, &mut session);
+            Some(vcd)
+        }
+        None => None,
+    };
     if args.profile.is_some() {
         session.start_profile(args.profile_interval);
     }
@@ -685,6 +751,9 @@ fn run(args: RunArgs) -> Result<()> {
     }
     if let Some(f) = &args.flash_file {
         session.machine.save_flash_file(f).with_context(|| format!("writing {}", f.display()))?;
+    }
+    if let (Some(v), Some(path)) = (&vcd, &args.vcd) {
+        finish_vcd(v, path, session.machine.now)?;
     }
     if let (Some(path), Some(p)) = (&args.profile, &session.profiler) {
         let title = args.image.as_ref().or(args.picoboot_load.as_ref()).and_then(|p| p.file_name());
@@ -749,6 +818,15 @@ fn run(args: RunArgs) -> Result<()> {
     if matches!(reason, StopReason::Lockup { .. }) {
         bail!("core locked up");
     }
+    Ok(())
+}
+
+fn finish_vcd(v: &sim_host::vcd::Vcd, path: &std::path::Path, end: Time) -> Result<()> {
+    let late = v.finish(end).with_context(|| format!("writing {}", path.display()))?;
+    if late > 0 {
+        log::warn!("{late} waveform changes arrived more than 50 ms after their time; they are shown late");
+    }
+    eprintln!("waveform: {}", path.display());
     Ok(())
 }
 

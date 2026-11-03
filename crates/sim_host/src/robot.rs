@@ -66,6 +66,8 @@ pub struct Robot {
     pub names: Vec<String>,
     /// Each board's physical inputs (sensor values), from its board file.
     pub inputs: Vec<Inputs>,
+    /// Each board's named pins (its board file's `[pins]` table).
+    pub pins: Vec<std::collections::BTreeMap<String, u8>>,
     /// The bus each board is on.
     pub board_bus: Vec<Option<usize>>,
     pub buses: Vec<RobotBus>,
@@ -88,6 +90,7 @@ impl Default for Robot {
             boards: Vec::new(),
             names: Vec::new(),
             inputs: Vec::new(),
+            pins: Vec::new(),
             board_bus: Vec::new(),
             buses: Vec::new(),
             bus_names: Vec::new(),
@@ -115,6 +118,7 @@ impl Robot {
         self.boards.push(session);
         self.names.push(name.to_string());
         self.inputs.push(Inputs::default());
+        self.pins.push(Default::default());
         self.board_bus.push(bus);
         self.power_on.push((Time::ZERO, true));
         self.boards.len() - 1
@@ -183,6 +187,10 @@ impl Robot {
                     for r in &rec[before..] {
                         hook(r);
                     }
+                }
+                if rb.on_can.is_some() && rb.bus.record.as_ref().is_some_and(|r| r.len() > 100_000) {
+                    // The hook has seen them; keep memory bounded on long runs
+                    rb.bus.record.as_mut().unwrap().drain(..50_000);
                 }
             }
             for b in self.boards.iter_mut() {
@@ -264,6 +272,7 @@ impl Robot {
             boards,
             names: self.names.clone(),
             inputs: self.inputs.clone(),
+            pins: self.pins.clone(),
             board_bus: self.board_bus.clone(),
             buses: self
                 .buses
@@ -382,6 +391,7 @@ impl Robot {
             let session = Session::new(m, &image);
             robot.add(&b.name, session, bus);
             robot.inputs[owner] = inputs;
+            robot.pins[owner] = board.pins.clone();
             if let Some(ms) = b.power_on_ms
                 && ms > 0.0
             {

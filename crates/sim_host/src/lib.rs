@@ -42,6 +42,7 @@ pub mod unwind;
 pub mod upload;
 pub mod usb;
 pub mod usbip;
+pub mod vcd;
 pub mod vehicle;
 
 pub use session::Session;
