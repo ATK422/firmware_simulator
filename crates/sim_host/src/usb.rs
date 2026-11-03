@@ -133,6 +133,33 @@ pub fn wait_for_device(
     }
 }
 
+/// pico-sdk's reset interface (`pico_usb_reset_interface`, vendor class, subclass 0, protocol 1) requests.
+pub mod reset_request {
+    pub const BOOTSEL: u8 = 0x01;
+    pub const FLASH: u8 = 0x02;
+}
+
+/// `picotool reboot [-u] -f`: asks a running pico-sdk firmware to reboot through its reset interface, into BOOTSEL
+/// (`bootsel`) or back into its flash image. Returns once the request was accepted (the device then drops off the
+/// bus).
+pub fn reboot_via_reset_interface(r: &mut impl UsbRunner, bootsel: bool, timeout: Time) -> Result<(), Error> {
+    let dev = wait_for_device(r, timeout, |d| d.interfaces.iter().any(is_reset_interface))?;
+    let iface = dev.interfaces.iter().find(|i| is_reset_interface(i)).unwrap().number;
+    let req = if bootsel { reset_request::BOOTSEL } else { reset_request::FLASH };
+    // A class request to the interface, as picotool sends it (TinyUSB hands vendor-type requests to the
+    // application's vendor callback instead of the interface's driver)
+    let s = SetupPacket::new(req_type::CLASS | req_type::INTERFACE, req, 0, iface as u16, 0);
+    match transfer(r, Time::from_secs(1), |h| h.submit_control(s, Vec::new())) {
+        // The firmware may reset before it finishes the status stage
+        Ok(_) | Err(Error::Usb(UsbError::Disconnected)) | Err(Error::Usb(UsbError::NoResponse)) => Ok(()),
+        Err(e) => Err(e),
+    }
+}
+
+fn is_reset_interface(i: &sim_devices::usb::InterfaceInfo) -> bool {
+    i.class == 0xFF && i.subclass == 0x00 && i.protocol == 0x01
+}
+
 // ---------------------------------------------------------------------------------------------- PICOBOOT
 
 /// RP2040 BOOTSEL mode: Raspberry Pi's vendor ID and the RP2 Boot product.
@@ -288,17 +315,19 @@ impl Picoboot {
         })();
         match result {
             Ok(d) => Ok(d),
-            Err(Error::Usb(UsbError::Stall)) => {
-                // The device halts the endpoints on a bad command: ask why, then reset the interface (which
-                // unstalls them) and start the toggles afresh as after CLEAR_FEATURE(HALT)
+            // A bad command stalls the endpoints at once; one that fails while it executes (a bad address in a
+            // write) halts the data endpoint and never sends the acknowledgement. Either way picotool asks for the
+            // status, then resets the interface, which unstalls the endpoints. The data toggles stay as they are on
+            // both sides: the bootrom's soft endpoint reset keeps its PIDs (it only takes back a PID it had handed
+            // to an aborted buffer), and the stalled or cancelled transaction moved no data.
+            Err(Error::Usb(e @ (UsbError::Stall | UsbError::TimedOut))) => {
                 let st = self.status(r)?;
                 self.reset(r)?;
-                let (o, i) = (self.ep_out, self.ep_in);
-                if let Some(h) = r.machine().sys.usb_host_mut() {
-                    h.reset_toggle(o);
-                    h.reset_toggle(i);
+                if st.token == token && st.status != 0 {
+                    Err(Error::Picoboot { cmd, status: st.status })
+                } else {
+                    Err(Error::Usb(e))
                 }
-                Err(Error::Picoboot { cmd, status: st.status })
             }
             Err(e) => Err(e),
         }

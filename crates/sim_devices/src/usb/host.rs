@@ -153,6 +153,10 @@ pub enum EnumStep {
 /// The host side of a CDC ACM serial port.
 #[derive(Clone, Debug, Default)]
 pub struct CdcPort {
+    /// Which CDC function of the device (0 = the first).
+    pub index: usize,
+    /// A client opened or used this port (the others are left alone).
+    used: bool,
     /// Line coding baud rate the host sets.
     pub baud: u32,
     /// DTR and RTS asserted (the port is open).
@@ -181,8 +185,8 @@ pub struct HostController {
     pub device: Option<DeviceInfo>,
     /// Enumerate automatically after a connect (otherwise the port stays enabled with the device at address 0).
     pub auto_enumerate: bool,
-    /// The CDC ACM driver, once [`HostController::cdc_open`] was called.
-    pub cdc: Option<CdcPort>,
+    /// The CDC ACM ports opened (or written to) so far, by index ([`HostController::cdc_open`]).
+    pub cdc: Vec<CdcPort>,
     /// Number of bus resets and completed enumerations so far.
     pub resets: u32,
     pub enumerations: u32,
@@ -215,7 +219,7 @@ impl HostController {
             enumeration: Enumeration::Idle,
             device: None,
             auto_enumerate: true,
-            cdc: None,
+            cdc: Vec::new(),
             resets: 0,
             enumerations: 0,
             transactions: 0,
@@ -410,47 +414,61 @@ impl HostController {
 
     // ------------------------------------------------------------------------------------------ CDC ACM
 
-    /// Opens the device's CDC ACM port (now, or once it is configured): line coding `baud` 8N1, DTR and RTS on.
-    pub fn cdc_open(&mut self, baud: u32) {
-        let cdc = self.cdc.get_or_insert_with(CdcPort::default);
+    fn cdc_port(&mut self, port: usize) -> &mut CdcPort {
+        while self.cdc.len() <= port {
+            let index = self.cdc.len();
+            self.cdc.push(CdcPort { index, ..CdcPort::default() });
+        }
+        let c = &mut self.cdc[port];
+        c.used = true;
+        c
+    }
+
+    /// Opens the device's CDC ACM port `port` (0 for the first CDC function; now, or once the device is
+    /// configured): line coding `baud` 8N1, DTR and RTS on.
+    pub fn cdc_open(&mut self, port: usize, baud: u32) {
+        let cdc = self.cdc_port(port);
         cdc.baud = baud;
         cdc.open = true;
         cdc.dirty = true;
     }
 
     /// Changes the line coding (1200 baud makes pico-sdk stdio reboot into BOOTSEL).
-    pub fn cdc_set_baud(&mut self, baud: u32) {
-        if let Some(c) = &mut self.cdc {
-            c.baud = baud;
-            c.dirty = true;
-        }
+    pub fn cdc_set_baud(&mut self, port: usize, baud: u32) {
+        let c = self.cdc_port(port);
+        c.baud = baud;
+        c.dirty = true;
     }
 
     /// Drops DTR and RTS (the terminal closes the port).
-    pub fn cdc_close(&mut self) {
-        if let Some(c) = &mut self.cdc {
-            c.open = false;
-            c.dirty = true;
-        }
+    pub fn cdc_close(&mut self, port: usize) {
+        let c = self.cdc_port(port);
+        c.open = false;
+        c.dirty = true;
     }
 
     /// Queues bytes for the device.
-    pub fn cdc_write(&mut self, bytes: &[u8]) {
-        self.cdc.get_or_insert_with(CdcPort::default).tx.extend(bytes);
+    pub fn cdc_write(&mut self, port: usize, bytes: &[u8]) {
+        self.cdc_port(port).tx.extend(bytes);
     }
 
     /// Takes what the device sent.
-    pub fn cdc_take_rx(&mut self) -> Vec<u8> {
-        self.cdc.as_mut().map(|c| std::mem::take(&mut c.rx)).unwrap_or_default()
+    pub fn cdc_take_rx(&mut self, port: usize) -> Vec<u8> {
+        self.cdc.get_mut(port).map(|c| std::mem::take(&mut c.rx)).unwrap_or_default()
     }
 
     fn drive_cdc(&mut self, now: Time) {
-        let Some(mut cdc) = self.cdc.take() else { return };
-        self.drive_cdc_inner(now, &mut cdc);
-        self.cdc = Some(cdc);
+        let mut ports = std::mem::take(&mut self.cdc);
+        for c in &mut ports {
+            self.drive_cdc_inner(now, c);
+        }
+        self.cdc = ports;
     }
 
     fn drive_cdc_inner(&mut self, now: Time, cdc: &mut CdcPort) {
+        if !cdc.used {
+            return;
+        }
         // Collect finished requests
         cdc.requests.retain(|id| match self.results.remove(id) {
             None => true,
@@ -485,7 +503,9 @@ impl HostController {
             return;
         };
         if !cdc.configured {
-            let (Some(comm), Some(data)) = (dev.interface(CDC_COMM_CLASS), dev.interface(CDC_DATA_CLASS)) else {
+            // The n-th communication interface and the n-th data interface make port n
+            let nth = |class: u8| dev.interfaces.iter().filter(|i| i.class == class && i.alternate == 0).nth(cdc.index);
+            let (Some(comm), Some(data)) = (nth(CDC_COMM_CLASS), nth(CDC_DATA_CLASS)) else {
                 return;
             };
             let (Some(i), Some(o)) =
@@ -510,7 +530,8 @@ impl HostController {
             let b = self.submit_control(SetupPacket::new(ty, CDC_SET_CONTROL_LINE_STATE, lines, iface, 0), Vec::new());
             cdc.requests.extend([a, b]);
         }
-        if cdc.reading.is_none() {
+        // Like a tty, the port is only read while it is open
+        if cdc.reading.is_none() && cdc.open {
             cdc.reading = Some(self.submit_bulk_in(cdc.data_in, 64));
         }
         if cdc.writing.is_none() && !cdc.tx.is_empty() {

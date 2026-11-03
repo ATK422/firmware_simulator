@@ -414,7 +414,7 @@ fn run(args: RunArgs) -> Result<()> {
     if args.usb || args.bootsel || args.usb_cdc.is_some() || args.picoboot_load.is_some() {
         let mut host = sim_devices::usb::host::HostController::new();
         if args.usb_cdc.is_some() {
-            host.cdc_open(115_200);
+            host.cdc_open(0, 115_200);
         }
         machine.sys.attach_usb_host(host, Time::ZERO);
         log::info!("USB port plugged into a host");

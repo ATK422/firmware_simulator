@@ -181,21 +181,18 @@ impl Session {
         }
     }
 
-    /// Collects what the device sent on its USB CDC port and passes pty input to it. Does nothing unless the USB
-    /// host has opened the port ([`sim_devices::usb::host::HostController::cdc_open`]).
+    /// Collects what the device sent on its (first) USB CDC port and passes pty input to it. Does nothing unless
+    /// the USB host has opened the port ([`sim_devices::usb::host::HostController::cdc_open`]).
     pub fn poll_usb_cdc(&mut self) {
         let now = self.machine.now;
         if let Some(pty) = &self.usb_cdc_pty {
             let input = pty.read();
             if !input.is_empty() {
-                self.machine.sys.with_usb_host(now, |h| h.cdc_write(&input));
+                self.machine.sys.with_usb_host(now, |h| h.cdc_write(0, &input));
             }
         }
         let Some(host) = self.machine.sys.usb_host_mut() else { return };
-        if host.cdc.is_none() {
-            return;
-        }
-        let rx = host.cdc_take_rx();
+        let rx = host.cdc_take_rx(0);
         if rx.is_empty() {
             return;
         }
