@@ -437,3 +437,52 @@ fn usbip_unlink_of_a_finished_request_keeps_its_answer() {
     let w = |i: usize| u32::from_be_bytes(h[i..i + 4].try_into().unwrap());
     assert_eq!((w(0), w(4), w(20)), (4, unlink_seq, 0), "RET_UNLINK, status 0: nothing was unlinked");
 }
+
+/// Requests the server cannot take are refused with -EINVAL straight away: an endpoint number above 15 (it used to
+/// be cut to its low byte: 0x101 became the mass storage bulk IN, which waits for a command), and a transfer longer
+/// than 16 MiB (Linux's usbfs limit; the server used to wait for, and buffer, up to 4 GiB of OUT data). A refused
+/// OUT request's data is skipped, so the requests after it still work.
+#[test]
+fn usbip_refuses_bad_endpoints_and_huge_transfers() {
+    use std::io::Write;
+    let mut m = bootsel_board();
+    sim_host::usb::wait_for_device(&mut m, Time::from_secs(1), |_| true).unwrap();
+    let mut s = Session::new(m, &Image::default());
+    let server = sim_host::usbip::UsbIpServer::bind("127.0.0.1:0").unwrap();
+    let addr = server.local_addr().unwrap();
+    s.usbip = Some(server);
+    let sock = std::net::TcpStream::connect(addr).unwrap();
+    sock.set_nonblocking(true).unwrap();
+    sock.set_nodelay(true).unwrap();
+    let mut c = UsbIpClient { sock, seq: 0, rx: Vec::new() };
+    let mut imp = vec![0x01, 0x11, 0x80, 0x03, 0, 0, 0, 0];
+    let mut busid = b"1-1".to_vec();
+    busid.resize(32, 0);
+    imp.extend(busid);
+    c.send(&imp);
+    c.read_exact(&mut s, 8 + 312);
+    const EINVAL: i32 = -22;
+    let seq = c.submit(0x101, true, [0; 8], 64, &[]);
+    assert_eq!(c.ret(&mut s), (seq, EINVAL, Vec::new()), "endpoint 257");
+    let seq = c.submit(1, true, [0; 8], (16 << 20) + 1, &[]);
+    assert_eq!(c.ret(&mut s), (seq, EINVAL, Vec::new()), "a bulk IN of 16 MiB + 1");
+    // A bulk OUT of 16 MiB + 1, with its data: refused without waiting for it
+    let seq = c.submit(2, false, [0; 8], (16 << 20) + 1, &[]);
+    assert_eq!(c.ret(&mut s), (seq, EINVAL, Vec::new()), "a bulk OUT of 16 MiB + 1");
+    let data = vec![0x5A; (16 << 20) + 1];
+    let mut sent = 0;
+    while sent < data.len() {
+        match c.sock.write(&data[sent..]) {
+            Ok(n) => sent += n,
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                s.run_for(Time::from_us(500));
+            }
+            Err(e) => panic!("{e}"),
+        }
+    }
+    let seq = c.submit(0, true, [0x80, 6, 0, 1, 0, 0, 18, 0], 18, &[]);
+    let (rs, status, data) = c.ret(&mut s);
+    assert_eq!((rs, status, data.len()), (seq, 0, 18), "in step after the skipped data");
+    assert_eq!(&data[8..12], &[0x8A, 0x2E, 0x03, 0x00]);
+    assert!(s.usbip.as_ref().unwrap().attached());
+}
