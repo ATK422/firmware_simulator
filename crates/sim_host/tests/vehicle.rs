@@ -249,3 +249,50 @@ transducer = [{ board = "talos_ivc", mount_m = [0.0, 0.0, 0.0] }]
     let at = medium.projectors[0].trajectory.at(4.0);
     assert!((at[0] - p[0]).abs() < 1e-6, "{at:?}");
 }
+
+/// A robot with a vehicle but no acoustic medium runs its boards side by side with `threads` > 1 (only a medium
+/// couples boards within a slice); the vehicle is stepped after each slice on the calling thread, from the boards'
+/// ESC motors and into their pressure inputs. Each thread count must give exactly the run of boards in turn.
+#[test]
+fn a_vehicle_without_a_medium_runs_the_same_on_threads() {
+    use sim_core::cpu::Cpu;
+    let run = |threads: usize| {
+        let mut r = load(&spec(|t| {
+            *t = t.replacen("[environment]\nfile = \"../environments/pool.toml\"\n", "", 1);
+            let i = t.find("[[vehicle.transducer]]").unwrap();
+            t.truncate(i);
+        }))
+        .unwrap();
+        assert!(r.medium.is_none());
+        r.threads = threads;
+        // Both wired motors spinning (and running down, as nothing commands them): thrust ahead and a dive
+        for e in r.boards[0]
+            .machine
+            .sys
+            .pin_devices
+            .iter_mut()
+            .filter_map(|d| d.as_any_mut().and_then(|a| a.downcast_mut::<Esc>()))
+        {
+            e.rpm = 3000.0;
+        }
+        r.vehicles[0].vehicle.state.rate = [0.0, 0.0, 0.2];
+        r.vehicles[0].keep_log(Time::from_ms(10));
+        assert!(r.run_until(Time::from_ms(300)).is_none());
+        let v = &r.vehicles[0];
+        let mut out = vec![format!("{:?}", v.vehicle.state), v.log.as_ref().unwrap().to_csv()];
+        out.push(format!("{:?}", r.inputs[1].get("depth.pressure_pa").to_bits()));
+        for (name, s) in r.names.iter().zip(&r.boards) {
+            out.extend(s.logs.iter().map(|(t, l)| format!("{name} [{t}] {l}")));
+            for (c, core) in s.machine.cores.iter().enumerate() {
+                let regs: Vec<u32> = (0..core.num_regs()).map(|n| core.read_reg(n)).collect();
+                out.push(format!("{name} core{c} {} {} {regs:x?}", s.machine.core_time(c), core.cycles()));
+            }
+        }
+        out
+    };
+    let turns = run(1);
+    // It moved: ahead from the starboard thruster, and down from the aft heave one
+    assert!(turns[1].lines().count() > 25, "{}", turns[1]);
+    assert_ne!(turns[1].lines().nth(1), turns[1].lines().last());
+    assert_eq!(turns, run(3));
+}

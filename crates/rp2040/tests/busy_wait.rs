@@ -112,3 +112,46 @@ fn skipped_busy_waits_change_nothing() {
         }
     }
 }
+
+/// A hang injected as fault injection does it (`sim_host::fault`): the core is sent to a `b .` with PRIMASK set
+/// while the watchdog runs. The loop touches nothing, so whole quanta of it are skipped, up to the next event: the
+/// timer alarm (which stays pending, masked) and then the watchdog's timeout, whose reset must come at exactly the
+/// same time as without skipping and without batches.
+#[test]
+fn masked_hang_is_skipped_up_to_the_watchdog_reset() {
+    let run = |skip: bool, batched: bool| {
+        let (mut m, sink) = machine(true, skip);
+        if !batched {
+            m.breakpoints.insert(0xFFFF_FFF1);
+        }
+        assert!(m.sys.poke(SRAM_BASE + 0x180, Size::Half, 0xE7FE)); // b .
+        let mut w = |addr: u32, v: u32| m.sys.write(&mut NullSink, 0, Time::ZERO, addr, Size::Word, v).unwrap();
+        w(WATCHDOG_BASE + 0x04, 3000); // LOAD
+        w(WATCHDOG_BASE, 1 << 30); // CTRL.ENABLE
+        assert_eq!(m.run_until(Time::from_ms(2)), StopReason::TimeLimit);
+        assert_eq!(m.resets, 0);
+        m.inject_call(0, SRAM_BASE + 0x181, &[]);
+        m.cores[0].set_primask(true);
+        let skipped_before = m.spin_skipped;
+        let mut reset_at = None;
+        for i in 21..=2000 {
+            assert_eq!(m.run_until(Time::from_us(100 * i)), StopReason::TimeLimit);
+            if m.resets == 1 && reset_at.is_none() {
+                // The cores restarted at the reset: their clocks and counts since then pin its time
+                let c = &m.cores[0];
+                reset_at = Some(format!("{} {} {} {}", m.now, m.core_time(0), c.cycles(), c.instructions()));
+                break;
+            }
+        }
+        let trace: Vec<String> = sink.take().into_iter().map(|(t, e)| format!("[{t}] {e}")).collect();
+        (reset_at.expect("the watchdog reset the chip"), trace, m.spin_skipped - skipped_before)
+    };
+    let (reset, trace, skipped) = run(true, true);
+    assert!(skipped > 10_000, "{skipped} instructions of the hang skipped, reset at {reset}");
+    for (skip, batched) in [(false, true), (false, false)] {
+        let (reset_ref, trace_ref, none) = run(skip, batched);
+        assert_eq!(none, 0);
+        assert_eq!(reset, reset_ref, "skip {skip} batched {batched}");
+        assert_eq!(trace, trace_ref, "skip {skip} batched {batched}");
+    }
+}

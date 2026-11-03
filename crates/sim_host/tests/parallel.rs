@@ -40,6 +40,11 @@ fn run(threads: usize) -> Option<(Vec<String>, Vec<String>, MockBridge)> {
         }
         state.push(format!("{name} sram {}", m.sys.sram.iter().map(|&b| b as u64).sum::<u64>()));
     }
+    // Talos's vehicle is stepped after each slice on this thread, from the boards' state
+    assert_eq!(r.vehicles.len(), 1);
+    for v in &r.vehicles {
+        state.push(format!("{} {:?} {:?}", v.vehicle.name, v.vehicle.state, v.rpms(&r.boards, r.now)));
+    }
     Some((frames, state, bridge))
 }
 
