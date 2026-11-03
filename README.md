@@ -30,7 +30,7 @@ Every run is repeatable: the same firmware and inputs give exactly the same resu
 
 ## Quick start
 
-**Prerequisites:** Rust (stable, 1.85 or newer) with the `thumbv6m-none-eabi` target, git, and read access to the
+**Prerequisites:** Linux or macOS (SocketCAN/vcan for the real `titan_bridge` is Linux only), Rust (stable, 1.85 or newer) with the `thumbv6m-none-eabi` target, git, and read access to the
 private repository `ATK422/titan_firmware_rs`. The C firmware additionally needs `gcc-arm-none-eabi`, `cmake` and
 `ninja` (optional; only the C tests use it).
 
@@ -270,10 +270,11 @@ Docker daemon, vhci-hcd module or hardware. These are written and statically che
 * The micro-ROS C board images; VCD files in GTKWave/Surfer/PulseView; the dashboard in a real browser
   ([tools.md](docs/tools.md#to-verify-locally)).
 
-**CI** ([`.github/workflows/ci.yml`](.github/workflows/ci.yml)) has two jobs: **test** builds the
+**CI** ([`.github/workflows/ci.yml`](.github/workflows/ci.yml)) has three jobs: **test** builds the
 titan_firmware_rs images, runs `cargo fmt --all --check`, `cargo clippy --workspace --all-targets --release -- -D warnings`,
 `python3 scripts/gen_boards.py --check` and every test, then prints the smoke and sweep tables; **c-firmware**
-builds the C programs and runs the tests that boot them. Both need the repository secret
+builds the C programs and runs the tests that boot them; **macos** builds and tests the emulator natively on
+macOS. All need the repository secret
 **`TITAN_FIRMWARE_RS_TOKEN`**: a fine-grained token with "Contents: read" on `ATK422/titan_firmware_rs`. Without it
 the firmware step fails loudly ([testing.md](docs/testing.md#ci)).
 

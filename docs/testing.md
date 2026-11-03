@@ -249,7 +249,7 @@ When the firmware rather than the emulator looks wrong, write a test that assert
 
 ## CI
 
-`.github/workflows/ci.yml` has two jobs:
+`.github/workflows/ci.yml` has three jobs:
 
 * **test**: checks out the submodules, builds the titan_firmware_rs images (`cargo build --workspace --release`),
   runs `cargo fmt --all --check`, `cargo clippy --workspace --all-targets --release -- -D warnings` and
@@ -258,6 +258,9 @@ When the firmware rather than the emulator looks wrong, write a test that assert
 * **c-firmware**: installs `gcc-arm-none-eabi`, builds the C programs with `scripts/build_c_firmware.sh` and runs
   the tests that boot them (`sim_host`'s `pico_sdk`, `flash`, `can`). It sets `CMAKE_POLICY_VERSION_MINIMUM=3.5`
   because the runners' CMake 4 refuses pico-sdk's bundled pioasm and elf2uf2 projects otherwise.
+* **macos**: builds the titan_firmware_rs images and runs clippy and the whole suite natively on macOS (Apple
+  silicon). SocketCAN is Linux only; on macOS `SocketCan::open` fails with a clear error and CAN reaches a Linux
+  machine through `can-tunnel` instead.
 
 `external/titan_firmware_rs` is the private repository `ATK422/titan_firmware_rs`. Give the workflow a token that
 can read it as the repository secret **`TITAN_FIRMWARE_RS_TOKEN`** (a fine-grained personal access token with

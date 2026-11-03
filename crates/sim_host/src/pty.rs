@@ -24,11 +24,7 @@ impl Pty {
             if libc::grantpt(fd) != 0 || libc::unlockpt(fd) != 0 {
                 return Err(io::Error::last_os_error());
             }
-            let mut buf = [0 as libc::c_char; 128];
-            if libc::ptsname_r(fd, buf.as_mut_ptr(), buf.len()) != 0 {
-                return Err(io::Error::last_os_error());
-            }
-            let path = CStr::from_ptr(buf.as_ptr()).to_string_lossy().into_owned();
+            let path = slave_path(fd)?;
             let mut tio: libc::termios = std::mem::zeroed();
             if libc::tcgetattr(fd, &mut tio) == 0 {
                 libc::cfmakeraw(&mut tio);
@@ -55,6 +51,33 @@ impl Pty {
         let n = unsafe { libc::read(self.master.as_raw_fd(), buf.as_mut_ptr().cast(), buf.len()) };
         if n > 0 { buf[..n as usize].to_vec() } else { Vec::new() }
     }
+}
+
+/// The slave side's path, with the reentrant `ptsname_r` (Linux).
+#[cfg(target_os = "linux")]
+unsafe fn slave_path(fd: libc::c_int) -> io::Result<String> {
+    let mut buf = [0 as libc::c_char; 128];
+    // SAFETY: the buffer is valid for its length, and ptsname_r NUL-terminates it on success
+    if unsafe { libc::ptsname_r(fd, buf.as_mut_ptr(), buf.len()) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: NUL-terminated by ptsname_r
+    Ok(unsafe { CStr::from_ptr(buf.as_ptr()) }.to_string_lossy().into_owned())
+}
+
+/// The slave side's path, with `ptsname` (macOS and other Unixes have no `ptsname_r`), which returns a static buffer:
+/// calls are serialised and the path is copied out before the lock is released.
+#[cfg(not(target_os = "linux"))]
+unsafe fn slave_path(fd: libc::c_int) -> io::Result<String> {
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let _guard = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    // SAFETY: ptsname returns NULL or a NUL-terminated static buffer, read while the lock is held
+    let p = unsafe { libc::ptsname(fd) };
+    if p.is_null() {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: non-null, NUL-terminated
+    Ok(unsafe { CStr::from_ptr(p) }.to_string_lossy().into_owned())
 }
 
 #[cfg(test)]
