@@ -126,3 +126,35 @@ fn core1_sysresetreq_restarts_it_in_the_bootrom() {
     assert_eq!(m.resets, 0, "no chip reset");
     assert_eq!(m.cores[0].pc(), SRAM_BASE + 0x120, "core 0 runs on undisturbed");
 }
+
+/// Core 1 comes out of reset a little after its PSM force-off is released. Forced off again before then, it stays
+/// off: the pending start must not switch it on while the PSM holds it in reset.
+#[test]
+fn core1_forced_off_again_before_it_starts_stays_off() {
+    use rp2040::memmap::PSM_BASE;
+    use rp2040::periph::sysctl::psm;
+    let mut m = Machine::new(MachineConfig { bootrom: Some(rp2040::BOOTROM_B1.to_vec()), ..Default::default() });
+    m.sys.unmodelled.log_mode = rp2040::unmodelled::LogMode::Off;
+    for (off, v) in [(0x00, 0x2000_2000), (0x04, SRAM_BASE + 0x121)] {
+        assert!(m.sys.poke(SRAM_BASE + off, Size::Word, v));
+    }
+    assert!(m.sys.poke(SRAM_BASE + 0x120, Size::Half, 0xE7FE)); // core 0: b .
+    m.direct_boot().unwrap();
+    // As a debugger (or core 0) writes PSM.FRCE_OFF; the machine picks it up after core 0's next instruction
+    let frce_off = |m: &mut Machine, v: u32| {
+        let now = m.now;
+        m.sys.write(&mut NullSink, 0, now, PSM_BASE + 4, Size::Word, v).unwrap();
+        let t = m.now + Time::from_ns(300);
+        assert_eq!(m.run_until(t), StopReason::TimeLimit);
+    };
+    frce_off(&mut m, 1 << psm::PROC1);
+    assert!(!m.core_enabled[1]);
+    frce_off(&mut m, 0);
+    frce_off(&mut m, 1 << psm::PROC1);
+    assert_eq!(m.run_until(m.now + Time::from_us(100)), StopReason::TimeLimit);
+    assert!(!m.core_enabled[1], "core 1 is held in reset");
+    // Released for good, it starts in the bootrom
+    frce_off(&mut m, 0);
+    assert_eq!(m.run_until(m.now + Time::from_us(100)), StopReason::TimeLimit);
+    assert!(m.core_enabled[1] && m.cores[1].pc() < 0x4000);
+}

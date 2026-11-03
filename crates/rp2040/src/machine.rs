@@ -367,7 +367,8 @@ impl Machine {
             self.sys.fire_event(&mut *self.trace, t, ev);
             match ev {
                 Event::External(id) => self.external_fired.push((t, id)),
-                Event::Core1Boot => self.boot_core1_rom_at(t),
+                // (Not while the PSM holds core 1 in reset again: its release schedules another start)
+                Event::Core1Boot if self.sys.psm.frce_off & (1 << psm::PROC1) == 0 => self.boot_core1_rom_at(t),
                 _ => {}
             }
             self.after_system_change();
