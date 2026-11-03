@@ -632,6 +632,14 @@ impl CortexM0Plus {
     /// Whether a sleeping core would wake now.
     pub fn would_wake(&mut self) -> bool {
         self.latch_irqs();
+        // Asked of a sleeping core every quantum: with nothing pending, nothing can preempt
+        if !self.any_pending() {
+            return match self.sleep {
+                None => true,
+                Some(Sleep::Wfi) => false,
+                Some(Sleep::Wfe) => self.event_reg,
+            };
+        }
         match self.sleep {
             None => true,
             Some(Sleep::Wfi) => self.preempting(true).is_some(),

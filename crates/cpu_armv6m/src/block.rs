@@ -24,7 +24,7 @@ pub(crate) const MAX_OPS: usize = 16;
 /// Most bytes of code in a block (16 instructions; a `BL` ends one).
 const MAX_BYTES: usize = 2 * MAX_OPS;
 /// Cache entries per core (direct mapped).
-const ENTRIES: usize = 2048;
+const ENTRIES: usize = 4096;
 
 /// What an op does. The ops before [`K::Ldr`] neither access the bus nor change anything but registers, flags and
 /// the PC; the ones from [`K::B`] on end a block.
