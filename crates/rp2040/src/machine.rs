@@ -442,6 +442,23 @@ impl Machine {
         StepOutcome::Ran(0)
     }
 
+    /// Makes core `c` call the function at `addr` with `args` in r0-r3, as if the instruction it was about to run
+    /// had been a call. The function returns to where the core was; r0-r3, r12 and LR are clobbered (as an
+    /// interrupt-free call would), so this is only safe for functions that never return or for tests that accept
+    /// the clobbering (fault injection, e.g. calling the firmware's panic path).
+    pub fn inject_call(&mut self, c: usize, addr: u32, args: &[u32]) {
+        assert!(args.len() <= 4, "only register arguments");
+        let cpu = &mut self.cores[c];
+        let ret = cpu.reg(15) | 1;
+        for (i, &a) in args.iter().enumerate() {
+            cpu.set_reg(i, a);
+        }
+        cpu.set_reg(14, ret);
+        cpu.set_pc(addr);
+        cpu.wake();
+        log::info!("[{}] core{c} injected call to {addr:#010x}", self.clocks[c].now);
+    }
+
     /// AIRCR.SYSRESETREQ: on the RP2040 this resets the requesting processor only (its PSM domain), not the
     /// peripherals or SIO.
     pub fn core_reset(&mut self, c: usize) {

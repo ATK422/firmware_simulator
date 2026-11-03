@@ -26,14 +26,21 @@ cargo run --release -- run test_programs/embassy_blinky.elf --time 2s --trace gp
 
 Core 0 boots the image as if the bootrom and boot2 had run ("direct boot"); the official bootrom is mapped at
 address 0 for its function table and soft-float routines, and core 1 runs it for real, waiting for the launch
-sequence on the SIO FIFO. The bootrom's flash functions are trapped and performed directly on the flash array
-(with W25Q16 erase/program times) until the QSPI flash is modelled. UART output is printed per line (or attached to
+sequence on the SIO FIFO. With `--rom-boot` both cores start in the bootrom as after power-on: it checks BOOTSEL
+(the QSPI chip select, read through SIO), loads boot2 from flash over the SSI, and boot2 puts the W25Q16 model in
+continuous quad read mode before jumping to the image. Either way the flash is a QSPI chip behind the SSI: XIP
+reads fault while the SSI is not set up for them, and the bootrom's flash routines (`flash_range_erase`,
+`flash_range_program`, ...) run for real against the chip's command set, with its erase and program times.
+`--hle-flash` traps those routines and performs them directly instead (faster, less faithful). `--flash-file
+FILE` keeps the flash in a file: loaded before the image is written over it, saved at the end, so what the firmware
+writes (or what the C Titan bootloader flashes) persists between runs.
+UART output is printed per line (or attached to
 a pseudo terminal with `--uart0 pty`). defmt logs are decoded from RTT (the `_SEGGER_RTT` control block
 and the ELF's `.defmt` table) and printed with the virtual time they were read and the firmware's own timestamp.
 
 Options: `--time` (virtual time to run, e.g. `500ms`), `--trace instr,exc,gpio,unmodelled,device`, `--trace-file`,
 `--quantum` (instructions per core before switching), `--uart0/--uart1 stdout|pty|none`, `--unmodelled first|every|off` (logging of registers the
-emulator does not model yet; each is named from the SVD), `--stop-on-bkpt`, `--crystal-hz`, `--gdb ADDR`.
+emulator does not model yet; each is named from the SVD), `--stop-on-bkpt`, `--crystal-hz`, `--gdb ADDR`, `--rom-boot`, `--hle-flash`, `--flash-file FILE`.
 
 ### Boards and CAN
 
@@ -90,6 +97,19 @@ ADC input) is placed in one with `--environment` and `--position x,y,z` (metres,
 cargo run --release -- run path/to/ivc_board2 --board boards/talos/ivc_board.toml --mock-bridge 8 \
     --environment environments/pool.toml --position 2,6,1
 ```
+
+### Flash, the bootloader and resets
+
+A watchdog reset (timeout or forced) restarts every block except the watchdog's scratch registers, the flash and
+SRAM, and goes back through the bootrom; AIRCR.SYSRESETREQ restarts only the core that asked. The library also
+has `Machine::run_pin_reset` (scratch registers cleared, SRAM kept) and `Machine::power_cycle` (SRAM comes up with
+arbitrary contents), with `VREG_AND_CHIP_RESET.CHIP_RESET` reporting which one happened. `Machine::inject_call`
+makes a core call a function, e.g. the firmware's panic path for fault injection.
+
+`sim_host::upload` speaks the C Titan bootloader's protocol (CANmore register-mapped pages, CRC-32/MPEG-2) the
+way `upload_tool` does, over the in-process CAN bus: it catches the bootloader in its boot delay, erases and
+programs the application, verifies it and reboots into it. The tests build the C bootloader with a small
+application (`test_programs/c_bl_app`, two versions) to exercise it.
 
 ### Debugging
 
