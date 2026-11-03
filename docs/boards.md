@@ -65,7 +65,7 @@ from the generator are information for whoever writes the overlay, not something
 | `name` | required | Board name, e.g. `"mk2/power_board"` |
 | `mcu` | `"rp2040"` | Only `rp2040` is supported |
 | `crystal_hz` | 12 MHz | XOSC frequency |
-| `flash_size` | 2 MiB | QSPI flash size in bytes (robot files and `sim_test`; `run` uses `--flash-size`) |
+| `flash_size` | 2 MiB | QSPI flash size in bytes (`run --flash-size` overrides it) |
 | `[pins]` | | Pin names from the header, for reference |
 
 ## Device tables

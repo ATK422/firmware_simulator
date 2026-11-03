@@ -87,7 +87,7 @@ differ by roughly the boot time.
 | `--rom-boot` | off | Boots through the bootrom and boot2 instead of directly ([below](#boot-modes-and-the-flash)) |
 | `--flash-file FILE` | | Keeps the flash in a file between runs |
 | `--hle-flash` | off | Traps the bootrom's flash functions instead of running them against the flash chip model |
-| `--flash-size BYTES` | 2 MiB | Size of the QSPI flash chip (`run` does not take it from the board file) |
+| `--flash-size BYTES` | the board file's `flash_size`, else 2 MiB | Size of the QSPI flash chip |
 | `--crystal-hz HZ` | 12 MHz | XOSC frequency (a board file's `crystal_hz` replaces it) |
 | `--bootsel`, `--usb`, `--usb-cdc stdout\|pty`, `--picoboot-load FILE`, `--load-via picoboot\|drive`, `--usbip ADDR` | | USB ([below](#usb-bootsel-picoboot-uf2-and-cdc)) |
 | `--trace KINDS` | | Comma separated: `instr`, `exc`, `gpio`, `unmodelled`, `device` ([below](#traces)) |

@@ -328,9 +328,9 @@ struct RunArgs {
     /// How to log accesses to unmodelled registers.
     #[arg(long, value_enum, default_value = "first")]
     unmodelled: UnmodelledLog,
-    /// Flash size in bytes.
-    #[arg(long, default_value_t = 2 * 1024 * 1024)]
-    flash_size: usize,
+    /// Flash size in bytes (default: the board file's `flash_size`, else 2 MiB).
+    #[arg(long)]
+    flash_size: Option<usize>,
     /// Crystal (XOSC) frequency.
     #[arg(long, default_value_t = 12_000_000)]
     crystal_hz: u64,
@@ -464,8 +464,13 @@ fn run(args: RunArgs) -> Result<()> {
         None => None,
     };
 
+    let board = match &args.board {
+        Some(p) => Some(sim_host::board::Board::load(p).map_err(anyhow::Error::msg)?),
+        None => None,
+    };
+    let flash_size = args.flash_size.or(board.as_ref().and_then(|b| b.flash_size)).unwrap_or(2 * 1024 * 1024);
     let config = MachineConfig {
-        flash_size: args.flash_size,
+        flash_size,
         bootrom: Some(rp2040::BOOTROM_B1.to_vec()),
         quantum: args.quantum,
         crystal_hz: args.crystal_hz,
@@ -500,10 +505,6 @@ fn run(args: RunArgs) -> Result<()> {
         machine.set_trace(Box::new(WriterSink { categories, out, prefix: String::new() }));
     }
 
-    let board = match &args.board {
-        Some(p) => Some(sim_host::board::Board::load(p).map_err(anyhow::Error::msg)?),
-        None => None,
-    };
     if let Some(b) = &board {
         let inputs = b.apply(&mut machine).map_err(anyhow::Error::msg)?;
         log::info!(
@@ -643,7 +644,7 @@ fn run(args: RunArgs) -> Result<()> {
         }
     }
     if let (Some(img), Some(path)) = (&to_load, &args.picoboot_load) {
-        picoboot_load(&mut session, img, args.flash_size as u32, args.load_via)
+        picoboot_load(&mut session, img, flash_size as u32, args.load_via)
             .with_context(|| format!("loading {}", path.display()))?;
     }
     let end = if to_load.is_some() { session.machine.now + args.time } else { args.time };
