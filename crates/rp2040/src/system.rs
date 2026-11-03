@@ -2013,6 +2013,12 @@ pub struct BatchBus<'a> {
     ticked: bool,
     /// An access since the last [`Bus::take_slow_access`] went through the general path.
     slow: bool,
+    /// An access in the batch went through the general path.
+    touched: bool,
+    /// End the batch after an access that goes through the general path (a fused batch, see
+    /// `Machine::run_until`: such an access may schedule an event or wake the other core, which the machine must
+    /// look at by the end of the quantum).
+    pub end_on_slow: bool,
 }
 
 /// What a batch touched, for busy-wait skipping (see `Machine::run_until`).
@@ -2056,7 +2062,15 @@ impl<'a> BatchBus<'a> {
             timer_ticks: None,
             ticked: false,
             slow: false,
+            touched: false,
+            end_on_slow: false,
         }
+    }
+
+    /// Whether an access in the batch went through the general path (reached a peripheral other than by reading
+    /// the timer, or found XIP not set up).
+    pub fn touched(&self) -> bool {
+        self.touched
     }
 
     /// Whether the batch only read memory (and the timer, always at the same tick count), writing nothing: then
@@ -2102,6 +2116,10 @@ impl<'a> BatchBus<'a> {
     fn xip_check(&mut self, addr: u32) -> Result<(), BusFault> {
         self.noisy = true;
         self.slow = true;
+        self.touched = true;
+        if self.end_on_slow {
+            self.after |= Self::ATTENTION;
+        }
         let now = self.now();
         self.sys.xip_check(now, addr)
     }
@@ -2148,6 +2166,12 @@ impl<'a> BatchBus<'a> {
     fn after_access(&mut self, now: Time) {
         let s = &mut *self.sys;
         self.xip_ok = s.xip_ready_from(now);
+        self.touched = true;
+        if self.end_on_slow {
+            // The machine takes over (the rest of the quantum is not fused) and refreshes the interrupt lines
+            self.after |= Self::ATTENTION;
+            return;
+        }
         if s.clk_sys_changed || s.reset_request.is_some() || s.psm_forced_off != 0 || s.psm_released != 0 {
             // The machine handles these, then refreshes the interrupt lines
             self.after |= Self::ATTENTION;
