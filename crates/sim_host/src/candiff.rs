@@ -78,6 +78,52 @@ fn channel_name(ch: u8) -> String {
     }
 }
 
+/// A control interface (register mapped protocol, `canmore::reg_mapped`) packet: requests from the host, responses
+/// from the board, as `canmore_cli` and `upload_tool` exchange them.
+pub fn control_interface(dir: Direction, data: &[u8]) -> String {
+    let words = |b: &[u8]| -> String {
+        b.chunks(4)
+            .map(|w| {
+                let mut x = [0u8; 4];
+                x[..w.len()].copy_from_slice(w);
+                format!("{:#010x}", u32::from_le_bytes(x))
+            })
+            .collect::<Vec<_>>()
+            .join(" ")
+    };
+    match dir {
+        Direction::AgentToClient => {
+            if data == canmore::reg_mapped::BOOTLOADER_REQUEST {
+                return "enter bootloader".into();
+            }
+            let [flags, count, page, offset, rest @ ..] = data else { return format!("request {}", hex(data)) };
+            let f = canmore::reg_mapped::Flags::from_byte(*flags);
+            let what = match (f.write, f.multiword) {
+                (true, true) => format!("write {} words", rest.len() / 4),
+                (true, false) => "write".to_string(),
+                (false, true) => format!("read {count} words"),
+                (false, false) => "read".to_string(),
+            };
+            let bulk = match (f.bulk, f.bulk_end) {
+                (_, true) => " (bulk end)",
+                (true, false) => " (bulk)",
+                _ => "",
+            };
+            let seq = if f.bulk || f.bulk_end { format!(" seq {count}") } else { String::new() };
+            let data = if rest.is_empty() { String::new() } else { format!(" = {}", words(rest)) };
+            format!("mode {} {what}{bulk}{seq} page {page:#04x} offset {offset:#04x}{data}", f.mode)
+        }
+        Direction::ClientToAgent => match data {
+            [] => "empty response".into(),
+            [0] => "ok".into(),
+            [r] => format!("error {r}"),
+            [0, seq] => format!("ok, bulk seq {seq}"),
+            [r, rest @ ..] if *r != 0 => format!("error {r} {}", hex(rest)),
+            [_, rest @ ..] => format!("ok {}", words(rest)),
+        },
+    }
+}
+
 /// The variant path of a `Debug`-printed enum value: `Esc(Telemetry { .. })` is `Esc::Telemetry`, `Ping { .. }`
 /// is `Ping`.
 pub fn variant_path(debug: &str) -> String {
@@ -146,6 +192,10 @@ pub fn decode(log: &[LogFrame], raw: bool) -> Decoded {
                     );
                     let d = format!("{p} (cnt={})", h.cnt);
                     (p, d)
+                }
+                (canmore::CHAN_CONTROL_INTERFACE, data) => {
+                    let text = control_interface(fields.direction, data);
+                    (text.clone(), text)
                 }
                 (_, data) => (hex(data), hex(data)),
             };
@@ -921,6 +971,34 @@ mod tests {
         let r = diff(&decode(&a, true), &decode(&b, true), &DiffOptions { full: true, ..Default::default() });
         assert_eq!(r.counts(), (1, 0, 1));
         assert_eq!(payload_change("classic 02", "classic 07"), "02 -> 07");
+    }
+
+    #[test]
+    fn control_interface_packets() {
+        let a2c = Direction::AgentToClient;
+        assert_eq!(control_interface(a2c, &canmore::reg_mapped::BOOTLOADER_REQUEST), "enter bootloader");
+        assert_eq!(control_interface(a2c, &[0x20, 0, 1, 2]), "mode 1 read page 0x01 offset 0x02");
+        assert_eq!(
+            control_interface(a2c, &[0x21, 0, 3, 4, 0x78, 0x56, 0x34, 0x12]),
+            "mode 1 write page 0x03 offset 0x04 = 0x12345678"
+        );
+        assert_eq!(
+            control_interface(a2c, &[0x43, 7, 5, 0, 1, 0, 0, 0]),
+            "mode 2 write (bulk) seq 7 page 0x05 offset 0x00 = 0x00000001"
+        );
+        assert_eq!(control_interface(a2c, &[0x28, 2, 1, 0]), "mode 1 read 2 words page 0x01 offset 0x00");
+        let c2a = Direction::ClientToAgent;
+        assert_eq!(control_interface(c2a, &[0]), "ok");
+        assert_eq!(control_interface(c2a, &[2]), "error 2");
+        assert_eq!(control_interface(c2a, &[0, 7]), "ok, bulk seq 7");
+        assert_eq!(control_interface(c2a, &[0, 0xEF, 0xBE, 0xAD, 0xDE]), "ok 0xdeadbeef");
+        // In a log, the control interface stream carries the decoded packets
+        let id = canmore::id::util_id(2, a2c, canmore::CHAN_CONTROL_INTERFACE);
+        let log =
+            vec![LogFrame { time_ns: 0, iface: "can0".into(), frame: CanFrame::classic(id, false, &[0x20, 0, 1, 2]) }];
+        let d = decode(&log, false);
+        assert_eq!(d.events[0].stream, "can0 client 2 host->board util ch14 (control interface)");
+        assert_eq!(d.events[0].payload, "mode 1 read page 0x01 offset 0x02");
     }
 
     #[test]
