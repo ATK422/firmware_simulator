@@ -144,6 +144,7 @@ pub mod pty;
 pub mod robot;
 pub mod rtt;
 pub mod session;
+pub mod signal;
 pub mod socketcan;
 pub mod target;
 pub mod unwind;

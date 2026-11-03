@@ -63,6 +63,9 @@ pub struct Session {
     behind_warned: std::time::Instant,
     /// A sampling profiler of the firmware (see [`crate::profile`]); `None` runs the machine directly.
     pub profiler: Option<crate::profile::Profiler>,
+    /// When this is set, [`Session::run_until`] returns [`StopReason::Requested`] at the next slice boundary (the
+    /// command line's [`crate::signal::STOP`], set by SIGINT or SIGTERM).
+    pub stop_flag: Option<&'static std::sync::atomic::AtomicBool>,
 }
 
 /// Callback for complete lines of text: `(virtual time, line)`.
@@ -110,6 +113,7 @@ impl Session {
             pacing: None,
             behind_warned: std::time::Instant::now(),
             profiler: None,
+            stop_flag: None,
         }
     }
 
@@ -161,6 +165,7 @@ impl Session {
             pacing: None,
             behind_warned: std::time::Instant::now(),
             profiler: None,
+            stop_flag: None,
         }
     }
 
@@ -341,9 +346,13 @@ impl Session {
         }
     }
 
-    /// Runs until virtual time `end`, polling RTT every [`Session::slice`].
+    /// Runs until virtual time `end`, polling RTT every [`Session::slice`]. Returns [`StopReason::Requested`] at
+    /// a slice boundary once [`Session::stop_flag`] is set.
     pub fn run_until(&mut self, end: Time) -> StopReason {
         loop {
+            if crate::signal::is_set(self.stop_flag) {
+                return StopReason::Requested;
+            }
             let target = (self.machine.now + self.slice).min(end);
             let reason = self.run_machine(target);
             self.step_can();

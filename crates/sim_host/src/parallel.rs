@@ -329,7 +329,9 @@ impl Drop for Crew<'_, '_> {
 /// slice's end, the others have still run to it, and the one with the lowest index is returned.
 pub(crate) fn run_until(robot: &mut Robot, end: Time) -> Option<(usize, StopReason)> {
     let max_threads = max_threads(robot);
-    let Robot { boards, buses, board_bus, power_on, vehicles, slice, now, realtime, pacing, balance, .. } = robot;
+    let Robot {
+        boards, buses, board_bus, power_on, vehicles, slice, now, realtime, pacing, balance, stop_flag, ..
+    } = robot;
     let n = boards.len();
     balance.fit(n, max_threads);
     let shared = Shared {
@@ -354,7 +356,7 @@ pub(crate) fn run_until(robot: &mut Robot, end: Time) -> Option<(usize, StopReas
         // Wall clock since the last regrouping, and the time spent pacing in it
         let mut window = Instant::now();
         let mut paced = Duration::ZERO;
-        while *now < end {
+        while *now < end && !crate::signal::is_set(*stop_flag) {
             let t = (*now + *slice).min(end);
             slice_no += 1;
             busy.fill(false);

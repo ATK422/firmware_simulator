@@ -421,6 +421,7 @@ fn robot(args: RobotArgs) -> Result<()> {
     let wall = std::time::Instant::now();
     let mut faults = faults.into_iter().peekable();
     let mut pending: Option<(Time, usize, sim_host::fault::Fault)> = None;
+    r.stop_flag = Some(&sim_host::signal::STOP);
     let stopped = loop {
         if pending.is_none() {
             pending = faults.next_if(|f| f.0 <= args.time);
@@ -430,13 +431,16 @@ fn robot(args: RobotArgs) -> Result<()> {
         let stopped = r.run_until(until);
         if let Some(d) = &mut dash {
             d.service_robot(&mut r, &bridges);
-            while d.paused() {
+            while d.paused() && !sim_host::signal::requested() {
                 std::thread::sleep(std::time::Duration::from_millis(20));
                 d.service_robot(&mut r, &bridges);
             }
         }
         if let Some(s) = stopped {
             break Some(s);
+        }
+        if sim_host::signal::requested() {
+            break None;
         }
         if until < target {
             continue;
@@ -456,26 +460,24 @@ fn robot(args: RobotArgs) -> Result<()> {
             bail!("fault {fault:?} on {}: {e}", r.names[i]);
         }
     };
+    let why = match &stopped {
+        Some((i, why)) => format!("{} stopped: {why:?}", r.names[*i]),
+        None if sim_host::signal::requested() => "Interrupted".into(),
+        None => "TimeLimit".into(),
+    };
     if let Some(d) = &mut dash {
-        let why = match &stopped {
-            Some((i, why)) => format!("{} stopped: {why:?}", r.names[*i]),
-            None => "TimeLimit".into(),
-        };
         d.finish_robot(&mut r, &why);
     }
     for s in r.boards.iter_mut() {
         s.flush_uarts();
     }
     can_host.finish()?;
-    eprintln!("stopped at {}; {:.2?} wall", r.now, wall.elapsed());
+    let interrupted = if why == "Interrupted" { " (Interrupted)" } else { "" };
+    eprintln!("stopped at {}{interrupted}; {:.2?} wall", r.now, wall.elapsed());
     if let (Some(v), Some(path)) = (&vcd, &args.vcd) {
         finish_vcd(v, path, r.now)?;
     }
     if let (Some(l), Some(path)) = (&json_log, &args.log_json) {
-        let why = match &stopped {
-            Some((i, why)) => format!("{} stopped: {why:?}", r.names[*i]),
-            None => "TimeLimit".into(),
-        };
         l.finish(r.now, &why).with_context(|| format!("writing {}", path.display()))?;
     }
     for v in &r.vehicles {
@@ -513,8 +515,10 @@ fn robot(args: RobotArgs) -> Result<()> {
     }
     if let Some(d) = &mut dash
         && args.dashboard_hold
+        && !sim_host::signal::requested()
     {
         eprintln!("run finished; the dashboard keeps serving on http://{}/ (Ctrl-C to quit)", d.addr);
+        sim_host::signal::exit_on_signal();
         d.hold();
     }
     if let Some((i, why)) = stopped {
@@ -675,7 +679,8 @@ struct RunArgs {
     /// Boot through the bootrom and boot2 (real flash path) instead of starting the image directly.
     #[arg(long)]
     rom_boot: bool,
-    /// Keep the flash in this file: loaded (if it exists) before the image is written over it, saved at the end.
+    /// Keep the flash in this file: loaded (if it exists) before the image is written over it, saved at the end of
+    /// the run (also when SIGINT or SIGTERM ends it).
     #[arg(long)]
     flash_file: Option<PathBuf>,
     /// Carry out the bootrom's flash functions directly (high-level emulation) instead of running them against the
@@ -1042,6 +1047,8 @@ fn run(args: RunArgs) -> Result<()> {
     faults.sort_by_key(|f| f.0);
     let mut faults = faults.into_iter().peekable();
     let mut pending: Option<(Time, sim_host::fault::Fault)> = None;
+    // From here on SIGINT and SIGTERM end the run cleanly, at the next slice boundary
+    session.stop_flag = Some(&sim_host::signal::STOP);
     let reason = loop {
         if pending.is_none() {
             pending = faults.next_if(|f| f.0 <= end);
@@ -1052,7 +1059,7 @@ fn run(args: RunArgs) -> Result<()> {
         let reason = session.run_until(until);
         if let Some(d) = &mut dash {
             d.service_session(&mut session);
-            while d.paused() {
+            while d.paused() && !sim_host::signal::requested() {
                 std::thread::sleep(std::time::Duration::from_millis(20));
                 d.service_session(&mut session);
             }
@@ -1077,6 +1084,11 @@ fn run(args: RunArgs) -> Result<()> {
         }
     };
     let elapsed = wall.elapsed();
+    // What the stop line, the JSON log and the dashboard give as the reason
+    let why = match reason {
+        StopReason::Requested if sim_host::signal::requested() => "Interrupted".to_string(),
+        r => format!("{r:?}"),
+    };
     session.flush_uarts();
     can_host.finish()?;
     for (ch, bytes) in session.rtt_text.drain(..) {
@@ -1089,7 +1101,7 @@ fn run(args: RunArgs) -> Result<()> {
         finish_vcd(v, path, session.machine.now)?;
     }
     if let (Some(l), Some(path)) = (&json_log, &args.log_json) {
-        l.finish(session.machine.now, &format!("{reason:?}")).with_context(|| format!("writing {}", path.display()))?;
+        l.finish(session.machine.now, &why).with_context(|| format!("writing {}", path.display()))?;
     }
     if let (Some(path), Some(p)) = (&args.profile, &session.profiler) {
         let title = args.image.as_ref().or(args.picoboot_load.as_ref()).and_then(|p| p.file_name());
@@ -1129,9 +1141,8 @@ fn run(args: RunArgs) -> Result<()> {
         StopReason::Requested => {}
     }
     eprintln!(
-        "stopped at {} ({:?}); core0 {} cycles, pc {}; {:.2?} wall",
+        "stopped at {} ({why}); core0 {} cycles, pc {}; {:.2?} wall",
         machine.now,
-        reason,
         machine.cores[0].cycles(),
         where_(machine.cores[0].pc()),
         elapsed
@@ -1152,9 +1163,10 @@ fn run(args: RunArgs) -> Result<()> {
         }
     }
     if let Some(d) = &mut dash {
-        d.finish_session(&mut session, &format!("{reason:?}"));
-        if args.dashboard_hold {
+        d.finish_session(&mut session, &why);
+        if args.dashboard_hold && !sim_host::signal::requested() {
             eprintln!("run finished; the dashboard keeps serving on http://{}/ (Ctrl-C to quit)", d.addr);
+            sim_host::signal::exit_on_signal();
             d.hold();
         }
     }
@@ -1204,7 +1216,22 @@ fn picoboot_load(session: &mut Session, image: &Image, flash_size: u32, via: Loa
 fn main() -> Result<()> {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).format_timestamp(None).init();
     let cli = Cli::parse();
-    match cli.command {
+    if matches!(cli.command, Command::Run(_) | Command::Robot(_) | Command::Picoboot(_)) {
+        // SIGINT and SIGTERM end a run the way reaching its time does (flash file saved, logs and trailers written)
+        sim_host::signal::install().context("catching SIGINT and SIGTERM")?;
+    }
+    let result = run_command(cli.command);
+    if result.is_ok()
+        && let Some(sig) = sim_host::signal::received()
+    {
+        // Finished cleanly, but because of the signal: exit as a shell expects of a process it ended
+        std::process::exit(128 + sig);
+    }
+    result
+}
+
+fn run_command(command: Command) -> Result<()> {
+    match command {
         Command::Run(args) => run(args),
         Command::Robot(args) => robot(args),
         Command::Picoboot(PicobootCommand::Load { file, run_args }) => {

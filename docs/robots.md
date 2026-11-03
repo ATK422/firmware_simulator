@@ -110,7 +110,9 @@ as `[t] NAME uart0: ...`); the run ends with the stop time, the wall time and ea
 | `--dashboard ADDR`, `--dashboard-hold` | | A live dashboard of all boards, buses and vehicles |
 | `--log-json FILE` | | Every log line, UART line, CAN frame and fault as JSON lines |
 
-It exits with an error if a board stops (a lockup, say) before `--time`.
+It exits with an error if a board stops (a lockup, say) before `--time`. Ctrl-C or SIGTERM ends the run cleanly
+at the next slice boundary, as for `run` ([running.md](running.md#exit-status)): logs, waveform, profiles, candump
+log and vehicle CSV are written, and the stop line says `(Interrupted)`.
 
 ### USB on robot boards
 
@@ -228,7 +230,8 @@ These options work with `run` (a board's own bus) and `robot` (every bus).
 `--candump-log FILE` writes the traffic in `candump -l` format: every acknowledged frame (what a listening
 interface would receive), stamped with the virtual time its last bit was sent, with the bus name as the
 interface. Unacknowledged frames (sent before anyone else was up) are counted and left out. The file is flushed
-every 0.5 s of wall time, so a Ctrl-C'd real-time run leaves a usable log.
+every 100 ms of wall time, so it can be followed while the run goes on, and a Ctrl-C'd run ends cleanly with the
+log complete.
 
 ```
 (0000000000.135357) can 06F#C0

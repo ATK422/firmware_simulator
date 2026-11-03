@@ -123,7 +123,7 @@ afterwards (pico-sdk's `flash_do_cmd` behind `pico_unique_id`, boot2) keeps work
 (`crates/sim_host/tests/hle.rs`).
 
 `--flash-file FILE` loads the flash from `FILE` (if it exists) before the image is written over it and saves it
-at the end, so what the firmware writes (a flash recorder, crash data, or an application the C Titan bootloader
+at the end (also after a lockup, and when Ctrl-C or SIGTERM ends the run: see [Exit status](#exit-status)), so what the firmware writes (a flash recorder, crash data, or an application the C Titan bootloader
 flashed) persists between runs. Without an image (`--bootsel`) the flash is the file's contents or blank.
 `run` needs an image otherwise, so there is no way to boot a flash file's contents alone: pass the image again
 (it is written over the same place) or reflash it with `picoboot load`.
@@ -309,3 +309,11 @@ Puddles in its simulated vehicle is `robots/puddles.toml` ([robots.md](robots.md
 deadlock: every core asleep with nothing scheduled, reported on stderr), and with an error when a core locked up,
 an option does not fit the board (`--input` of an input the board does not have, `--mock-bridge` without a bus) or a
 fault could not be applied.
+
+SIGINT (Ctrl-C) or SIGTERM (`kill`, `timeout`) ends a `run` or `robot` cleanly: the emulator stops at the next
+slice boundary (within 100 µs of virtual time) and does everything the end of `--time` does: it saves
+`--flash-file`, writes the JSON log's `end` record (`"reason":"Interrupted"`), the waveform, the profile and the
+candump log, and prints the stop line, `stopped at 12.345678s (Interrupted); ...`. It then exits with 128 plus the
+signal's number (130 for SIGINT, 143 for SIGTERM), as a shell expects of a process a signal ended. A second signal
+quits at once without any of that, and so does a signal while `--dashboard-hold` keeps the dashboard up after the
+run.

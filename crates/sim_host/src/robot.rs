@@ -100,6 +100,9 @@ pub struct Robot {
     pub(crate) pacing: Option<(std::time::Instant, Time)>,
     /// How the boards were spread over threads last time, and what they cost (see [`crate::parallel`]).
     pub(crate) balance: crate::parallel::Balance,
+    /// When this is set, [`Robot::run_until`] returns at the next slice boundary, before `end` (the command
+    /// line's [`crate::signal::STOP`], set by SIGINT or SIGTERM).
+    pub stop_flag: Option<&'static std::sync::atomic::AtomicBool>,
 }
 
 impl Default for Robot {
@@ -124,6 +127,7 @@ impl Default for Robot {
             vehicles: Vec::new(),
             pacing: None,
             balance: Default::default(),
+            stop_flag: None,
         }
     }
 }
@@ -173,6 +177,7 @@ impl Robot {
     }
 
     /// Runs every board until `end`. Returns the first board that stopped for another reason, with the reason.
+    /// Returns `None` early, at a slice boundary with [`Robot::now`] before `end`, once [`Robot::stop_flag`] is set.
     pub fn run_until(&mut self, end: Time) -> Option<(usize, StopReason)> {
         // The sensors see a vehicle moved since the last run (a scenario putting it elsewhere) from the start
         for v in &self.vehicles {
@@ -181,7 +186,7 @@ impl Robot {
         if crate::parallel::worth_it(self, end) {
             return crate::parallel::run_until(self, end);
         }
-        while self.now < end {
+        while self.now < end && !crate::signal::is_set(self.stop_flag) {
             let t = (self.now + self.slice).min(end);
             for (i, b) in self.boards.iter_mut().enumerate() {
                 if !power_on_by(b, &mut self.power_on[i], t) {
@@ -371,6 +376,7 @@ impl Robot {
             vehicles,
             pacing: None,
             balance: self.balance.clone(),
+            stop_flag: None,
         }
     }
 
