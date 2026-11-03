@@ -87,6 +87,61 @@ fn ivc2_boards_exchange_a_byte_across_the_pool() {
     assert!(m.projectors[1].edge_count < 10);
 }
 
+/// The C IVCBoard2 modem (titan_firmware blake/ivc's ivc/rx/tx/consensus/fft code, unmodified, with UART0 in place
+/// of micro-ROS: `test_programs/c_ivc_modem`) and the Rust `ivc_board2` understand each other across the pool, both
+/// ways. This is the C/Rust interop the emulator can check without the micro-ROS library (docs/acoustics.md).
+#[test]
+fn c_and_rust_ivc_board2_modems_exchange_bytes() {
+    if common::titan_elf("ivc_board2").is_none() {
+        return;
+    }
+    let c_modem = common::repo().join("test_programs/c_ivc_modem/c_ivc_modem.elf");
+    let (mut r, talos, _) = robot("ivc2_pool.toml", |spec| {
+        spec.board[1].name = "c_ivc".into();
+        spec.board[1].elf = c_modem;
+        spec.board[1].rom_boot = true;
+    });
+    // C -> Rust: a byte on the C board's UART is what its ivc/enqueue_data callback would enqueue
+    r.run_until(Time::from_ms(3500));
+    let now = r.now;
+    r.boards[1].machine.sys.uart_inject(0, &[0xC3], now);
+    // Rust -> C, once that packet (9 s) is over
+    talos.send_at(Time::from_ms(13_500), HostToDevice::Ivc2(ivc2::HostToDevice::EnqueueData(0x5A)));
+    r.run_until(Time::from_ms(22_500));
+    let c_log = r.boards[1].uart_text[0].clone();
+    assert!(c_log.contains("enqueueing 195") && c_log.contains("wrote out last sync"), "{c_log}");
+    let got = ivc2_bytes(&talos);
+    assert_eq!(got.iter().map(|b| b.1).collect::<Vec<_>>(), [0xC3], "{c_log}");
+    assert!((12.0..13.5).contains(&got[0].0.as_secs_f64()), "{got:?}");
+    assert!(r.boards[0].logged("Transmitting 0x5a"));
+    assert!(c_log.contains("packet read complete with: 90") && c_log.contains("ROS ivc/rx_new 90"), "{c_log}");
+    assert_eq!(c_log.matches("ROS ivc/rx_new").count(), 1, "{c_log}");
+}
+
+/// Firmware finding (C IVCBoard2, blake/ivc `tx.c`): `attempt_writing` dequeues the next byte on every main loop pass
+/// even while a packet is going out, and only overwrites `data_to_write`; the packet in flight carries the bits of
+/// the newest byte from then on, and the earlier byte is lost. Two bytes enqueued together arrive as one, the second.
+/// (The Rust port waits for the packet to end; this is why the interop robot file says to send one byte at a time.)
+#[test]
+fn firmware_finding_c_ivc_board2_overwrites_the_packet_in_flight() {
+    if common::titan_elf("ivc_board2").is_none() {
+        return;
+    }
+    let c_modem = common::repo().join("test_programs/c_ivc_modem/c_ivc_modem.elf");
+    let (mut r, talos, _) = robot("ivc2_pool.toml", |spec| {
+        spec.board[1].elf = c_modem;
+        spec.board[1].rom_boot = true;
+    });
+    r.run_until(Time::from_ms(3500));
+    let now = r.now;
+    r.boards[1].machine.sys.uart_inject(0, &[0xC3, 0x5A], now);
+    r.run_until(Time::from_ms(14_000));
+    let c_log = &r.boards[1].uart_text[0];
+    assert!(c_log.contains("dequeeud: 195") && c_log.contains("dequeeud: 90"), "{c_log}");
+    assert_eq!(c_log.matches("wrote out last sync").count(), 1, "one packet: {c_log}");
+    assert_eq!(ivc2_bytes(&talos).iter().map(|b| b.1).collect::<Vec<_>>(), [0x5A]);
+}
+
 fn ivc_bytes(bridge: &MockBridge) -> Vec<(Time, u8)> {
     bridge
         .state()

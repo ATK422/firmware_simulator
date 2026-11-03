@@ -148,3 +148,133 @@ fn bad_pin_names_are_reported() {
     let err = String::from_utf8_lossy(&out.stderr);
     assert!(err.contains("no pin \"esc9_pwm\"") && err.contains("esc1_pwm_pin"), "{err}");
 }
+
+/// A robot with two boards, the second `c_dual_usb` (titan_dual_stdio_usb) with `extra` robot file keys.
+fn dual_usb_robot(name: &str, extra: &str) -> PathBuf {
+    let robot = temp(name);
+    std::fs::write(
+        &robot,
+        format!(
+            "[[board]]\nname = \"blinky\"\nboard = {pb:?}\nelf = {blink:?}\n\n\
+             [[board]]\nname = \"c_ivc\"\nboard = {ivc:?}\nelf = {dual:?}\n{extra}\n",
+            pb = path(&repo().join("boards/mk2/power_board.toml")),
+            blink = path(&repo().join("test_programs/blink.elf")),
+            ivc = path(&repo().join("boards/talos/ivc_board.toml")),
+            dual = path(&repo().join("test_programs/c_dual_usb/c_dual_usb.elf")),
+        ),
+    )
+    .unwrap();
+    robot
+}
+
+/// `robot --usb-cdc BOARD=stdout` prints the board's USB text log with its name; `--usb-cdc2 BOARD=pty:PATH` puts
+/// its second port on a terminal linked from PATH, and replaces the robot file's setting.
+#[test]
+fn robot_usb_cdc_ports_from_the_command_line() {
+    let link = temp("c_ivc-ros");
+    let robot = dual_usb_robot("usb.toml", "usb_cdc2 = \"pty\"");
+    let out = sim(&[
+        "robot",
+        path(&robot),
+        "--time",
+        "300ms",
+        "--usb-cdc",
+        "c_ivc=stdout",
+        "--usb-cdc2",
+        &format!("c_ivc=pty:{}", path(&link)),
+    ]);
+    assert!(out.contains("] c_ivc usb: titan dual stdio up"), "{out}");
+    assert!(out.contains("c_ivc: USB CDC port 1 on /dev/") && out.contains(&format!("(linked from {})", path(&link))));
+    assert_eq!(out.matches("USB CDC port").count(), 1, "the command line replaces the file's pty: {out}");
+    // Mistakes are reported
+    for (args, want) in [
+        (&["--usb-cdc2", "c_ivc=stdout"][..], "raw bytes"),
+        (&["--usb-cdc", "nope=stdout"], "--usb-cdc: no board \"nope\""),
+        (&["--usb-cdc", "c_ivc"], "expected BOARD=SINK"),
+        (&["--ivc-send", "1s@blinky:0x5a"], "not an IVC image"),
+        (&["--ivc-send", "1s@blinky:300"], "0-255 or 0x00-0xff"),
+    ] {
+        let out = Command::new(env!("CARGO_BIN_EXE_firmware_simulator"))
+            .args(["robot", path(&robot), "--time", "1ms"])
+            .args(args)
+            .output()
+            .unwrap();
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert!(!out.status.success() && err.contains(want), "{args:?}: {err}");
+    }
+}
+
+/// `robot --ivc-send`: Talos's IVCBoard2 transmits a byte through its mock bridge, and the surface vehicle's mock
+/// bridge prints it as it arrives across the pool.
+#[test]
+fn robot_ivc_send_reaches_the_other_vehicle() {
+    let fw = sim_host::titan_rs_release_dir(&repo()).join("ivc_board2");
+    if !fw.exists() {
+        eprintln!("skipping: {} not built", fw.display());
+        return;
+    }
+    let robot = repo().join("robots/ivc2_pool.toml");
+    let out = sim(&[
+        "robot",
+        path(&robot),
+        "--mock-bridge",
+        "talos:8",
+        "--mock-bridge",
+        "surface:8",
+        "--ivc-send",
+        "3.5s@talos_ivc:0x5a",
+        "--time",
+        "12.5s",
+    ]);
+    assert!(out.contains("talos_ivc: ") && out.contains("Transmitting 0x5a"), "{out}");
+    let got: Vec<&str> = out.lines().filter(|l| l.contains("IVC received")).collect();
+    assert_eq!(got.len(), 1, "{out}");
+    assert!(got[0].starts_with('[') && got[0].ends_with("] surface_ivc: IVC received 0x5a"), "{got:?}");
+    // Sent at 3.5 s, nine seconds of packet: it arrives as the packet's closing sync starts
+    let t: f64 = got[0][1..got[0].find("s]").unwrap()].parse().unwrap();
+    assert!((11.5..12.5).contains(&t), "{t}");
+    // Without a mock bridge on the board's bus the command says which to add
+    let err = Command::new(env!("CARGO_BIN_EXE_firmware_simulator"))
+        .args(["robot", path(&robot), "--ivc-send", "1s@surface_ivc:1", "--time", "1ms"])
+        .output()
+        .unwrap();
+    let err = String::from_utf8_lossy(&err.stderr);
+    assert!(err.contains("surface_ivc has no mock bridge (add --mock-bridge surface:8)"), "{err}");
+}
+
+/// `robots/ivc2_interop.toml` loads with the C image from `$TITAN_FIRMWARE_DIR` (a stand-in here: `c_dual_usb`,
+/// titan_dual_stdio_usb like the C IVCBoard2, at the C build's path), boots it through the bootrom and opens its
+/// two USB ports; the command line moves the ptys away from the file's fixed paths.
+#[test]
+fn ivc2_interop_robot_takes_the_c_image_from_titan_firmware_dir() {
+    if !sim_host::titan_rs_release_dir(&repo()).join("ivc_board2").exists() {
+        eprintln!("skipping: ivc_board2 not built");
+        return;
+    }
+    let tf = temp("titan_firmware");
+    let build = tf.join("talos/IVCBoard2/build");
+    std::fs::create_dir_all(&build).unwrap();
+    std::fs::copy(repo().join("test_programs/c_dual_usb/c_dual_usb.elf"), build.join("IVCBoard2_with_bl.uf2")).unwrap();
+    let ros = temp("interop-ros");
+    let robot = repo().join("robots/ivc2_interop.toml");
+    let out = Command::new(env!("CARGO_BIN_EXE_firmware_simulator"))
+        .args(["robot", path(&robot), "--mock-bridge", "talos:8", "--time", "800ms", "--usb-cdc", "c_ivc=stdout"])
+        .arg("--usb-cdc2")
+        .arg(format!("c_ivc=pty:{}", path(&ros)))
+        .env("TITAN_FIRMWARE_DIR", &tf)
+        .output()
+        .unwrap();
+    let text = String::from_utf8_lossy(&out.stdout).into_owned() + &String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "{text}");
+    assert!(text.contains("] c_ivc usb: titan dual stdio up"), "{text}");
+    assert!(text.contains("c_ivc: USB CDC port 1 on /dev/") && text.contains(path(&ros)), "{text}");
+    assert!(text.contains("talos_ivc: ") && text.contains("ROS connected"), "{text}");
+    // Without the variable the error says what to set
+    let out = Command::new(env!("CARGO_BIN_EXE_firmware_simulator"))
+        .args(["robot", path(&robot), "--time", "1ms"])
+        .env_remove("TITAN_FIRMWARE_DIR")
+        .output()
+        .unwrap();
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(!out.status.success() && err.contains("TITAN_FIRMWARE_DIR is not set"), "{err}");
+}

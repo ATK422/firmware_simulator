@@ -26,6 +26,104 @@ pub fn resolve_image(path: &std::path::Path) -> std::path::PathBuf {
         _ => path.to_path_buf(),
     }
 }
+/// Expands a path from a robot file: a leading `~` (or `~/...`) is `$HOME`, and `$NAME` or `${NAME}` is the value
+/// of the environment variable `NAME` (letters, digits and `_`), e.g. `${TITAN_FIRMWARE_DIR}/talos/...`. `$$` is a
+/// literal `$`. An unset variable is an error that names it.
+pub fn expand_path(path: &str) -> Result<std::path::PathBuf, String> {
+    expand_path_with(path, |name| std::env::var(name).ok())
+}
+
+/// [`expand_path`] with the variables (and `HOME`) looked up by `var`.
+pub fn expand_path_with(path: &str, var: impl Fn(&str) -> Option<String>) -> Result<std::path::PathBuf, String> {
+    let lookup = |name: &str| {
+        var(name).ok_or_else(|| match name {
+            "TITAN_FIRMWARE_DIR" => format!(
+                "{path}: TITAN_FIRMWARE_DIR is not set (point it at your titan_firmware checkout, e.g. \
+                 `export TITAN_FIRMWARE_DIR=~/titan_firmware`)"
+            ),
+            _ => format!("{path}: environment variable {name} is not set"),
+        })
+    };
+    let mut out = String::new();
+    let mut rest = path;
+    if let Some(after) = rest.strip_prefix('~')
+        && (after.is_empty() || after.starts_with('/'))
+    {
+        out.push_str(&lookup("HOME")?);
+        rest = after;
+    }
+    while let Some(i) = rest.find('$') {
+        out.push_str(&rest[..i]);
+        let after = &rest[i + 1..];
+        let is_name = |c: char| c.is_ascii_alphanumeric() || c == '_';
+        if let Some(a) = after.strip_prefix('$') {
+            out.push('$');
+            rest = a;
+        } else if let Some(braced) = after.strip_prefix('{') {
+            let end = braced.find('}').ok_or_else(|| format!("{path}: unclosed ${{"))?;
+            let name = &braced[..end];
+            if name.is_empty() || !name.chars().all(is_name) {
+                return Err(format!("{path}: bad variable name {name:?}"));
+            }
+            out.push_str(&lookup(name)?);
+            rest = &braced[end + 1..];
+        } else {
+            let end = after.find(|c: char| !is_name(c)).unwrap_or(after.len());
+            if end == 0 {
+                return Err(format!("{path}: `$` without a variable name (write `$$` for a `$`)"));
+            }
+            out.push_str(&lookup(&after[..end])?);
+            rest = &after[end..];
+        }
+    }
+    out.push_str(rest);
+    Ok(out.into())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn vars(name: &str) -> Option<String> {
+        match name {
+            "HOME" => Some("/home/me".into()),
+            "TITAN_FIRMWARE_DIR" => Some("/src/titan_firmware".into()),
+            "A_1" => Some("x".into()),
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn expands_home_and_variables() {
+        let e = |p: &str| expand_path_with(p, vars).map(|p| p.to_string_lossy().into_owned());
+        assert_eq!(e("~").unwrap(), "/home/me");
+        assert_eq!(e("~/build/a.uf2").unwrap(), "/home/me/build/a.uf2");
+        assert_eq!(e("~other/a").unwrap(), "~other/a", "only the user's own home");
+        assert_eq!(
+            e("${TITAN_FIRMWARE_DIR}/talos/IVCBoard2/build/IVCBoard2_with_bl.uf2").unwrap(),
+            "/src/titan_firmware/talos/IVCBoard2/build/IVCBoard2_with_bl.uf2"
+        );
+        assert_eq!(e("$A_1/b-$A_1.elf").unwrap(), "x/b-x.elf");
+        assert_eq!(e("a$$b").unwrap(), "a$b");
+        assert_eq!(e("../relative/path").unwrap(), "../relative/path");
+    }
+
+    #[test]
+    fn unset_and_malformed_variables_are_errors() {
+        let e = |p: &str| expand_path_with(p, |_| None).unwrap_err();
+        assert!(
+            e("${TITAN_FIRMWARE_DIR}/x").contains("TITAN_FIRMWARE_DIR is not set"),
+            "{}",
+            e("${TITAN_FIRMWARE_DIR}")
+        );
+        assert!(e("$NOPE/x").contains("NOPE is not set"));
+        assert!(e("~/x").contains("HOME is not set"));
+        assert!(expand_path_with("${A", vars).unwrap_err().contains("unclosed"));
+        assert!(expand_path_with("${A-B}", vars).unwrap_err().contains("bad variable name"));
+        assert!(expand_path_with("a$/b", vars).unwrap_err().contains("without a variable name"));
+    }
+}
+
 pub mod board;
 pub mod bridges;
 pub mod candiff;

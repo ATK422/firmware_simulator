@@ -65,6 +65,7 @@ const OUTSIDE: &[(&str, &str)] = &[
     ("--interface", "titan_bridge"),
     ("--client-id", "titan_bridge"),
     ("--dev", "micro_ros_agent serial"),
+    ("--once", "ros2 topic pub"),
     ("--check", "scripts/gen_boards.py, cargo fmt"),
     ("--down", "scripts/vcan_up.sh"),
     ("--tool", "valgrind"),

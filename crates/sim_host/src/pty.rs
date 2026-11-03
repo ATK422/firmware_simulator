@@ -36,6 +36,20 @@ impl Pty {
         }
     }
 
+    /// [`Pty::open`], and if `link` is given, a symlink there pointing at the terminal, so tools can use a fixed name
+    /// (a symlink an earlier run left there is replaced; any other file there is an error).
+    pub fn open_linked(link: Option<&std::path::Path>) -> io::Result<Pty> {
+        let pty = Pty::open()?;
+        if let Some(link) = link {
+            if std::fs::symlink_metadata(link).is_ok_and(|m| m.file_type().is_symlink()) {
+                std::fs::remove_file(link)?;
+            }
+            std::os::unix::fs::symlink(&pty.path, link)
+                .map_err(|e| io::Error::new(e.kind(), format!("linking {} to {}: {e}", link.display(), pty.path)))?;
+        }
+        Ok(pty)
+    }
+
     /// Writes UART output to the terminal. Bytes are dropped while nobody has the pty open.
     pub fn write(&self, data: &[u8]) {
         // SAFETY: writing from a valid buffer to our own fd
