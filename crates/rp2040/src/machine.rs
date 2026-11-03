@@ -1096,6 +1096,9 @@ impl Machine {
         self.clk_sys = s.clk_sys;
         self.systick_ref = s.systick_ref;
         self.sys.irq_dirty = true;
+        // The run loop's caches describe the state before the restore (as in `fork`, the copy starts without them)
+        self.budget_carry = None;
+        self.spin_watch = None;
     }
 
     /// Lets attached devices update their outputs (after the host delivered something to them).
