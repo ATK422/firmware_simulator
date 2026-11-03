@@ -1507,3 +1507,20 @@ fn block_add_with_carry_matches_the_reference() {
         }
     }
 }
+
+#[test]
+fn stacking_wraps_around_the_address_space() {
+    // An MSP just above zero puts the frame at the top of the address space (the PPB, which takes the writes) and
+    // past 0xFFFF_FFFF to address 0: the frame addresses wrap, as the core's address arithmetic does
+    let mut rig = Rig::new(&[NOP, NOP]);
+    rig.handler(16, HANDLER, &[bx(14)]);
+    rig.cpu.r[13] = 0x10;
+    rig.cpu.nvic.enabled = 1;
+    rig.cpu.set_irq_lines(1);
+    rig.run(1);
+    assert_eq!((rig.cpu.ipsr(), rig.r(13)), (16, 0xFFFF_FFF0));
+    assert_eq!(rig.bus.word(0x8), CODE, "stacked return address at frame + 24, wrapped to 0x8");
+    rig.cpu.set_irq_lines(0);
+    rig.run(1);
+    assert_eq!((rig.cpu.ipsr(), rig.cpu.pc(), rig.r(13)), (0, CODE, 0x10));
+}

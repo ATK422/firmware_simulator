@@ -465,7 +465,7 @@ impl CortexM0Plus {
         let xpsr = self.xpsr() & !(1 << 9) | align << 9;
         let vals = [self.r[0], self.r[1], self.r[2], self.r[3], self.r[12], self.r[14], return_addr, xpsr];
         for (i, v) in vals.iter().enumerate() {
-            self.write_mem(bus, frame + 4 * i as u32, Size::Word, *v)?;
+            self.write_mem(bus, frame.wrapping_add(4 * i as u32), Size::Word, *v)?;
         }
         self.r[13] = frame;
         self.r[14] = if self.ipsr != 0 {
@@ -507,7 +507,7 @@ impl CortexM0Plus {
         let frame = self.r[13];
         let mut vals = [0u32; 8];
         for (i, v) in vals.iter_mut().enumerate() {
-            *v = self.read_mem(bus, frame + 4 * i as u32, Size::Word)?;
+            *v = self.read_mem(bus, frame.wrapping_add(4 * i as u32), Size::Word)?;
         }
         self.r[0] = vals[0];
         self.r[1] = vals[1];
