@@ -555,6 +555,21 @@ impl CanEndpoint for SharedReplay {
     }
 }
 
+/// A bus record as the log [`CandumpWriter`] would have written it (acknowledged frames, stamped with their end
+/// to the microsecond), for tests that record with `CanBus::record` and compare afterwards.
+pub fn from_records(records: &[BusRecord], iface: &str) -> Vec<LogFrame> {
+    records
+        .iter()
+        .filter(|r| r.acked)
+        .map(|r| LogFrame { time_ns: r.end.as_ns() / 1000 * 1000, iface: iface.to_string(), frame: r.frame.clone() })
+        .collect()
+}
+
+/// A log as `candump -l` text.
+pub fn to_text(log: &[LogFrame]) -> String {
+    log.iter().map(|f| format_line(f.time_ns, &f.iface, &f.frame) + "\n").collect()
+}
+
 /// The interfaces a log has frames on, in order of first appearance.
 pub fn interfaces(log: &[LogFrame]) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();

@@ -69,12 +69,11 @@ fn record_replay_and_diff_a_board() {
     let (bench, text_a) = logged_run(bench, end);
     // The log holds every acknowledged frame of the bus, as a listening candump would see them
     let log_a = canlog::parse(&text_a).unwrap();
-    let acked: Vec<_> = bench.frames().iter().filter(|r| r.acked).collect();
-    assert_eq!(log_a.len(), acked.len());
-    for (l, r) in log_a.iter().zip(&acked) {
-        assert_eq!(l.frame, r.frame);
-        assert_eq!(l.time_ns, r.end.as_ns() / 1000 * 1000, "microsecond timestamps of the frame's end");
-    }
+    let acked = bench.frames().iter().filter(|r| r.acked).count();
+    assert_eq!(log_a.len(), acked);
+    assert!(log_a.iter().zip(bench.frames().iter().filter(|r| r.acked)).all(|(l, r)| l.frame == r.frame));
+    assert_eq!(canlog::from_records(bench.frames(), "can0"), log_a, "microsecond timestamps of the frames' ends");
+    assert_eq!(canlog::to_text(&log_a), text_a);
     assert!(bench.statuses().len() >= 2, "the bridge saw the board connect");
 
     // Replaying only what the bridge sent gives the board the same inputs: the runs are the same
