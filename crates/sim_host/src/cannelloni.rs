@@ -72,7 +72,8 @@ pub fn encode(frames: &[CanFrame], seq: &mut u8) -> Vec<Vec<u8>> {
     out
 }
 
-/// Unpacks a datagram: its sequence number and frames (error frames are dropped).
+/// Unpacks a datagram: its sequence number and frames (error frames, and CAN FD frames flagged as remote, are
+/// dropped).
 pub fn decode(p: &[u8]) -> Result<(u8, Vec<CanFrame>), String> {
     if p.len() < HEADER_LEN {
         return Err(format!("{} byte datagram", p.len()));
@@ -100,9 +101,11 @@ pub fn decode(p: &[u8]) -> Result<(u8, Vec<CanFrame>), String> {
         if len > if fd { 64 } else { 8 } {
             return Err(format!("{len} byte frame"));
         }
-        let rtr = !fd && id & CAN_RTR_FLAG != 0;
+        // As cannelloni's parser: no data follows any id with the RTR flag, CAN FD or not
+        let rtr = id & CAN_RTR_FLAG != 0;
         let data = if rtr { vec![0; len] } else { take(len)?.to_vec() };
-        if id & CAN_ERR_FLAG != 0 {
+        // CAN FD has no remote frames
+        if id & CAN_ERR_FLAG != 0 || (fd && rtr) {
             continue;
         }
         let extended = id & CAN_EFF_FLAG != 0;
@@ -318,6 +321,20 @@ mod tests {
         assert_eq!(decode(&err_frame).unwrap().1, vec![], "error frames are dropped");
         assert!(Cannelloni::parse_spec("127.0.0.1:1,127.0.0.1:2").is_ok());
         assert!(Cannelloni::parse_spec("127.0.0.1:1").is_err());
+    }
+
+    /// cannelloni's parser reads no data for any id with `CAN_RTR_FLAG`, CAN FD or not (and its encoder writes
+    /// none), so the frames after such a one are where cannelloni put them. CAN FD has no remote frames: that one
+    /// is dropped.
+    #[test]
+    fn an_fd_frame_with_the_rtr_flag_carries_no_data() {
+        #[rustfmt::skip]
+        let p = [
+            2, 0, 0, 0, 2,
+            0x40, 0, 0x01, 0x23, 0x88, 0x01,
+            0, 0, 0, 0x6F, 1, 0xC0,
+        ];
+        assert_eq!(decode(&p).unwrap().1, vec![CanFrame::classic(0x6F, false, &[0xC0])]);
     }
 
     /// Two buses joined by a tunnel over loopback: what is sent on one arrives on the other, both ways.
