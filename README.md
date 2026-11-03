@@ -181,7 +181,8 @@ can client 1 board->host Power::Electrical::ElectricalReadings  2      2      2 
 It exits with 0 when the logs agree, 1 when they differ (`--max-skew` adds a timing limit) and 2 on errors, for
 CI. `--ignore-payload STREAM` compares a stream's presence and timing only (e.g. `FirmwareStatus`, whose uptime
 differs between a board and its emulation), `--only` picks streams, `--raw` compares frames by identifier without
-decoding, and `--iface-map can0=internal` renames interfaces (two logs with one interface each are matched as they
+decoding, `--robot robots/talos.toml` names each client's board in the report (`internal client 1 (poac) ...`),
+and `--iface-map can0=internal` renames interfaces (two logs with one interface each are matched as they
 are). This is how a real board's traffic is held against the emulator's (PLAN.md, testing against hardware): record
 the board with `candump -l can0 > hw.log`, replay the robot computer's side into the emulated board, and compare.
 

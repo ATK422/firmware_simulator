@@ -68,11 +68,12 @@ fn robot_replay_and_diff() {
     assert_eq!(code, 0, "{err}");
     assert!(err.contains("(internal -> internal)") && err.contains("(external -> external)"), "{err}");
 
-    let (code, out, err) = run(exe().arg("can-diff").arg(&a).arg(&b));
+    let (code, out, err) =
+        run(exe().arg("can-diff").arg(&a).arg(&b).arg("--robot").arg(repo().join("robots/talos.toml")));
     assert_eq!(code, 0, "{out}{err}");
     assert!(out.contains("identical"), "{out}");
-    assert!(out.contains("external client 21 board->host SmartBattery::BatteryStatus"), "{out}");
-    assert!(out.contains("internal client 8 board->host Heartbeat"), "{out}");
+    assert!(out.contains("external client 21 (battery) board->host SmartBattery::BatteryStatus"), "{out}");
+    assert!(out.contains("internal client 8 (ivc) board->host Heartbeat"), "{out}");
     assert!(out.contains("aligned on their timestamps as logged"), "{out}");
 
     // Without the bridges' traffic the boards never connect: their link messages are missing

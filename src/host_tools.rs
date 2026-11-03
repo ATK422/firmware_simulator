@@ -270,6 +270,25 @@ pub struct CanDiffArgs {
     /// Also fail if paired events are further apart than this (after the global alignment).
     #[arg(long, value_parser = super::parse_time)]
     max_skew: Option<Time>,
+    /// Name the boards in the report from this robot file: `internal client 1 (poac) ...` (log interfaces are the
+    /// bus names, after --iface-map).
+    #[arg(long)]
+    robot: Option<PathBuf>,
+}
+
+/// Adds the board name after `client N` in each stream name, from (bus, client) pairs.
+fn label_streams(report: &mut candiff::Report, boards: &[(String, u8, String)]) {
+    for s in &mut report.streams {
+        let mut words: Vec<String> = s.name.split(' ').map(str::to_string).collect();
+        if words.len() > 2
+            && words[1] == "client"
+            && let Ok(c) = words[2].parse::<u8>()
+            && let Some((_, _, board)) = boards.iter().find(|(bus, client, _)| *bus == words[0] && *client == c)
+        {
+            words[2] = format!("{c} ({board})");
+            s.name = words.join(" ");
+        }
+    }
 }
 
 fn parse_signed_time(s: &str) -> Result<i64, String> {
@@ -317,7 +336,15 @@ pub fn can_diff(args: CanDiffArgs) -> Result<bool> {
         ignore_payload: args.ignore_payload,
         only: args.only,
     };
-    let report = candiff::diff(&candiff::decode(&a, args.raw), &candiff::decode(&b, args.raw), &opts);
+    let mut report = candiff::diff(&candiff::decode(&a, args.raw), &candiff::decode(&b, args.raw), &opts);
+    if let Some(robot) = &args.robot {
+        let spec = sim_host::bridges::read_spec(robot).map_err(anyhow::Error::msg)?;
+        let dir = robot.parent().unwrap_or(Path::new("."));
+        let cmds = sim_host::bridges::plan(&spec, dir, &[], None).map_err(anyhow::Error::msg)?;
+        let boards: Vec<(String, u8, String)> =
+            cmds.into_iter().filter_map(|c| Some((c.bus?, c.client_id?, c.board))).collect();
+        label_streams(&mut report, &boards);
+    }
     println!("A: {}\nB: {}", args.a.display(), args.b.display());
     print!("{}", report.render(args.details));
     let mut same = report.identical();
@@ -421,6 +448,20 @@ pub fn can_tunnel(args: TunnelArgs) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn stream_labels() {
+        let mut r = candiff::diff(&Default::default(), &Default::default(), &Default::default());
+        for n in ["internal client 1 board->host Heartbeat", "external client 1 board->host Heartbeat", "can id 123"] {
+            r.streams.push(candiff::StreamDiff { name: n.into(), ..Default::default() });
+        }
+        label_streams(&mut r, &[("internal".into(), 1, "poac".into())]);
+        let names: Vec<&str> = r.streams.iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(
+            names,
+            ["internal client 1 (poac) board->host Heartbeat", "external client 1 board->host Heartbeat", "can id 123"]
+        );
+    }
 
     #[test]
     fn signed_times() {
