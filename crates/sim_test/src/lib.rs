@@ -14,6 +14,19 @@
 //! let base = b.snapshot(); // fast setup: boot once, run every case from here
 //! ```
 //!
+//! Faults ([`Fault`]) are injected now with [`Bench::inject`] or at a set time with [`Bench::inject_at`]:
+//!
+//! ```no_run
+//! use sim_test::{Bench, Fault, Time};
+//!
+//! let Some(elf) = sim_test::titan_rs("power_board") else { return };
+//! let mut b = Bench::builder(&elf).board("mk2/power_board").bridge(1).boot().unwrap();
+//! b.inject_at(Time::from_ms(1500), Fault::Bridge(false)); // titan_bridge goes away
+//! b.inject_at(Time::from_ms(3000), Fault::Bridge(true));
+//! b.run_until(Time::from_ms(4000)).unwrap();
+//! assert!(b.logged("Lost connection to ROS"));
+//! ```
+//!
 //! [`RobotBench`] does the same for a robot file (several boards, buses and an acoustic environment), and
 //! [`sweep`] runs one scenario from a snapshot over a set of parameters in parallel, e.g. the IVC range and noise
 //! sweeps in `tests/ivc_sweep.rs`.
@@ -23,14 +36,19 @@ use std::path::{Path, PathBuf};
 pub use rp2040::StopReason;
 pub use sim_acoustics::medium::Trajectory;
 pub use sim_core::time::Time;
+pub use sim_devices::fault::{AnalogFault, I2cFault};
+pub use sim_devices::mcp251xfd::{ErrorCounters, ErrorState};
 pub use sim_host::Session;
 pub use sim_host::board::{Board, Inputs};
+pub use sim_host::ethernet::PuddlesBridge;
+pub use sim_host::fault::Fault;
 pub use sim_host::mock_bridge::MockBridge;
 pub use sim_host::robot::{Robot, RobotSpec};
 pub use titan_link;
 
 use sim_core::image::Image;
 use sim_devices::can::{BusRecord, CanBus};
+use sim_host::fault::{BridgeControl, FaultTarget};
 use titan_link::{DeviceToHost, FirmwareStatus, HostToDevice};
 
 /// The repository root.
@@ -91,7 +109,8 @@ impl BenchBuilder {
     }
 
     /// Puts a mock `titan_bridge` for CANmore client `client` on the board's bus, pinging from time 0 and enabling
-    /// the vehicle (kill switch released).
+    /// the vehicle (kill switch released). On a board with Ethernet and no CAN (Puddles) it is a
+    /// [`PuddlesBridge`] on the cable instead (`client` is unused).
     pub fn bridge(self, client: u8) -> Self {
         self.bridge_with(client, Time::ZERO, Some(false))
     }
@@ -142,7 +161,15 @@ impl BenchBuilder {
         }
         let mut session = Session::new(m, &image);
         let mut bridge = None;
-        if let Some(rates) = board.as_ref().and_then(|b| b.can_rates()) {
+        let mut puddles = None;
+        if session.machine.sys.ethernet.is_some() && board.as_ref().is_some_and(|b| b.can.is_none()) {
+            if let Some((_, start, kill)) = self.bridge {
+                let br = PuddlesBridge::new(start);
+                br.set_kill(kill);
+                session.eth_endpoints.push(Box::new(br.clone()));
+                puddles = Some(br);
+            }
+        } else if let Some(rates) = board.as_ref().and_then(|b| b.can_rates()) {
             let mut bus = CanBus::new("can0", rates);
             if self.record_bus {
                 bus.record = Some(Vec::new());
@@ -157,7 +184,7 @@ impl BenchBuilder {
         } else if self.bridge.is_some() {
             return Err("a bridge needs a board with a CAN bus".into());
         }
-        Ok(Bench { session, inputs, bridge, image })
+        Ok(Bench { session, inputs, bridge, puddles, image, schedule: Vec::new() })
     }
 }
 
@@ -167,7 +194,11 @@ pub struct Bench {
     /// The board's physical inputs (see its board file).
     pub inputs: Inputs,
     pub bridge: Option<MockBridge>,
+    /// The scripted bridge on the Ethernet cable, for a board with Ethernet instead of CAN.
+    pub puddles: Option<PuddlesBridge>,
     image: Image,
+    /// Faults still to inject, by time.
+    schedule: Vec<(Time, Fault)>,
 }
 
 impl Bench {
@@ -186,15 +217,57 @@ impl Bench {
         self.session.machine.now
     }
 
-    /// Runs until virtual time `t`. A stop for any other reason than reaching `t` (lockup, deadlock) is an error.
+    /// Runs until virtual time `t`, injecting scheduled faults on the way. A stop for any other reason than reaching
+    /// `t` (lockup, deadlock) is an error; so is a scheduled fault that cannot be applied (it panics).
     pub fn run_until(&mut self, t: Time) -> Result<(), StopReason> {
-        match self.session.run_until(t) {
-            StopReason::TimeLimit => {
-                self.session.poll_uarts();
-                Ok(())
+        loop {
+            let next = self.schedule.first().map(|f| f.0).filter(|&at| at <= t);
+            let target = next.unwrap_or(t);
+            match self.session.run_until(target) {
+                StopReason::TimeLimit => self.session.poll_uarts(),
+                other => return Err(other),
             }
-            other => Err(other),
+            match next {
+                Some(_) => {
+                    let (at, fault) = self.schedule.remove(0);
+                    if let Err(e) = self.inject(fault.clone()) {
+                        panic!("fault {fault:?} scheduled at {at}: {e}");
+                    }
+                }
+                None => return Ok(()),
+            }
         }
+    }
+
+    /// Injects `fault` now.
+    pub fn inject(&mut self, fault: Fault) -> Result<(), String> {
+        let n = self.session.machine.can_nodes().len();
+        let mut bus = self.session.can_bus.take();
+        let bridge: Option<&dyn BridgeControl> = match (&self.bridge, &self.puddles) {
+            (Some(b), _) => Some(b),
+            (None, Some(p)) => Some(p),
+            (None, None) => None,
+        };
+        let r = FaultTarget { session: &mut self.session, bus: bus.as_mut().map(|b| (b, 0..n)), bridge, power: None }
+            .apply(&fault);
+        self.session.can_bus = bus;
+        r
+    }
+
+    /// Injects `fault` when the bench reaches virtual time `at` (immediately, if it is already past).
+    pub fn inject_at(&mut self, at: Time, fault: Fault) {
+        let i = self.schedule.partition_point(|f| f.0 <= at);
+        self.schedule.insert(i, (at, fault));
+    }
+
+    /// The error counters of the board's CAN controller.
+    pub fn can_errors(&mut self) -> Option<ErrorCounters> {
+        sim_host::fault::can_error_counters(&mut self.session).first().copied()
+    }
+
+    /// The board's CAN controller model, to look at what it counted.
+    pub fn can_controller(&mut self) -> Option<&mut sim_devices::mcp251xfd::Mcp251xfd> {
+        sim_host::fault::can_controller(&mut self.session)
     }
 
     /// Runs for `d` more; panics if the machine stops for another reason.
@@ -239,37 +312,77 @@ impl Bench {
         }
     }
 
+    /// Runs until a log line containing `text` appears that was read after `after`, for at most `limit` more.
+    pub fn wait_for_log_after(&mut self, text: &str, after: Time, limit: Time) -> Result<Time, String> {
+        let end = self.now() + limit;
+        loop {
+            if let Some(t) = self.log_times(text).into_iter().find(|&t| t > after) {
+                return Ok(t);
+            }
+            if self.now() >= end {
+                return Err(format!("no {text:?} after {after} by {}; log: {:#?}", self.now(), self.session.logs));
+            }
+            let t = (self.now() + Time::from_ms(10)).min(end);
+            self.run_until(t).map_err(|e| format!("{e:?}"))?;
+        }
+    }
+
     /// Text a UART sent so far.
     pub fn uart(&self, n: usize) -> &str {
         &self.session.uart_text[n]
     }
 
-    fn bridge(&self) -> &MockBridge {
-        self.bridge.as_ref().expect("the bench has no bridge")
+    fn no_bridge() -> ! {
+        panic!("the bench has no bridge")
     }
 
     /// Sends a message from the (mock) bridge.
     pub fn send(&self, msg: HostToDevice) {
-        self.bridge().send(msg);
+        match (&self.bridge, &self.puddles) {
+            (Some(b), _) => b.send(msg),
+            (None, Some(p)) => p.send(msg),
+            _ => Self::no_bridge(),
+        }
     }
 
     /// Every titan_link message the bridge received, with when.
     pub fn messages(&self) -> Vec<(Time, DeviceToHost)> {
-        self.bridge().state().received.clone()
+        match (&self.bridge, &self.puddles) {
+            (Some(b), _) => b.state().received.clone(),
+            (None, Some(p)) => p.state().received.clone(),
+            _ => Self::no_bridge(),
+        }
     }
 
     /// Received messages picked out by `f`.
     pub fn picked<T>(&self, f: impl Fn(&DeviceToHost) -> Option<T>) -> Vec<(Time, T)> {
-        self.bridge().state().received.iter().filter_map(|(t, m)| f(m).map(|v| (*t, v))).collect()
+        self.messages().iter().filter_map(|(t, m)| f(m).map(|v| (*t, v))).collect()
     }
 
     pub fn statuses(&self) -> Vec<(Time, FirmwareStatus)> {
-        self.bridge().statuses()
+        self.picked(|m| match m {
+            DeviceToHost::FirmwareStatus(s) => Some(s.clone()),
+            _ => None,
+        })
+    }
+
+    /// The fault bits of the last firmware status the bridge received.
+    pub fn faults(&self) -> Option<u32> {
+        self.statuses().last().map(|s| s.1.faults)
     }
 
     /// Problems the bridge had decoding what the board sent.
     pub fn link_errors(&self) -> Vec<String> {
-        self.bridge().state().errors.clone()
+        match (&self.bridge, &self.puddles) {
+            (Some(b), _) => b.state().errors.clone(),
+            (None, Some(p)) => p.state().errors.clone(),
+            _ => Self::no_bridge(),
+        }
+    }
+
+    /// Times of the log lines containing `text`.
+    pub fn log_times(&self, text: &str) -> Vec<Time> {
+        self.session.logs.iter().filter(|(_, l)| l.message.contains(text)).map(|(t, _)| *t).collect()
     }
 
     /// Every frame on the board's bus (with [`BenchBuilder::record_bus`]).
@@ -277,15 +390,10 @@ impl Bench {
         self.session.can_bus.as_ref().and_then(|b| b.record.as_deref()).unwrap_or(&[])
     }
 
-    /// Makes core 0 call the firmware's panic path now (`__defmt_default_panic`, the target of `defmt::panic!`;
-    /// in C images `panic` is called with a message).
+    /// Makes core 0 call the firmware's panic path now (`__defmt_default_panic`, the target of `defmt::panic!`).
+    /// Same as injecting [`Fault::Panic`].
     pub fn inject_panic(&mut self) -> Result<(), String> {
-        if let Some(s) = self.image.symbol("__defmt_default_panic") {
-            let addr = s.addr;
-            self.session.machine.inject_call(0, addr, &[]);
-            return Ok(());
-        }
-        Err("no panic entry point found in the image".into())
+        self.inject(Fault::Panic)
     }
 
     /// Resets the chip through the watchdog (scratch registers and RAM kept).
@@ -306,7 +414,18 @@ impl Bench {
         if let Some(b) = &bridge {
             session.can_endpoints.push(Box::new(b.clone()));
         }
-        Bench { session, inputs: self.inputs.clone(), bridge, image: self.image.clone() }
+        let puddles = self.puddles.as_ref().map(PuddlesBridge::fork);
+        if let Some(p) = &puddles {
+            session.eth_endpoints.push(Box::new(p.clone()));
+        }
+        Bench {
+            session,
+            inputs: self.inputs.clone(),
+            bridge,
+            puddles,
+            image: self.image.clone(),
+            schedule: self.schedule.clone(),
+        }
     }
 }
 
@@ -315,6 +434,8 @@ pub struct RobotBench {
     pub robot: Robot,
     /// The mock bridge on each bus, by bus index.
     pub bridges: Vec<Option<MockBridge>>,
+    /// Faults still to inject: when, on which board.
+    schedule: Vec<(Time, String, Fault)>,
 }
 
 impl RobotBench {
@@ -339,17 +460,42 @@ impl RobotBench {
             robot.buses[j].endpoints.push(Box::new(br.clone()));
             out[j] = Some(br);
         }
-        Ok(RobotBench { robot, bridges: out })
+        Ok(RobotBench { robot, bridges: out, schedule: Vec::new() })
     }
 
     pub fn now(&self) -> Time {
         self.robot.now
     }
 
+    /// Runs every board until `t`, injecting scheduled faults on the way; panics if a board stops.
     pub fn run_until(&mut self, t: Time) {
-        if let Some((i, why)) = self.robot.run_until(t) {
-            panic!("board {} stopped at {}: {why:?}", self.robot.names[i], self.robot.boards[i].machine.now);
+        loop {
+            let next = self.schedule.first().map(|f| f.0).filter(|&at| at <= t);
+            if let Some((i, why)) = self.robot.run_until(next.unwrap_or(t)) {
+                panic!("board {} stopped at {}: {why:?}", self.robot.names[i], self.robot.boards[i].machine.now);
+            }
+            if next.is_none() {
+                return;
+            }
+            let (at, board, fault) = self.schedule.remove(0);
+            if let Err(e) = self.inject(&board, fault.clone()) {
+                panic!("fault {fault:?} on {board} scheduled at {at}: {e}");
+            }
         }
+    }
+
+    /// Injects `fault` on board `board` now. CAN bus faults other than unplugging go to the bus the board is on;
+    /// bridge faults to the mock bridge on that bus.
+    pub fn inject(&mut self, board: &str, fault: Fault) -> Result<(), String> {
+        let i = self.robot.index(board).ok_or_else(|| format!("no board {board}"))?;
+        let bridge = self.robot.board_bus[i].and_then(|j| self.bridges[j].as_ref()).map(|b| b as &dyn BridgeControl);
+        sim_host::fault::robot_target(&mut self.robot, i, bridge).apply(&fault)
+    }
+
+    /// Injects `fault` on board `board` when the robot reaches `at`.
+    pub fn inject_at(&mut self, at: Time, board: &str, fault: Fault) {
+        let i = self.schedule.partition_point(|f| f.0 <= at);
+        self.schedule.insert(i, (at, board.to_string(), fault));
     }
 
     pub fn run_for(&mut self, d: Time) {
@@ -381,7 +527,7 @@ impl RobotBench {
                 robot.buses[j].endpoints.push(Box::new(b.clone()));
             }
         }
-        RobotBench { robot, bridges }
+        RobotBench { robot, bridges, schedule: self.schedule.clone() }
     }
 
     /// Moves board `name`'s transducer.

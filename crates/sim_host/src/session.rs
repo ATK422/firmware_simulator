@@ -43,6 +43,8 @@ pub struct Session {
     pub on_can: Option<CanCallback>,
     /// Host participants on the board's Ethernet cable (Puddles), if it has one.
     pub eth_endpoints: Vec<Box<dyn crate::ethernet::EthEndpoint>>,
+    /// Frames lost on the way between the board's Ethernet cable and the host endpoints (fault injection).
+    pub eth_loss: Option<crate::fault::PacketLoss>,
     /// Keep virtual time from running ahead of the wall clock.
     pub realtime: bool,
     pacing: Option<(std::time::Instant, Time)>,
@@ -80,6 +82,7 @@ impl Session {
             can_endpoints: Vec::new(),
             on_can: None,
             eth_endpoints: Vec::new(),
+            eth_loss: None,
             realtime: false,
             pacing: None,
             behind_warned: std::time::Instant::now(),
@@ -122,6 +125,7 @@ impl Session {
             can_endpoints: Vec::new(),
             on_can: None,
             eth_endpoints: Vec::new(),
+            eth_loss: self.eth_loss.clone(),
             realtime: self.realtime,
             pacing: None,
             behind_warned: std::time::Instant::now(),
@@ -229,13 +233,20 @@ impl Session {
         let now = self.machine.now;
         let frames = std::mem::take(&mut wire.lock().unwrap().from_device);
         for (t, f) in &frames {
+            if self.eth_loss.as_mut().is_some_and(|l| l.drop_from_board()) {
+                continue;
+            }
             for e in self.eth_endpoints.iter_mut() {
                 e.receive(f, *t);
             }
         }
         let mut w = wire.lock().unwrap();
         for e in self.eth_endpoints.iter_mut() {
-            w.to_device.extend(e.take_tx(now));
+            for f in e.take_tx(now) {
+                if !self.eth_loss.as_mut().is_some_and(|l| l.drop_to_board()) {
+                    w.to_device.push_back(f);
+                }
+            }
         }
         if w.to_device.len() > 1000 {
             w.to_device.clear();

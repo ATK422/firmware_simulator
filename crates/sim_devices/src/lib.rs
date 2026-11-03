@@ -8,6 +8,7 @@
 //! * [`sht41`], [`mcp342x`], [`ms5837`], [`ssd1306`]: I2C sensors, ADC and display
 //! * [`cd74hc4051`]: an analog multiplexer in front of an ADC input
 //! * [`ws2812`]: an LED strip, decoded from its data pin
+//! * [`fault`]: fault injectors for I2C devices and ADC inputs (CAN bus faults are in [`can`])
 //!
 //! Physical inputs (temperatures, pressures, voltages) are [`sim_core::analog::Signal`]s.
 //!
@@ -19,6 +20,7 @@ pub mod cd74hc4051;
 pub mod drv8243;
 pub mod dshot;
 pub mod dynamixel;
+pub mod fault;
 pub mod hiwonder;
 pub mod i2c;
 pub mod i2c_pins;

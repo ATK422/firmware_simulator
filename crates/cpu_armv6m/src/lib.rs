@@ -203,6 +203,11 @@ impl CortexM0Plus {
         self.primask
     }
 
+    /// Sets PRIMASK as `CPSID i` / `CPSIE i` would (fault injection: a task stuck with interrupts masked).
+    pub fn set_primask(&mut self, masked: bool) {
+        self.primask = masked;
+    }
+
     pub fn control(&self) -> u32 {
         (self.spsel as u32) << 1 | self.npriv as u32
     }
