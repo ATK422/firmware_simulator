@@ -42,6 +42,9 @@ pub struct Session {
     usb_cdc_line: String,
     /// A pseudo terminal attached to the USB CDC port (host side of the device's serial port).
     pub usb_cdc_pty: Option<crate::pty::Pty>,
+    /// A pseudo terminal attached to the device's second USB CDC port, e.g. titan_dual_stdio_usb's secondary port,
+    /// which the micro-ROS USB transport uses (a raw byte stream: no line hook). The host must have opened port 1.
+    pub usb_cdc2_pty: Option<crate::pty::Pty>,
     /// A USB/IP server exporting the board's USB device to the real host.
     pub usbip: Option<crate::usbip::UsbIpServer>,
     /// The CAN bus the board's CAN controllers sit on, if any.
@@ -96,6 +99,7 @@ impl Session {
             on_usb_cdc_line: None,
             usb_cdc_line: String::new(),
             usb_cdc_pty: None,
+            usb_cdc2_pty: None,
             usbip: None,
             can_bus: None,
             can_endpoints: Vec::new(),
@@ -146,6 +150,7 @@ impl Session {
             on_usb_cdc_line: None,
             usb_cdc_line: self.usb_cdc_line.clone(),
             usb_cdc_pty: None,
+            usb_cdc2_pty: None,
             usbip: None,
             can_bus: self.can_bus.clone(),
             can_endpoints: Vec::new(),
@@ -208,6 +213,18 @@ impl Session {
     /// the USB host has opened the port ([`sim_devices::usb::host::HostController::cdc_open`]).
     pub fn poll_usb_cdc(&mut self) {
         let now = self.machine.now;
+        if let Some(pty) = &self.usb_cdc2_pty {
+            let input = pty.read();
+            if !input.is_empty() {
+                self.machine.sys.with_usb_host(now, |h| h.cdc_write(1, &input));
+            }
+            if let Some(host) = self.machine.sys.usb_host_mut() {
+                let rx = host.cdc_take_rx(1);
+                if !rx.is_empty() {
+                    pty.write(&rx);
+                }
+            }
+        }
         if let Some(pty) = &self.usb_cdc_pty {
             let input = pty.read();
             if !input.is_empty() {

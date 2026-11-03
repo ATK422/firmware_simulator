@@ -126,6 +126,51 @@ fn titan_dual_stdio_usb_two_cdc_ports() {
     assert_eq!(got, b"PING");
 }
 
+/// The second CDC port on a pseudo terminal (`run --usb-cdc2 pty`): what a host program such as the micro-ROS agent
+/// writes to the terminal reaches the device's secondary port, and the device's answer comes back on the terminal.
+/// The first port stays on its own (its text is not mixed in).
+#[test]
+fn second_cdc_port_on_a_pty() {
+    use std::io::{Read, Write};
+    let mut s = common::boot(&common::repo().join("test_programs/c_dual_usb/c_dual_usb.elf"), None);
+    let mut host = HostController::new();
+    host.cdc_open(0, 115_200);
+    host.cdc_open(1, 115_200);
+    s.machine.sys.attach_usb_host(host, Time::ZERO);
+    let pty = sim_host::pty::Pty::open().expect("pty");
+    let mut term = std::fs::OpenOptions::new().read(true).write(true).open(&pty.path).expect("open the pty's terminal");
+    s.usb_cdc2_pty = Some(pty);
+    assert!(cdc_wait(&mut s, 0, "titan dual stdio up\r\n", Time::from_secs(2)), "{:?}", s.usb_cdc_text);
+    term.write_all(b"ping").unwrap();
+    term.flush().unwrap();
+    let mut got = Vec::new();
+    for _ in 0..200 {
+        s.run_for(Time::from_ms(1));
+        let mut buf = [0u8; 64];
+        // The terminal side blocks: only read once the device has answered (the master side is in raw mode)
+        if s.machine.now > Time::from_ms(1) && got.len() < 4 {
+            set_nonblocking(&term);
+            if let Ok(n) = term.read(&mut buf) {
+                got.extend_from_slice(&buf[..n]);
+            }
+        }
+        if got.len() >= 4 {
+            break;
+        }
+    }
+    assert_eq!(got, b"PING");
+    assert!(!s.usb_cdc_text.contains("PING"), "port 1's bytes stay off port 0: {:?}", s.usb_cdc_text);
+}
+
+fn set_nonblocking(f: &std::fs::File) {
+    use std::os::fd::AsRawFd;
+    // SAFETY: fcntl on a file descriptor we own
+    unsafe {
+        let flags = libc::fcntl(f.as_raw_fd(), libc::F_GETFL);
+        libc::fcntl(f.as_raw_fd(), libc::F_SETFL, flags | libc::O_NONBLOCK);
+    }
+}
+
 #[test]
 fn picotool_style_forced_reload_through_the_reset_interface() {
     // A pico-sdk stdio_usb firmware is running; `picotool load -f` reboots it into BOOTSEL through its reset
