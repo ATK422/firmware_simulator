@@ -13,7 +13,7 @@ their sensors, actuators, the water around them and the robot computer's side of
 | [acoustics.md](acoustics.md) | Acoustic environments, transducers, the shared medium, IVC link tests and sweeps |
 | [vehicles.md](vehicles.md) | Vehicle physics: vehicle files, thruster wiring, sensors following the hull, CSV logs |
 | [testing.md](testing.md) | Writing firmware tests with `sim_test`, the test suites, CI |
-| [tools.md](tools.md) | Developer tools: the firmware profiler, VCD waveforms, the live dashboard and its API, JSON logs, robot traces |
+| [tools.md](tools.md) | Developer tools: the firmware profiler, VCD waveforms, the live dashboard and its API, the MCP server for coding agents, JSON logs, robot traces |
 | [faults.md](faults.md) | Every fault, its CLI spelling and what it models; firmware findings so far |
 | [internals.md](internals.md) | Architecture for contributors: crates, time, the run loop, peripherals, adding models, determinism, performance |
 

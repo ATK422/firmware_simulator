@@ -70,6 +70,7 @@ const OUTSIDE: &[(&str, &str)] = &[
     ("--down", "scripts/vcan_up.sh"),
     ("--tool", "valgrind"),
     ("--repeat", "the bench example"),
+    ("--scope", "claude mcp add"),
 ];
 
 /// A `firmware_simulator` command shown on a page: its subcommand and the text of its arguments (continuation
@@ -82,7 +83,7 @@ fn commands(text: &str) -> Vec<(String, String)> {
             let rest = &line[at + "firmware_simulator ".len()..];
             let sub = rest.split_whitespace().next().unwrap_or("");
             let sub = sub.trim_matches(|c: char| !c.is_ascii_alphanumeric() && c != '-');
-            if !["run", "robot", "can-diff", "bridges", "can-tunnel", "picoboot"].contains(&sub) {
+            if !["run", "robot", "can-diff", "bridges", "can-tunnel", "picoboot", "mcp"].contains(&sub) {
                 continue;
             }
             // Up to the end of the code span or the line, with `\` continuations
@@ -113,6 +114,7 @@ fn commands_use_options_their_subcommand_has() {
         ("bridges", help_options(&["bridges"])),
         ("can-tunnel", help_options(&["can-tunnel"])),
         ("picoboot", picoboot),
+        ("mcp", help_options(&["mcp"])),
     ];
     let mut checked = 0;
     let mut wrong = Vec::new();
@@ -134,7 +136,8 @@ fn commands_use_options_their_subcommand_has() {
 #[test]
 fn every_option_mentioned_exists() {
     let mut known = BTreeSet::new();
-    for sub in [&["run"][..], &["robot"], &["can-diff"], &["bridges"], &["can-tunnel"], &["picoboot", "load"]] {
+    for sub in [&["run"][..], &["robot"], &["can-diff"], &["bridges"], &["can-tunnel"], &["picoboot", "load"], &["mcp"]]
+    {
         known.extend(help_options(sub));
     }
     known.extend(OUTSIDE.iter().map(|(o, _)| o.to_string()));

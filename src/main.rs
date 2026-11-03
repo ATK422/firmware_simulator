@@ -15,6 +15,7 @@ use sim_core::trace::{Category, WriterSink};
 use sim_host::Session;
 
 mod host_tools;
+mod mcp;
 
 #[derive(Parser)]
 #[command(version, about = "RP2040 emulator for UWRT titan firmware")]
@@ -41,6 +42,9 @@ enum Command {
     /// What `picotool` does, against an emulated board in BOOTSEL mode.
     #[command(subcommand)]
     Picoboot(PicobootCommand),
+    /// Serves the Model Context Protocol on stdin/stdout, for coding agents: tools to run the emulator, read a run's
+    /// state, logs and CAN frames, and inject faults, set inputs and pause.
+    Mcp(mcp::McpArgs),
 }
 
 #[derive(Subcommand)]
@@ -160,6 +164,10 @@ struct RobotArgs {
     /// Keep serving the dashboard after the run ends (until interrupted).
     #[arg(long, requires = "dashboard")]
     dashboard_hold: bool,
+    /// Pause virtual time when it reaches this (`0`: from the start, within the first 10 ms); resume from the
+    /// dashboard.
+    #[arg(long, requires = "dashboard", value_parser = parse_time)]
+    dashboard_pause_at: Option<Time>,
     /// Write every log line, UART line, CAN frame and fault as one JSON object per line to this file, for tools.
     #[arg(long)]
     log_json: Option<PathBuf>,
@@ -382,6 +390,7 @@ fn robot(args: RobotArgs) -> Result<()> {
                 .collect();
             let mut d = sim_host::dashboard::Dashboard::start(addr, infos, r.bus_names.clone())
                 .with_context(|| format!("binding {addr}"))?;
+            d.pause_at(args.dashboard_pause_at);
             for (i, s) in r.boards.iter_mut().enumerate() {
                 d.tap_session(i, s);
             }
@@ -766,6 +775,10 @@ struct RunArgs {
     /// Keep serving the dashboard after the run ends (until interrupted).
     #[arg(long, requires = "dashboard")]
     dashboard_hold: bool,
+    /// Pause virtual time when it reaches this (`0`: from the start, within the first 10 ms); resume from the
+    /// dashboard.
+    #[arg(long, requires = "dashboard", value_parser = parse_time)]
+    dashboard_pause_at: Option<Time>,
     /// Write every log line, UART line, CAN frame and fault as one JSON object per line to this file, for tools.
     #[arg(long)]
     log_json: Option<PathBuf>,
@@ -1046,6 +1059,7 @@ fn run(args: RunArgs) -> Result<()> {
             let buses = session.can_bus.as_ref().map(|b| vec![b.name.clone()]).unwrap_or_default();
             let mut d = sim_host::dashboard::Dashboard::start(addr, vec![info], buses)
                 .with_context(|| format!("binding {addr}"))?;
+            d.pause_at(args.dashboard_pause_at);
             d.tap_session(0, &mut session);
             if let Some(l) = link.take() {
                 d.add_link(Some(0), None, l);
@@ -1255,6 +1269,7 @@ fn main() -> Result<()> {
         },
         Command::Bridges(args) => host_tools::bridges(args),
         Command::CanTunnel(args) => host_tools::can_tunnel(args),
+        Command::Mcp(args) => mcp::serve(args),
     }
 }
 
