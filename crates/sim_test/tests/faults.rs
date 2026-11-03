@@ -593,6 +593,30 @@ fn sensor_faults_on_the_power_board() {
     let _ = FAULT_SHT41_ERROR;
 }
 
+/// The smart battery's BQ40Z80 gauge (bit-banged SMBus) drops off and comes back: FAULT_BQ40_NOT_CONNECTED is
+/// raised while it is gone and lowered when the board reconnects to it.
+#[test]
+fn smart_battery_gauge_lost_and_found() {
+    let Some(elf) = sim_test::titan_rs("smart_battery") else { return };
+    const NOT_CONNECTED: u32 = 1 << 6;
+    let mut b = Bench::builder(&elf).board("mk2/sbh_mcu").bridge(21).boot().unwrap();
+    b.run_until(ms(1500)).unwrap();
+    assert!(b.logged("Connected to gauge, serial 21"));
+    assert_eq!(b.faults(), Some(0));
+    b.inject(Fault::I2c { address: 0x0B, fault: Some(I2cFault::Absent) }).unwrap();
+    let lost = b.wait_for_log("Lost the gauge", ms(2000)).unwrap();
+    b.run_for(ms(500));
+    assert_eq!(b.faults().unwrap() & NOT_CONNECTED, NOT_CONNECTED);
+    b.inject(Fault::I2c { address: 0x0B, fault: None }).unwrap();
+    let back = b.now();
+    let found = b.wait_for_log_after("Connected to gauge", back, ms(2000)).unwrap();
+    assert!(b.logged("Fault FAULT_BQ40_NOT_CONNECTED lowered"));
+    b.run_for(ms(1200));
+    assert_eq!(b.faults().unwrap() & NOT_CONNECTED, 0, "lowered once the gauge answers (lost {lost}, found {found})");
+    // The link to the bridge was never affected
+    assert!(!b.logged("Lost connection to ROS"));
+}
+
 // ------------------------------------------------------------------------------------------------ power and resets
 
 #[test]
@@ -625,6 +649,21 @@ fn hung_task_trips_the_watchdog_with_a_crash_record() {
         assert_eq!(b.faults().unwrap() & FAULT_WATCHDOG_RESET, FAULT_WATCHDOG_RESET);
         assert!(b.log_times("ROS connected").iter().any(|&c| c > reboot));
     }
+}
+
+/// The same hang in a C (pico-sdk) image, which has no busy loop of its own to hang in: `titan_safety` reports the
+/// watchdog reset and its crash count on UART0 after the reboot.
+#[test]
+fn hung_c_firmware_reports_a_watchdog_reset() {
+    let Some(elf) = sim_test::titan_c("basic_template/template_project.elf") else { return };
+    let mut b = Bench::builder(&elf).boot().unwrap();
+    b.run_until(ms(500)).unwrap();
+    assert!(b.uart(0).contains("[safety]: Clean Boot: Power-on Reset"), "{}", b.uart(0));
+    b.inject(Fault::Hang { core: 0, interrupts_masked: true }).unwrap();
+    b.run_until(ms(2500)).unwrap();
+    let out = b.uart(0);
+    assert!(out.contains("[safety]: Watchdog Reset (Total Crashes: 1) - UNKNOWN_SAFETY_ACTIVE"), "{out}");
+    assert!(out.contains("Fault FAULT_WATCHDOG_RESET (0) Raised"), "{out}");
 }
 
 /// A panic before ROS connects (3 s watchdog) is recorded as a panic; a brownout then clears the crash record.

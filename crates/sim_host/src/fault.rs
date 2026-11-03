@@ -65,7 +65,8 @@ pub enum Fault {
     Brownout { off: Time },
     /// Core `core` hangs in a busy loop where it is (a task that never yields), with interrupts masked if
     /// `interrupts_masked` (a critical section that never ends). Nothing else runs on that core, so the safety
-    /// task stops feeding the watchdog.
+    /// task stops feeding the watchdog. The loop is a `b .` from the image ([`hang_address`]), or one placed in the
+    /// XIP cache's SRAM for images without one.
     Hang { core: usize, interrupts_masked: bool },
     /// Core 0 calls the firmware's panic path.
     Panic,
@@ -488,7 +489,16 @@ fn hang(s: &mut Session, core: usize, interrupts_masked: bool) -> Result<(), Str
         return Err(format!("core {core} is not running"));
     }
     let image = s.machine.image.clone().ok_or("no image loaded")?;
-    let addr = hang_address(&image).ok_or("the image has no busy loop (`b .`) to hang in")?;
+    let addr = match hang_address(&image) {
+        Some(a) => a,
+        None => {
+            // No such loop in the image (pico-sdk images have none): put one where the firmware cannot see it, at
+            // the end of the XIP cache's SRAM, which an image running from flash with the cache on never uses
+            let a = rp2040::memmap::XIP_SRAM_BASE + rp2040::memmap::XIP_SRAM_SIZE as u32 - 2;
+            s.machine.sys.poke(a, sim_core::Size::Half, 0xE7FE);
+            a
+        }
+    };
     s.machine.inject_call(core, addr | 1, &[]);
     if interrupts_masked {
         s.machine.cores[core].set_primask(true);
