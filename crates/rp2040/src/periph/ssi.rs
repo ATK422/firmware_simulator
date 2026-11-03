@@ -87,15 +87,34 @@ impl Ssi {
         self.chip.preset_quad_xip();
     }
 
-    /// The state the bootrom's `connect_internal_flash`/`flash_exit_xip` leave the SSI in: enabled, standard SPI,
-    /// 8-bit frames. Used by the HLE flash traps.
-    pub fn enter_command_mode(&mut self) {
+    /// Disables the SSI as a write of 0 to SSIENR does: the FIFOs empty and an SSI-driven transaction ends.
+    fn disable(&mut self, now: Time, data: &mut [u8]) {
         self.regs[SSIENR] = 0;
+        self.rx.clear();
+        self.enhanced.clear();
+        self.eeprom_left = 0;
+        self.end_ssi_transaction(now, data);
+    }
+
+    /// The state the bootrom's `flash_exit_xip` leaves the SSI and the chip in (and `flash_range_erase` and
+    /// `flash_range_program`, which leave it in that mode): enabled, standard SPI, 8-bit frames, transmit and
+    /// receive, the baud divider at 6, and the chip out of continuous read mode. Used by the HLE flash traps.
+    pub fn enter_command_mode(&mut self, now: Time, data: &mut [u8]) {
+        self.disable(now, data);
         self.regs[CTRLR0] = 7 << 16; // DFS_32 = 7: 8-bit frames
+        self.regs[0x14 / 4] = 6; // BAUDR
         self.regs[0x10 / 4] = 1; // SER
         self.regs[SSIENR] = 1;
         self.chip.continuous = false;
-        self.rx.clear();
+    }
+
+    /// The state the bootrom's `flash_enter_cmd_xip` leaves the SSI in: XIP through serial 03h reads (8-bit
+    /// instruction, 24-bit address), 32-bit frames in EEPROM read mode. Used by the HLE flash traps.
+    pub fn enter_cmd_xip(&mut self, now: Time, data: &mut [u8]) {
+        self.disable(now, data);
+        self.regs[CTRLR0] = 31 << 16 | 3 << 8;
+        self.regs[SPI_CTRLR0] = 0x03 << 24 | 2 << 8 | 6 << 2;
+        self.regs[SSIENR] = 1;
     }
 
     fn enabled(&self) -> bool {
@@ -339,6 +358,23 @@ pub struct IoQspi {
 }
 
 impl IoQspi {
+    /// What the bootrom's `connect_internal_flash` leaves: the block reset and every QSPI pin given to the XIP
+    /// block (function 0), without overrides. BOOTSEL is a button, not a register: it stays as it is.
+    pub fn connect_internal_flash(&mut self) {
+        *self = IoQspi { ctrl: [0; 6], bootsel_pressed: self.bootsel_pressed, ..IoQspi::default() };
+    }
+
+    /// Sets the SS output override (GPIO_QSPI_SS_CTRL.OUTOVER), as the bootrom's `flash_cs_force` does.
+    pub fn set_cs_override(&mut self, o: CsOverride) {
+        let v = match o {
+            CsOverride::Normal => 0,
+            CsOverride::Invert => 1,
+            CsOverride::Low => 2,
+            CsOverride::High => 3,
+        };
+        self.ctrl[1] = (self.ctrl[1] & !(3 << 8)) | v << 8;
+    }
+
     /// SS output override, from GPIO_QSPI_SS_CTRL.OUTOVER.
     pub fn cs_override(&self) -> CsOverride {
         match (self.ctrl[1] >> 8) & 3 {

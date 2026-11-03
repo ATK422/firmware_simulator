@@ -126,17 +126,30 @@ fn snapshots_carry_their_own_vehicle() {
     assert!(r.run_until(Time::from_ms(100)).is_none());
     let mut copy = r.snapshot();
     copy.vehicles[0].vehicle.state.velocity = [0.0, 0.0, 1.0];
-    assert!(copy.run_until(Time::from_ms(300)).is_none());
-    // The depth sensor input is shared, so the copy's run left its own pressure there; the original's next run
-    // starts by putting its own back
-    let port = [0.3, 0.0, 0.1];
-    assert_eq!(r.inputs[1].get("depth.pressure_pa"), copy.vehicles[0].vehicle.pressure_at(port));
-    assert!(r.run_until(r.now).is_none());
-    assert_eq!(r.inputs[1].get("depth.pressure_pa"), r.vehicles[0].vehicle.pressure_at(port));
-    assert!(r.run_until(Time::from_ms(300)).is_none());
+    // The two take turns 10 ms at a time, each writing its own vehicle's pressure to its own depth sensor input
+    while r.now < Time::from_ms(300) {
+        let t = r.now + Time::from_ms(10);
+        assert!(copy.run_until(t).is_none() && r.run_until(t).is_none());
+    }
     // The copy dived 20 cm; the original, trimmed 2 N positive, barely moved
     let (a, b) = (r.vehicles[0].vehicle.state.position[2], copy.vehicles[0].vehicle.state.position[2]);
     assert!(b - a > 0.1, "{a} {b}");
+    let port = [0.3, 0.0, 0.1];
+    for robot in [&mut r, &mut copy] {
+        let want = robot.vehicles[0].vehicle.pressure_at(port);
+        assert_eq!(robot.inputs[1].get("depth.pressure_pa"), want);
+        // ... which is what that robot's MS5837 model reads
+        let now = robot.now;
+        let sensor = robot.boards[1]
+            .machine
+            .sys
+            .i2c_devices
+            .iter()
+            .find_map(|a| a.dev.as_any().downcast_ref::<sim_devices::ms5837::Ms5837>())
+            .unwrap();
+        assert_eq!(sensor.pressure_pa.at(now), want);
+    }
+    assert!(copy.inputs[1].get("depth.pressure_pa") > r.inputs[1].get("depth.pressure_pa") + 1000.0);
     // Each one's transducer follows its own vehicle
     for robot in [&mut r, &mut copy] {
         let want = robot.vehicles[0].vehicle.point(MOUNT);
@@ -145,6 +158,10 @@ fn snapshots_carry_their_own_vehicle() {
         let medium = robot.medium.as_ref().unwrap().lock().unwrap();
         assert!((medium.projectors[0].trajectory.at(0.3)[2] - want[2]).abs() < 1e-9);
     }
+    // A vehicle put somewhere else between runs is seen there from the start of the next run
+    copy.vehicles[0].vehicle.state.position[2] += 1.0;
+    assert!(copy.run_until(copy.now).is_none());
+    assert_eq!(copy.inputs[1].get("depth.pressure_pa"), copy.vehicles[0].vehicle.pressure_at(port));
 }
 
 #[test]
@@ -193,7 +210,10 @@ fn shipped_robot_files_load_their_vehicles() {
 
 /// The first-generation IVC boards of `robots/ivc_pool.toml` still talk when Talos's board rides on a vehicle that
 /// a current carries towards the surface vehicle: its projector and hydrophone move with the hull. (At 0.5 m/s
-/// the first byte fails its CRC, exactly as with a scripted `Trajectory::Linear` at that speed.)
+/// the first byte fails its CRC, exactly as with a scripted `Trajectory::Linear` at that speed. That is not the
+/// Doppler shift, which the receiver does not notice: the board passes spots of the pool where the previous
+/// symbol's reverberation is above the detector's threshold, and a fixed board at such a spot loses the byte too;
+/// see `firmware_finding_ivc_symbols_lost_to_pool_reverberation` in `tests/ivc_link.rs`.)
 #[test]
 fn ivc_boards_talk_from_a_drifting_vehicle() {
     use titan_link::{DeviceToHost, HostToDevice};
@@ -248,4 +268,51 @@ transducer = [{ board = "talos_ivc", mount_m = [0.0, 0.0, 0.0] }]
     let medium = r.medium.as_ref().unwrap().lock().unwrap();
     let at = medium.projectors[0].trajectory.at(4.0);
     assert!((at[0] - p[0]).abs() < 1e-6, "{at:?}");
+}
+
+/// A robot with a vehicle but no acoustic medium runs its boards side by side with `threads` > 1 (only a medium
+/// couples boards within a slice); the vehicle is stepped after each slice on the calling thread, from the boards'
+/// ESC motors and into their pressure inputs. Each thread count must give exactly the run of boards in turn.
+#[test]
+fn a_vehicle_without_a_medium_runs_the_same_on_threads() {
+    use sim_core::cpu::Cpu;
+    let run = |threads: usize| {
+        let mut r = load(&spec(|t| {
+            *t = t.replacen("[environment]\nfile = \"../environments/pool.toml\"\n", "", 1);
+            let i = t.find("[[vehicle.transducer]]").unwrap();
+            t.truncate(i);
+        }))
+        .unwrap();
+        assert!(r.medium.is_none());
+        r.threads = threads;
+        // Both wired motors spinning (and running down, as nothing commands them): thrust ahead and a dive
+        for e in r.boards[0]
+            .machine
+            .sys
+            .pin_devices
+            .iter_mut()
+            .filter_map(|d| d.as_any_mut().and_then(|a| a.downcast_mut::<Esc>()))
+        {
+            e.rpm = 3000.0;
+        }
+        r.vehicles[0].vehicle.state.rate = [0.0, 0.0, 0.2];
+        r.vehicles[0].keep_log(Time::from_ms(10));
+        assert!(r.run_until(Time::from_ms(300)).is_none());
+        let v = &r.vehicles[0];
+        let mut out = vec![format!("{:?}", v.vehicle.state), v.log.as_ref().unwrap().to_csv()];
+        out.push(format!("{:?}", r.inputs[1].get("depth.pressure_pa").to_bits()));
+        for (name, s) in r.names.iter().zip(&r.boards) {
+            out.extend(s.logs.iter().map(|(t, l)| format!("{name} [{t}] {l}")));
+            for (c, core) in s.machine.cores.iter().enumerate() {
+                let regs: Vec<u32> = (0..core.num_regs()).map(|n| core.read_reg(n)).collect();
+                out.push(format!("{name} core{c} {} {} {regs:x?}", s.machine.core_time(c), core.cycles()));
+            }
+        }
+        out
+    };
+    let turns = run(1);
+    // It moved: ahead from the starboard thruster, and down from the aft heave one
+    assert!(turns[1].lines().count() > 25, "{}", turns[1]);
+    assert_ne!(turns[1].lines().nth(1), turns[1].lines().last());
+    assert_eq!(turns, run(3));
 }

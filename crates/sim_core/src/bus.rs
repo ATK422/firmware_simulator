@@ -58,9 +58,33 @@ pub trait Bus {
         self.read(addr, Size::Half).map(|v| v as u16)
     }
 
+    /// Instruction fetch from memory that needs no checks (no faults, no side effects), or `None` to go through
+    /// [`Bus::fetch16`]. Lets an interpreter keep its fast path free of error handling.
+    #[inline]
+    fn fetch16_fast(&mut self, addr: u32) -> Option<u16> {
+        let _ = addr;
+        None
+    }
+
     /// Extra stall cycles accumulated by accesses since the last call (e.g. XIP cache misses).
     fn take_stall_cycles(&mut self) -> u32 {
         0
+    }
+
+    /// Called by a CPU running a batch of instructions (see `CortexM0Plus::run_batch`) before each instruction,
+    /// with the cycles the batch has taken so far, so that accesses can be stamped with the time they happen at.
+    #[inline]
+    fn set_elapsed(&mut self, cycles: u64) {
+        let _ = cycles;
+    }
+
+    /// Whether an access since the last call reached something other than plain memory (a peripheral register),
+    /// after which the machine must look at the system before the CPU goes on: interrupt lines, clocks, resets may
+    /// have changed. A batch of instructions ends after such an access. The default ends every batch after one
+    /// instruction.
+    #[inline]
+    fn take_attention(&mut self) -> bool {
+        true
     }
 
     /// Reads without side effects, for debuggers and tracing. `None` if the location cannot be peeked.
@@ -129,7 +153,7 @@ pub trait Peripheral<Ctx> {
 pub mod mem {
     use super::Size;
 
-    #[inline]
+    #[inline(always)]
     pub fn read(buf: &[u8], off: usize, size: Size) -> u32 {
         match size {
             Size::Byte => buf[off] as u32,
@@ -138,7 +162,7 @@ pub mod mem {
         }
     }
 
-    #[inline]
+    #[inline(always)]
     pub fn write(buf: &mut [u8], off: usize, size: Size, value: u32) {
         match size {
             Size::Byte => buf[off] = value as u8,

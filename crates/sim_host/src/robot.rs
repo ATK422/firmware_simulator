@@ -73,6 +73,9 @@ pub struct Robot {
     /// The water the boards' transducers are in.
     pub medium: Option<SharedMedium>,
     pub slice: Time,
+    /// Threads the boards run on within a slice (1, the default: the calling thread; 0: one per core). Boards in
+    /// an acoustic medium always take turns on one (see [`crate::parallel`]).
+    pub threads: usize,
     pub now: Time,
     /// Pace virtual time to the wall clock.
     pub realtime: bool,
@@ -93,6 +96,7 @@ impl Default for Robot {
             bus_names: Vec::new(),
             medium: None,
             slice: Time::from_us(100),
+            threads: 1,
             now: Time::ZERO,
             realtime: false,
             power_on: Vec::new(),
@@ -145,27 +149,34 @@ impl Robot {
     pub fn run_until(&mut self, end: Time) -> Option<(usize, StopReason)> {
         let wall = std::time::Instant::now();
         let start = self.now;
-        // The sensor inputs may have been set by a snapshot of this robot since (they are shared)
+        // The sensors see a vehicle moved since the last run (a scenario putting it elsewhere) from the start
         for v in &self.vehicles {
             v.update_outputs();
         }
         while self.now < end {
             let t = (self.now + self.slice).min(end);
-            for (i, b) in self.boards.iter_mut().enumerate() {
-                let (on_at, on) = &mut self.power_on[i];
-                if !*on {
-                    if t <= *on_at {
-                        continue;
+            if self.medium.is_none() {
+                // Nothing couples the boards within a slice: they can run side by side
+                if let Some(stop) = crate::parallel::run_boards(&mut self.boards, &mut self.power_on, t, self.threads) {
+                    return Some(stop);
+                }
+            } else {
+                for (i, b) in self.boards.iter_mut().enumerate() {
+                    let (on_at, on) = &mut self.power_on[i];
+                    if !*on {
+                        if t <= *on_at {
+                            continue;
+                        }
+                        b.machine.power_on_at(*on_at);
+                        *on = true;
                     }
-                    b.machine.power_on_at(*on_at);
-                    *on = true;
-                }
-                match b.machine.run_until(t) {
-                    StopReason::TimeLimit => {}
-                    other => return Some((i, other)),
-                }
-                if let Some(m) = &self.medium {
-                    m.lock().unwrap().progress(i, t);
+                    match b.machine.run_until(t) {
+                        StopReason::TimeLimit => {}
+                        other => return Some((i, other)),
+                    }
+                    if let Some(m) = &self.medium {
+                        m.lock().unwrap().progress(i, t);
+                    }
                 }
             }
             for (j, rb) in self.buses.iter_mut().enumerate() {
@@ -231,15 +242,24 @@ impl Robot {
         }
     }
 
-    /// A deep copy of the whole robot: every machine, device, bus and the acoustic medium, re-linked so the copy's
-    /// hydrophones and projectors use the copy's medium. Host endpoints are not copied (they are often handles to
-    /// shared state, like a mock bridge); give the copy its own. Physical inputs stay shared: setting one affects
-    /// the original and the copy, so set them after restoring, before running. That includes the pressure inputs
-    /// a vehicle drives: copies of a robot with a vehicle can take turns (each run starts by writing its own
-    /// vehicle's pressures), but must not run at the same time.
+    /// A deep copy of the whole robot: every machine, device, bus, the acoustic medium and the vehicles, re-linked
+    /// so the copy's hydrophones and projectors use the copy's medium and vehicles, and its devices (and the sensor
+    /// inputs its vehicles drive) read the copy's own physical inputs. The original and any number of copies can
+    /// run side by side, each with its own inputs. Host endpoints are not copied (they are often handles to shared
+    /// state, like a mock bridge); give the copy its own.
     pub fn snapshot(&self) -> Robot {
         let medium = self.medium.as_ref().map(|m| Arc::new(std::sync::Mutex::new(m.lock().unwrap().clone())));
-        let mut boards: Vec<Session> = self.boards.iter().map(Session::snapshot).collect();
+        let mut boards = Vec::new();
+        let mut inputs = Vec::new();
+        let mut map = sim_core::analog::Relink::new();
+        for (b, i) in self.boards.iter().zip(&self.inputs) {
+            let mut s = b.snapshot();
+            let (copy, m) = i.deep_copy();
+            crate::board::relink_inputs(&mut s.machine, &m);
+            map.merge(&m);
+            boards.push(s);
+            inputs.push(copy);
+        }
         if let (Some(old), Some(new)) = (&self.medium, &medium) {
             for b in &mut boards {
                 crate::acoustic::relink(&mut b.machine, old, new);
@@ -248,7 +268,8 @@ impl Robot {
         // The copy's transducers follow the copy's vehicles
         let mut vehicles = Vec::new();
         for v in &self.vehicles {
-            let (copy, pairs) = v.deep_copy();
+            let (mut copy, pairs) = v.deep_copy();
+            copy.relink_inputs(&map);
             for (old, new) in pairs {
                 let (old, new) = (Trajectory::Live(old), Trajectory::Live(new));
                 if let Some(m) = &medium {
@@ -267,7 +288,7 @@ impl Robot {
         Robot {
             boards,
             names: self.names.clone(),
-            inputs: self.inputs.clone(),
+            inputs,
             board_bus: self.board_bus.clone(),
             buses: self
                 .buses
@@ -277,6 +298,7 @@ impl Robot {
             bus_names: self.bus_names.clone(),
             medium,
             slice: self.slice,
+            threads: self.threads,
             now: self.now,
             realtime: self.realtime,
             power_on: self.power_on.clone(),

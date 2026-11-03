@@ -309,6 +309,13 @@ impl I2cDevice for Bq40z80 {
     fn as_any(&self) -> &dyn std::any::Any {
         self
     }
+
+    fn relink_inputs(&mut self, map: &sim_core::analog::Relink) {
+        self.voltage_mv.relink(map);
+        self.current_ma.relink(map);
+        self.soc_percent.relink(map);
+        self.temperature_c.relink(map);
+    }
 }
 
 #[cfg(test)]

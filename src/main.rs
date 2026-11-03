@@ -84,6 +84,10 @@ struct RobotArgs {
     /// Pace virtual time to the wall clock.
     #[arg(long)]
     realtime: bool,
+    /// Run the boards on this many threads (0: one per core). Results are the same; robots in an acoustic
+    /// environment always run their boards in turn.
+    #[arg(long, default_value_t = 1)]
+    threads: usize,
     /// Replace the ambient noise every hydrophone hears with white noise at this level, dB re 1 µPa²/Hz.
     #[arg(long)]
     noise_db: Option<f64>,
@@ -213,6 +217,7 @@ fn robot(args: RobotArgs) -> Result<()> {
     }
     let can_host = host_tools::attach_robot(&args.can_host, &mut r, &args.cans)?;
     r.realtime = args.realtime;
+    r.threads = args.threads;
     let wall = std::time::Instant::now();
     let mut faults = faults.into_iter().peekable();
     let stopped = loop {

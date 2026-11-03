@@ -1079,3 +1079,149 @@ fn debugger_register_view() {
     assert_eq!(rig.cpu.num_regs(), reg::COUNT);
     let _ = rig.step();
 }
+
+// ------------------------------------------------------------------ batches
+
+/// A bus whose accesses never need the machine's attention, so batches only end for CPU reasons.
+struct QuietBus<'a>(&'a mut TestBus);
+
+impl Bus for QuietBus<'_> {
+    fn read(&mut self, addr: u32, size: Size) -> Result<u32, BusFault> {
+        self.0.read(addr, size)
+    }
+    fn write(&mut self, addr: u32, size: Size, value: u32) -> Result<(), BusFault> {
+        self.0.write(addr, size, value)
+    }
+    fn take_attention(&mut self) -> bool {
+        false
+    }
+}
+
+impl Rig {
+    fn batch(&mut self, max_steps: u32, budget: u64) -> crate::Batch {
+        self.cpu.run_batch(&mut QuietBus(&mut self.bus), max_steps, budget, 0)
+    }
+}
+
+/// A loop of loads, stores, arithmetic and branches: r0 counts down from 10, r1 accumulates through RAM.
+fn loop_program() -> Vec<u16> {
+    vec![
+        movs(0, 10),
+        ldr_lit(2, 4), // r2 = RAM (the literal at CODE + 0x14)
+        movs(1, 0),
+        // loop:
+        str_i(0, 2, 0),
+        ldr_i(3, 2, 0),
+        dp(0xC, 1, 3), // orrs r1, r3
+        subs_i8(0, 1),
+        bcond(1, -6), // bne loop
+        b(-2),        // spin
+        0,
+        (RAM & 0xFFFF) as u16,
+        (RAM >> 16) as u16,
+    ]
+}
+
+#[test]
+fn batch_runs_as_steps_would() {
+    let mut stepped = Rig::new(&loop_program());
+    let mut batched = Rig::new(&loop_program());
+    let mut cycles = 0;
+    for _ in 0..40 {
+        cycles += stepped.run(1);
+    }
+    let b = batched.batch(40, u64::MAX);
+    assert_eq!(b, crate::Batch { steps: 40, cycles: cycles as u64, stop: None });
+    assert_eq!(batched.cpu.r, stepped.cpu.r);
+    assert_eq!(batched.cpu.cycles(), stepped.cpu.cycles());
+    assert_eq!(batched.cpu.instructions(), 40);
+    assert_eq!(batched.flags(), stepped.flags());
+    assert_eq!(batched.bus.writes, stepped.bus.writes);
+}
+
+#[test]
+fn batch_ends_at_its_budget_and_step_limit() {
+    let mut rig = Rig::new(&loop_program());
+    // movs (1) + ldr literal (2) + movs (1) = 4 cycles: a budget of 3 ends after the load
+    let b = rig.batch(100, 3);
+    assert_eq!((b.steps, b.cycles), (2, 3));
+    let b = rig.batch(5, u64::MAX);
+    assert_eq!(b.steps, 5);
+    // A zero budget still runs one instruction, as a step would before the time check
+    let b = rig.batch(100, 0);
+    assert_eq!(b.steps, 1);
+}
+
+#[test]
+fn batch_stops_before_an_exception_is_taken() {
+    let mut rig = Rig::new(&[CPSID, NOP, NOP, CPSIE, NOP, NOP]);
+    rig.handler(16, HANDLER, &[bx(14)]);
+    rig.cpu.nvic.enabled = 1;
+    rig.run(1);
+    rig.cpu.set_irq_lines(1);
+    // Masked: both NOPs and CPSIE run; the IRQ then preempts before the next NOP
+    let b = rig.batch(100, u64::MAX);
+    assert_eq!(b.steps, 3);
+    assert_eq!(rig.cpu.ipsr(), 0);
+    assert_eq!(rig.cpu.pc(), CODE + 8);
+    // A batch does not take exceptions; a step does
+    assert_eq!(rig.batch(100, u64::MAX).steps, 0);
+    rig.run(1);
+    assert_eq!(rig.cpu.ipsr(), 16);
+}
+
+#[test]
+fn batch_stops_when_systick_pends() {
+    let mut rig = Rig::new(&[NOP; 32]);
+    rig.handler(exception::SYSTICK, HANDLER, &[NOP; 8]);
+    rig.cpu.systick.rvr = 9;
+    rig.cpu.systick.cvr = 5;
+    rig.cpu.systick.csr = 0b111;
+    // The 5th cycle wraps; the exception is taken before the 6th instruction
+    assert_eq!(rig.batch(100, u64::MAX).steps, 5);
+    rig.run(1);
+    assert_eq!(rig.cpu.ipsr(), exception::SYSTICK);
+}
+
+#[test]
+fn batch_ends_after_sleep_sev_and_ppb_accesses() {
+    let mut rig = Rig::new(&[NOP, SEV, NOP, WFI, NOP]);
+    assert_eq!(rig.batch(100, u64::MAX).steps, 2, "SEV must reach the other core");
+    assert!(rig.cpu.take_sev());
+    assert_eq!(rig.batch(100, u64::MAX).steps, 2, "WFI");
+    assert_eq!(rig.cpu.sleep_state(), Some(Sleep::Wfi));
+    assert_eq!(rig.batch(100, u64::MAX).steps, 0, "asleep");
+
+    // LDR r1, [r0] from the PPB (SysTick CSR)
+    let mut rig = Rig::new(&[ldr_i(1, 0, 0), NOP, NOP, WFI]);
+    rig.cpu.r[0] = 0xE000_E010;
+    assert_eq!(rig.batch(100, u64::MAX).steps, 1);
+    assert_eq!(rig.batch(100, u64::MAX).steps, 3);
+}
+
+#[test]
+fn batch_ends_after_bus_attention() {
+    // The default `take_attention` asks for attention after every instruction
+    let mut rig = Rig::new(&[NOP, NOP, NOP]);
+    assert_eq!(rig.cpu.run_batch(&mut rig.bus, 100, u64::MAX, 0).steps, 1);
+}
+
+#[test]
+fn batch_stops_at_breakpoints_faults_and_trapped_addresses() {
+    let mut rig = Rig::new(&[NOP, bkpt(7), NOP]);
+    let b = rig.batch(100, u64::MAX);
+    assert_eq!((b.steps, b.stop), (2, Some(StepOutcome::Breakpoint(7))));
+    assert_eq!(rig.cpu.pc(), CODE + 2, "the PC stays on the BKPT");
+    assert_eq!((rig.cpu.last_pc, rig.cpu.last_opcode), (CODE + 2, 0xBE07), "for escalate_breakpoint");
+
+    // An undefined instruction is taken as a HardFault, which ends the batch
+    let mut rig = Rig::new(&[NOP, 0xDE00, NOP]);
+    let b = rig.batch(100, u64::MAX);
+    assert_eq!((b.steps, b.stop), (2, None));
+    assert_eq!(rig.cpu.ipsr(), exception::HARD_FAULT);
+    assert_eq!(b.cycles, 1 + 15);
+
+    // Below `trap_below` the batch hands back to single steps
+    let mut rig = Rig::new(&[NOP, NOP]);
+    assert_eq!(rig.cpu.run_batch(&mut QuietBus(&mut rig.bus), 100, u64::MAX, CODE + 1).steps, 0);
+}

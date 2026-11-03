@@ -37,6 +37,9 @@ pub trait I2cDevice: Send {
     fn faulty(&mut self) -> Option<&mut crate::fault::FaultyI2c> {
         None
     }
+    /// Points the shared input values the device reads at their counterparts in `map` (a snapshot's own inputs,
+    /// see [`sim_core::analog::Relink`]). Devices that read inputs implement it; the default reads none.
+    fn relink_inputs(&mut self, _map: &sim_core::analog::Relink) {}
 }
 
 sim_core::clone_box!(I2cDevice);

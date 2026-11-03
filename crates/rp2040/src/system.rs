@@ -8,7 +8,7 @@
 use sim_core::analog::{AnalogSource, Signal};
 use sim_core::bus::{Bus, BusFault, Size, WriteMode, mem};
 use sim_core::sched::Scheduler;
-use sim_core::time::{ClockPeriod, Time};
+use sim_core::time::{ClockPeriod, CycleClock, Time};
 use sim_core::trace::{Category, TraceEvent, TraceSink};
 use sim_core::wire::External;
 use sim_devices::DeviceCtx;
@@ -23,7 +23,7 @@ use crate::memmap::*;
 use crate::periph::adc::{self, Adc};
 use crate::periph::clocks::{Clocks, Freqs, Pll};
 use crate::periph::dma::{self, Dma, DmaBus};
-use crate::periph::gpio::{Drive, Gpio, func};
+use crate::periph::gpio::{BankDrive, Drive, Gpio, func};
 use crate::periph::i2c::{I2c, Step, StepResult};
 use crate::periph::pio::{self, Pio};
 use crate::periph::pwm::Pwm;
@@ -324,21 +324,29 @@ impl System {
 
     #[inline]
     fn flash_offset(&self, addr: u32) -> usize {
-        (addr & 0x00FF_FFFF) as usize % self.flash.len()
+        let len = self.flash.len();
+        let off = (addr & 0x00FF_FFFF) as usize;
+        // Flash sizes are powers of two in practice; a mask is much cheaper than the division
+        if len.is_power_of_two() { off & (len - 1) } else { off % len }
+    }
+
+    /// Whether flash reads at `now` and later work without looking further (the common case: the SSI is set up for
+    /// XIP and the chip is not busy). The same as [`System::xip_check`] succeeding at the first test.
+    #[inline]
+    fn xip_ready_from(&self, now: Time) -> bool {
+        self.xip_config.is_ok() && now >= self.xip_busy_until
     }
 
     /// IRQ lines seen by `core`'s NVIC.
     pub fn irq_lines(&self, core: u8) -> u32 {
-        let c = core as usize & 1;
+        self.irq_lines_both()[core as usize & 1]
+    }
+
+    /// IRQ lines seen by both cores' NVICs (the shared lines are collected once).
+    pub fn irq_lines_both(&self) -> [u32; 2] {
         let mut lines = self.timer.irq_lines();
         if self.pwm.irq_line() {
             lines |= 1 << irq::PWM_IRQ_WRAP;
-        }
-        if self.gpio.irq(c) {
-            lines |= 1 << irq::IO_IRQ_BANK0;
-        }
-        if self.sio.fifo_irq(c) {
-            lines |= 1 << (irq::SIO_IRQ_PROC0 + c as u32);
         }
         if self.uart[0].irq() {
             lines |= 1 << irq::UART0_IRQ;
@@ -371,13 +379,19 @@ impl System {
             lines |= 1 << irq::I2C1_IRQ;
         }
         for (b, base) in [(0, irq::PIO0_IRQ_0), (1, irq::PIO1_IRQ_0)] {
-            for n in 0..2 {
-                if self.pio[b].irq_line(n) {
-                    lines |= 1 << (base + n as u32);
-                }
-            }
+            let [l0, l1] = self.pio[b].irq_lines();
+            lines |= (l0 as u32) << base | (l1 as u32) << (base + 1);
         }
-        lines
+        std::array::from_fn(|c| {
+            let mut lines = lines;
+            if self.gpio.irq(c) {
+                lines |= 1 << irq::IO_IRQ_BANK0;
+            }
+            if self.sio.fifo_irq(c) {
+                lines |= 1 << (irq::SIO_IRQ_PROC0 + c as u32);
+            }
+            lines
+        })
     }
 
     // ------------------------------------------------------------------ cross-block effects
@@ -499,7 +513,7 @@ impl System {
                 bit::IO_BANK0 => {
                     self.gpio.reset_io(true);
                 }
-                bit::PADS_BANK0 => self.gpio.pads = Gpio::default().pads,
+                bit::PADS_BANK0 => self.gpio.reset_pads(),
                 bit::PLL_SYS => self.clocks.pll_sys = Pll::default(),
                 bit::PLL_USB => self.clocks.pll_usb = Pll::default(),
                 bit::PWM => {
@@ -596,7 +610,13 @@ impl System {
         let spis = &self.spi;
         let pios = &self.pio;
         let clk = self.clk_sys;
-        let changed = self.gpio.evaluate(|f, pin| match f {
+        let bank = BankDrive {
+            sio_out,
+            sio_oe,
+            pio_out: [pios[0].pad_out, pios[1].pad_out],
+            pio_oe: [pios[0].pad_oe, pios[1].pad_oe],
+        };
+        let changed = self.gpio.evaluate(bank, |f, pin| match f {
             func::SIO => Drive { out: sio_out & (1 << pin) != 0, oe: sio_oe & (1 << pin) != 0 },
             func::PWM if pwm.drives_pin(pin) => Drive { out: pwm.pin_output(&clk, now, pin), oe: true },
             func::PIO0 | func::PIO1 => {
@@ -774,7 +794,7 @@ impl System {
             }
         }
         self.in_pio = false;
-        let lines = self.pio.iter().flat_map(|p| [p.irq_line(0), p.irq_line(1)]).fold(0u8, |a, l| a << 1 | l as u8);
+        let lines = self.pio.iter().flat_map(|p| p.irq_lines()).fold(0u8, |a, l| a << 1 | l as u8);
         if lines != self.pio_lines {
             self.pio_lines = lines;
             self.irq_dirty = true;
@@ -1946,6 +1966,309 @@ impl Bus for CoreBus<'_> {
             }
             _ => self.read(addr, Size::Half).map(|v| v as u16),
         }
+    }
+
+    fn peek(&mut self, addr: u32, size: Size) -> Option<u32> {
+        self.sys.peek_core(self.core, addr, size)
+    }
+}
+
+/// One core's view of the system bus while it runs a batch of instructions (`CortexM0Plus::run_batch`).
+///
+/// SRAM, ROM and flash (while XIP works) are read and written directly. Everything else goes through
+/// [`System::read`]/[`System::write`] at the exact time of the accessing instruction (the batch's start time plus
+/// the cycles the batch took before it). The run loop handles a few things after every instruction; the batch
+/// does what they amount to after each such access and ends ([`Bus::take_attention`]) only when the machine has
+/// to act:
+///
+/// * interrupt lines (`irq_dirty`): recomputed here; the batch goes on if the running core's lines are unchanged,
+///   and the machine hands the other core its lines when the batch ends (that core does not run meanwhile);
+/// * a new `clk_sys`, a reset request or a PSM change: the batch ends and the machine handles them as after a
+///   single step;
+/// * the XIP state: re-checked, as the access may have reconfigured the SSI.
+///
+/// Events the access scheduled need nothing: the run loop's time limit is fixed for the whole quantum.
+pub struct BatchBus<'a> {
+    pub sys: &'a mut System,
+    pub trace: &'a mut dyn TraceSink,
+    pub core: u8,
+    /// The core's clock at the start of the batch, and the period it counts.
+    clock: CycleClock,
+    period: ClockPeriod,
+    /// Cycles the batch has taken before the current instruction.
+    elapsed: u64,
+    /// What the last instruction's slow accesses left to do: [`BatchBus::ATTENTION`], [`BatchBus::CHECK_IRQS`].
+    after: u8,
+    /// Flash reads need no further checks (until the next peripheral access).
+    xip_ok: bool,
+    /// The flash size is a power of two: offsets are `addr & flash_mask` (else they go through `flash_offset`).
+    flash_mask: Option<usize>,
+    /// The running core's interrupt lines as its NVIC sees them.
+    core_lines: u32,
+    /// Interrupt lines computed during the batch, for the machine to hand to both cores.
+    lines: Option<[u32; 2]>,
+    /// What the batch did besides reading memory: see [`BatchBus::quiet`].
+    noisy: bool,
+    timer_ticks: Option<u64>,
+    ticked: bool,
+}
+
+/// What a batch touched, for busy-wait skipping (see `Machine::run_until`).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Quiet {
+    /// It read memory (SRAM, ROM, flash with XIP working) and nothing else.
+    Memory,
+    /// It also read the timer, and every read saw this tick count.
+    Timer(u64),
+    /// It also read the timer, which ticked in between: not a repeat, but the next batch may be.
+    Ticked,
+}
+
+impl<'a> BatchBus<'a> {
+    pub fn new(
+        sys: &'a mut System,
+        trace: &'a mut dyn TraceSink,
+        core: u8,
+        clock: CycleClock,
+        period: ClockPeriod,
+        core_lines: u32,
+    ) -> Self {
+        // Time only moves forward within the batch, so if XIP works at its start it works until something changes
+        // the SSI or flash (a peripheral access)
+        let xip_ok = sys.xip_ready_from(clock.now);
+        let len = sys.flash.len();
+        let flash_mask = len.is_power_of_two().then(|| len - 1);
+        BatchBus {
+            flash_mask,
+            sys,
+            trace,
+            core,
+            clock,
+            period,
+            elapsed: 0,
+            after: 0,
+            xip_ok,
+            core_lines,
+            lines: None,
+            noisy: false,
+            timer_ticks: None,
+            ticked: false,
+        }
+    }
+
+    /// Whether the batch only read memory (and the timer, always at the same tick count), writing nothing: then
+    /// running it again from the same core state does exactly the same, as long as the tick count holds.
+    pub fn quiet(&self) -> Option<Quiet> {
+        match (self.noisy, self.ticked, self.timer_ticks) {
+            (true, _, _) => None,
+            (false, true, _) => Some(Quiet::Ticked),
+            (false, false, None) => Some(Quiet::Memory),
+            (false, false, Some(t)) => Some(Quiet::Timer(t)),
+        }
+    }
+
+    /// Interrupt lines recomputed during the batch, for cores 0 and 1.
+    pub fn take_lines(&mut self) -> Option<[u32; 2]> {
+        self.lines.take()
+    }
+
+    /// The start time of the current instruction.
+    #[inline]
+    fn now(&self) -> Time {
+        if self.elapsed == 0 { self.clock.now } else { self.clock.time_after(&self.period, self.elapsed) }
+    }
+
+    #[inline(always)]
+    fn flash(&mut self, addr: u32) -> Result<usize, BusFault> {
+        if self.xip_ok {
+            // What xip_check does when XIP works
+            self.sys.xip_failed = false;
+        } else {
+            self.xip_check(addr)?;
+        }
+        Ok(match self.flash_mask {
+            Some(mask) => addr as usize & mask,
+            None => self.sys.flash_offset(addr),
+        })
+    }
+
+    // The slow paths are kept out of line so that the fast ones stay small enough to inline into the interpreter
+
+    #[cold]
+    #[inline(never)]
+    fn xip_check(&mut self, addr: u32) -> Result<(), BusFault> {
+        self.noisy = true;
+        let now = self.now();
+        self.sys.xip_check(now, addr)
+    }
+
+    /// Firmware polls the timer constantly (embassy-time, busy waits); reading it changes nothing the batch or the
+    /// machine would have to look at, so it skips the general peripheral path.
+    #[inline(never)]
+    fn timer_read(&mut self, addr: u32, size: Size) -> Result<u32, BusFault> {
+        let now = self.now();
+        match self.sys.timer.read(&self.sys.watchdog.tick, now, addr & 0xFFC) {
+            Some(v) => {
+                let ticks = self.sys.watchdog.tick.ticks(now);
+                if self.timer_ticks.is_some_and(|t| t != ticks) {
+                    self.ticked = true;
+                }
+                self.timer_ticks = Some(ticks);
+                Ok(mem::lane(v, addr, size))
+            }
+            None => self.slow_read(addr, size),
+        }
+    }
+
+    #[inline(never)]
+    fn slow_read(&mut self, addr: u32, size: Size) -> Result<u32, BusFault> {
+        self.noisy = true;
+        let now = self.now();
+        let r = self.sys.read(self.trace, self.core, now, addr, size);
+        self.after_access(now);
+        r
+    }
+
+    #[inline(never)]
+    fn slow_write(&mut self, addr: u32, size: Size, value: u32) -> Result<(), BusFault> {
+        self.noisy = true;
+        let now = self.now();
+        let r = self.sys.write(self.trace, self.core, now, addr, size, value);
+        self.after_access(now);
+        r
+    }
+
+    /// What the run loop would do after the instruction, as far as this access is concerned (see the type's docs).
+    fn after_access(&mut self, now: Time) {
+        let s = &mut *self.sys;
+        self.xip_ok = s.xip_ready_from(now);
+        if s.clk_sys_changed || s.reset_request.is_some() || s.psm_forced_off != 0 || s.psm_released != 0 {
+            // The machine handles these, then refreshes the interrupt lines
+            self.after |= Self::ATTENTION;
+            return;
+        }
+        // The lines are recomputed once the whole instruction is done, as the run loop would
+        if s.irq_dirty {
+            self.after |= Self::CHECK_IRQS;
+        }
+    }
+
+    /// The machine must act before the next instruction.
+    const ATTENTION: u8 = 1;
+    /// An access left `irq_dirty` set: recompute the lines after the instruction.
+    const CHECK_IRQS: u8 = 2;
+
+    /// Does what an instruction's slow accesses left to do; returns whether the batch must end.
+    #[inline(never)]
+    fn settle(&mut self) -> bool {
+        let after = std::mem::take(&mut self.after);
+        // With ATTENTION the machine takes over, and refreshes the interrupt lines itself afterwards
+        after & Self::ATTENTION != 0 || self.refresh_irqs()
+    }
+
+    fn refresh_irqs(&mut self) -> bool {
+        let s = &mut *self.sys;
+        if s.irq_dirty {
+            s.irq_dirty = false;
+            let lines = s.irq_lines_both();
+            self.lines = Some(lines);
+            if lines[self.core as usize] != self.core_lines {
+                self.core_lines = lines[self.core as usize];
+                return true;
+            }
+        }
+        false
+    }
+}
+
+impl Bus for BatchBus<'_> {
+    #[inline]
+    fn read(&mut self, addr: u32, size: Size) -> Result<u32, BusFault> {
+        let sram = addr.wrapping_sub(SRAM_BASE) as usize;
+        if sram < SRAM_SIZE {
+            return Ok(mem::read(&self.sys.sram, sram, size));
+        }
+        if addr >> 26 == XIP_BASE >> 26 {
+            let off = self.flash(addr)?;
+            return Ok(mem::read(&self.sys.flash, off, size));
+        }
+        if (addr as usize) < ROM_SIZE {
+            return Ok(mem::read(&self.sys.rom, addr as usize, size));
+        }
+        if addr & !0x3FFF == TIMER_BASE {
+            return self.timer_read(addr, size);
+        }
+        self.slow_read(addr, size)
+    }
+
+    #[inline]
+    fn write(&mut self, addr: u32, size: Size, value: u32) -> Result<(), BusFault> {
+        let sram = addr.wrapping_sub(SRAM_BASE) as usize;
+        if sram < SRAM_SIZE {
+            self.noisy = true;
+            mem::write(&mut self.sys.sram, sram, size, value);
+            return Ok(());
+        }
+        self.slow_write(addr, size, value)
+    }
+
+    #[inline(always)]
+    fn fetch16_fast(&mut self, addr: u32) -> Option<u16> {
+        fn half(buf: &[u8], off: usize) -> Option<u16> {
+            buf.get(off..off + 2).map(|b| u16::from_le_bytes([b[0], b[1]]))
+        }
+        if addr >> 26 == XIP_BASE >> 26 {
+            if self.xip_ok && self.flash_mask.is_some() {
+                // What xip_check does when XIP works
+                self.sys.xip_failed = false;
+                return half(&self.sys.flash, addr as usize & self.flash_mask.unwrap_or(0));
+            }
+            return None;
+        }
+        let sram = addr.wrapping_sub(SRAM_BASE) as usize;
+        if sram < SRAM_SIZE {
+            return half(&self.sys.sram, sram);
+        }
+        if (addr as usize) < ROM_SIZE {
+            return half(&self.sys.rom, addr as usize);
+        }
+        None
+    }
+
+    #[inline(always)]
+    fn fetch16(&mut self, addr: u32) -> Result<u16, BusFault> {
+        // Halfword aligned (the PC always is), so the second byte is in range whenever the first is
+        fn half(buf: &[u8], off: usize) -> Option<u16> {
+            buf.get(off..off + 2).map(|b| u16::from_le_bytes([b[0], b[1]]))
+        }
+        if addr >> 26 == XIP_BASE >> 26 {
+            let off = self.flash(addr)?;
+            if let Some(v) = half(&self.sys.flash, off) {
+                return Ok(v);
+            }
+        }
+        let sram = addr.wrapping_sub(SRAM_BASE) as usize;
+        if sram < SRAM_SIZE
+            && let Some(v) = half(&self.sys.sram, sram)
+        {
+            return Ok(v);
+        }
+        if (addr as usize) < ROM_SIZE
+            && let Some(v) = half(&self.sys.rom, addr as usize)
+        {
+            return Ok(v);
+        }
+        self.slow_read(addr, Size::Half).map(|v| v as u16)
+    }
+
+    #[inline]
+    fn set_elapsed(&mut self, cycles: u64) {
+        self.elapsed = cycles;
+    }
+
+    #[inline]
+    fn take_attention(&mut self) -> bool {
+        self.after != 0 && self.settle()
     }
 
     fn peek(&mut self, addr: u32, size: Size) -> Option<u32> {

@@ -406,10 +406,10 @@ impl Bench {
         self.session.machine.power_cycle();
     }
 
-    /// A copy that runs on independently from here (machine, devices, bus, logs and bridge state). Physical inputs
-    /// stay shared with the original: set them after taking the copy.
+    /// A copy that runs on independently from here (machine, devices, bus, logs, bridge state, and physical inputs
+    /// of its own: setting one on the copy leaves the original alone).
     pub fn snapshot(&self) -> Bench {
-        let mut session = self.session.snapshot();
+        let (mut session, inputs) = self.session.snapshot_with_inputs(&self.inputs);
         let bridge = self.bridge.as_ref().map(MockBridge::fork);
         if let Some(b) = &bridge {
             session.can_endpoints.push(Box::new(b.clone()));
@@ -418,22 +418,18 @@ impl Bench {
         if let Some(p) = &puddles {
             session.eth_endpoints.push(Box::new(p.clone()));
         }
-        Bench {
-            session,
-            inputs: self.inputs.clone(),
-            bridge,
-            puddles,
-            image: self.image.clone(),
-            schedule: self.schedule.clone(),
-        }
+        Bench { session, inputs, bridge, puddles, image: self.image.clone(), schedule: self.schedule.clone() }
     }
 }
 
-/// Several boards from a robot file, each bus with an optional mock bridge.
+/// Several boards from a robot file, each bus with an optional mock bridge, and each board with Ethernet (the
+/// Puddles backplane) with an optional [`PuddlesBridge`] on its cable ([`RobotBench::eth_bridge`]).
 pub struct RobotBench {
     pub robot: Robot,
     /// The mock bridge on each bus, by bus index.
     pub bridges: Vec<Option<MockBridge>>,
+    /// The scripted bridge on each board's Ethernet cable, by board index.
+    pub eth_bridges: Vec<Option<PuddlesBridge>>,
     /// Faults still to inject: when, on which board.
     schedule: Vec<(Time, String, Fault)>,
 }
@@ -460,7 +456,28 @@ impl RobotBench {
             robot.buses[j].endpoints.push(Box::new(br.clone()));
             out[j] = Some(br);
         }
-        Ok(RobotBench { robot, bridges: out, schedule: Vec::new() })
+        let eth_bridges = vec![None; robot.boards.len()];
+        Ok(RobotBench { robot, bridges: out, eth_bridges, schedule: Vec::new() })
+    }
+
+    /// The scripted `titan_bridge` on board `name`'s Ethernet cable: put there (pinging from now, the kill switch
+    /// released) the first time it is asked for. Snapshots get a copy of it ([`RobotBench::snapshot`]). Panics if
+    /// the board has no Ethernet.
+    pub fn eth_bridge(&mut self, name: &str) -> PuddlesBridge {
+        let i = self.robot.index(name).expect("no such board");
+        let now = self.robot.now;
+        // Boards may have been added to the robot by hand since it was loaded
+        self.eth_bridges.resize(self.robot.boards.len(), None);
+        let session = &mut self.robot.boards[i];
+        assert!(session.machine.sys.ethernet.is_some(), "{name} has no Ethernet");
+        self.eth_bridges[i]
+            .get_or_insert_with(|| {
+                let br = PuddlesBridge::new(now);
+                br.set_kill(Some(false));
+                session.eth_endpoints.push(Box::new(br.clone()));
+                br
+            })
+            .clone()
     }
 
     pub fn now(&self) -> Time {
@@ -485,10 +502,15 @@ impl RobotBench {
     }
 
     /// Injects `fault` on board `board` now. CAN bus faults other than unplugging go to the bus the board is on;
-    /// bridge faults to the mock bridge on that bus.
+    /// bridge faults to the mock bridge on that bus, or to the board's Ethernet bridge.
     pub fn inject(&mut self, board: &str, fault: Fault) -> Result<(), String> {
         let i = self.robot.index(board).ok_or_else(|| format!("no board {board}"))?;
-        let bridge = self.robot.board_bus[i].and_then(|j| self.bridges[j].as_ref()).map(|b| b as &dyn BridgeControl);
+        let eth = self.eth_bridges.get(i).and_then(Option::as_ref);
+        let bridge = match (self.robot.board_bus[i].and_then(|j| self.bridges[j].as_ref()), eth) {
+            (Some(b), _) => Some(b as &dyn BridgeControl),
+            (None, Some(p)) => Some(p as &dyn BridgeControl),
+            (None, None) => None,
+        };
         sim_host::fault::robot_target(&mut self.robot, i, bridge).apply(&fault)
     }
 
@@ -518,7 +540,8 @@ impl RobotBench {
         self.bridge(bus).state().received.iter().filter_map(|(t, m)| f(m).map(|v| (*t, v))).collect()
     }
 
-    /// A copy of the robot (boards, buses, acoustic medium and bridges) that runs on independently.
+    /// A copy of the robot (boards, buses, acoustic medium, inputs, vehicles, and the CAN and Ethernet bridges)
+    /// that runs on independently. Host endpoints added to the robot by hand are not copied.
     pub fn snapshot(&self) -> RobotBench {
         let mut robot = self.robot.snapshot();
         let bridges: Vec<Option<MockBridge>> = self.bridges.iter().map(|b| b.as_ref().map(MockBridge::fork)).collect();
@@ -527,7 +550,14 @@ impl RobotBench {
                 robot.buses[j].endpoints.push(Box::new(b.clone()));
             }
         }
-        RobotBench { robot, bridges, schedule: self.schedule.clone() }
+        let eth_bridges: Vec<Option<PuddlesBridge>> =
+            self.eth_bridges.iter().map(|b| b.as_ref().map(PuddlesBridge::fork)).collect();
+        for (i, b) in eth_bridges.iter().enumerate() {
+            if let Some(b) = b {
+                robot.boards[i].eth_endpoints.push(Box::new(b.clone()));
+            }
+        }
+        RobotBench { robot, bridges, eth_bridges, schedule: self.schedule.clone() }
     }
 
     /// Moves board `name`'s transducer.
@@ -538,15 +568,14 @@ impl RobotBench {
 }
 
 /// Runs `scenario` once per point, each from its own snapshot of `base`, on up to `threads` threads at a time.
-/// Results come back in the order of `points`. A robot with a vehicle driving sensor inputs runs one point at a
-/// time, since its snapshots share those inputs (see [`Robot::snapshot`]).
+/// Results come back in the order of `points`. Each snapshot has its own physical inputs (see
+/// [`Robot::snapshot`]), so a scenario may set them, and the points with vehicles run side by side too.
 pub fn sweep<P: Sync, R: Send>(
     base: &RobotBench,
     points: &[P],
     threads: usize,
     scenario: impl Fn(RobotBench, &P) -> R + Sync,
 ) -> Vec<R> {
-    let threads = if base.robot.vehicles.iter().any(|v| v.has_sensors()) { 1 } else { threads };
     let mut results: Vec<Option<R>> = (0..points.len()).map(|_| None).collect();
     for (chunk_points, chunk_results) in points.chunks(threads.max(1)).zip(results.chunks_mut(threads.max(1))) {
         let benches: Vec<RobotBench> = chunk_points.iter().map(|_| base.snapshot()).collect();

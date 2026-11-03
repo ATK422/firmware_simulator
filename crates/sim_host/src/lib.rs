@@ -36,6 +36,7 @@ pub mod ethernet;
 pub mod fault;
 pub mod gdb;
 pub mod mock_bridge;
+pub mod parallel;
 pub mod pty;
 pub mod robot;
 pub mod rtt;
