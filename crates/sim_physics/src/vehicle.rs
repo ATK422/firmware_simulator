@@ -131,7 +131,20 @@ impl VehicleFile {
         if f.params.mass_kg <= 0.0 || f.params.inertia_kg_m2.iter().any(|i| *i <= 0.0) || f.params.height_m <= 0.0 {
             return Err("mass, inertia and height must be positive".into());
         }
+        // Thrust coefficients are thrust / at_rpm²: a zero (or negative, or non-finite) speed or thrust would make
+        // them, and with them the whole state, NaN or backwards
+        let curve_ok = |c: &crate::thruster::ThrustCurve| {
+            c.at_rpm > 0.0
+                && c.at_rpm.is_finite()
+                && [c.forward_n, c.reverse_n].iter().all(|n| *n >= 0.0 && n.is_finite())
+        };
+        if f.thruster_model.as_ref().is_some_and(|c| !curve_ok(c)) {
+            return Err("thruster_model: a thrust curve needs at_rpm > 0 and thrusts >= 0".into());
+        }
         for t in &f.thruster {
+            if t.curve.as_ref().is_some_and(|c| !curve_ok(c)) {
+                return Err(format!("thruster {}: a thrust curve needs at_rpm > 0 and thrusts >= 0", t.name));
+            }
             if t.curve.is_none() && f.thruster_model.is_none() {
                 return Err(format!("thruster {}: no thrust curve (give one or a [thruster_model])", t.name));
             }
@@ -708,5 +721,11 @@ direction = [1.0, 0.0, 0.0]
         );
         assert!(VehicleFile::parse(&ok.replace("mass_kg = 10.0", "mass_kg = 0.0")).is_err());
         assert!(VehicleFile::parse(&ok.replace("direction = [1.0, 0.0, 0.0]", "direction = [0.0, 0.0, 0.0]")).is_err());
+        // A thrust curve at 0 RPM has no coefficient (it would make every thrust, and the whole state, NaN)
+        let zero_rpm = ok.replace("at_rpm = 3800.0", "at_rpm = 0.0");
+        assert!(VehicleFile::parse(&zero_rpm).unwrap_err().contains("thrust curve"));
+        let own = format!("{ok}curve = {{ forward_n = 50.0, reverse_n = 40.0, at_rpm = 0.0 }}\n");
+        assert!(VehicleFile::parse(&own).unwrap_err().contains("thrust curve"));
+        assert!(VehicleFile::parse(&ok.replace("forward_n = 50.0", "forward_n = -50.0")).is_err());
     }
 }
