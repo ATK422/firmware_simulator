@@ -480,6 +480,9 @@ impl Board {
             }
         }
         if let Some(e) = &self.w5500 {
+            if e.bus > 1 {
+                return Err(format!("SPI bus {} does not exist", e.bus));
+            }
             let wire = sim_devices::w5500::wire();
             m.sys.attach_spi(e.bus, e.cs, Box::new(sim_devices::w5500::W5500::new(wire.clone(), e.int_pin)));
             m.sys.ethernet = Some(wire);
@@ -490,6 +493,9 @@ impl Board {
             for b in &d.bridges {
                 let out = match (b.nfault_pin, &b.nfault_input) {
                     (Some(p), None) => {
+                        if p as usize >= rp2040::memmap::NUM_GPIOS {
+                            return Err(format!("DRV8243 nFAULT: GPIO {p} does not exist"));
+                        }
                         m.sys.gpio.external[p as usize] = External::Driven(Level::High);
                         sim_devices::drv8243::Nfault::Pin(p)
                     }
@@ -688,6 +694,22 @@ mux = { select_pins = [3, 4, 5], inputs = [{ volts = 1.0 }, { volts = 2.0 }] }
         let v = m.sys.analog_inputs[2].as_mut().unwrap().voltage(sim_core::Time::ZERO, 1 << 3);
         assert_eq!(v, 2.0);
         assert!(Board::parse("name = \"x\"\n[[i2c]]\nbus = 0\ndevice = \"nope\"\n").unwrap().apply(&mut m).is_err());
+    }
+
+    /// Board-file values that name a GPIO or bus the chip doesn't have are errors, like the other sections'
+    /// checks: a DRV8243 `nfault_pin` past GPIO 29 used to panic indexing the pin array, and a W5500 on SPI bus 2
+    /// was attached to nothing without a word.
+    #[test]
+    fn out_of_range_pins_and_buses_are_errors() {
+        for text in [
+            "name = \"x\"\n[[drv8243]]\nnsleep_pin = 25\nbridges = [{ nfault_pin = 30 }]\n",
+            "name = \"x\"\n[w5500]\nbus = 2\ncs = 1\nint_pin = 4\n",
+        ] {
+            let b = Board::parse(text).unwrap();
+            let mut m = Machine::new(Default::default());
+            let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| b.apply(&mut m).map(|_| ())));
+            assert!(matches!(r, Ok(Err(_))), "{text}: {r:?}");
+        }
     }
 
     #[test]
