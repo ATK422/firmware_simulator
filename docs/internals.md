@@ -64,16 +64,27 @@ scheduled. Counters (timer, PWM, watchdog) are computed lazily from virtual time
    timer ticks; such quanta are skipped up to the next event, tick or the end of the run, while the other core
    cannot run. Skipped instructions still count as executed. The ESC board's control loop spends 62 % of its
    instructions in such a loop.
-4. **Idle fast-forward.** When both cores sleep (`WFI`/`WFE` with nothing pending) time jumps to the next event,
+4. **Quantum fusing** (`Machine::fuse_quanta`). While the other core cannot run, no SysTick counts and the last
+   quantum wrote memory and touched nothing else (the core is computing), the next quantum's first batch may run on
+   through up to 64 quanta: the boundaries in between would change nothing, since events are not due before the
+   limit and nothing that could wake the other core happens in a batch that touches only memory. A fused batch ends
+   after any other access (it may schedule an event or wake the other core) and after a timer read (busy-waits
+   poll the timer, and are only found at quantum boundaries); the rest of that quantum runs as usual.
+5. **Idle fast-forward.** When both cores sleep (`WFI`/`WFE` with nothing pending) time jumps to the next event,
    bounded by SysTick wake-ups. Embassy firmware spends most of its time there. With nothing scheduled at all the
    run stops with `StopReason::Deadlock`.
-5. **PIO** state machines are cycle exact (one instruction, delay or stall cycle per tick of their fractional
+6. **PIO** state machines are cycle exact (one instruction, delay or stall cycle per tick of their fractional
    divider) and advanced lazily, skipping delays and machines stalled on something that has not changed. A machine
    polling its own registers, FIFO levels or pins in a loop (the ESC's DShot reply wait) is not ticked through it:
-   whole iterations are skipped and the rest replayed when something reads or changes it.
+   whole iterations are skipped and the rest replayed when something reads or changes it. A CPU read of a PIO
+   register that changes nothing (FSTAT, FLEVEL, IRQ, INTR...) advances the blocks once rather than twice
+   (`System::pio_fast_reads`).
 
-`Machine::skip_spins` and `Pio::skip_loops` switch the two skips off; `crates/rp2040/tests/batching.rs`,
-`busy_wait.rs` and the PIO tests compare runs with and without them.
+`Machine::skip_spins`, `Machine::fuse_quanta` and `Pio::skip_loops` switch the skips and the fusing off;
+`crates/rp2040/tests/batching.rs`, `busy_wait.rs`, `fused_quanta.rs`, `crates/sim_test/tests/fast_paths.rs` and
+the PIO tests compare runs with and without them (`fast_paths.rs` also for `System::pio_fast_reads` and
+`System::sio_fast_irqs`, which spares the interrupt-line recomputation after SIO accesses other than to the
+FIFOs).
 
 Resets go through the same loop: a watchdog reset or `SYSRESETREQ` is a `ResetRequest` the machine carries out
 (`watchdog_reset`, `run_pin_reset`, `power_cycle`, `power_on_at`), with the reset kind reported in
@@ -223,7 +234,8 @@ counts, SRAM). The fingerprint must not change when the emulator is made faster.
 machine: compare the best of several repeats, or the instruction counts under `valgrind --tool=callgrind` with
 `--repeat 1`.
 
-Measured on a shared 4-core machine (CPU time for 2 s of virtual time): template 0.04 s, ESC board 2.0 s,
-IVCBoard2 1.2 s, Talos 5.8 s, IVC2 pool 3.6 s. What is left is mostly the interpreter itself (about 95 host
-instructions per emulated one), PIO and peripheral polling on the ESC board, and the acoustic model in the pool;
-going further would take a decoded-instruction cache or block-at-a-time execution.
+Measured on a shared 4-core machine (CPU time for 2 s of virtual time): template 0.03 s, ESC board 1.8 s,
+IVCBoard2 0.6 s, Talos 4.7 s, IVC2 pool 2.2 s. Under callgrind, advancing the PIO blocks (on register reads and
+their 1 µs event) still takes about 22 % of the ESC board's time: the DShot state machines' clock recovery is
+ticked cycle by cycle. In Talos, reads of the XOSC status register (about 1.5 million per 200 ms of virtual
+time, through the general peripheral path) take about 7 %.
