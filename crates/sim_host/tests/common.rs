@@ -14,7 +14,7 @@ pub fn repo() -> PathBuf {
 
 /// A titan_firmware_rs release ELF, if it has been built (see CLAUDE.md); tests skip when it is missing.
 pub fn titan_elf(name: &str) -> Option<PathBuf> {
-    let p = repo().join("external/titan_firmware_rs/firmware/target/thumbv6m-none-eabi/release").join(name);
+    let p = sim_host::titan_rs_release_dir(&repo()).join(name);
     if p.exists() {
         Some(p)
     } else {

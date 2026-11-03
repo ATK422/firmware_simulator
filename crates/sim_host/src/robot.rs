@@ -278,7 +278,8 @@ impl Robot {
             // Robot-level straps replace the board file's entries for the same pins
             board.gpio.retain(|g| !b.gpio.iter().any(|o| o.pin == g.pin));
             board.gpio.extend(b.gpio.iter().cloned());
-            let image = Image::load(&dir.join(&b.elf)).map_err(|e| format!("{}: {e}", b.elf.display()))?;
+            let elf = crate::resolve_image(&dir.join(&b.elf));
+            let image = Image::load(&elf).map_err(|e| format!("{}: {e}", elf.display()))?;
             let mut m = Machine::new(MachineConfig {
                 bootrom: Some(rp2040::BOOTROM_B1.to_vec()),
                 flash_size: board.flash_size.unwrap_or(2 << 20),
