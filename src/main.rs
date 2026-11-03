@@ -326,7 +326,7 @@ fn robot(args: RobotArgs) -> Result<()> {
         for b in &args.trace_board {
             anyhow::ensure!(r.index(b).is_some(), "--trace-board: no board {b:?}");
         }
-        let out = SharedWriter::open(args.trace_file.as_deref())?;
+        let out = open_trace(args.trace_file.as_deref())?;
         let categories = trace_categories(&args.trace);
         for (s, name) in r.boards.iter_mut().zip(&r.names) {
             if args.trace_board.is_empty() || args.trace_board.contains(name) {
@@ -550,33 +550,10 @@ fn trace_categories(kinds: &[TraceKind]) -> Vec<Category> {
         .collect()
 }
 
-/// A trace output several boards' sinks write to: a file (buffered) or stderr.
-#[derive(Clone)]
-struct SharedWriter(std::sync::Arc<std::sync::Mutex<Box<dyn std::io::Write + Send>>>);
-
-impl SharedWriter {
-    fn open(path: Option<&std::path::Path>) -> Result<SharedWriter> {
-        let out: Box<dyn std::io::Write + Send> = match path {
-            Some(p) => Box::new(std::io::BufWriter::new(
-                std::fs::File::create(p).with_context(|| format!("creating {}", p.display()))?,
-            )),
-            None => Box::new(std::io::stderr()),
-        };
-        Ok(SharedWriter(std::sync::Arc::new(std::sync::Mutex::new(out))))
-    }
-}
-
-impl std::io::Write for SharedWriter {
-    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        self.0.lock().unwrap().write(buf)
-    }
-    /// Under one lock: each trace line is one `write_all`, and stays whole with boards on several threads.
-    fn write_all(&mut self, buf: &[u8]) -> std::io::Result<()> {
-        self.0.lock().unwrap().write_all(buf)
-    }
-    fn flush(&mut self) -> std::io::Result<()> {
-        self.0.lock().unwrap().flush()
-    }
+/// Where a trace goes: `--trace-file` (buffered, and flushed every 100 ms so it can be followed) or stderr.
+fn open_trace(path: Option<&Path>) -> Result<sim_host::flush::SharedWriter> {
+    sim_host::flush::SharedWriter::file_or_stderr(path)
+        .with_context(|| format!("creating {}", path.map_or_else(String::new, |p| p.display().to_string())))
 }
 
 #[derive(Clone, Copy, ValueEnum, PartialEq, Eq)]
@@ -840,12 +817,7 @@ fn run(args: RunArgs) -> Result<()> {
     }
     let categories = trace_categories(&args.trace);
     if !categories.is_empty() {
-        let out: Box<dyn std::io::Write + Send> = match &args.trace_file {
-            Some(p) => Box::new(std::io::BufWriter::new(
-                std::fs::File::create(p).with_context(|| format!("creating {}", p.display()))?,
-            )),
-            None => Box::new(std::io::stderr()),
-        };
+        let out = open_trace(args.trace_file.as_deref())?;
         machine.set_trace(Box::new(WriterSink { categories, out, prefix: String::new() }));
     }
 

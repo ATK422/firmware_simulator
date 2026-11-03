@@ -220,7 +220,9 @@ firmware_simulator run $FW/power_board --board boards/mk2/power_board.toml --moc
     --dashboard 127.0.0.1:8080 --log-json power.jsonl
 ```
 
-None of them changes what a single-core program does; with both cores running, the profiler's extra cuts can
+`--log-json`, `--trace-file` and `--candump-log` are flushed every 100 ms of wall time and stdout line by line, so
+`tail -f` (or a script waiting for a line) can follow a run while it goes on. None of them changes what a
+single-core program does; with both cores running, the profiler's extra cuts can
 shift how their instructions interleave, as a different `--quantum` would. They combine with each other and with
 `--trace`. With `picoboot load`, the profile names the functions of the image that was flashed.
 

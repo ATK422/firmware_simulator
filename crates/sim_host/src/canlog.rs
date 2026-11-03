@@ -259,7 +259,6 @@ pub struct CandumpWriter(Arc<Mutex<WriterState>>);
 
 struct WriterState {
     out: Box<dyn Write + Send>,
-    last_flush: std::time::Instant,
     written: u64,
     /// Frames not written because nobody acknowledged them (a listening interface would have).
     unacked: u64,
@@ -278,14 +277,16 @@ impl CandumpWriter {
         Ok(Self::new(Box::new(std::io::BufWriter::new(f))))
     }
 
+    /// A log written to `out`, flushed every [`crate::flush::FLUSH_PERIOD`] (the last frames too, when the bus
+    /// goes quiet).
     pub fn new(out: Box<dyn Write + Send>) -> CandumpWriter {
-        CandumpWriter(Arc::new(Mutex::new(WriterState {
-            out,
-            last_flush: std::time::Instant::now(),
-            written: 0,
-            unacked: 0,
-            error: None,
-        })))
+        let state = Arc::new(Mutex::new(WriterState { out, written: 0, unacked: 0, error: None }));
+        crate::flush::flush_periodically(&state, crate::flush::FLUSH_PERIOD, |m| {
+            if let Ok(mut s) = m.lock() {
+                let _ = s.out.flush();
+            }
+        });
+        CandumpWriter(state)
     }
 
     /// Writes one bus record (skipped if it was not acknowledged).
@@ -301,10 +302,6 @@ impl CandumpWriter {
             return;
         }
         s.written += 1;
-        if s.last_flush.elapsed() > std::time::Duration::from_millis(500) {
-            let _ = s.out.flush();
-            s.last_flush = std::time::Instant::now();
-        }
     }
 
     /// A bus callback writing that bus's frames as `iface`, after calling `then` (an existing callback, such as
@@ -843,5 +840,24 @@ mod tests {
 
     fn sim_host_rates() -> BitRates {
         crate::board::bus_rates("external").unwrap()
+    }
+
+    #[test]
+    fn the_last_frame_reaches_the_file_when_the_bus_goes_quiet() {
+        let path = crate::flush::tests::temp_path("candump.log");
+        let w = CandumpWriter::create(&path).unwrap();
+        let rec = BusRecord {
+            start: Time::from_us(10),
+            end: Time::from_us(120),
+            sender: sim_devices::can::Sender::Node(1),
+            frame: CanFrame::classic(0x6F, false, &[0xC0]),
+            acked: true,
+            error: None,
+        };
+        w.record("can0", &rec);
+        let text = crate::flush::tests::wait_for_file(&path, |t| t.ends_with('\n'));
+        assert!(text.ends_with("can0 06F#C0\n"), "{text:?}");
+        drop(w);
+        std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
     }
 }
