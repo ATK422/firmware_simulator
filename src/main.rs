@@ -12,6 +12,7 @@ use sim_core::cpu::Cpu;
 use sim_core::image::Image;
 use sim_core::time::Time;
 use sim_core::trace::{Category, WriterSink};
+use sim_host::Session;
 
 #[derive(Parser)]
 #[command(version, about = "RP2040 emulator for UWRT titan firmware")]
@@ -69,12 +70,15 @@ struct RunArgs {
     /// Flash size in bytes.
     #[arg(long, default_value_t = 2 * 1024 * 1024)]
     flash_size: usize,
-    /// clk_sys frequency until the clock tree is modelled.
-    #[arg(long, default_value_t = 125_000_000)]
-    clk_sys_hz: u64,
+    /// Crystal (XOSC) frequency.
+    #[arg(long, default_value_t = 12_000_000)]
+    crystal_hz: u64,
     /// Stop on BKPT instructions instead of escalating them to HardFault.
     #[arg(long)]
     stop_on_bkpt: bool,
+    /// Wait for GDB on this address (e.g. `127.0.0.1:3333`) before running.
+    #[arg(long)]
+    gdb: Option<String>,
 }
 
 /// Parses `10ms`, `2s`, `250us`, `100ns` or a bare number of seconds.
@@ -106,7 +110,7 @@ fn run(args: RunArgs) -> Result<()> {
         flash_size: args.flash_size,
         bootrom: Some(rp2040::BOOTROM_B1.to_vec()),
         quantum: args.quantum,
-        clk_sys_hz: args.clk_sys_hz,
+        crystal_hz: args.crystal_hz,
     };
     let mut machine = Machine::new(config);
     machine.sys.unmodelled.log_mode = match args.unmodelled {
@@ -142,9 +146,29 @@ fn run(args: RunArgs) -> Result<()> {
     let vtor = machine.direct_boot().map_err(anyhow::Error::msg)?;
     log::info!("direct boot: VTOR {vtor:#010x}, entry {:#010x}", machine.cores[0].pc());
 
+    let mut session = Session::new(machine, &image);
+    session.keep_logs = false;
+    session.on_log = Some(Box::new(|t, line| println!("[{t}] {line}")));
+    if let Some(rtt) = &session.rtt {
+        let defmt = if session.has_defmt() { ", decoding defmt" } else { "" };
+        log::info!("RTT control block at {:#010x}{defmt}", rtt.addr);
+    }
+
     let wall = std::time::Instant::now();
-    let reason = machine.run_until(args.time);
+    if let Some(addr) = &args.gdb {
+        let listener = std::net::TcpListener::bind(addr).with_context(|| format!("binding {addr}"))?;
+        log::info!("waiting for GDB on {addr}");
+        if sim_host::gdb::serve(&listener, &mut session)? == sim_host::gdb::Ended::Killed {
+            eprintln!("GDB ended the session at {}", session.machine.now);
+            return Ok(());
+        }
+    }
+    let reason = session.run_until(args.time);
     let elapsed = wall.elapsed();
+    for (ch, bytes) in session.rtt_text.drain(..) {
+        print!("[rtt{ch}] {}", String::from_utf8_lossy(&bytes));
+    }
+    let machine = &mut session.machine;
     let where_ = |pc: u32| match machine.symbolize(pc) {
         Some(s) => format!("{pc:#010x} <{s}>"),
         None => format!("{pc:#010x}"),

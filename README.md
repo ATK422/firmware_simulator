@@ -20,12 +20,26 @@ milestones are in [PLAN.md](PLAN.md).
 ## Usage
 
 ```bash
-cargo run --release -- run test_programs/blink.elf --time 100us --trace gpio
+cargo run --release -- run external/titan_firmware_rs/firmware/target/thumbv6m-none-eabi/release/template --time 1s
+cargo run --release -- run test_programs/embassy_blinky.elf --time 2s --trace gpio
 ```
+
+The image boots as if the bootrom and boot2 had run ("direct boot"); the official bootrom is mapped at address 0
+for its function table and soft-float routines. defmt logs are decoded from RTT (the `_SEGGER_RTT` control block
+and the ELF's `.defmt` table) and printed with the virtual time they were read and the firmware's own timestamp.
 
 Options: `--time` (virtual time to run, e.g. `500ms`), `--trace instr,exc,gpio,unmodelled,device`, `--trace-file`,
 `--quantum` (instructions per core before switching), `--unmodelled first|every|off` (logging of registers the
-emulator does not model yet; each is named from the SVD), `--stop-on-bkpt`.
+emulator does not model yet; each is named from the SVD), `--stop-on-bkpt`, `--crystal-hz`, `--gdb ADDR`.
+
+### Debugging
+
+`--gdb 127.0.0.1:3333` waits for GDB before running. Each core is a thread; breakpoints, stepping, Ctrl-C, memory
+and register access, and `monitor reset` / `monitor time` work. Virtual time stops while GDB has the target halted.
+
+```bash
+gdb-multiarch -ex "target remote :3333" -ex "break main" -ex continue path/to/firmware.elf
+```
 
 ## Tests
 
@@ -33,8 +47,10 @@ emulator does not model yet; each is named from the SVD), `--stop-on-bkpt`.
 cargo test --workspace
 ```
 
-`test_programs/` holds hand-written Thumb programs used by the tests; the ELFs are committed, `make -C
-test_programs` rebuilds them with `arm-none-eabi-as`.
+`test_programs/` holds hand-written Thumb programs and a small embassy firmware used by the tests; the ELFs are
+committed, `make -C test_programs` rebuilds them (`arm-none-eabi-as`, and the `thumbv6m-none-eabi` Rust target).
+Tests that boot titan_firmware_rs images skip themselves unless the firmware has been built
+(`cd external/titan_firmware_rs/firmware && cargo build --workspace --release`).
 
 ## Third-party data
 

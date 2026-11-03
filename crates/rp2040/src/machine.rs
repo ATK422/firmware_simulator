@@ -20,7 +20,9 @@ use sim_core::time::{ClockPeriod, CycleClock, Time};
 use sim_core::trace::{Category, NullSink, TraceEvent, TraceSink};
 
 use crate::memmap::*;
-use crate::system::{CoreBus, Event, System};
+use crate::periph::sysctl::psm;
+use crate::periph::timer::WatchdogReset;
+use crate::system::{CoreBus, Event, ResetRequest, System};
 
 /// Machine configuration.
 #[derive(Clone, Debug)]
@@ -31,13 +33,13 @@ pub struct MachineConfig {
     pub bootrom: Option<Vec<u8>>,
     /// Instructions a core runs before the other gets a turn.
     pub quantum: u32,
-    /// `clk_sys` frequency used until the clock tree is modelled.
-    pub clk_sys_hz: u64,
+    /// Crystal frequency (XOSC).
+    pub crystal_hz: u64,
 }
 
 impl Default for MachineConfig {
     fn default() -> Self {
-        MachineConfig { flash_size: 2 * 1024 * 1024, bootrom: None, quantum: 16, clk_sys_hz: 125_000_000 }
+        MachineConfig { flash_size: 2 * 1024 * 1024, bootrom: None, quantum: 16, crystal_hz: 12_000_000 }
     }
 }
 
@@ -83,6 +85,12 @@ pub struct Machine {
     pub breakpoints: BTreeSet<u32>,
     pub bkpt_policy: BkptPolicy,
     stop_requested: bool,
+    /// Vector table used by direct boot, reused after resets.
+    boot_vtor: Option<u32>,
+    /// Number of chip resets since power-on.
+    pub resets: u32,
+    /// `External` events that fired, as `(time, id)`, for the host to collect.
+    pub external_fired: Vec<(Time, u32)>,
     /// Skip the breakpoint check for this core's next instruction (resuming from a breakpoint).
     skip_breakpoint: [bool; 2],
     trace_instructions: bool,
@@ -103,26 +111,38 @@ impl Machine {
     pub fn new(config: MachineConfig) -> Machine {
         let mut cores = [CortexM0Plus::new(), CortexM0Plus::new()];
         cores[1].cpuid = 0x410C_C601;
-        Machine {
+        let mut m = Machine {
             cores,
             clocks: [CycleClock::default(); 2],
             core_enabled: [true, false],
-            sys: System::new(config.flash_size, config.bootrom.as_deref()),
+            sys: {
+                let mut sys = System::new(config.flash_size, config.bootrom.as_deref());
+                sys.clocks.xosc.crystal_hz = config.crystal_hz;
+                sys
+            },
             trace: Box::new(NullSink),
             now: Time::ZERO,
             quantum: config.quantum.max(1),
-            clk_sys: ClockPeriod::from_hz(config.clk_sys_hz),
+            clk_sys: ClockPeriod::from_hz(1),
             image: None,
             breakpoints: BTreeSet::new(),
             bkpt_policy: BkptPolicy::default(),
             stop_requested: false,
+            boot_vtor: None,
+            resets: 0,
+            external_fired: Vec::new(),
             skip_breakpoint: [false; 2],
             trace_instructions: false,
-        }
+        };
+        m.clk_sys = m.sys.clk_sys;
+        m.sys.clk_sys_changed = false;
+        m
     }
 
     pub fn set_trace(&mut self, trace: Box<dyn TraceSink>) {
         self.trace_instructions = trace.wants(Category::Instruction);
+        // Tracing GPIO makes every PWM edge visible
+        self.sys.pwm.observed = if trace.wants(Category::Gpio) { 0xFF } else { 0 };
         let exceptions = trace.wants(Category::Exception);
         for c in &mut self.cores {
             c.log_exceptions = exceptions;
@@ -164,6 +184,7 @@ impl Machine {
         let mut bus = CoreBus { sys: &mut self.sys, trace: &mut trace, core: 0, now: Time::ZERO };
         self.cores[0].reset(&mut bus, vtor);
         self.core_enabled = [true, false];
+        self.boot_vtor = Some(vtor);
         Ok(vtor)
     }
 
@@ -195,11 +216,87 @@ impl Machine {
     fn fire_events(&mut self, until: Time) {
         while let Some((t, ev)) = self.sys.sched.pop_due(until) {
             self.now = self.now.max(t);
-            match ev {
-                Event::External(_) => {}
+            self.sys.fire_event(&mut *self.trace, t, ev);
+            if let Event::External(id) = ev {
+                self.external_fired.push((t, id));
             }
+            self.after_system_change();
         }
         self.now = self.now.max(until);
+    }
+
+    /// Picks up effects of peripheral activity that concern the machine: a new `clk_sys` period, resets, PSM.
+    fn after_system_change(&mut self) {
+        if self.sys.clk_sys_changed {
+            self.sys.clk_sys_changed = false;
+            self.clk_sys = self.sys.clk_sys;
+        }
+        if let Some(req) = self.sys.reset_request.take() {
+            match req {
+                ResetRequest::Watchdog(kind) => self.watchdog_reset(kind),
+            }
+        }
+        if self.sys.psm_forced_off != 0 || self.sys.psm_released != 0 {
+            let off = std::mem::take(&mut self.sys.psm_forced_off);
+            let _released = std::mem::take(&mut self.sys.psm_released);
+            if off & (1 << psm::PROC1) != 0 {
+                // Core 1 is held in reset while forced off; nothing launches it again in direct boot
+                self.core_enabled[1] = false;
+                self.cores[1] = CortexM0Plus::new();
+            }
+        }
+    }
+
+    /// Resets the chip from the watchdog: peripherals and cores restart, RAM and scratch registers survive.
+    pub fn watchdog_reset(&mut self, kind: WatchdogReset) {
+        let t = self.clocks[0].now.max(self.clocks[1].now).max(self.now);
+        log::info!("[{t}] watchdog reset ({kind:?})");
+        self.resets += 1;
+        self.sys.watchdog.record_reset(kind);
+        self.sys.watchdog_reset(t);
+        self.clk_sys = self.sys.clk_sys;
+        self.sys.clk_sys_changed = false;
+        self.now = t;
+        for c in 0..2 {
+            let log = self.cores[c].log_exceptions;
+            self.cores[c] = CortexM0Plus::new();
+            self.cores[c].log_exceptions = log;
+            self.clocks[c] = CycleClock::new(t);
+        }
+        self.reboot();
+    }
+
+    /// AIRCR.SYSRESETREQ: on the RP2040 this resets the requesting processor only (its PSM domain), not the
+    /// peripherals or SIO.
+    pub fn core_reset(&mut self, c: usize) {
+        log::info!("[{}] core{c} SYSRESETREQ", self.clocks[c].now);
+        let log = self.cores[c].log_exceptions;
+        self.cores[c] = CortexM0Plus::new();
+        self.cores[c].log_exceptions = log;
+        if c == 0 {
+            if let Some(vtor) = self.boot_vtor {
+                let mut trace = NullSink;
+                let now = self.clocks[0].now;
+                let mut bus = CoreBus { sys: &mut self.sys, trace: &mut trace, core: 0, now };
+                self.cores[0].reset(&mut bus, vtor);
+            }
+        } else {
+            self.core_enabled[1] = false;
+        }
+    }
+
+    /// Starts the cores again after a reset.
+    fn reboot(&mut self) {
+        match self.boot_vtor {
+            Some(vtor) => {
+                let mut trace = NullSink;
+                let now = self.now;
+                let mut bus = CoreBus { sys: &mut self.sys, trace: &mut trace, core: 0, now };
+                self.cores[0].reset(&mut bus, vtor);
+                self.core_enabled = [true, false];
+            }
+            None => self.core_enabled = [false, false],
+        }
     }
 
     /// Whether core `c` can make progress now (running, and awake or wakeable).
@@ -225,6 +322,9 @@ impl Machine {
         match outcome {
             StepOutcome::Ran(cycles) => {
                 self.clocks[c].advance(&self.clk_sys, cycles as u64);
+                if self.sys.clk_sys_changed || self.sys.reset_request.is_some() || self.sys.psm_forced_off != 0 {
+                    self.after_system_change();
+                }
                 if self.trace_instructions {
                     self.trace_instruction(c, now);
                 }
@@ -240,6 +340,9 @@ impl Machine {
                 }
                 if self.cores[c].take_sev() {
                     self.cores[1 - c].signal_event();
+                }
+                if self.cores[c].take_reset_request() {
+                    self.core_reset(c);
                 }
             }
             StepOutcome::Breakpoint(_) if self.bkpt_policy == BkptPolicy::HardFault => {
@@ -418,6 +521,7 @@ impl Machine {
 
     /// Debugger memory read from `core`'s point of view (its PPB registers included).
     pub fn debug_read(&mut self, core: usize, addr: u32, size: Size) -> Option<u32> {
+        self.sys.peek_time = self.clocks[core].now.max(self.now);
         let mut trace = NullSink;
         let mut bus = CoreBus { sys: &mut self.sys, trace: &mut trace, core: core as u8, now: self.now };
         self.cores[core].debug_read(&mut bus, addr, size)
