@@ -623,6 +623,13 @@ impl Machine {
             return false;
         }
         let t = self.clocks[c].now.max(self.now);
+        if self.cores[c].is_sleeping() && self.clocks[c].now < self.now && self.cores[c].systick.counts_core_clock() {
+            // A sleeping core's SysTick counts the cycles the other core ran meanwhile (without moving its clock
+            // past them: whole cycles, so that doing this every quantum loses none)
+            let cycles = self.idle_cycles(c, self.now);
+            self.cores[c].advance_idle(cycles);
+            self.clocks[c].advance(&self.clk_sys, cycles);
+        }
         self.sync_systick_reference(c, t);
         self.cores[c].would_wake()
     }

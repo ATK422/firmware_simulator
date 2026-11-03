@@ -73,3 +73,13 @@ fn idle_fast_forward_reaches_the_systick_wrap() {
     assert!(expect > 100, "{expect} wraps expected");
     assert!(n.abs_diff(expect) <= 1, "{n} SysTick calls on core 1, expected {expect}");
 }
+
+/// A core asleep in WFI keeps counting SysTick on the core clock while the other core runs (quantum by quantum),
+/// and its exception wakes it on time, as when the other core sleeps too.
+#[test]
+fn sleeping_core_systick_counts_while_the_other_core_runs() {
+    let (n, expect) = systick_calls(true, 99, Time::from_ms(10));
+    let (asleep, _) = systick_calls(false, 99, Time::from_ms(10));
+    assert!(n.abs_diff(expect) <= 1, "{n} SysTick calls on core 1, expected {expect}");
+    assert!(n.abs_diff(asleep) <= 1, "{n} vs {asleep} with core 0 asleep");
+}
