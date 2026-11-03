@@ -68,6 +68,19 @@ pub enum Fault {
     InvalidReturn(u32),
 }
 
+impl Fault {
+    /// The address of the instruction that faults, for a fault raised by the instruction at `pc`: that one, except
+    /// for an interworking branch to an address with bit 0 clear, which completes (with EPSR.T clear) and faults on
+    /// the instruction at its target (ARMv6-M ARM `BXWritePC` sets EPSR.T from bit 0 and branches; the fault is
+    /// then the next instruction's, whose address is the stacked return address).
+    pub fn faulting_pc(self, pc: u32) -> u32 {
+        match self {
+            Fault::InvalidState(target) => target & !1,
+            _ => pc,
+        }
+    }
+}
+
 impl From<BusFault> for Fault {
     fn from(f: BusFault) -> Fault {
         Fault::Bus(f)
@@ -714,7 +727,7 @@ impl CortexM0Plus {
                         return Batch { steps: steps + 1, cycles, stop };
                     }
                     f => {
-                        self.r[15] = pc;
+                        self.r[15] = f.faulting_pc(pc);
                         self.cycles += cycles;
                         self.instructions += steps as u64 - 1;
                         match self.take_fault(bus, f) {
@@ -892,7 +905,7 @@ impl CortexM0Plus {
                 StepOutcome::Breakpoint(imm)
             }
             Err(f) => {
-                self.r[15] = pc;
+                self.r[15] = f.faulting_pc(pc);
                 self.take_fault(bus, f)
             }
         }

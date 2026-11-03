@@ -1549,3 +1549,47 @@ fn wfe_does_not_wake_on_an_interrupt_masked_by_primask() {
     rig.run(1);
     assert_eq!(rig.cpu.ipsr(), 16);
 }
+
+#[test]
+fn branch_to_an_even_address_faults_at_the_target() {
+    // BX/BLX/POP {pc} to an address with bit 0 clear complete (LR, SP, registers written) and the HardFault is taken
+    // for the instruction at the target: the stacked return address is the target
+    let target = HANDLER + 0x200;
+    let check = |rig: &mut Rig, lr: u32| {
+        assert_eq!(rig.cpu.ipsr(), exception::HARD_FAULT);
+        assert_eq!(rig.cpu.last_fault.unwrap(), crate::FaultRecord { pc: target, fault: Fault::InvalidState(target) });
+        let sp = rig.r(13);
+        assert_eq!(rig.bus.word(sp + 24), target, "stacked PC");
+        assert_eq!(rig.bus.word(sp + 20), lr, "stacked LR");
+    };
+    for blocks in [None, Some(false), Some(true)] {
+        let mut rig = Rig::new(&[NOP, blx(1)]);
+        rig.cpu.r[1] = target;
+        rig.cpu.r[14] = 0x1234_5679;
+        match blocks {
+            None => {
+                rig.run(2);
+            }
+            Some(b) => {
+                batch_on(&mut rig, b, 10, 1000);
+            }
+        }
+        check(&mut rig, (CODE + 4) | 1);
+
+        let mut rig = Rig::new(&[NOP, pop(0b1, true)]);
+        rig.cpu.r[13] = STACK_TOP - 8;
+        rig.bus.set_word(STACK_TOP - 8, 7);
+        rig.bus.set_word(STACK_TOP - 4, target);
+        match blocks {
+            None => {
+                rig.run(2);
+            }
+            Some(b) => {
+                batch_on(&mut rig, b, 10, 1000);
+            }
+        }
+        check(&mut rig, 0xFFFF_FFFF);
+        assert_eq!(rig.r(0), 7, "the POP completed");
+        assert_eq!(rig.r(13), (STACK_TOP - 32) & !7, "frame pushed below the popped SP");
+    }
+}
