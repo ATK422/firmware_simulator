@@ -258,11 +258,6 @@ impl HostController {
         std::mem::take(&mut self.reports)
     }
 
-    /// The messages not yet taken (without taking them).
-    pub fn reports_debug(&self) -> &[(Time, String)] {
-        &self.reports
-    }
-
     fn report(&mut self, now: Time, msg: String) {
         log::debug!("[{now}] usb host: {msg}");
         if self.reports.len() < 10_000 {
