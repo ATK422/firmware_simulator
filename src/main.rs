@@ -920,7 +920,15 @@ fn run(args: RunArgs) -> Result<()> {
         None => None,
     };
     if args.profile.is_some() {
-        session.start_profile(args.profile_interval);
+        match &to_load {
+            // The machine's image is the one it booted (or none, with --bootsel); name what was flashed
+            Some(img) => {
+                let m = &session.machine;
+                let p = sim_host::profile::Profiler::for_image(img, &m.sys.rom, args.profile_interval, m.now);
+                session.profiler = Some(p);
+            }
+            None => session.start_profile(args.profile_interval),
+        }
     }
     let mut dash = match &args.dashboard {
         Some(addr) => {
