@@ -109,6 +109,43 @@ struct RobotArgs {
     faults: Vec<(Time, String, sim_host::fault::Fault)>,
     #[command(flatten)]
     can_host: host_tools::CanHostArgs,
+    /// Trace categories to print for the boards (comma separated), each line prefixed with the board's name.
+    #[arg(long, value_delimiter = ',')]
+    trace: Vec<TraceKind>,
+    /// Only trace these boards (comma separated names; all by default).
+    #[arg(long, value_delimiter = ',')]
+    trace_board: Vec<String>,
+    /// Write the trace to this file instead of stderr.
+    #[arg(long)]
+    trace_file: Option<PathBuf>,
+    /// Profile every board's firmware: write `DIR/BOARD.txt` (functions by time, per core) and `DIR/BOARD.folded`
+    /// (folded stacks for flamegraph tools).
+    #[arg(long)]
+    profile_dir: Option<PathBuf>,
+    /// Mean virtual time between profile samples.
+    #[arg(long, default_value = "10us", value_parser = parse_time)]
+    profile_interval: Time,
+    /// Write a waveform (VCD, for GTKWave, Surfer or PulseView) of the GPIOs to this file.
+    #[arg(long)]
+    vcd: Option<PathBuf>,
+    /// GPIOs in the waveform: numbers, ranges and names from the board file's `[pins]` table, e.g.
+    /// `0-7,25,status_ledr` (default all).
+    #[arg(long, default_value = "all")]
+    vcd_pins: String,
+    /// Add decoded events to the waveform as string variables: defmt logs, UART lines, CAN frames, device reports
+    /// (GTKWave and Surfer show them; PulseView reads only the pins).
+    #[arg(long)]
+    vcd_events: bool,
+    /// Serve a live dashboard on this address (e.g. `127.0.0.1:8080`): logs, firmware status, CAN traffic, pins,
+    /// inputs, vehicles, and controls to inject faults, set inputs and pause.
+    #[arg(long)]
+    dashboard: Option<String>,
+    /// Keep serving the dashboard after the run ends (until interrupted).
+    #[arg(long, requires = "dashboard")]
+    dashboard_hold: bool,
+    /// Write every log line, UART line, CAN frame and fault as one JSON object per line to this file, for tools.
+    #[arg(long)]
+    log_json: Option<PathBuf>,
 }
 
 fn parse_board_udp(s: &str) -> Result<(String, String, String), String> {
@@ -164,12 +201,14 @@ fn robot(args: RobotArgs) -> Result<()> {
         s.on_uart_line = Some(Box::new(move |t, u, line| println!("[{t}] {name} uart{u}: {line}")));
     }
     let mut bridges: Vec<Option<sim_host::mock_bridge::MockBridge>> = vec![None; r.buses.len()];
+    let mut all_bridges = Vec::new();
     for (bus, client) in &args.mock_bridges {
         let j = r.bus_names.iter().position(|n| n == bus).with_context(|| format!("no bus {bus:?}"))?;
         let rb = &mut r.buses[j];
         let b = sim_host::mock_bridge::MockBridge::new(*client, rb.bus.rates.data.is_some(), Time::ZERO);
         b.set_kill(Some(false));
         rb.endpoints.push(Box::new(b.clone()));
+        all_bridges.push((j, *client, b.clone()));
         bridges[j].get_or_insert(b);
         log::info!("mock bridge for client {client} on {bus}");
     }
@@ -194,12 +233,15 @@ fn robot(args: RobotArgs) -> Result<()> {
     if let Some(db) = args.noise_db {
         r.set_noise_db(db);
     }
+    let mut eth_bridges = Vec::new();
     for name in &args.eth_mock_bridges {
-        let s = r.board(name).with_context(|| format!("no board {name:?}"))?;
+        let i = r.index(name).with_context(|| format!("no board {name:?}"))?;
+        let s = &mut r.boards[i];
         anyhow::ensure!(s.machine.sys.ethernet.is_some(), "{name} has no Ethernet");
         let bridge = sim_host::ethernet::PuddlesBridge::new(Time::ZERO);
         bridge.set_kill(Some(false));
-        s.eth_endpoints.push(Box::new(bridge));
+        s.eth_endpoints.push(Box::new(bridge.clone()));
+        eth_bridges.push((i, bridge));
         log::info!("mock bridge attached to {name} over Ethernet");
     }
     for (name, local, peer) in &args.udps {
@@ -218,26 +260,162 @@ fn robot(args: RobotArgs) -> Result<()> {
     let can_host = host_tools::attach_robot(&args.can_host, &mut r, &args.cans)?;
     r.realtime = args.realtime;
     r.threads = args.threads;
+    if !args.trace.is_empty() {
+        for b in &args.trace_board {
+            anyhow::ensure!(r.index(b).is_some(), "--trace-board: no board {b:?}");
+        }
+        let out = SharedWriter::open(args.trace_file.as_deref())?;
+        let categories = trace_categories(&args.trace);
+        for (s, name) in r.boards.iter_mut().zip(&r.names) {
+            if args.trace_board.is_empty() || args.trace_board.contains(name) {
+                let sink = WriterSink { categories: categories.clone(), out: out.clone(), prefix: format!("{name}: ") };
+                let old = std::mem::replace(&mut s.machine.trace, Box::new(sim_core::trace::NullSink));
+                s.machine.set_trace(sim_core::trace::MultiSink::combine(old, Box::new(sink)));
+            }
+        }
+    }
+    let vcd = match &args.vcd {
+        Some(path) => {
+            let mut scopes = Vec::new();
+            for (i, name) in r.names.iter().enumerate() {
+                let pins = sim_host::vcd::parse_pins(&args.vcd_pins, &r.pins[i])
+                    .map_err(|e| anyhow::anyhow!("{name}: {e}"))?;
+                let opts = sim_host::vcd::VcdOptions { pins, events: args.vcd_events };
+                scopes.push(sim_host::vcd::Scope::board(name, &r.pins[i], &opts));
+            }
+            if args.vcd_events {
+                scopes.extend(r.bus_names.iter().map(|b| sim_host::vcd::Scope::bus(b)));
+            }
+            let vcd =
+                sim_host::vcd::Vcd::create(path, &scopes).with_context(|| format!("creating {}", path.display()))?;
+            for (i, s) in r.boards.iter_mut().enumerate() {
+                vcd.attach(i, s);
+            }
+            if args.vcd_events {
+                let n = r.boards.len();
+                for (j, rb) in r.buses.iter_mut().enumerate() {
+                    vcd.attach_bus(n + j, rb);
+                }
+            }
+            Some(vcd)
+        }
+        None => None,
+    };
+    if let Some(dir) = &args.profile_dir {
+        std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
+        for s in r.boards.iter_mut() {
+            s.start_profile(args.profile_interval);
+        }
+    }
+    let mut dash = match &args.dashboard {
+        Some(addr) => {
+            let infos = (0..r.boards.len())
+                .map(|i| sim_host::dashboard::BoardInfo {
+                    name: r.names[i].clone(),
+                    image: r.images[i].clone(),
+                    inputs: r.inputs[i].clone(),
+                    pins: r.pins[i].clone(),
+                    fault_names: Vec::new(),
+                })
+                .collect();
+            let mut d = sim_host::dashboard::Dashboard::start(addr, infos, r.bus_names.clone())
+                .with_context(|| format!("binding {addr}"))?;
+            for (i, s) in r.boards.iter_mut().enumerate() {
+                d.tap_session(i, s);
+            }
+            for (j, rb) in r.buses.iter_mut().enumerate() {
+                d.tap_bus(j, rb);
+            }
+            for (bus, client) in &args.mock_bridges {
+                let j = r.bus_names.iter().position(|n| n == bus).unwrap();
+                let board =
+                    (0..r.boards.len()).find(|&i| r.board_bus[i] == Some(j) && r.client_ids[i] == Some(*client));
+                if let Some(b) = all_bridges.iter().find(|(jj, c, _)| *jj == j && c == client).map(|x| x.2.clone()) {
+                    d.add_link(board, Some(j), sim_host::dashboard::Link::Can(b));
+                }
+            }
+            for (i, b) in &eth_bridges {
+                d.add_link(Some(*i), None, sim_host::dashboard::Link::Eth(b.clone()));
+            }
+            eprintln!("dashboard on http://{}/", d.addr);
+            Some(d)
+        }
+        None => None,
+    };
+    let json_log = match &args.log_json {
+        Some(path) => {
+            let log =
+                sim_host::jsonlog::JsonLog::create(path).with_context(|| format!("creating {}", path.display()))?;
+            for (s, name) in r.boards.iter_mut().zip(&r.names) {
+                log.tap_session(name, None, s);
+            }
+            for (rb, name) in r.buses.iter_mut().zip(&r.bus_names) {
+                log.tap_bus(name, rb);
+            }
+            Some(log)
+        }
+        None => None,
+    };
     let wall = std::time::Instant::now();
     let mut faults = faults.into_iter().peekable();
+    let mut pending: Option<(Time, usize, sim_host::fault::Fault)> = None;
     let stopped = loop {
-        let next = faults.next_if(|f| f.0 <= args.time);
-        let until = next.as_ref().map_or(args.time, |f| f.0);
-        if let Some(s) = r.run_until(until) {
+        if pending.is_none() {
+            pending = faults.next_if(|f| f.0 <= args.time);
+        }
+        let target = pending.as_ref().map_or(args.time, |f| f.0);
+        let until = if dash.is_some() { target.min(r.now + DASHBOARD_PIECE) } else { target };
+        let stopped = r.run_until(until);
+        if let Some(d) = &mut dash {
+            d.service_robot(&mut r, &bridges);
+            while d.paused() {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+                d.service_robot(&mut r, &bridges);
+            }
+        }
+        if let Some(s) = stopped {
             break Some(s);
         }
-        let Some((_, i, fault)) = next else { break None };
+        if until < target {
+            continue;
+        }
+        let Some((_, i, fault)) = pending.take() else { break None };
         let bridge = r.board_bus[i].and_then(|j| bridges[j].clone());
         let ctl = bridge.as_ref().map(|b| b as &dyn sim_host::fault::BridgeControl);
-        if let Err(e) = sim_host::fault::robot_target(&mut r, i, ctl).apply(&fault) {
+        let applied = sim_host::fault::robot_target(&mut r, i, ctl).apply(&fault);
+        if let Some(d) = &mut dash {
+            let name = r.names[i].clone();
+            d.note_fault(r.now, &name, &format!("{fault:?}"), &applied);
+        }
+        if let Some(l) = &json_log {
+            l.fault(r.now, &r.names[i], &format!("{fault:?}"), &applied);
+        }
+        if let Err(e) = applied {
             bail!("fault {fault:?} on {}: {e}", r.names[i]);
         }
     };
+    if let Some(d) = &mut dash {
+        let why = match &stopped {
+            Some((i, why)) => format!("{} stopped: {why:?}", r.names[*i]),
+            None => "TimeLimit".into(),
+        };
+        d.finish_robot(&mut r, &why);
+    }
     for s in r.boards.iter_mut() {
         s.flush_uarts();
     }
     can_host.finish()?;
     eprintln!("stopped at {}; {:.2?} wall", r.now, wall.elapsed());
+    if let (Some(v), Some(path)) = (&vcd, &args.vcd) {
+        finish_vcd(v, path, r.now)?;
+    }
+    if let (Some(l), Some(path)) = (&json_log, &args.log_json) {
+        let why = match &stopped {
+            Some((i, why)) => format!("{} stopped: {why:?}", r.names[*i]),
+            None => "TimeLimit".into(),
+        };
+        l.finish(r.now, &why).with_context(|| format!("writing {}", path.display()))?;
+    }
     for v in &r.vehicles {
         let s = &v.vehicle.state;
         let [roll, pitch, yaw] = s.attitude.euler().map(f64::to_degrees);
@@ -249,6 +427,14 @@ fn robot(args: RobotArgs) -> Result<()> {
             s.position[2],
             sim_physics::math::norm(s.velocity)
         );
+    }
+    if let Some(dir) = &args.profile_dir {
+        for (s, name) in r.boards.iter().zip(&r.names) {
+            let Some(p) = &s.profiler else { continue };
+            let path = dir.join(format!("{name}.txt"));
+            let folded = p.report().write(&path, name).with_context(|| format!("writing {}", path.display()))?;
+            eprintln!("profile of {name}: {} and {}", path.display(), folded.display());
+        }
     }
     if let Some(path) = &args.vehicle_csv {
         let several = r.vehicles.len() > 1;
@@ -262,6 +448,12 @@ fn robot(args: RobotArgs) -> Result<()> {
             let csv = v.log.as_ref().map(|l| l.to_csv()).unwrap_or_default();
             std::fs::write(&p, csv).with_context(|| format!("writing {}", p.display()))?;
         }
+    }
+    if let Some(d) = &mut dash
+        && args.dashboard_hold
+    {
+        eprintln!("run finished; the dashboard keeps serving on http://{}/ (Ctrl-C to quit)", d.addr);
+        d.hold();
     }
     if let Some((i, why)) = stopped {
         bail!("{} stopped: {why:?}", r.names[i]);
@@ -281,6 +473,44 @@ enum TraceKind {
     Unmodelled,
     /// Device messages (CAN frames, UART bytes, ...).
     Device,
+}
+
+fn trace_categories(kinds: &[TraceKind]) -> Vec<Category> {
+    kinds
+        .iter()
+        .map(|t| match t {
+            TraceKind::Instr => Category::Instruction,
+            TraceKind::Exc => Category::Exception,
+            TraceKind::Gpio => Category::Gpio,
+            TraceKind::Unmodelled => Category::Unmodelled,
+            TraceKind::Device => Category::Device,
+        })
+        .collect()
+}
+
+/// A trace output several boards' sinks write to: a file (buffered) or stderr.
+#[derive(Clone)]
+struct SharedWriter(std::sync::Arc<std::sync::Mutex<Box<dyn std::io::Write + Send>>>);
+
+impl SharedWriter {
+    fn open(path: Option<&std::path::Path>) -> Result<SharedWriter> {
+        let out: Box<dyn std::io::Write + Send> = match path {
+            Some(p) => Box::new(std::io::BufWriter::new(
+                std::fs::File::create(p).with_context(|| format!("creating {}", p.display()))?,
+            )),
+            None => Box::new(std::io::stderr()),
+        };
+        Ok(SharedWriter(std::sync::Arc::new(std::sync::Mutex::new(out))))
+    }
+}
+
+impl std::io::Write for SharedWriter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap().write(buf)
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.0.lock().unwrap().flush()
+    }
 }
 
 #[derive(Clone, Copy, ValueEnum, PartialEq, Eq)]
@@ -415,6 +645,34 @@ struct RunArgs {
     faults: Vec<(Time, sim_host::fault::Fault)>,
     #[command(flatten)]
     can_host: host_tools::CanHostArgs,
+    /// Profile the firmware: write the functions by time (per core) to FILE and folded stacks for flamegraph tools
+    /// next to it (FILE with the extension `.folded`).
+    #[arg(long)]
+    profile: Option<PathBuf>,
+    /// Mean virtual time between profile samples.
+    #[arg(long, default_value = "10us", value_parser = parse_time)]
+    profile_interval: Time,
+    /// Write a waveform (VCD, for GTKWave, Surfer or PulseView) of the GPIOs to this file.
+    #[arg(long)]
+    vcd: Option<PathBuf>,
+    /// GPIOs in the waveform: numbers, ranges and names from the board file's `[pins]` table, e.g.
+    /// `0-7,25,status_ledr` (default all).
+    #[arg(long, default_value = "all")]
+    vcd_pins: String,
+    /// Add decoded events to the waveform as string variables: defmt logs, UART lines, CAN frames, device reports
+    /// (GTKWave and Surfer show them; PulseView reads only the pins).
+    #[arg(long)]
+    vcd_events: bool,
+    /// Serve a live dashboard on this address (e.g. `127.0.0.1:8080`): logs, firmware status, CAN traffic, pins,
+    /// inputs, vehicles, and controls to inject faults, set inputs and pause.
+    #[arg(long)]
+    dashboard: Option<String>,
+    /// Keep serving the dashboard after the run ends (until interrupted).
+    #[arg(long, requires = "dashboard")]
+    dashboard_hold: bool,
+    /// Write every log line, UART line, CAN frame and fault as one JSON object per line to this file, for tools.
+    #[arg(long)]
+    log_json: Option<PathBuf>,
 }
 
 fn parse_input(s: &str) -> Result<(String, f64), String> {
@@ -484,17 +742,7 @@ fn run(args: RunArgs) -> Result<()> {
     if args.stop_on_bkpt {
         machine.bkpt_policy = BkptPolicy::Stop;
     }
-    let categories: Vec<Category> = args
-        .trace
-        .iter()
-        .map(|t| match t {
-            TraceKind::Instr => Category::Instruction,
-            TraceKind::Exc => Category::Exception,
-            TraceKind::Gpio => Category::Gpio,
-            TraceKind::Unmodelled => Category::Unmodelled,
-            TraceKind::Device => Category::Device,
-        })
-        .collect();
+    let categories = trace_categories(&args.trace);
     if !categories.is_empty() {
         let out: Box<dyn std::io::Write + Send> = match &args.trace_file {
             Some(p) => Box::new(std::io::BufWriter::new(
@@ -505,8 +753,10 @@ fn run(args: RunArgs) -> Result<()> {
         machine.set_trace(Box::new(WriterSink { categories, out, prefix: String::new() }));
     }
 
+    let mut board_inputs = sim_host::board::Inputs::default();
     if let Some(b) = &board {
         let inputs = b.apply(&mut machine).map_err(anyhow::Error::msg)?;
+        board_inputs = inputs.clone();
         log::info!(
             "board {} ({} SPI, {} I2C device(s); inputs: {})",
             b.name,
@@ -594,6 +844,7 @@ fn run(args: RunArgs) -> Result<()> {
     }
 
     let mut bridge_ctl: Option<Box<dyn sim_host::fault::BridgeControl>> = None;
+    let mut link: Option<sim_host::dashboard::Link> = None;
     if let Some(rates) = board.as_ref().and_then(|b| b.can_rates()) {
         let mut bus = sim_devices::can::CanBus::new(args.can.as_deref().unwrap_or("can"), rates);
         if args.candump {
@@ -610,6 +861,7 @@ fn run(args: RunArgs) -> Result<()> {
             let bridge = sim_host::mock_bridge::MockBridge::new(client, rates.data.is_some(), sim_core::Time::ZERO);
             bridge.set_kill(Some(false));
             session.can_endpoints.push(Box::new(bridge.clone()));
+            link = Some(sim_host::dashboard::Link::Can(bridge.clone()));
             bridge_ctl = Some(Box::new(bridge));
             log::info!("mock bridge for client {client} attached");
         }
@@ -618,6 +870,7 @@ fn run(args: RunArgs) -> Result<()> {
             let bridge = sim_host::ethernet::PuddlesBridge::new(Time::ZERO);
             bridge.set_kill(Some(false));
             session.eth_endpoints.push(Box::new(bridge.clone()));
+            link = Some(sim_host::dashboard::Link::Eth(bridge.clone()));
             bridge_ctl = Some(Box::new(bridge));
             log::info!("mock bridge attached over Ethernet (UDP {})", sim_host::ethernet::LINK_PORT);
         }
@@ -648,23 +901,91 @@ fn run(args: RunArgs) -> Result<()> {
             .with_context(|| format!("loading {}", path.display()))?;
     }
     let end = if to_load.is_some() { session.machine.now + args.time } else { args.time };
+    let vcd = match &args.vcd {
+        Some(path) => {
+            let named = board.as_ref().map(|b| b.pins.clone()).unwrap_or_default();
+            let pins = sim_host::vcd::parse_pins(&args.vcd_pins, &named).map_err(anyhow::Error::msg)?;
+            let opts = sim_host::vcd::VcdOptions { pins, events: args.vcd_events };
+            let name = board.as_ref().map_or("board", |b| b.name.as_str());
+            let scope = sim_host::vcd::Scope::board(name, &named, &opts);
+            let vcd =
+                sim_host::vcd::Vcd::create(path, &[scope]).with_context(|| format!("creating {}", path.display()))?;
+            vcd.attach(0, &mut session);
+            Some(vcd)
+        }
+        None => None,
+    };
+    if args.profile.is_some() {
+        session.start_profile(args.profile_interval);
+    }
+    let mut dash = match &args.dashboard {
+        Some(addr) => {
+            let image = args.image.as_ref().or(args.picoboot_load.as_ref()).and_then(|p| p.file_name());
+            let image = image.map_or("firmware".into(), |t| t.to_string_lossy().into_owned());
+            let info = sim_host::dashboard::BoardInfo {
+                name: board.as_ref().map_or_else(|| image.clone(), |b| b.name.clone()),
+                image,
+                inputs: board_inputs.clone(),
+                pins: board.as_ref().map(|b| b.pins.clone()).unwrap_or_default(),
+                fault_names: Vec::new(),
+            };
+            let buses = session.can_bus.as_ref().map(|b| vec![b.name.clone()]).unwrap_or_default();
+            let mut d = sim_host::dashboard::Dashboard::start(addr, vec![info], buses)
+                .with_context(|| format!("binding {addr}"))?;
+            d.tap_session(0, &mut session);
+            if let Some(l) = link.take() {
+                d.add_link(Some(0), None, l);
+            }
+            eprintln!("dashboard on http://{}/", d.addr);
+            Some(d)
+        }
+        None => None,
+    };
+    let json_log = match &args.log_json {
+        Some(path) => {
+            let log =
+                sim_host::jsonlog::JsonLog::create(path).with_context(|| format!("creating {}", path.display()))?;
+            let name = board.as_ref().map_or("board", |b| b.name.as_str());
+            let bus = session.can_bus.as_ref().map(|b| b.name.clone());
+            log.tap_session(name, bus.as_deref(), &mut session);
+            Some(log)
+        }
+        None => None,
+    };
     let mut faults = args.faults.clone();
     faults.sort_by_key(|f| f.0);
     let mut faults = faults.into_iter().peekable();
+    let mut pending: Option<(Time, sim_host::fault::Fault)> = None;
     let reason = loop {
-        let next = faults.next_if(|f| f.0 <= end);
-        let reason = session.run_until(next.as_ref().map_or(end, |f| f.0));
-        let Some((_, fault)) = next.filter(|_| matches!(reason, StopReason::TimeLimit)) else { break reason };
-        let n = session.machine.can_nodes().len();
-        let mut bus = session.can_bus.take();
-        let target = sim_host::fault::FaultTarget {
-            session: &mut session,
-            bus: bus.as_mut().map(|b| (b, 0..n)),
-            bridge: bridge_ctl.as_deref(),
-            power: None,
-        };
-        let applied = target.apply(&fault);
-        session.can_bus = bus;
+        if pending.is_none() {
+            pending = faults.next_if(|f| f.0 <= end);
+        }
+        let target = pending.as_ref().map_or(end, |f| f.0);
+        // With a dashboard, run in short pieces so what it shows and what it is asked to do stay current
+        let until = if dash.is_some() { target.min(session.machine.now + DASHBOARD_PIECE) } else { target };
+        let reason = session.run_until(until);
+        if let Some(d) = &mut dash {
+            d.service_session(&mut session);
+            while d.paused() {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+                d.service_session(&mut session);
+            }
+        }
+        if !matches!(reason, StopReason::TimeLimit) {
+            break reason;
+        }
+        if until < target {
+            continue;
+        }
+        let Some((_, fault)) = pending.take() else { break reason };
+        let applied = sim_host::fault::apply_to_session(&mut session, bridge_ctl.as_deref(), &fault);
+        if let Some(d) = &mut dash {
+            d.note_fault(session.machine.now, "", &format!("{fault:?}"), &applied);
+        }
+        if let Some(l) = &json_log {
+            let name = board.as_ref().map_or("board", |b| b.name.as_str());
+            l.fault(session.machine.now, name, &format!("{fault:?}"), &applied);
+        }
         if let Err(e) = applied {
             bail!("fault {fault:?}: {e}");
         }
@@ -678,6 +999,18 @@ fn run(args: RunArgs) -> Result<()> {
     if let Some(f) = &args.flash_file {
         session.machine.save_flash_file(f).with_context(|| format!("writing {}", f.display()))?;
     }
+    if let (Some(v), Some(path)) = (&vcd, &args.vcd) {
+        finish_vcd(v, path, session.machine.now)?;
+    }
+    if let (Some(l), Some(path)) = (&json_log, &args.log_json) {
+        l.finish(session.machine.now, &format!("{reason:?}")).with_context(|| format!("writing {}", path.display()))?;
+    }
+    if let (Some(path), Some(p)) = (&args.profile, &session.profiler) {
+        let title = args.image.as_ref().or(args.picoboot_load.as_ref()).and_then(|p| p.file_name());
+        let title = title.map_or("firmware".into(), |t| t.to_string_lossy().into_owned());
+        let folded = p.report().write(path, &title).with_context(|| format!("writing {}", path.display()))?;
+        eprintln!("profile: {} and {}", path.display(), folded.display());
+    }
     if let Some(path) = &args.screenshot {
         match session.machine.sys.i2c_device::<sim_devices::ssd1306::Ssd1306>() {
             Some(oled) => {
@@ -689,7 +1022,12 @@ fn run(args: RunArgs) -> Result<()> {
     }
     let machine = &mut session.machine;
     let where_ = |pc: u32| match machine.symbolize(pc) {
-        Some(s) => format!("{pc:#010x} <{s}>"),
+        Some(s) => {
+            // `name+0x12`: demangle the name part
+            let (name, off) = s.rsplit_once('+').filter(|(_, o)| o.starts_with("0x")).unwrap_or((&s, ""));
+            let off = if off.is_empty() { String::new() } else { format!("+{off}") };
+            format!("{pc:#010x} <{}{off}>", sim_host::demangle::demangle(name))
+        }
         None => format!("{pc:#010x}"),
     };
     match reason {
@@ -727,9 +1065,28 @@ fn run(args: RunArgs) -> Result<()> {
             eprintln!("  {name:32} {reads:>8} reads {writes:>8} writes");
         }
     }
+    if let Some(d) = &mut dash {
+        d.finish_session(&mut session, &format!("{reason:?}"));
+        if args.dashboard_hold {
+            eprintln!("run finished; the dashboard keeps serving on http://{}/ (Ctrl-C to quit)", d.addr);
+            d.hold();
+        }
+    }
     if matches!(reason, StopReason::Lockup { .. }) {
         bail!("core locked up");
     }
+    Ok(())
+}
+
+/// Virtual time run between dashboard updates.
+const DASHBOARD_PIECE: Time = Time::from_ms(10);
+
+fn finish_vcd(v: &sim_host::vcd::Vcd, path: &std::path::Path, end: Time) -> Result<()> {
+    let late = v.finish(end).with_context(|| format!("writing {}", path.display()))?;
+    if late > 0 {
+        log::warn!("{late} waveform changes arrived more than 50 ms after their time; they are shown late");
+    }
+    eprintln!("waveform: {}", path.display());
     Ok(())
 }
 

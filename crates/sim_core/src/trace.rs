@@ -174,6 +174,51 @@ impl<W: std::io::Write + Send> TraceSink for WriterSink<W> {
     }
 }
 
+/// Passes each event to every sink that wants its category (a printed trace and a waveform file at once).
+#[derive(Default)]
+pub struct MultiSink {
+    pub sinks: Vec<Box<dyn TraceSink>>,
+}
+
+impl MultiSink {
+    pub fn new(sinks: Vec<Box<dyn TraceSink>>) -> Self {
+        MultiSink { sinks }
+    }
+
+    /// `sink` combined with `extra`, unless `sink` wants nothing (then `extra` alone).
+    pub fn combine(sink: Box<dyn TraceSink>, extra: Box<dyn TraceSink>) -> Box<dyn TraceSink> {
+        const ALL: [Category; 6] = [
+            Category::Instruction,
+            Category::Exception,
+            Category::Gpio,
+            Category::Peripheral,
+            Category::Unmodelled,
+            Category::Device,
+        ];
+        if ALL.iter().any(|&c| sink.wants(c)) { Box::new(MultiSink::new(vec![sink, extra])) } else { extra }
+    }
+}
+
+impl TraceSink for MultiSink {
+    fn wants(&self, category: Category) -> bool {
+        self.sinks.iter().any(|s| s.wants(category))
+    }
+    fn event(&mut self, time: Time, event: TraceEvent) {
+        let c = event.category();
+        let n = self.sinks.iter().filter(|s| s.wants(c)).count();
+        let mut seen = 0;
+        let mut event = Some(event);
+        for s in &mut self.sinks {
+            if s.wants(c) {
+                seen += 1;
+                // The last interested sink gets the event itself, the others a copy
+                let ev = if seen == n { event.take().unwrap() } else { event.clone().unwrap() };
+                s.event(time, ev);
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -188,5 +233,20 @@ mod tests {
         let ev = sink.take();
         assert_eq!(ev.len(), 1);
         assert_eq!(ev[0].1.to_string(), "GPIO25 = 1");
+    }
+
+    #[test]
+    fn multi_sink_fans_out_by_category() {
+        let gpio = VecSink::new(&[Category::Gpio]);
+        let both = VecSink::new(&[Category::Gpio, Category::Device]);
+        let mut m = MultiSink::new(vec![Box::new(gpio.clone()), Box::new(both.clone())]);
+        assert!(m.wants(Category::Device) && m.wants(Category::Gpio) && !m.wants(Category::Instruction));
+        m.event(Time(1), TraceEvent::Gpio { pin: 1, level: true });
+        m.event(Time(2), TraceEvent::Device { source: "x".into(), message: "y".into() });
+        assert_eq!(gpio.take().len(), 1);
+        assert_eq!(both.take().len(), 2);
+        // Combining with a sink that wants nothing keeps just the other
+        let c = MultiSink::combine(Box::new(NullSink), Box::new(gpio.clone()));
+        assert!(c.wants(Category::Gpio) && !c.wants(Category::Device));
     }
 }

@@ -1,7 +1,7 @@
 # Rebuilds the hand-written test programs. The ELFs are committed so the tests do not need an ARM toolchain.
 AS = arm-none-eabi-as
 LD = arm-none-eabi-ld
-PROGRAMS = blink watchdog sysreset embassy_blinky
+PROGRAMS = blink watchdog sysreset profile embassy_blinky
 
 all: $(PROGRAMS:=.elf)
 

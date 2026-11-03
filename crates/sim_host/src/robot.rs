@@ -66,6 +66,12 @@ pub struct Robot {
     pub names: Vec<String>,
     /// Each board's physical inputs (sensor values), from its board file.
     pub inputs: Vec<Inputs>,
+    /// Each board's named pins (its board file's `[pins]` table).
+    pub pins: Vec<std::collections::BTreeMap<String, u8>>,
+    /// Each board's CANmore client ID (its board file's `[can] client_id`).
+    pub client_ids: Vec<Option<u8>>,
+    /// Each board's firmware image file name.
+    pub images: Vec<String>,
     /// The bus each board is on.
     pub board_bus: Vec<Option<usize>>,
     pub buses: Vec<RobotBus>,
@@ -83,6 +89,8 @@ pub struct Robot {
     pub power_on: Vec<(Time, bool)>,
     /// Simulated vehicles moved by the boards' thrusters, stepped after every slice.
     pub vehicles: Vec<VehicleSim>,
+    /// Real-time pacing: the wall clock and virtual time it started from.
+    pacing: Option<(std::time::Instant, Time)>,
 }
 
 impl Default for Robot {
@@ -91,6 +99,9 @@ impl Default for Robot {
             boards: Vec::new(),
             names: Vec::new(),
             inputs: Vec::new(),
+            pins: Vec::new(),
+            client_ids: Vec::new(),
+            images: Vec::new(),
             board_bus: Vec::new(),
             buses: Vec::new(),
             bus_names: Vec::new(),
@@ -101,6 +112,7 @@ impl Default for Robot {
             realtime: false,
             power_on: Vec::new(),
             vehicles: Vec::new(),
+            pacing: None,
         }
     }
 }
@@ -119,6 +131,9 @@ impl Robot {
         self.boards.push(session);
         self.names.push(name.to_string());
         self.inputs.push(Inputs::default());
+        self.pins.push(Default::default());
+        self.client_ids.push(None);
+        self.images.push(String::new());
         self.board_bus.push(bus);
         self.power_on.push((Time::ZERO, true));
         self.boards.len() - 1
@@ -147,8 +162,6 @@ impl Robot {
 
     /// Runs every board until `end`. Returns the first board that stopped for another reason, with the reason.
     pub fn run_until(&mut self, end: Time) -> Option<(usize, StopReason)> {
-        let wall = std::time::Instant::now();
-        let start = self.now;
         // The sensors see a vehicle moved since the last run (a scenario putting it elsewhere) from the start
         for v in &self.vehicles {
             v.update_outputs();
@@ -170,7 +183,7 @@ impl Robot {
                         b.machine.power_on_at(*on_at);
                         *on = true;
                     }
-                    match b.machine.run_until(t) {
+                    match b.run_machine(t) {
                         StopReason::TimeLimit => {}
                         other => return Some((i, other)),
                     }
@@ -211,6 +224,8 @@ impl Robot {
                 v.advance(t, &self.boards);
             }
             if self.realtime {
+                // Paced from where pacing started, across calls, so runs in short pieces keep real time too
+                let (wall, start) = *self.pacing.get_or_insert((std::time::Instant::now(), self.now));
                 let ahead = (self.now - start).as_secs_f64() - wall.elapsed().as_secs_f64();
                 if ahead > 0.002 {
                     std::thread::sleep(std::time::Duration::from_secs_f64(ahead));
@@ -218,6 +233,11 @@ impl Robot {
             }
         }
         None
+    }
+
+    /// Starts real-time pacing afresh from now (after virtual time was held, e.g. paused from the dashboard).
+    pub fn reset_pacing(&mut self) {
+        self.pacing = None;
     }
 
     /// Puts board `i`'s transducer (projector and hydrophone) on `trajectory`, e.g. at another range between runs
@@ -289,6 +309,9 @@ impl Robot {
             boards,
             names: self.names.clone(),
             inputs,
+            pins: self.pins.clone(),
+            client_ids: self.client_ids.clone(),
+            images: self.images.clone(),
             board_bus: self.board_bus.clone(),
             buses: self
                 .buses
@@ -303,6 +326,7 @@ impl Robot {
             realtime: self.realtime,
             power_on: self.power_on.clone(),
             vehicles,
+            pacing: None,
         }
     }
 
@@ -408,6 +432,9 @@ impl Robot {
             let session = Session::new(m, &image);
             robot.add(&b.name, session, bus);
             robot.inputs[owner] = inputs;
+            robot.pins[owner] = board.pins.clone();
+            robot.client_ids[owner] = board.can.as_ref().and_then(|c| c.client_id);
+            robot.images[owner] = elf.file_name().map(|f| f.to_string_lossy().into_owned()).unwrap_or_default();
             if let Some(ms) = b.power_on_ms
                 && ms > 0.0
             {

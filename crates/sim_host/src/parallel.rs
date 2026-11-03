@@ -16,6 +16,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 use rp2040::{Machine, MachineConfig, StopReason};
 use sim_core::time::Time;
 
+use crate::profile::Profiler;
 use crate::session::Session;
 
 /// Threads to use for `threads` = 0: one per core.
@@ -24,13 +25,14 @@ fn default_threads() -> usize {
     *N.get_or_init(|| std::thread::available_parallelism().map_or(1, |n| n.get()))
 }
 
-/// What a worker hands back: the machine and why it stopped, or the panic it stopped with.
-type Done = (usize, std::thread::Result<(Machine, StopReason)>);
+/// What a worker hands back: the machine (and its profiler) and why it stopped, or the panic it stopped with.
+type Done = (usize, std::thread::Result<(Machine, Option<Profiler>, StopReason)>);
 
-/// A machine to run to a time, and where its result goes.
+/// A machine to run to a time (through its board's profiler, if it has one), and where its result goes.
 struct Job {
     index: usize,
     machine: Machine,
+    profiler: Option<Profiler>,
     until: Time,
     done: Sender<Done>,
 }
@@ -62,11 +64,15 @@ impl Pool {
                     loop {
                         let job = queue.lock().unwrap().recv();
                         let Ok(job) = job else { return };
-                        let Job { index, mut machine, until, done } = job;
+                        let Job { index, mut machine, mut profiler, until, done } = job;
                         // A panic goes back to the robot's thread (and the worker carries on)
                         let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
-                            let reason = machine.run_until(until);
-                            (machine, reason)
+                            // As `Session::run_machine` does
+                            let reason = match &mut profiler {
+                                None => machine.run_until(until),
+                                Some(p) => p.run_until(&mut machine, until),
+                            };
+                            (machine, profiler, reason)
                         }));
                         // The robot waits for every job it sent; it is gone only if it panicked
                         let _ = done.send((index, r));
@@ -94,7 +100,7 @@ fn placeholder() -> Machine {
 }
 
 /// Switches on the boards due by `t` (`power_on` holds when and whether each was), then runs every powered board's
-/// machine to `t` on up to `threads` threads (0: one per core). Returns the board with the lowest index that
+/// machine to `t` (through its profiler, if it has one) on up to `threads` threads (0: one per core). Returns the board with the lowest index that
 /// stopped for a reason other than reaching `t`; the others have still run to `t`.
 pub fn run_boards(
     boards: &mut [Session],
@@ -116,7 +122,7 @@ pub fn run_boards(
     let threads = if threads == 0 { default_threads() } else { threads }.min(powered.len());
     if threads <= 1 {
         for i in powered {
-            match boards[i].machine.run_until(t) {
+            match boards[i].run_machine(t) {
                 StopReason::TimeLimit => {}
                 other => return Some((i, other)),
             }
@@ -128,14 +134,16 @@ pub fn run_boards(
     let (done, results) = channel();
     for &i in &powered {
         let machine = std::mem::replace(&mut boards[i].machine, placeholder());
-        jobs.send(Job { index: i, machine, until: t, done: done.clone() }).expect("board workers are gone");
+        let profiler = boards[i].profiler.take();
+        jobs.send(Job { index: i, machine, profiler, until: t, done: done.clone() }).expect("board workers are gone");
     }
     drop(done);
     let mut stop: Option<(usize, StopReason)> = None;
     for _ in &powered {
         let (i, r) = results.recv().expect("board workers are gone");
-        let (machine, reason) = r.unwrap_or_else(|panic| std::panic::resume_unwind(panic));
+        let (machine, profiler, reason) = r.unwrap_or_else(|panic| std::panic::resume_unwind(panic));
         let spare = std::mem::replace(&mut boards[i].machine, machine);
+        boards[i].profiler = profiler;
         placeholders().lock().unwrap().push(spare);
         if reason != StopReason::TimeLimit && stop.is_none_or(|(j, _)| i < j) {
             stop = Some((i, reason));
@@ -159,7 +167,7 @@ mod tests {
         let (done, results) = channel();
         for index in 0..3 {
             let machine = placeholder();
-            jobs.send(Job { index, machine, until: Time::from_us(10), done: done.clone() }).unwrap();
+            jobs.send(Job { index, machine, profiler: None, until: Time::from_us(10), done: done.clone() }).unwrap();
         }
         let mut seen: Vec<usize> = (0..3).map(|_| results.recv().unwrap().0).collect();
         seen.sort();
