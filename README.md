@@ -173,6 +173,21 @@ programs skip unless `scripts/build_c_firmware.sh` has built them into `build/c`
 pico-sdk programs equivalent to pico-examples' `hello_uart`, `hello_multicore` and `flash/program`
 (`make -C test_programs pico` rebuilds them against titan_firmware's pico-sdk).
 
+## Performance
+
+`cargo run --release -p sim_test --example bench` runs the template, ESC and IVCBoard2 images on their boards and
+the Talos and IVC2 pool robots for 2 s of virtual time and prints wall and CPU time, virtual/wall, emulated MIPS and
+a fingerprint of everything the run produced (logs, bridge messages, CPU and SRAM state), which must not change
+when the emulator is made faster. What keeps it fast without changing results:
+
+* A core runs instructions in batches against memory directly; a batch ends only when the machine has something
+  to do (interrupt lines or clocks changed, a reset, `SEV`, sleep, the quantum or the next event).
+* A core polling the timer in a closed loop (a busy-wait) skips whole quanta until the timer ticks or something
+  else can happen; a PIO state machine polling its pins or FIFO level is skipped the same way.
+* Both cores asleep: time jumps to the next event.
+* `robot --threads N` (`Robot::threads`) runs a robot's boards on several threads within each slice, with the same
+  results; robots in an acoustic environment always run their boards in turn.
+
 ## Third-party data
 
 * `crates/rp2040/svd/rp2040.svd`: from the pico-sdk, BSD-3-Clause.
