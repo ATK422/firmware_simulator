@@ -462,7 +462,20 @@ fn auto_offset(a: &BTreeMap<&str, Vec<&Event>>, b: &BTreeMap<&str, Vec<&Event>>,
             best = (score + same, off, same);
         }
     }
-    best.1
+    // The candidate is a bin's mean; refine it to the median difference of the pairs it makes
+    let mut d = Vec::new();
+    for (name, ea) in a {
+        let Some(eb) = b.get(name) else { continue };
+        let ta: Vec<i64> = ea.iter().map(|e| e.t_ns).collect();
+        let tb: Vec<i64> = eb.iter().map(|e| e.t_ns - best.1).collect();
+        let (pairs, _, _) = pair(&ta, &tb, stream_tolerance(&ta, &tb, tol));
+        d.extend(pairs.iter().map(|(i, j)| tb[*j] - ta[*i]));
+    }
+    if d.is_empty() {
+        return best.1;
+    }
+    d.sort_unstable();
+    best.1 + d[d.len() / 2]
 }
 
 fn hash(s: &str) -> u64 {

@@ -205,7 +205,7 @@ fn hardware_style_recording() {
     let r = candiff::diff(&candiff::decode(&hw_log, false), &candiff::decode(&emu, false), &opts);
     eprintln!("{}", r.render(3));
     assert!(r.identical(), "{}", r.render(5));
-    assert!((r.offset_ns + EPOCH as i64).abs() < 200_000, "offset {}", r.offset_ns);
+    assert!((r.offset_ns + EPOCH as i64).abs() < 50_000, "offset {}", r.offset_ns);
     assert!(r.max_abs_skew_ns() < 400_000, "{}", r.max_abs_skew_ns());
     let hb = r.streams.iter().find(|s| s.name.ends_with("board->host Heartbeat")).unwrap();
     let jitter = hb.period_a.unwrap().std_ms;
