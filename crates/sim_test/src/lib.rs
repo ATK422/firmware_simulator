@@ -278,7 +278,7 @@ impl Bench {
         }
     }
 
-    /// Sets a physical input (`sht41.temperature_c`, `adc1.volts`, ...).
+    /// Sets a physical input (`sht41.temperature_c`, `port_battery`, `adc1`, ...: the names `Board::apply` returns).
     pub fn set(&self, input: &str, value: f64) {
         self.inputs.set(input, value);
     }
