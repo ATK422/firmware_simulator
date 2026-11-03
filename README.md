@@ -2,34 +2,31 @@
 
 [![CI](https://github.com/ATK422/firmware_simulator/actions/workflows/ci.yml/badge.svg)](https://github.com/ATK422/firmware_simulator/actions/workflows/ci.yml)
 
-An RP2040 emulator, written in Rust, that runs the **unmodified** firmware of OSU UWRT's underwater robot boards:
-[`titan_firmware`](external/titan_firmware) (C, pico-sdk) and [`titan_firmware_rs`](external/titan_firmware_rs)
-(Rust, embassy). One board or a whole robot (Talos, Puddles) runs in one process, its boards on shared CAN buses,
-with their sensors and actuators, the water between the acoustic modems and the vehicle the thrusters push. The
-robot computer's side is a scripted mock bridge, or the real `titan_bridge` over SocketCAN. Runs are
-**deterministic**, instruction for instruction, so firmware gets integration tests in CI, faults can be injected
-and replayed exactly, and whole-robot scenarios can be tried without a robot, a pool or a bench of boards.
+**Run our robot boards' firmware on a laptop, with no hardware.**
+
+Every UWRT board has an RP2040 chip. firmware_simulator pretends to be that chip, plus the parts around it: the
+CAN controller, sensors, ESCs and thrusters, and even the water between the acoustic modems. You give it the same
+firmware file you would flash onto a board ([`titan_firmware_rs`](external/titan_firmware_rs) in Rust or
+[`titan_firmware`](external/titan_firmware) in C), and it runs it unchanged.
+
+Use it to:
+
+* check that a firmware change boots and comes online on CAN before you flash a board;
+* run a whole robot (Talos, Puddles) at your desk, with a fake robot computer or the real `titan_bridge`;
+* write automated tests that run in CI on every push;
+* break things on purpose (pull a CAN cable, kill a sensor, brown out a rail) and see how the firmware reacts.
+
+Every run is repeatable: the same firmware and inputs give exactly the same result, every time.
 
 **Full guide: [docs/](docs/README.md)** · Design and milestones: [PLAN.md](PLAN.md)
 
-- [What it can do](#what-it-can-do)
 - [Quick start](#quick-start)
+- [What it can do](#what-it-can-do)
 - [Boards, firmware and robots](#boards-firmware-and-robots)
 - [Architecture](#architecture)
 - [Performance and determinism](#performance-and-determinism)
 - [Status and limitations](#status-and-limitations)
 - [Contributing](#contributing)
-
-## What it can do
-
-| Area | Highlights | Docs |
-|---|---|---|
-| **CPU and chip** | Two Cortex-M0+ cores (the whole ARMv6-M Thumb set, exceptions, NVIC, SysTick, M0+ cycle counts); the official B1 bootrom running for real; direct, ROM and BOOTSEL boot; QSPI flash behind XIP; DMA, SPI, I2C, UART, ADC, PWM, both PIO blocks (cycle exact), USB device mode, watchdog and resets as on the chip | [internals.md](docs/internals.md#peripherals-and-their-modelling-status), [running.md](docs/running.md#boot-modes-and-the-flash) |
-| **Boards and devices** | Board files generated from titan_firmware's board headers, plus hand-written overlays: MCP2517FD CAN FD, W5500 Ethernet, SHT41, MCP342x ADCs, MS5837 depth, SSD1306, BQ40Z80 gauge, DShot ESCs, Dynamixel and Hiwonder servos, WS2812, DRV8243; named physical inputs (`--input stbd_battery=15.1`) | [boards.md](docs/boards.md) |
-| **Robots and the water** | Robot files with several boards on CAN FD and classic buses, power-on offsets and ID straps; acoustic environments (pool, open water, harbour) with multipath, noise and Doppler between IVC boards; a 6-DOF vehicle the firmware's DShot frames move, with depth sensors and transducers following it | [robots.md](docs/robots.md), [acoustics.md](docs/acoustics.md), [vehicles.md](docs/vehicles.md) |
-| **Host integration** | Mock `titan_bridge` built on the real `canmore`/`titan_link` crates; SocketCAN (vcan) for the real host tools; Puddles over Ethernet/UDP; CAN log recording, replay and `can-diff`; cannelloni tunnels; `titan_bridge` command lines; USB with BOOTSEL, PICOBOOT, UF2 drive, CDC and USB/IP; GDB server | [robots.md](docs/robots.md#can-logs-recording-replaying-comparing), [running.md](docs/running.md#usb-bootsel-picoboot-uf2-and-cdc) |
-| **Testing and faults** | The `sim_test` harness (`Bench`, `RobotBench`, snapshots, parallel sweeps); a smoke test for every board image; fault injection that fails the hardware, not the firmware's state (CAN bit errors, stuck bus, absent I2C devices, ADC shorts, brownouts, hangs, bridge loss, kill switch) | [testing.md](docs/testing.md), [faults.md](docs/faults.md) |
-| **Developer tools** | Sampling firmware profiler with stack walks and flame-graph stacks; VCD waveforms with decoded traffic; a live web dashboard with fault, input and pause controls; JSON logs; instruction, exception, GPIO and device traces | [tools.md](docs/tools.md) |
 
 ## Quick start
 
@@ -95,19 +92,10 @@ firmware_simulator robot robots/talos.toml --mock-bridge internal:1 --mock-bridg
 
 ```
 [INFO  firmware_simulator] 9 board(s) on 2 bus(es)
-[INFO  firmware_simulator] mock bridge for client 1 on internal
-[INFO  firmware_simulator] mock bridge for client 21 on external
 [0.131600s] sbc: 0.000023 INFO  talos/sbc_board v1.0 (release type 2, git 342ee0d)
-...
 [0.133700s] esc0: 0.000014 INFO  ESC board 0 (thrusters 0-3), client ID 2
-[0.134500s] battery: 0.000012 INFO  Board serial number 21
-[0.134900s] ivc: 0.000158 INFO  This board is talos
-[0.135400s] poac: 0.003339 INFO  CAN controller online as client 1
-[0.136700s] esc1: 0.000014 INFO  ESC board 1 (thrusters 4-7), client ID 3
 ...
-[0.165600s] battery: 0.031138 INFO  Connected to gauge, serial 21
 [0.200400s] poac: 0.068333 INFO  ROS connected
-[0.200700s] battery: 0.066214 INFO  ROS connected
 [0.265800s] ivc: 0.131092 INFO  CAN controller online as client 8
 stopped at 1.000000s; 4.43s wall
 vehicle talos: at [5.00, 6.00, 0.25] m, roll 0.0 pitch 0.0 yaw 0.0 deg, 0.00 m/s
@@ -140,6 +128,19 @@ test every_board_boots_and_connects ... ok
 Always test in release mode. Tests whose firmware is not built print `skipping: ...` and **pass**, so check with
 `--nocapture` that a green run really ran the firmware. To write a test, start from
 [the walkthrough](docs/testing.md#a-first-test-step-by-step).
+
+## What it can do
+
+The details, by area; each row links to the page that covers it.
+
+| Area | Highlights | Docs |
+|---|---|---|
+| **CPU and chip** | Two Cortex-M0+ cores (the whole ARMv6-M Thumb set, exceptions, NVIC, SysTick, M0+ cycle counts); the official B1 bootrom running for real; direct, ROM and BOOTSEL boot; QSPI flash behind XIP; DMA, SPI, I2C, UART, ADC, PWM, both PIO blocks (cycle exact), USB device mode, watchdog and resets as on the chip | [internals.md](docs/internals.md#peripherals-and-their-modelling-status), [running.md](docs/running.md#boot-modes-and-the-flash) |
+| **Boards and devices** | Board files generated from titan_firmware's board headers, plus hand-written overlays: MCP2517FD CAN FD, W5500 Ethernet, SHT41, MCP342x ADCs, MS5837 depth, SSD1306, BQ40Z80 gauge, DShot ESCs, Dynamixel and Hiwonder servos, WS2812, DRV8243; named physical inputs (`--input stbd_battery=15.1`) | [boards.md](docs/boards.md) |
+| **Robots and the water** | Robot files with several boards on CAN FD and classic buses, power-on offsets and ID straps; acoustic environments (pool, open water, harbour) with multipath, noise and Doppler between IVC boards; a 6-DOF vehicle the firmware's DShot frames move, with depth sensors and transducers following it | [robots.md](docs/robots.md), [acoustics.md](docs/acoustics.md), [vehicles.md](docs/vehicles.md) |
+| **Host integration** | Mock `titan_bridge` built on the real `canmore`/`titan_link` crates; SocketCAN (vcan) for the real host tools; Puddles over Ethernet/UDP; CAN log recording, replay and `can-diff`; cannelloni tunnels; `titan_bridge` command lines; USB with BOOTSEL, PICOBOOT, UF2 drive, CDC and USB/IP; GDB server | [robots.md](docs/robots.md#can-logs-recording-replaying-comparing), [running.md](docs/running.md#usb-bootsel-picoboot-uf2-and-cdc) |
+| **Testing and faults** | The `sim_test` harness (`Bench`, `RobotBench`, snapshots, parallel sweeps); a smoke test for every board image; fault injection that fails the hardware, not the firmware's state (CAN bit errors, stuck bus, absent I2C devices, ADC shorts, brownouts, hangs, bridge loss, kill switch) | [testing.md](docs/testing.md), [faults.md](docs/faults.md) |
+| **Developer tools** | Sampling firmware profiler with stack walks and flame-graph stacks; VCD waveforms with decoded traffic; a live web dashboard with fault, input and pause controls; JSON logs; instruction, exception, GPIO and device traces | [tools.md](docs/tools.md) |
 
 ## Boards, firmware and robots
 
