@@ -26,6 +26,8 @@ firmware_simulator run $FW/power_board --board boards/mk2/power_board.toml --moc
 
 # robot: TIME@BOARD:FAULT
 firmware_simulator robot robots/talos.toml --mock-bridge internal:4 --fault 1.5s@camera_cage:i2c-absent:0x76
+#   [1.522000s] camera_cage: 1.390034 ERROR Depth sensor failed: Comm(NoAcknowledge)
+#   [1.522200s] camera_cage: 1.390065 ERROR Fault FAULT_DEPTH_INIT_ERROR raised (arg 0x5) at camera_cage_bb/src/cage.rs:131
 ```
 
 With `--candump`, frames destroyed by an injected error are marked `(destroyed: Bit { data_phase: true })`.
@@ -102,7 +104,9 @@ as on hardware.
 ## Firmware findings so far
 
 Behaviour of the firmware (not the emulator) that looks wrong, each pinned down by a test asserting today's
-behaviour, so a fix shows up as a test to update. No firmware was changed. Unless noted, the tests are in
+behaviour of the pinned `external/titan_firmware_rs`, so a fix shows up as a test to update. No firmware was
+changed here; fixes for findings 1-3 have been proposed to titan_firmware_rs separately, and these tests change
+when the submodule moves to them. Unless noted, the tests are in
 `crates/sim_test/tests/faults.rs`.
 
 | # | Finding | Test |
@@ -114,13 +118,12 @@ behaviour, so a fix shows up as a test to update. No firmware was changed. Unles
 | 5 | **CAN error states are invisible to the firmware.** The Rust driver does not enable CERRIF, so error passive and bus-off are never logged or raised as faults; at a 60 % error rate the board goes bus-off, recovers, and ends with no fault and no log line | `can_bus_off_and_automatic_recovery` |
 | 6 | **Latched faults that never clear**: `FAULT_DEPTH_ERROR` after the depth sensor answers again (also in the C camera cage), `FAULT_BQ40_COMMAND_FAIL` after the gauge comes back | `depth_sensor_failures_on_the_camera_cage`, `smart_battery_gauge_lost_and_found` |
 | 7 | **No plausibility checks on sensor values**: bit flips on the MS5837's reads publish wild depths; a frozen depth sensor goes unnoticed while the vehicle dives; a shorted or open battery sense input publishes 0 V or a wandering value. (The SHT41's CRC does catch glitches, and an absent MCP3426 raises `FAULT_ADC_ERROR`) | `depth_sensor_failures_on_the_camera_cage`, `stuck_depth_sensor_goes_unnoticed`, `sensor_faults_on_the_power_board` |
-| 8 | **The bootrom acknowledges PICOBOOT commands without a data phase whatever their result** (B1 and B2 alike), so a misaligned FLASH_ERASE "succeeds" and erases nothing | `crates/sim_host/tests/usb.rs`, `picoboot_rejects_bad_commands_and_recovers` |
+| 8 | **The first-generation IVC modem loses symbols to pool reverberation at full receive gain.** A symbol counts only if the wanted band is above 300 *and the other band below 300*; mid-slot, the previous symbol still arrives over reflected paths about 30 dB down, which with the assumed 40 dB gain reads around that fixed threshold. A board moving at 0.5 m/s, or fixed at some ranges (5.6 m), loses a byte. A threshold relative to the stronger band would not care. Depends on the assumed reflection coefficients and gain | `crates/sim_host/tests/ivc_link.rs`, `firmware_finding_ivc_symbols_lost_to_pool_reverberation` |
+| 9 | **The bootrom acknowledges PICOBOOT commands without a data phase whatever their result** (B1 and B2 alike), so a misaligned FLASH_ERASE "succeeds" and erases nothing | `crates/sim_host/tests/usb.rs`, `picoboot_rejects_bad_commands_and_recovers` |
 
 Observations not pinned down by a test: in a Talos run IVCBoard2's CANmore heartbeat comes every 523 ms and its
 link heartbeat every 105 ms instead of 500/100 ms like the other boards (deterministic, so either the firmware's
-timing on IVCBoard2 or an emulation effect); the DShot ESC model keeps its last throttle when frames stop, so a
-board that stops sending without sending neutral first leaves its thrusters running (the firmware does send
-neutral on kill).
+timing on IVCBoard2 or an emulation effect).
 
 **To verify locally**: the CAN error model against a real MCP2517FD/MCP2518FD (bus-off reporting, recovery timing,
 what TXAT exhaustion does: finding 1 depends on it); findings 1 and 3 on a real board; `--fault` with the real

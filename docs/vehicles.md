@@ -140,5 +140,8 @@ In code: `Robot::vehicle(name)` returns the `VehicleSim` (its `vehicle.state`, `
 Diagonal added mass and drag (no cross-coupling, lift or fins); added mass does not shrink out of the water; a
 flat surface (no waves); no walls (a vehicle can leave a tank sideways); no propeller reaction torque; thrust does
 not depend on inflow speed; the water density is a vehicle setting, not taken from the acoustic environment.
-Snapshots of a robot share board inputs, including the pressures a vehicle drives, so `sim_test::sweep` runs
-robots with vehicle sensors one point at a time.
+The ESC model stops a motor 250 ms after its last DShot frame (`signal_loss_ms`), an assumed value.
+
+Snapshots of a robot copy its vehicles and give the copy its own sensor inputs, so `sim_test::sweep` runs
+vehicle scenarios side by side (`vehicle_talos.rs` sweeps three depths, `vehicle.rs` three Puddles dive
+throttles).

@@ -112,9 +112,10 @@ float/double routines and flash functions run for real.
 | BOOTSEL | `--bootsel` | Powers on with BOOTSEL held: the bootrom's USB boot mode (implies `--rom-boot` and `--usb`) |
 
 XIP reads fault while the SSI is not set up for them, as on hardware. `--hle-flash` traps `flash_range_erase`,
-`flash_range_program` and the other ROM flash entry points and carries them out directly (faster, less faithful;
-pico-sdk's `pico_unique_id`, used by stdio_usb, hangs with it because the trapped `flash_enter_cmd_xip` does
-nothing).
+`flash_range_program` and the other ROM flash entry points and carries them out directly (faster, less
+faithful), leaving the SSI, the QSPI pins and the chip as the real functions do, so code that talks to the chip
+afterwards (pico-sdk's `flash_do_cmd` behind `pico_unique_id`, boot2) keeps working
+(`crates/sim_host/tests/hle.rs`).
 
 `--flash-file FILE` loads the flash from `FILE` (if it exists) before the image is written over it and saves it
 at the end, so what the firmware writes (a flash recorder, crash data, or an application the C Titan bootloader

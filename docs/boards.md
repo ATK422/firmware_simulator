@@ -205,11 +205,12 @@ pulses outside the datasheet's windows are counted as timing errors.
 | `telemetry_pin` | | UART pin for KISS telemetry (10 bytes at 115 200 baud), if wired |
 | `max_rpm` | 4000 | Mechanical RPM at full throttle |
 | `pole_pairs` | 7 | Motor pole pairs (for eRPM) |
+| `signal_loss_ms` | 250 | The motor stops this long after the last valid frame and coasts down (0: never). Assumed from BLHeli_S/Bluejay behaviour, not measured on the UWRT ESCs |
 
 The model decodes DShot150-1200 frames (rate measured from the frame), answers bidirectional DShot (a line idling
 high) with its eRPM 30 µs after each frame, sends telemetry when asked, and turns a motor that follows the throttle
-with a 60 ms first-order lag (3D mode: 48-1047 forward, 1049-2047 reverse). It keeps its last throttle when frames
-stop (no signal-loss disarm). A vehicle reads each ESC's RPM ([vehicles.md](vehicles.md)).
+with a 60 ms first-order lag (3D mode: 48-1047 forward, 1049-2047 reverse). After a signal loss it follows the
+next valid frame (there is no arming sequence). A vehicle reads each ESC's RPM ([vehicles.md](vehicles.md)).
 
 ### `[[dynamixel]]`
 
@@ -287,4 +288,5 @@ The inputs of the shipped boards:
 | `lilboat/po_half` | `water_depth.*`, `reghousing_depth.*` (MS5837), `sht41.*`, `rail_3v3`, `rail_balanced`, `tank_pressure_v`, `regulated_pressure_v` |
 | `lilboat/hbridge_board` | `h0.nfault_v`, `h1.nfault_v`, `h3.nfault_v` (driven by the DRV8243 model) |
 
-Inputs are shared between a bench and its snapshots: set them after taking a snapshot, before running it.
+Each snapshot of a bench or robot gets inputs of its own (`Inputs::deep_copy`), so copies can run side by side
+with different values.

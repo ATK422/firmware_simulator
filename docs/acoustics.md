@@ -190,7 +190,7 @@ snapshot and move a board to its range).
 
 | Test | What it shows |
 |---|---|
-| `crates/sim_host/tests/ivc_link.rs` | IVCBoard to IVCBoard and IVCBoard2 to IVCBoard2 exchange bytes across `pool.toml` |
+| `crates/sim_host/tests/ivc_link.rs` | IVCBoard to IVCBoard and IVCBoard2 to IVCBoard2 exchange bytes across `pool.toml`; the first-generation modem's reverberation finding |
 | `crates/sim_host/tests/acoustics.rs` | IVCBoard2's pinger amplitude against distance |
 | `crates/sim_host/tests/vehicle.rs` (`ivc_boards_talk_from_a_drifting_vehicle`) | First-generation IVC boards still link with one of them on a drifting vehicle |
 | `crates/sim_test/tests/ivc_sweep.rs` | Delivery against range and noise for both generations, in open water: boot once, snapshot, run every point in parallel from the snapshot; asserts that delivery degrades monotonically |
@@ -206,9 +206,12 @@ cargo test --release -p sim_test --test ivc_sweep -- --nocapture
 
 They are the slowest tests in the suite (minutes). See [testing.md](testing.md#sweeps) for writing one.
 
-Seen but not explained: in `robots/ivc_pool.toml` the first-generation boards lose their first byte when one
-moves at 0.5 m/s (closing or opening), with a scripted `Trajectory::Linear` as with a vehicle; at 0.2 m/s both
-bytes arrive. Either the modem is that sensitive to range rate or the moving-path handling has an artefact.
+In `robots/ivc_pool.toml` the first-generation boards lose a byte when one moves at 0.5 m/s, and also at some
+fixed ranges. That is the modem, not Doppler or the moving-path model: its fixed threshold on the "other" band is
+reached by the previous symbol's reverberation at the assumed 40 dB receive gain
+(`firmware_finding_ivc_symbols_lost_to_pool_reverberation` in `ivc_link.rs`, [faults.md](faults.md#firmware-findings-so-far)).
+The hydrophone unit tests check the moving paths against exact recomputation at every sample and the Doppler
+shift of a walking-speed source.
 
 ## Making a new environment
 

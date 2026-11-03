@@ -161,7 +161,9 @@ tables ([boards.md](boards.md)) attach them.
 
    Each gets a `DeviceCtx` (current time, set or read SoC pins, `drive_at` a future pin change, `wake_at`, `report`
    to the `device` trace) and provides `clone_box` (and `as_any` where tests need to find it again). Physical
-   quantities are `sim_core::analog::Signal`s, so tests and vehicles can drive them.
+   quantities are `sim_core::analog::Signal`s, so tests and vehicles can drive them; a model that reads inputs
+   implements `relink_inputs` (call `Signal::relink` on each), or snapshots would share its inputs with the
+   original (`board::tests::a_copy_gets_inputs_of_its_own` checks every kind).
 2. Unit-test it against `sim_devices::TestCtx` with the datasheet's transactions.
 3. Give it a board file table: a `Deserialize` struct and a field in `sim_host::board::Board`, attached in
    `Board::apply` (`m.sys.attach_spi`, `attach_i2c`, `attach_pin_device`, `attach_analog`), returning its inputs
@@ -190,10 +192,13 @@ benchmark fingerprints rely on it.
 
 Machines are plain data: a snapshot is a deep copy (`Machine::snapshot` and `restore`; `Session::snapshot` and
 `Robot::snapshot` return a new session or robot to run). Boxed device models implement `clone_box` (the `clone_box!` macro gives `Clone` for
-the boxed trait). What is not copied: the trace sink, host endpoints (bridges, sockets: give the copy its own;
-`MockBridge::fork` and `PuddlesBridge::fork` copy a bridge's state), and physical inputs, which are shared
-`Arc<Mutex<f64>>` handles. A robot snapshot re-links the copy's hydrophones and projectors to the copy's acoustic
-medium and its vehicle's paths.
+the boxed trait). What is not copied: the trace sink and host endpoints (bridges, sockets: give the copy its own;
+`MockBridge::fork` and `PuddlesBridge::fork` copy a bridge's state). Physical inputs are shared
+`Arc<Mutex<f64>>` handles that the device models read through `Signal::Shared`; `Inputs::deep_copy` makes new ones
+and a `Relink` map from old to new, and `sim_host::board::relink_inputs` walks every device of the copied machine
+(`relink_inputs` on each device trait) to point it at them. `Bench`, `RobotBench` and `Robot` snapshots do this
+(`Session::snapshot_with_inputs`); a plain `Session::snapshot` keeps sharing. A robot snapshot also re-links the
+copy's hydrophones and projectors to the copy's acoustic medium and its vehicles' paths.
 
 ## Performance
 

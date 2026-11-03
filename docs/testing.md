@@ -160,7 +160,7 @@ attached device, `sys.gpio.input(pin)`, `sys.pin_device::<T>()`, `sys.i2c_device
 
 ## Inputs
 
-Inputs are shared handles: setting one takes effect at the next ADC conversion or sensor read. Values a board
+Setting an input takes effect at the next ADC conversion or sensor read. Values a board
 starts with come from its board file; change them there (or in `edit_board`) for a different starting point, since
 the firmware may read them during boot. A vehicle drives pressure inputs itself ([vehicles.md](vehicles.md)).
 
@@ -175,14 +175,14 @@ example to copy; its `scenarios` helper runs several fault scenarios from one sn
 ## Snapshots
 
 `Bench::snapshot` and `RobotBench::snapshot` deep-copy everything (machines, devices, buses, acoustic medium,
-vehicles, logs, bridge state) in a few milliseconds; the copy runs on independently and exactly as the original
-would (`tests/harness.rs` checks that frame for frame). Two things are shared rather than copied:
+vehicles, logs, bridge state, physical inputs) in a few milliseconds; the copy runs on independently and exactly
+as the original would (`tests/harness.rs` checks that frame for frame, and that two copies with different battery
+voltages run side by side, each reporting its own).
 
-* **Physical inputs**: setting one in a copy sets it in the original too, so set them after taking the copy and
-  before running it, and don't run copies with different input values at the same time. A robot's vehicle
-  pressures are inputs too.
-* **Host endpoints** are not copied: the benches fork their mock bridges, but a bridge you added by hand, a
-  SocketCAN interface or the Puddles Ethernet bridge in a `RobotBench` must be attached to the copy again.
+Host endpoints are the exception: the benches fork the bridges they made (`bridge`, `RobotBench`'s mock bridges and
+its `eth_bridge`s), but an endpoint you added by hand (another `MockBridge`, a SocketCAN interface, a UDP relay)
+must be attached to the copy again. One level down, `Session::snapshot` shares the inputs with the original;
+`Session::snapshot_with_inputs` gives the copy its own.
 
 ## Robots
 
@@ -205,14 +205,15 @@ let got = r.picked("surface", |m| match m {
 ```
 
 `board(name)` is a board's `Session`, `robot` the `sim_host::robot::Robot` (buses, vehicles, `threads`),
-`place(board, trajectory)` moves a board's transducer. For more than one bridge per bus, add `MockBridge`s to
+`place(board, trajectory)` moves a board's transducer, and `eth_bridge(board)` puts a `PuddlesBridge` on an
+Ethernet board's cable (Puddles) and returns it; bridge faults go to it when the board has no CAN bridge. For more than one bridge per bus, add `MockBridge`s to
 `r.robot.buses[j].endpoints` yourself (`tests/robot.rs` does).
 
 ## Sweeps
 
 `sweep(&base, &points, threads, |bench, point| ...)` runs a scenario once per point, each from its own snapshot of
-`base`, on up to `threads` threads, and returns the results in the order of the points. A robot whose vehicle
-drives sensor inputs runs one point at a time (its snapshots share those inputs). `tests/ivc_sweep.rs` is the
+`base`, on up to `threads` threads, and returns the results in the order of the points. Each point has inputs of
+its own, so a scenario may set them. `tests/ivc_sweep.rs` is the
 example: boot two IVC boards once, then for each point move one board to the point's range, set the noise, send
 bytes and count what arrives.
 
@@ -227,7 +228,7 @@ pass) without them.
 | `crates/rp2040` unit tests (`src/periph/*`) | Register-level peripheral behaviour from the datasheet |
 | `crates/rp2040/tests/` | Hand-written programs (`m0_blink`, `m1_watchdog`, `m6_resets`), pioasm-assembled PIO programs (`pio_programs`), the bootrom's USB boot (`usb_boot`), and the performance work's equivalence checks (`batching`, `busy_wait`, `systick_reference`) |
 | `crates/sim_devices`, `sim_acoustics`, `sim_physics` unit tests | Each device model, the acoustic channel, the vehicle physics |
-| `crates/sim_host/tests/` | Firmware on boards built by hand, per milestone: `template`, `embassy_blinky`, `gdb`, `pico_sdk`, `can`, `sensors`, `pio`, `flash`, `acoustics`, `ivc_link`, `usb`, `vehicle`, `parallel` (threaded robots run as in turn) |
+| `crates/sim_host/tests/` | Firmware on boards built by hand, per milestone: `template`, `embassy_blinky`, `gdb`, `pico_sdk`, `can`, `sensors`, `pio`, `flash`, `hle` (`--hle-flash` leaves the flash as the ROM does), `acoustics`, `ivc_link`, `usb`, `vehicle`, `parallel` (threaded robots run as in turn) |
 | `crates/sim_test/tests/smoke.rs` | Every titan_firmware_rs board image on its board: connects, reports its identity, no link errors, no panic |
 | `crates/sim_test/tests/robot.rs` | All of Talos on its two buses |
 | `crates/sim_test/tests/puddles.rs` | Puddles over Ethernet/UDP |
