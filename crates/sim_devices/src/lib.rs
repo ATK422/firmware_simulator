@@ -31,6 +31,7 @@ pub mod sht41;
 pub mod spi;
 pub mod ssd1306;
 pub mod uart;
+pub mod usb;
 pub mod w5500;
 pub mod ws2812;
 

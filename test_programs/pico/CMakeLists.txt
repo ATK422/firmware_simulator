@@ -16,3 +16,9 @@ target_link_libraries(hello_multicore pico_stdlib pico_multicore hardware_divide
 
 add_executable(flash_program flash_program.c)
 target_link_libraries(flash_program pico_stdlib hardware_flash)
+
+# stdio over USB (TinyUSB CDC ACM), for the USB device controller and host model
+add_executable(hello_usb hello_usb.c)
+target_link_libraries(hello_usb pico_stdlib)
+pico_enable_stdio_usb(hello_usb 1)
+pico_enable_stdio_uart(hello_usb 0)

@@ -16,6 +16,7 @@ use sim_devices::i2c::I2cDevice;
 use sim_devices::pin::PinDevice;
 use sim_devices::spi::SpiDevice;
 use sim_devices::uart::UartDevice;
+use sim_devices::usb::host::HostController;
 
 use crate::irq;
 use crate::memmap::*;
@@ -32,6 +33,7 @@ use crate::periph::ssi::{IoQspi, Ssi};
 use crate::periph::sysctl::{self, Psm, Resets, Vreg, bit, psm};
 use crate::periph::timer::{Timer, Watchdog, WatchdogReset};
 use crate::periph::uart::Uart;
+use crate::periph::usb::{self, Usb};
 use crate::unmodelled::Unmodelled;
 
 /// Scheduler keys. Each peripheral owns its keys; at most one event per key is pending.
@@ -57,6 +59,8 @@ pub enum Event {
     Wire,
     /// An ADC conversion ends or starts.
     Adc,
+    /// The USB host controller's next step (a transaction, SOF or port state change).
+    Usb,
     /// Core 1 comes out of reset after its PSM force-off was released (handled by the machine).
     Core1Boot,
     /// Wakes the run loop at a given time without doing anything (host input, test hooks).
@@ -114,6 +118,10 @@ pub struct System {
     /// The device addressed by the transfer in progress on each I2C bus (index into `i2c_devices`).
     i2c_target: [Option<usize>; 2],
     pub adc: Adc,
+    /// The USB controller and its DPRAM.
+    pub usb: Usb,
+    /// The USB host the chip's USB port is plugged into, if any (see [`System::attach_usb_host`]).
+    pub usb_host: Option<Box<HostController>>,
     pub pio: [Pio; 2],
     /// Time base of the PIO cycle count: `clk_sys` cycle `.1` was at time `.0`.
     pio_base: (Time, u64),
@@ -205,6 +213,8 @@ impl System {
             i2c_devices: Vec::new(),
             i2c_target: [None; 2],
             adc: Adc::default(),
+            usb: Usb::default(),
+            usb_host: None,
             pio: [Pio::new(0), Pio::new(1)],
             pio_base: (Time::ZERO, 0),
             in_pio: false,
@@ -247,7 +257,10 @@ impl System {
         let chip = std::mem::take(&mut self.ssi.chip);
         self.ssi = Ssi::default();
         self.ssi.chip = chip;
+        // BOOTSEL is a button on the board: it stays pressed through the reset
+        let bootsel = self.io_qspi.bootsel_pressed;
         self.io_qspi = IoQspi::default();
+        self.io_qspi.bootsel_pressed = bootsel;
         self.refresh_xip();
         self.sio = Sio::default();
         let observed = self.pwm.observed;
@@ -268,9 +281,12 @@ impl System {
         }
         self.dma = Dma::default();
         self.dreq_pulses = [0; 64];
+        self.usb.reset();
         self.unmodelled.reset();
         self.sched = Scheduler::new();
         self.update_clocks(now);
+        // The host notices the pull-up going away
+        self.usb_kicked(now);
         self.irq_dirty = true;
         self.reset_request = None;
     }
@@ -345,6 +361,9 @@ impl System {
         if self.adc.irq() {
             lines |= 1 << irq::ADC_IRQ_FIFO;
         }
+        if self.usb.irq() {
+            lines |= 1 << irq::USBCTRL_IRQ;
+        }
         if self.i2c[0].irq() {
             lines |= 1 << irq::I2C0_IRQ;
         }
@@ -398,6 +417,12 @@ impl System {
                 self.uart_advance(n, now);
             }
             self.clk_peri = ClockPeriod::from_hz(new.clk_peri);
+        }
+        if new.clk_usb != old.clk_usb {
+            self.usb.clk_ok = usb::clk_usb_ok(new.clk_usb);
+            if new.clk_usb != 0 && !self.usb.clk_ok {
+                log::warn!("[{now}] clk_usb = {} Hz: USB full speed needs 48 MHz", new.clk_usb);
+            }
         }
         self.freqs = new;
     }
@@ -507,6 +532,10 @@ impl System {
                     self.uart[i].reset();
                     self.sched.cancel(Event::UartTx(i as u8));
                     self.sched.cancel(Event::UartRx(i as u8));
+                }
+                bit::USBCTRL => {
+                    self.usb.reset();
+                    self.usb_kicked(now);
                 }
                 bit::TIMER => {
                     self.timer = Timer::new();
@@ -1131,7 +1160,76 @@ impl System {
                 self.apply_wire(trace, t);
             }
             Event::Adc => self.adc_advance(trace, t),
+            Event::Usb => self.usb_poll(trace, t),
             Event::Core1Boot | Event::External(_) => {}
+        }
+    }
+
+    // ------------------------------------------------------------------ USB
+
+    /// Plugs the chip's USB port into a host (VBUS comes up; the host enumerates the device once its pull-up
+    /// appears).
+    pub fn attach_usb_host(&mut self, host: HostController, now: Time) {
+        self.usb.vbus = true;
+        self.usb_host = Some(Box::new(host));
+        self.usb_kicked(now);
+    }
+
+    /// The attached USB host, for queueing transfers. Call [`System::usb_reschedule`] after changing it.
+    pub fn usb_host_mut(&mut self) -> Option<&mut HostController> {
+        self.usb_host.as_deref_mut()
+    }
+
+    /// Runs `f` on the attached USB host and lets it pick up whatever `f` queued.
+    pub fn with_usb_host<R>(&mut self, now: Time, f: impl FnOnce(&mut HostController) -> R) -> Option<R> {
+        let r = f(self.usb_host.as_deref_mut()?);
+        self.usb_reschedule(now);
+        Some(r)
+    }
+
+    /// Tells the host that something changed (transfers queued from outside, firmware armed a buffer).
+    pub fn usb_reschedule(&mut self, now: Time) {
+        self.usb.kick = true;
+        self.usb_kicked(now);
+    }
+
+    fn usb_line_state(&self) -> u32 {
+        self.usb.line_state(self.gpio.inputs(), |p| self.gpio.funcsel(p))
+    }
+
+    /// The controller asked for the host's attention: let it retry NAKed pipes and see the pull-up.
+    fn usb_kicked(&mut self, now: Time) {
+        if !std::mem::take(&mut self.usb.kick) {
+            return;
+        }
+        let Some(host) = self.usb_host.as_deref_mut() else { return };
+        if let Some(t) = host.kick(now, &mut self.usb) {
+            let t = t.max(now);
+            if self.sched.due(Event::Usb).is_none_or(|d| d > t) {
+                self.sched.schedule(Event::Usb, t);
+            }
+        }
+        self.irq_dirty = true;
+    }
+
+    /// The host's scheduled step.
+    fn usb_poll(&mut self, trace: &mut dyn TraceSink, now: Time) {
+        let Some(host) = self.usb_host.as_deref_mut() else { return };
+        let next = host.poll(now, &mut self.usb);
+        self.usb.kick = false;
+        match next {
+            Some(t) => self.sched.schedule(Event::Usb, t.max(now)),
+            None => {
+                self.sched.cancel(Event::Usb);
+            }
+        }
+        self.irq_dirty = true;
+        let mut reports = host.take_reports();
+        reports.append(&mut self.usb.reports);
+        for (t, m) in reports {
+            if trace.wants(Category::Device) {
+                trace.event(t, TraceEvent::Device { source: "usb".into(), message: m });
+            }
         }
     }
 
@@ -1210,6 +1308,12 @@ impl System {
                 let n = (base == UART1_BASE) as usize;
                 let v = self.uart[n].read(&self.clk_peri, now, off);
                 self.uart_advance(n, now);
+                v
+            }
+            USBCTRL_REGS_BASE => {
+                let ls = self.usb_line_state();
+                let v = self.usb.read(off, ls);
+                self.irq_dirty = true;
                 v
             }
             _ => None,
@@ -1364,6 +1468,12 @@ impl System {
                 self.uart_advance(n, now);
                 ok.then_some(())
             }
+            USBCTRL_REGS_BASE => {
+                let ok = self.usb.write(off, value, mode);
+                self.irq_dirty = true;
+                self.usb_kicked(now);
+                ok.then_some(())
+            }
             SYSINFO_BASE if off <= 0x40 => Some(()),
             _ => None,
         };
@@ -1409,6 +1519,8 @@ impl System {
                 Some(off) => Ok(mem::read(&self.sram, off, size)),
                 None => Err(BusFault::Unmapped(addr)),
             },
+            // The USB DPRAM is RAM on the AHB-lite bus: any access width, no atomic aliases
+            0x5 if addr >> 16 == USBCTRL_DPRAM_BASE >> 16 => Ok(self.usb.dpram_read((addr & 0xFFF) as usize, size)),
             0x4 | 0x5 | 0xD => {
                 let word = self.periph_read(trace, core, now, addr & !3);
                 Ok(mem::lane(word, addr, size))
@@ -1454,6 +1566,13 @@ impl System {
                 }
                 None => Err(BusFault::Unmapped(addr)),
             },
+            0x5 if addr >> 16 == USBCTRL_DPRAM_BASE >> 16 => {
+                self.usb.dpram_write((addr & 0xFFF) as usize, size, value);
+                if self.usb.kick {
+                    self.usb_kicked(now);
+                }
+                Ok(())
+            }
             0x4 | 0x5 | 0xD => {
                 self.periph_write(trace, core, now, addr & !3, mem::replicate(value, size));
                 Ok(())
@@ -1476,6 +1595,7 @@ impl System {
                 Some(mem::read(&self.xip_sram, (addr & 0x3FFF) as usize, size))
             }
             0x2 => sram_offset(addr).map(|o| mem::read(&self.sram, o, size)),
+            0x5 if addr >> 16 == USBCTRL_DPRAM_BASE >> 16 => Some(self.usb.dpram_read((addr & 0xFFF) as usize, size)),
             0x4 | 0x5 | 0xD | 0x1 => Some(mem::lane(self.peek_periph(core, addr & !3), addr, size)),
             _ => None,
         }
@@ -1509,6 +1629,7 @@ impl System {
             DMA_BASE => self.dma.read(off),
             WATCHDOG_BASE => self.watchdog.read(now, off),
             VREG_AND_CHIP_RESET_BASE => self.vreg.read(off),
+            USBCTRL_REGS_BASE => self.usb.peek(off, self.usb_line_state()),
             _ => None,
         };
         v.unwrap_or_else(|| self.unmodelled.peek(addr))
@@ -1529,6 +1650,9 @@ impl System {
                 Some(o) => mem::write(&mut self.sram, o, size, value),
                 None => return false,
             },
+            0x5 if addr >> 16 == USBCTRL_DPRAM_BASE >> 16 => {
+                mem::write(&mut self.usb.dpram, (addr & 0xFFF) as usize, size, value)
+            }
             _ => return false,
         }
         true

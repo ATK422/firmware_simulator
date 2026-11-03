@@ -103,7 +103,8 @@ pub struct Machine {
     pub hle: BTreeMap<u32, RomFn>,
     /// Whether ROM flash functions are trapped. Off once the flash chip is modelled at the SSI level.
     pub hle_enabled: bool,
-    /// Firmware asked to reboot into BOOTSEL mode.
+    /// Firmware asked to reboot into BOOTSEL mode (`reset_usb_boot`); the machine then really goes through the
+    /// bootrom's USB boot (see [`Machine::watchdog_reset`]).
     pub usb_boot_requested: bool,
     /// `External` events that fired, as `(time, id)`, for the host to collect.
     pub external_fired: Vec<(Time, u32)>,
@@ -325,6 +326,21 @@ impl Machine {
     pub fn watchdog_reset(&mut self, kind: WatchdogReset) {
         let t = self.clocks[0].now.max(self.clocks[1].now).max(self.now);
         log::info!("[{t}] watchdog reset ({kind:?})");
+        // WATCHDOG.SCRATCH4-7 holding the bootrom's magic make the bootrom jump to SCRATCH7 after the reset
+        // (pico-sdk `watchdog_reboot` with a PC, the bootrom's `reset_usb_boot`, PICOBOOT REBOOT with a PC). Only
+        // the bootrom honours them, so even a direct-booted machine goes through it from now on.
+        let s = self.sys.watchdog.scratch;
+        if s[4] == 0xB007_C0D3 && s[5] == s[7] ^ 0xB007_C0D3u32.wrapping_neg() {
+            if (s[7] as usize) < ROM_SIZE {
+                // The only ROM entry point used this way is the USB boot wrapper
+                self.usb_boot_requested = true;
+                log::info!("[{t}] rebooting into USB boot (BOOTSEL)");
+            }
+            if !self.rom_boot && self.has_bootrom() {
+                self.rom_boot = true;
+                self.boot_vtor = None;
+            }
+        }
         self.resets += 1;
         self.sys.watchdog.record_reset(kind);
         self.sys.watchdog_reset(t);
@@ -432,12 +448,7 @@ impl Machine {
                     (0..r2).map(|i| self.sys.peek(r1.wrapping_add(i), Size::Byte).unwrap_or(0xFF) as u8).collect();
                 hle::program(&mut self.sys.flash, r0, &data)
             }
-            RomFn::ResetToUsbBoot => {
-                log::warn!("[{now}] core{c} called reset_usb_boot (BOOTSEL mode is not emulated)");
-                self.usb_boot_requested = true;
-                self.request_stop();
-                Time::from_us(1)
-            }
+            RomFn::ResetToUsbBoot => unreachable!("reset_usb_boot is not trapped"),
             RomFn::ConnectInternalFlash | RomFn::FlashExitXip => {
                 // Leave the SSI as the ROM does, so firmware can send its own commands (pico-sdk's flash_do_cmd)
                 self.sys.ssi.enter_command_mode();
@@ -551,7 +562,15 @@ impl Machine {
             && !self.cores[c].is_sleeping()
             && let Some(f) = self.hle.get(&pc).copied()
         {
-            return self.run_hle(c, f);
+            if f != RomFn::ResetToUsbBoot {
+                return self.run_hle(c, f);
+            }
+            // reset_usb_boot runs for real (the bootrom reboots itself into USB boot through the watchdog); only
+            // note that it was called
+            if !self.usb_boot_requested {
+                log::info!("[{now}] core{c} called reset_usb_boot");
+            }
+            self.usb_boot_requested = true;
         }
         let mut bus = CoreBus { sys: &mut self.sys, trace: &mut *self.trace, core: c as u8, now };
         let outcome = self.cores[c].step(&mut bus);
