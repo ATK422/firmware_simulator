@@ -238,7 +238,7 @@ pass) without them.
 | `crates/sim_test/tests/ivc_sweep.rs` | IVC delivery against range and noise (prints tables with `--nocapture`; the slowest suite) |
 | `crates/sim_test/tests/guide.rs` | This page's walkthrough |
 | `tests/host_cli.rs` (root package) | The command line: robot record/replay/diff, `bridges` outputs, `scripts/vcan_up.sh` with stand-ins, the Docker files' consistency |
-| `tests/docs.rs` (root package) | Every `--option` the docs mention exists |
+| `tests/docs.rs` (root package) | Every command line option the docs and the README mention exists |
 
 `test_programs/` holds the hand-written Thumb programs, a small embassy firmware and pico-sdk programs used by
 these tests; their ELFs are committed (`make -C test_programs` rebuilds them).

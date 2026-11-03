@@ -6,7 +6,7 @@
 //! `titan_link` message per datagram, port 2203 on both ends) with the 100 ms ping and kill switch forwarding of
 //! the CAN mock bridge, and records what the board sends, CANmore heartbeat broadcasts (port 2201) included.
 //! [`UdpRelay`] instead connects the board to a real UDP socket on the host, so the real `titan_bridge` can talk to
-//! it (see the README).
+//! it (see `docs/running.md`).
 
 use std::net::{SocketAddr, UdpSocket};
 use std::sync::{Arc, Mutex};

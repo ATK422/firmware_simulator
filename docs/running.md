@@ -120,6 +120,10 @@ nothing).
 at the end, so what the firmware writes (a flash recorder, crash data, or an application the C Titan bootloader
 flashed) persists between runs. Without an image (`--bootsel`) the flash is the file's contents or blank.
 
+The C Titan bootloader can be reflashed over CAN the way `upload_tool` does it: `sim_host::upload` speaks its
+protocol (CANmore register-mapped pages, CRC-32/MPEG-2) over the in-process bus, catching the bootloader in its
+boot delay (`crates/sim_host/tests/flash.rs`, with a small application in two versions from `test_programs/c_bl_app`).
+
 Resets behave as on the chip: a watchdog reset (timeout or forced) restarts every block except the watchdog's
 scratch registers, the flash and SRAM, and goes back through the bootrom; `AIRCR.SYSRESETREQ` restarts only the
 core that asked. A reboot through the bootrom's scratch vector (`reset_usb_boot`, `watchdog_reboot`) switches a
