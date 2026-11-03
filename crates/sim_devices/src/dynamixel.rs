@@ -311,7 +311,11 @@ impl Dynamixel {
                 if !params[4..].contains(&self.id()) {
                     return None;
                 }
-                let end = (addr as usize + len as usize).min(TABLE_LEN);
+                // Past the control table: an access error, as for READ
+                let end = addr as usize + len as usize;
+                if end > TABLE_LEN {
+                    return Some(self.status(err::ACCESS, &[]));
+                }
                 let data = self.table[addr as usize..end].to_vec();
                 Some(self.status(0, &data))
             }
@@ -347,6 +351,10 @@ impl Dynamixel {
                 return;
             }
             let pkt: Vec<u8> = self.buf.drain(..7 + len).collect();
+            if len < 3 {
+                // LEN counts the instruction and the CRC: no packet is shorter
+                continue;
+            }
             let crc = u16::from_le_bytes([pkt[5 + len], pkt[6 + len]]);
             let id = pkt[4];
             if crc16(&pkt[..5 + len]) != crc {
@@ -481,5 +489,23 @@ mod tests {
         let st = exchange(&mut d, &mut ctx, &bad).unwrap();
         assert_eq!(st[8], err::CRC);
         assert_eq!(d.crc_errors, 1);
+    }
+
+    /// Packets from the firmware with a valid CRC but a LEN too short to hold an instruction (LEN counts the
+    /// instruction, parameters and CRC, so at least 3), and a SYNC_READ starting past the control table, used to
+    /// panic the emulator slicing the packet or the table. The first are dropped; the second gets an access error,
+    /// as a READ does.
+    #[test]
+    fn malformed_packets_do_not_panic() {
+        let mut ctx = TestCtx { now: Time::from_ms(1), ..Default::default() };
+        let mut d = Dynamixel::xl430(10, 2, 57_600);
+        // LEN 2: the CRC right after the header, no instruction
+        let mut p = vec![0xFF, 0xFF, 0xFD, 0x00, 2, 2, 0];
+        p.extend(crc16(&p).to_le_bytes());
+        assert!(exchange(&mut d, &mut ctx, &p).is_none(), "LEN 2");
+        let st = exchange(&mut d, &mut ctx, &packet(BROADCAST, 0x82, &[200, 0, 4, 0, 2])).unwrap();
+        assert_eq!(st[8], err::ACCESS, "SYNC_READ past the table");
+        // Still answering afterwards
+        assert!(exchange(&mut d, &mut ctx, &packet(2, 0x01, &[])).is_some());
     }
 }
