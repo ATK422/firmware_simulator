@@ -352,6 +352,12 @@ impl Session {
         self.run_until(end)
     }
 
+    /// Starts pacing afresh from now (after virtual time was held, e.g. paused from the dashboard), so the run does
+    /// not race to catch up with the wall clock.
+    pub fn reset_pacing(&mut self) {
+        self.pacing = None;
+    }
+
     /// Sleeps until the wall clock catches up with virtual time; warns when the emulation falls behind.
     fn pace(&mut self) {
         let now = self.machine.now;

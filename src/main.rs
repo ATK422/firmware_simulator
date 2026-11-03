@@ -112,6 +112,13 @@ struct RobotArgs {
     /// (GTKWave and Surfer show them; PulseView reads only the pins).
     #[arg(long)]
     vcd_events: bool,
+    /// Serve a live dashboard on this address (e.g. `127.0.0.1:8080`): logs, firmware status, CAN traffic, pins,
+    /// inputs, vehicles, and controls to inject faults, set inputs and pause.
+    #[arg(long)]
+    dashboard: Option<String>,
+    /// Keep serving the dashboard after the run ends (until interrupted).
+    #[arg(long, requires = "dashboard")]
+    dashboard_hold: bool,
 }
 
 fn parse_board_udp(s: &str) -> Result<(String, String, String), String> {
@@ -167,12 +174,14 @@ fn robot(args: RobotArgs) -> Result<()> {
         s.on_uart_line = Some(Box::new(move |t, u, line| println!("[{t}] {name} uart{u}: {line}")));
     }
     let mut bridges: Vec<Option<sim_host::mock_bridge::MockBridge>> = vec![None; r.buses.len()];
+    let mut all_bridges = Vec::new();
     for (bus, client) in &args.mock_bridges {
         let j = r.bus_names.iter().position(|n| n == bus).with_context(|| format!("no bus {bus:?}"))?;
         let rb = &mut r.buses[j];
         let b = sim_host::mock_bridge::MockBridge::new(*client, rb.bus.rates.data.is_some(), Time::ZERO);
         b.set_kill(Some(false));
         rb.endpoints.push(Box::new(b.clone()));
+        all_bridges.push((j, *client, b.clone()));
         bridges[j].get_or_insert(b);
         log::info!("mock bridge for client {client} on {bus}");
     }
@@ -197,12 +206,15 @@ fn robot(args: RobotArgs) -> Result<()> {
     if let Some(db) = args.noise_db {
         r.set_noise_db(db);
     }
+    let mut eth_bridges = Vec::new();
     for name in &args.eth_mock_bridges {
-        let s = r.board(name).with_context(|| format!("no board {name:?}"))?;
+        let i = r.index(name).with_context(|| format!("no board {name:?}"))?;
+        let s = &mut r.boards[i];
         anyhow::ensure!(s.machine.sys.ethernet.is_some(), "{name} has no Ethernet");
         let bridge = sim_host::ethernet::PuddlesBridge::new(Time::ZERO);
         bridge.set_kill(Some(false));
-        s.eth_endpoints.push(Box::new(bridge));
+        s.eth_endpoints.push(Box::new(bridge.clone()));
+        eth_bridges.push((i, bridge));
         log::info!("mock bridge attached to {name} over Ethernet");
     }
     for (name, local, peer) in &args.udps {
@@ -252,21 +264,83 @@ fn robot(args: RobotArgs) -> Result<()> {
             s.start_profile(args.profile_interval);
         }
     }
+    let mut dash = match &args.dashboard {
+        Some(addr) => {
+            let infos = (0..r.boards.len())
+                .map(|i| sim_host::dashboard::BoardInfo {
+                    name: r.names[i].clone(),
+                    image: r.images[i].clone(),
+                    inputs: r.inputs[i].clone(),
+                    pins: r.pins[i].clone(),
+                    fault_names: Vec::new(),
+                })
+                .collect();
+            let mut d = sim_host::dashboard::Dashboard::start(addr, infos, r.bus_names.clone())
+                .with_context(|| format!("binding {addr}"))?;
+            for (i, s) in r.boards.iter_mut().enumerate() {
+                d.tap_session(i, s);
+            }
+            for (j, rb) in r.buses.iter_mut().enumerate() {
+                d.tap_bus(j, rb);
+            }
+            for (bus, client) in &args.mock_bridges {
+                let j = r.bus_names.iter().position(|n| n == bus).unwrap();
+                let board =
+                    (0..r.boards.len()).find(|&i| r.board_bus[i] == Some(j) && r.client_ids[i] == Some(*client));
+                if let Some(b) = all_bridges.iter().find(|(jj, c, _)| *jj == j && c == client).map(|x| x.2.clone()) {
+                    d.add_link(board, Some(j), sim_host::dashboard::Link::Can(b));
+                }
+            }
+            for (i, b) in &eth_bridges {
+                d.add_link(Some(*i), None, sim_host::dashboard::Link::Eth(b.clone()));
+            }
+            eprintln!("dashboard on http://{}/", d.addr);
+            Some(d)
+        }
+        None => None,
+    };
     let wall = std::time::Instant::now();
     let mut faults = faults.into_iter().peekable();
+    let mut pending: Option<(Time, usize, sim_host::fault::Fault)> = None;
     let stopped = loop {
-        let next = faults.next_if(|f| f.0 <= args.time);
-        let until = next.as_ref().map_or(args.time, |f| f.0);
-        if let Some(s) = r.run_until(until) {
+        if pending.is_none() {
+            pending = faults.next_if(|f| f.0 <= args.time);
+        }
+        let target = pending.as_ref().map_or(args.time, |f| f.0);
+        let until = if dash.is_some() { target.min(r.now + DASHBOARD_PIECE) } else { target };
+        let stopped = r.run_until(until);
+        if let Some(d) = &mut dash {
+            d.service_robot(&mut r, &bridges);
+            while d.paused() {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+                d.service_robot(&mut r, &bridges);
+            }
+        }
+        if let Some(s) = stopped {
             break Some(s);
         }
-        let Some((_, i, fault)) = next else { break None };
+        if until < target {
+            continue;
+        }
+        let Some((_, i, fault)) = pending.take() else { break None };
         let bridge = r.board_bus[i].and_then(|j| bridges[j].clone());
         let ctl = bridge.as_ref().map(|b| b as &dyn sim_host::fault::BridgeControl);
-        if let Err(e) = sim_host::fault::robot_target(&mut r, i, ctl).apply(&fault) {
+        let applied = sim_host::fault::robot_target(&mut r, i, ctl).apply(&fault);
+        if let Some(d) = &mut dash {
+            let name = r.names[i].clone();
+            d.note_fault(r.now, &name, &format!("{fault:?}"), &applied);
+        }
+        if let Err(e) = applied {
             bail!("fault {fault:?} on {}: {e}", r.names[i]);
         }
     };
+    if let Some(d) = &mut dash {
+        let why = match &stopped {
+            Some((i, why)) => format!("{} stopped: {why:?}", r.names[*i]),
+            None => "TimeLimit".into(),
+        };
+        d.finish_robot(&mut r, &why);
+    }
     for s in r.boards.iter_mut() {
         s.flush_uarts();
     }
@@ -306,6 +380,12 @@ fn robot(args: RobotArgs) -> Result<()> {
             let csv = v.log.as_ref().map(|l| l.to_csv()).unwrap_or_default();
             std::fs::write(&p, csv).with_context(|| format!("writing {}", p.display()))?;
         }
+    }
+    if let Some(d) = &mut dash
+        && args.dashboard_hold
+    {
+        eprintln!("run finished; the dashboard keeps serving on http://{}/ (Ctrl-C to quit)", d.addr);
+        d.hold();
     }
     if let Some((i, why)) = stopped {
         bail!("{} stopped: {why:?}", r.names[i]);
@@ -475,6 +555,13 @@ struct RunArgs {
     /// (GTKWave and Surfer show them; PulseView reads only the pins).
     #[arg(long)]
     vcd_events: bool,
+    /// Serve a live dashboard on this address (e.g. `127.0.0.1:8080`): logs, firmware status, CAN traffic, pins,
+    /// inputs, vehicles, and controls to inject faults, set inputs and pause.
+    #[arg(long)]
+    dashboard: Option<String>,
+    /// Keep serving the dashboard after the run ends (until interrupted).
+    #[arg(long, requires = "dashboard")]
+    dashboard_hold: bool,
 }
 
 fn parse_input(s: &str) -> Result<(String, f64), String> {
@@ -564,8 +651,10 @@ fn run(args: RunArgs) -> Result<()> {
         Some(p) => Some(sim_host::board::Board::load(p).map_err(anyhow::Error::msg)?),
         None => None,
     };
+    let mut board_inputs = sim_host::board::Inputs::default();
     if let Some(b) = &board {
         let inputs = b.apply(&mut machine).map_err(anyhow::Error::msg)?;
+        board_inputs = inputs.clone();
         log::info!(
             "board {} ({} SPI, {} I2C device(s); inputs: {})",
             b.name,
@@ -653,6 +742,7 @@ fn run(args: RunArgs) -> Result<()> {
     }
 
     let mut bridge_ctl: Option<Box<dyn sim_host::fault::BridgeControl>> = None;
+    let mut link: Option<sim_host::dashboard::Link> = None;
     if let Some(rates) = board.as_ref().and_then(|b| b.can_rates()) {
         let mut bus = sim_devices::can::CanBus::new(args.can.as_deref().unwrap_or("can"), rates);
         if args.candump {
@@ -669,6 +759,7 @@ fn run(args: RunArgs) -> Result<()> {
             let bridge = sim_host::mock_bridge::MockBridge::new(client, rates.data.is_some(), sim_core::Time::ZERO);
             bridge.set_kill(Some(false));
             session.can_endpoints.push(Box::new(bridge.clone()));
+            link = Some(sim_host::dashboard::Link::Can(bridge.clone()));
             bridge_ctl = Some(Box::new(bridge));
             log::info!("mock bridge for client {client} attached");
         }
@@ -677,6 +768,7 @@ fn run(args: RunArgs) -> Result<()> {
             let bridge = sim_host::ethernet::PuddlesBridge::new(Time::ZERO);
             bridge.set_kill(Some(false));
             session.eth_endpoints.push(Box::new(bridge.clone()));
+            link = Some(sim_host::dashboard::Link::Eth(bridge.clone()));
             bridge_ctl = Some(Box::new(bridge));
             log::info!("mock bridge attached over Ethernet (UDP {})", sim_host::ethernet::LINK_PORT);
         }
@@ -723,23 +815,59 @@ fn run(args: RunArgs) -> Result<()> {
     if args.profile.is_some() {
         session.start_profile(args.profile_interval);
     }
+    let mut dash = match &args.dashboard {
+        Some(addr) => {
+            let image = args.image.as_ref().or(args.picoboot_load.as_ref()).and_then(|p| p.file_name());
+            let image = image.map_or("firmware".into(), |t| t.to_string_lossy().into_owned());
+            let info = sim_host::dashboard::BoardInfo {
+                name: board.as_ref().map_or_else(|| image.clone(), |b| b.name.clone()),
+                image,
+                inputs: board_inputs.clone(),
+                pins: board.as_ref().map(|b| b.pins.clone()).unwrap_or_default(),
+                fault_names: Vec::new(),
+            };
+            let buses = session.can_bus.as_ref().map(|b| vec![b.name.clone()]).unwrap_or_default();
+            let mut d = sim_host::dashboard::Dashboard::start(addr, vec![info], buses)
+                .with_context(|| format!("binding {addr}"))?;
+            d.tap_session(0, &mut session);
+            if let Some(l) = link.take() {
+                d.add_link(Some(0), None, l);
+            }
+            eprintln!("dashboard on http://{}/", d.addr);
+            Some(d)
+        }
+        None => None,
+    };
     let mut faults = args.faults.clone();
     faults.sort_by_key(|f| f.0);
     let mut faults = faults.into_iter().peekable();
+    let mut pending: Option<(Time, sim_host::fault::Fault)> = None;
     let reason = loop {
-        let next = faults.next_if(|f| f.0 <= end);
-        let reason = session.run_until(next.as_ref().map_or(end, |f| f.0));
-        let Some((_, fault)) = next.filter(|_| matches!(reason, StopReason::TimeLimit)) else { break reason };
-        let n = session.machine.can_nodes().len();
-        let mut bus = session.can_bus.take();
-        let target = sim_host::fault::FaultTarget {
-            session: &mut session,
-            bus: bus.as_mut().map(|b| (b, 0..n)),
-            bridge: bridge_ctl.as_deref(),
-            power: None,
-        };
-        let applied = target.apply(&fault);
-        session.can_bus = bus;
+        if pending.is_none() {
+            pending = faults.next_if(|f| f.0 <= end);
+        }
+        let target = pending.as_ref().map_or(end, |f| f.0);
+        // With a dashboard, run in short pieces so what it shows and what it is asked to do stay current
+        let until = if dash.is_some() { target.min(session.machine.now + DASHBOARD_PIECE) } else { target };
+        let reason = session.run_until(until);
+        if let Some(d) = &mut dash {
+            d.service_session(&mut session);
+            while d.paused() {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+                d.service_session(&mut session);
+            }
+        }
+        if !matches!(reason, StopReason::TimeLimit) {
+            break reason;
+        }
+        if until < target {
+            continue;
+        }
+        let Some((_, fault)) = pending.take() else { break reason };
+        let applied = sim_host::fault::apply_to_session(&mut session, bridge_ctl.as_deref(), &fault);
+        if let Some(d) = &mut dash {
+            d.note_fault(session.machine.now, "", &format!("{fault:?}"), &applied);
+        }
         if let Err(e) = applied {
             bail!("fault {fault:?}: {e}");
         }
@@ -815,11 +943,21 @@ fn run(args: RunArgs) -> Result<()> {
             eprintln!("  {name:32} {reads:>8} reads {writes:>8} writes");
         }
     }
+    if let Some(d) = &mut dash {
+        d.finish_session(&mut session, &format!("{reason:?}"));
+        if args.dashboard_hold {
+            eprintln!("run finished; the dashboard keeps serving on http://{}/ (Ctrl-C to quit)", d.addr);
+            d.hold();
+        }
+    }
     if matches!(reason, StopReason::Lockup { .. }) {
         bail!("core locked up");
     }
     Ok(())
 }
+
+/// Virtual time run between dashboard updates.
+const DASHBOARD_PIECE: Time = Time::from_ms(10);
 
 fn finish_vcd(v: &sim_host::vcd::Vcd, path: &std::path::Path, end: Time) -> Result<()> {
     let late = v.finish(end).with_context(|| format!("writing {}", path.display()))?;

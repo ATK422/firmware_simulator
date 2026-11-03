@@ -271,6 +271,20 @@ impl PacketLoss {
     }
 }
 
+/// Applies `fault` to a single board with its own bus (`session.can_bus`), as `run --fault` does.
+pub fn apply_to_session(
+    session: &mut Session,
+    bridge: Option<&dyn BridgeControl>,
+    fault: &Fault,
+) -> Result<(), String> {
+    let n = session.machine.can_nodes().len();
+    let mut bus = session.can_bus.take();
+    let target = FaultTarget { session, bus: bus.as_mut().map(|b| (b, 0..n)), bridge, power: None };
+    let applied = target.apply(fault);
+    session.can_bus = bus;
+    applied
+}
+
 /// A board to apply a fault to.
 pub struct FaultTarget<'a> {
     pub session: &'a mut Session,

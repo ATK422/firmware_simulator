@@ -25,6 +25,7 @@ pub fn resolve_image(path: &std::path::Path) -> std::path::PathBuf {
     }
 }
 pub mod board;
+pub mod dashboard;
 pub mod defmt;
 pub mod demangle;
 pub mod ethernet;

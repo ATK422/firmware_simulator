@@ -23,4 +23,6 @@ sim_physics.workspace = true
 canmore = { path = "../../external/titan_firmware_rs/crates/canmore" }
 titan_link = { path = "../../external/titan_firmware_rs/crates/titan_link" }
 serde = { version = "1", features = ["derive"] }
+# Already in the dependency tree through defmt-decoder: the dashboard's JSON
+serde_json = "1"
 toml = "0.8"

@@ -954,6 +954,7 @@ dependencies = [
  "object",
  "rp2040",
  "serde",
+ "serde_json",
  "sim_acoustics",
  "sim_core",
  "sim_devices",
