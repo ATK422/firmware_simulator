@@ -107,9 +107,9 @@ it only pays off with a few heavy boards on an otherwise idle multi-core machine
 was measured on, Talos was not faster with 4 threads. The default is 1. Emulator log lines from different boards
 can interleave differently with threads; what the boards do does not change.
 
-**Speed.** Talos (nine boards) runs at roughly a quarter of real time on one core, so `--realtime` with all of
-Talos is not expected to keep up; single boards like the template run far faster than real time, IVCBoard2 and
-the ESC board around real time. `cargo run --release -p sim_test --example bench` measures it
+**Speed.** Talos (nine boards) runs at 0.3-0.4x real time on one core of the shared machine it was measured on,
+so `--realtime` with all of Talos is not expected to keep up; the template runs about 40x faster than real time,
+IVCBoard2 and the ESC board about 1.2-1.4x. `cargo run --release -p sim_test --example bench` measures it
 ([internals.md](internals.md#performance)).
 
 ## Mock bridges
