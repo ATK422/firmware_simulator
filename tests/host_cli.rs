@@ -154,3 +154,102 @@ fn bridges_probe_finds_client_ids() {
     assert_eq!(commands.len(), 9, "{out}");
     assert!(!out.contains("no CANmore heartbeat") && !out.contains("suggests client"), "{out}");
 }
+
+/// Stand-ins for `ip`, `modprobe` and `sudo` that log their calls and keep the interfaces in a file, so the vcan
+/// script's logic runs without kernel CAN support.
+fn stub_tools(dir: &Path, modprobe_ok: bool) {
+    let ip = r#"#!/bin/bash
+echo "ip $*" >> "$STUB_DIR/log"
+state="$STUB_DIR/state"
+touch "$state"
+case "$1 $2" in
+    "link show")
+        line=$(grep "^$3 " "$state") || exit 1
+        echo "1: $3: <NOARP,UP> mtu ${line#* } qdisc noqueue"
+        ;;
+    "link add") echo "$4 16" >> "$state" ;;
+    "link set") if [ "$5" = mtu ]; then sed -i "s/^$4 .*/$4 $6/" "$state"; fi ;;
+    "link delete") sed -i "/^$4 /d" "$state" ;;
+esac
+"#;
+    let modprobe =
+        format!("#!/bin/bash\necho \"modprobe $*\" >> \"$STUB_DIR/log\"\nexit {}\n", if modprobe_ok { 0 } else { 1 });
+    let sudo = "#!/bin/bash\n\"$@\"\n";
+    for (name, text) in [("ip", ip), ("modprobe", modprobe.as_str()), ("sudo", sudo)] {
+        let p = dir.join(name);
+        std::fs::write(&p, text).unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+}
+
+fn vcan_up(stubs: &Path, args: &[&str]) -> (i32, String, String) {
+    let path = format!("{}:{}", stubs.display(), std::env::var("PATH").unwrap());
+    run(Command::new("bash").arg(repo().join("scripts/vcan_up.sh")).args(args).env("PATH", path).env("STUB_DIR", stubs))
+}
+
+#[test]
+fn vcan_script() {
+    check_bash(&repo().join("scripts/vcan_up.sh"));
+    let d = scratch("vcan");
+    stub_tools(&d, true);
+    let (code, out, err) = vcan_up(&d, &[]);
+    assert_eq!(code, 0, "{err}");
+    assert_eq!(out, "vcan0 up (CAN FD MTU 72)\nvcan1 up (CAN FD MTU 72)\n");
+    let log = std::fs::read_to_string(d.join("log")).unwrap();
+    for call in
+        ["modprobe vcan", "ip link add dev vcan0 type vcan", "ip link set dev vcan0 mtu 72", "ip link set dev vcan1 up"]
+    {
+        assert!(log.contains(call), "{call}: {log}");
+    }
+    assert!(log.contains("ip link set dev vcan1 txqueuelen 1000"));
+    assert_eq!(std::fs::read_to_string(d.join("state")).unwrap(), "vcan0 72\nvcan1 72\n");
+    // Again: nothing is re-created, and an interface that already has the FD MTU is not taken down
+    std::fs::remove_file(d.join("log")).unwrap();
+    let (code, _, _) = vcan_up(&d, &["vcan0"]);
+    assert_eq!(code, 0);
+    let log = std::fs::read_to_string(d.join("log")).unwrap();
+    assert!(!log.contains("link add") && !log.contains("down"), "{log}");
+    let (code, out, _) = vcan_up(&d, &["--down"]);
+    assert_eq!((code, out.as_str()), (0, "vcan0 removed\nvcan1 removed\n"));
+    assert_eq!(std::fs::read_to_string(d.join("state")).unwrap(), "");
+    // Without the kernel module it says what to do instead
+    stub_tools(&d, false);
+    let (code, _, err) = vcan_up(&d, &[]);
+    assert_eq!(code, 1);
+    assert!(err.contains("no virtual CAN support"), "{err}");
+    assert_eq!(vcan_up(&d, &["--bogus"]).0, 2);
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+/// The Docker files can't be built here; check what can be checked: the compose file parses (with PyYAML, if
+/// present), the services use the host's network, and every file the Dockerfiles copy exists.
+#[test]
+fn docker_files_are_consistent() {
+    let dir = repo().join("docker");
+    for df in ["robot_computer/Dockerfile", "emulator/Dockerfile"] {
+        let text = std::fs::read_to_string(dir.join(df)).unwrap();
+        for line in text.lines().filter(|l| l.starts_with("COPY ") && !l.contains("--from")) {
+            let words: Vec<&str> = line.split_whitespace().collect();
+            for src in &words[1..words.len() - 1] {
+                if *src != "." {
+                    assert!(repo().join(src).exists(), "{df}: {src} does not exist");
+                }
+            }
+        }
+    }
+    check_bash(&dir.join("robot_computer/entrypoint.sh"));
+    let compose = dir.join("robot_computer/compose.yaml");
+    let script = "import sys, yaml\nd = yaml.safe_load(open(sys.argv[1]))\nfor n, s in d['services'].items():\n    \
+                  print(n, s['network_mode'], s.get('build', {}).get('dockerfile', '-'))\n";
+    let (code, out, err) = run(Command::new("python3").args(["-I", "-c", script]).arg(&compose));
+    if err.contains("No module named 'yaml'") {
+        eprintln!("skipping the YAML check: no PyYAML");
+        return;
+    }
+    assert_eq!(code, 0, "{err}");
+    assert_eq!(
+        out,
+        "emulator host docker/emulator/Dockerfile\nrobot_computer host docker/robot_computer/Dockerfile\ntools host -\n"
+    );
+}

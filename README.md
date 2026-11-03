@@ -13,7 +13,7 @@ milestones are in [PLAN.md](PLAN.md).
 | [`rp2040`](crates/rp2040) | The SoC: memory map, bus fabric, peripherals, the two-core `Machine` and its run loop; register tables generated from `rp2040.svd` |
 | [`sim_devices`](crates/sim_devices) | External chip models: SPI/I2C/UART/pin-level device traits, CAN bus, MCP2517FD/MCP2518FD, W5500, SHT41, MCP3426/8, MS5837, SSD1306, CD74HC4051, BQ40Z80, DRV8243, WS2812, DShot ESC, Dynamixel and Hiwonder servos |
 | [`sim_acoustics`](crates/sim_acoustics) | Underwater acoustic environments: water, transducers by spec, receive chains, multipath, noise, sources, and the medium boards share (projectors driven by pins, moving vehicles) |
-| [`sim_host`](crates/sim_host) | Sessions and robots, board files, host bridges: GDB, RTT/defmt, SocketCAN, mock bridges, Ethernet/UDP, UART ptys, the C bootloader upload |
+| [`sim_host`](crates/sim_host) | Sessions and robots, board files, host bridges: GDB, RTT/defmt, SocketCAN, mock bridges, Ethernet/UDP, UART ptys, the C bootloader upload; candump logs, replay and log comparison, cannelloni tunnels, titan_bridge command lines |
 | [`sim_test`](crates/sim_test) | Firmware integration test harness: benches, robots, snapshots, sweeps |
 | `firmware_simulator` (root) | The command line tool |
 
@@ -129,6 +129,108 @@ cargo run --release -- run path/to/puddles_backplane --board boards/mk2/puddles_
     --udp 127.0.0.1:2203=127.0.0.1:2204 --realtime
 ```
 
+### CAN logs: recording, replaying, comparing
+
+`--candump-log FILE` (with `run` and `robot`) writes the bus traffic in `candump -l` format: every acknowledged
+frame (what a listening interface would receive), stamped with the virtual time its last bit was sent, with the bus
+name as the interface:
+
+```
+(0000000000.135357) internal 06F#C0
+(0000000000.200059) internal 01420802##10002
+```
+
+`--replay FILE` puts recorded traffic back on a bus as a host endpoint: `candump -l` logs and candump's text output
+(`candump can0`, with `-t a`, `-x`, `-a`) are read. Frames keep their spacing; a log with Unix timestamps (from
+hardware) starts at virtual time 0 and one written by `--candump-log` replays at its own times, unless
+`--replay-offset TIME` says when its first frame goes out. Each frame is made ready its on-wire duration before its
+logged time, so on a free bus it ends exactly when it ended in the log. `--replay-filter` selects frames by CANmore
+fields: `key=value` terms joined by `,` (all must hold, `!` negates one, `|` separates alternatives), with keys
+`sender` (`host`: what the robot computer sent, or `board`), `client`, `type` (`msg`/`util`), `channel`, `iface` and
+`id` (`0x123` or `0x100/0x700`); repeated filters are alternatives. In a robot, an interface of the log goes to the
+bus of the same name (or the one `--can` bridges to that interface); `--replay-iface can0=internal` maps others.
+
+```bash
+# What the real robot computer sent to the power board, replayed to the emulated one
+cargo run --release -- run path/to/power_board --board boards/mk2/power_board.toml \
+    --replay hw.log --replay-filter sender=host,client=1 --candump-log sim.log --time 30s
+# Everything on the bus except ESC board 0, which the emulator plays
+cargo run --release -- robot robots/talos.toml --replay hw.log --replay-iface can0=internal \
+    --replay-filter sender=host --replay-filter '!client=2'
+```
+
+`can-diff A B` compares two logs by what the frames mean. CANmore messages are re-assembled per client and
+direction and their `titan_link` payloads decoded; each kind of message is a stream (`internal client 1
+board->host FirmwareStatus`, `... host->board Ping`, `... board->host heartbeat` for the CANmore heartbeat, which is
+compared without its rolling counter). The logs are lined up (two emulator logs on their own timestamps, otherwise
+on their first frames; `--align auto` searches for the offset, `--offset` gives it), each stream is lined up on its
+own, and events are paired in order within `--tolerance` (20 ms, at most half the stream's period). Only the time
+both logs cover is compared. The report has a table of streams (events in each log, paired, missing in B, extra in
+B, payload differences, period and jitter in each log, the stream's offset and the largest time difference of a
+pair), then examples of each difference with the fields that changed:
+
+```
+stream                                                         A      B paired   miss  extra payload         period A ms         period B ms   offset ms    max skew
+can client 1 board->host Power::Electrical::ElectricalReadings  2      2      2      0      0       2     1001.16 ± 0.000     1001.16 ± 0.000      +0.000       0.000
+...
+  can client 1 board->host Power::Electrical::ElectricalReadings:
+    2 with different payloads
+      1.068199  port_voltage: 16.195385 -> 12.995312
+```
+
+It exits with 0 when the logs agree, 1 when they differ (`--max-skew` adds a timing limit) and 2 on errors, for
+CI. `--ignore-payload STREAM` compares a stream's presence and timing only (e.g. `FirmwareStatus`, whose uptime
+differs between a board and its emulation), `--only` picks streams, `--raw` compares frames by identifier without
+decoding, and `--iface-map can0=internal` renames interfaces (two logs with one interface each are matched as they
+are). This is how a real board's traffic is held against the emulator's (PLAN.md, testing against hardware): record
+the board with `candump -l can0 > hw.log`, replay the robot computer's side into the emulated board, and compare.
+
+### Robot in a box: vcan, titan_bridge and the host tools
+
+`scripts/vcan_up.sh` loads the vcan module and creates `vcan0` and `vcan1` (or the interfaces named) with the CAN FD
+MTU and a longer transmit queue; `--down` removes them. Then the emulated robot is on those interfaces, and the
+real host tools run against it unchanged, with one `titan_bridge` per Rust board:
+
+```bash
+scripts/vcan_up.sh
+cargo run --release -- robot robots/talos.toml --can internal=vcan0 --can external=vcan1 --realtime --time 100000s
+cargo run --release -- bridges robots/talos.toml            # the titan_bridge command for each board:
+#   titan_bridge --board poac --interface vcan0 --namespace talos --client-id 1
+#   titan_bridge --board esc0 --interface vcan0 --namespace talos --client-id 2
+#   titan_bridge --board esc1 --interface vcan0 --namespace talos --client-id 3
+#   ...
+#   titan_bridge --board ivc2 --interface vcan0 --namespace talos --client-id 8
+#   titan_bridge --board smart_battery --interface vcan1 --namespace talos --client-id 21
+cargo run --release -- bridges robots/talos.toml --format script -o bridges.sh   # starts them all (riptide-shell)
+cargo run --release -- bridges robots/talos.toml --format launch -o bridges.launch.py   # or: ros2 launch
+candump -l vcan0                                            # the internal bus
+canmore_cli                                                 # lists the boards on every can*/vcan* interface
+upload_tool -b talos/ivc_board path/to/ivc_board            # over CAN: a board with the C Titan bootloader
+```
+
+`bridges` takes each board's `--board` profile from its firmware image (titan_bridge's profiles are mirrored, and a
+test checks them against titan_bridge's sources), the ESC board's ID from its GPIO 29 strap and the smart battery's
+client ID from the serial number in its board file's flash; the Nth bus of the robot file is `vcanN` unless
+`--can BUS=IFACE` says otherwise. `--probe` boots the robot for a moment and reads each board's client ID from its
+CANmore heartbeats instead. Boards without a Rust bridge (C images, examples) are listed with a note.
+
+`docker/robot_computer/` has a ROS 2 Humble image with titan_bridge, upload_tool and canmore_cli and a compose file
+that runs it next to the emulator on the host's vcan interfaces; see [its README](docker/robot_computer/README.md)
+(written but not built or run yet).
+
+### CAN over UDP
+
+`--cannelloni LOCAL,PEER` (`run`) or `--cannelloni BUS=LOCAL,PEER` (`robot`) tunnels a bus over UDP in the framing
+of [cannelloni](https://github.com/mguentner/cannelloni) (protocol version 2), for host tools on a machine, VM or
+container that cannot share the emulator's vcan. On that side `firmware_simulator can-tunnel vcan0 LOCAL,PEER`
+connects a local vcan to it (or cannelloni itself, untested). Use `--realtime`.
+
+```bash
+firmware_simulator robot robots/talos.toml --realtime --cannelloni internal=0.0.0.0:20000,10.0.0.2:20000
+# on 10.0.0.2, after scripts/vcan_up.sh:
+firmware_simulator can-tunnel vcan0 0.0.0.0:20000,10.0.0.1:20000
+```
+
 ### Flash, the bootloader and resets
 
 A watchdog reset (timeout or forced) restarts every block except the watchdog's scratch registers, the flash and
@@ -162,8 +264,11 @@ sets inputs, injects faults (panics, resets, missing parts) and reads what the b
 the same for a robot file; both snapshot in a few milliseconds, and `sweep` runs a scenario from a snapshot over a
 set of parameters in parallel. Its tests are the smoke test of every board image (`tests/smoke.rs`), the whole of
 Talos on its buses (`tests/robot.rs`), Puddles over UDP (`tests/puddles.rs`), the H-bridge and harness checks
-(`tests/harness.rs`) and the IVC range and noise sweeps (`tests/ivc_sweep.rs`, run with `--nocapture` to see the
-tables). CI (`.github/workflows/ci.yml`) builds titan_firmware_rs and runs all of them.
+(`tests/harness.rs`), the IVC range and noise sweeps (`tests/ivc_sweep.rs`, run with `--nocapture` to see the
+tables), and recording, replaying and comparing a board's traffic plus a cannelloni tunnel (`tests/can_log.rs`).
+`tests/host_cli.rs` (in the root package) runs the host tools through the command line: Talos recorded, its
+bridges' side replayed and the logs compared, the `bridges` outputs, and `scripts/vcan_up.sh` against stand-ins for
+`ip` and `modprobe`. CI (`.github/workflows/ci.yml`) builds titan_firmware_rs and runs all of them.
 
 `test_programs/` holds hand-written Thumb programs and a small embassy firmware used by the tests; the ELFs are
 committed, `make -C test_programs` rebuilds them (`arm-none-eabi-as`, and the `thumbv6m-none-eabi` Rust target).
