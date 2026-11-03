@@ -1,0 +1,64 @@
+# Acoustic interop between the two IVCBoard2 firmwares in the pool: the Rust `ivc_board2` (titan_link over CAN to
+# a mock bridge) on Talos, and the C titan_firmware IVCBoard2 (branch blake/ivc; micro-ROS over USB) on a second
+# vehicle 5 m away. Both speak the same modem on paper (docs/acoustics.md#c-and-rust-ivcboard2-interop).
+#
+# The C board's image comes from your titan_firmware checkout, built as usual (it needs the Docker-built micro-ROS
+# library; see titan_firmware's docs/02_Testing_Firmware.md):
+#
+#   git -C ~/titan_firmware checkout blake/ivc
+#   cd ~/titan_firmware/talos/IVCBoard2 && mkdir -p build && cd build && cmake .. && make
+#   export TITAN_FIRMWARE_DIR=~/titan_firmware
+#
+# Run it in real time (the micro-ROS agent's timeouts are on the wall clock), with a mock bridge for the Rust board:
+#
+#   firmware_simulator robot robots/ivc2_interop.toml --mock-bridge talos:8 --realtime --time 600s \
+#       --ivc-send 30s@talos_ivc:0x5a
+#
+# The C board's text log is on /tmp/c_ivc-log (USB CDC port 0; also printed as `c_ivc uart0:` lines) and its
+# micro-ROS port on /tmp/c_ivc-ros (CDC port 1). In another terminal (ROS 2 sourced):
+#
+#   ros2 run micro_ros_agent micro_ros_agent serial --dev /tmp/c_ivc-ros
+#   ros2 topic echo /talos/ivc/rx_new                       # what the C board receives (std_msgs/Int8)
+#   ros2 topic pub --once /talos/ivc/enqueue_data std_msgs/msg/Int8 "{data: 90}"   # the C board sends 0x5a
+#
+# The C node is in the `talos` namespace (ROBOT_NAMESPACE), hence the absolute topic names. Int8 is signed:
+# bytes above 0x7f are negative (0xa5 is -91).
+#
+# What to look for:
+#   * Rust -> C: `--ivc-send 30s@talos_ivc:0x5a` makes the Rust board log `Transmitting 0x5a`; about 8.7 s later
+#     the C board logs `packet read complete with: 90` and publishes 90 on /talos/ivc/rx_new.
+#   * C -> Rust: after the `ros2 topic pub`, the C board logs `enqueueing 90` and `writing out: ...` for each bit;
+#     about 9 s later this command prints `[t] talos_ivc: IVC received 0x5a` (the Rust board's mock bridge got
+#     `Ivc2(RxNew(0x5a))`).
+#   * The emulator runs this pair at about 0.4x real time (measured with the C modem alone), so with --realtime
+#     virtual time falls behind the wall clock; the firmware's own micro-ROS timeouts are on virtual time.
+#   * Leave each packet 10 s before sending the next, and don't send from both at once: the modem is half duplex,
+#     has no ACK, and the C transmitter overwrites a packet in flight with the next queued byte.
+[environment]
+file = "../environments/pool.toml"
+
+[[bus]]
+name = "talos"
+
+[[bus]]
+name = "surface"
+
+[[board]]
+name = "talos_ivc"
+board = "../boards/talos/ivc_board.toml"
+elf = "../external/titan_firmware_rs/firmware/target/thumbv6m-none-eabi/release/ivc_board2"
+bus = "talos"
+position_m = [5.0, 6.0, 1.5]
+
+[[board]]
+name = "c_ivc"
+board = "../boards/talos/ivc_board.toml"
+# The C build's bootloader plus application, booted through the bootrom like a powered-on board. The CAN bootloader
+# hands over to the application after its boot delay; nothing else is on this bus.
+elf = "${TITAN_FIRMWARE_DIR}/talos/IVCBoard2/build/IVCBoard2_with_bl.uf2"
+rom_boot = true
+bus = "surface"
+power_on_ms = 37
+position_m = [10.0, 6.0, 1.5]
+usb_cdc = "pty:/tmp/c_ivc-log"
+usb_cdc2 = "pty:/tmp/c_ivc-ros"

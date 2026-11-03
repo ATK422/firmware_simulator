@@ -24,10 +24,13 @@
 //!                                     # or trajectory = [[0.0, [x, y, z]], [10.0, [x, y, z]]]
 //! # power_on_ms = 37                   # switched on later than time 0
 //! # gpio = [{ pin = 6, level = "high" }]   # straps, replacing the board file's for those pins
+//! # usb_cdc = "pty:/tmp/ivc-log"      # USB plugged into a host that opens CDC port 0 (stdout, pty, pty:PATH)
+//! # usb_cdc2 = "pty:/tmp/ivc-ros"     # and port 1 (micro-ROS over titan_dual_stdio_usb); `usb = true` just plugs in
 //! # [board.transducer]                # replaces the board file's transducer
 //! ```
 //!
-//! Paths are relative to the robot file. Several vehicles go in one file as several buses.
+//! Paths are relative to the robot file; `elf`, `board` and pty paths may start with `~` and contain `$NAME` or
+//! `${NAME}` environment variables ([`crate::expand_path`]). Several vehicles go in one file as several buses.
 //!
 //! A `[[vehicle]]` section (see [`crate::vehicle`]) adds a simulated vehicle that the boards' thrusters move, with
 //! the depth sensors and transducers of the boards on it following its motion.
@@ -44,6 +47,7 @@ use sim_devices::can::{CanBus, CanEndpoint, CanNode};
 
 use crate::board::{Board, GpioEntry, Inputs, TransducerEntry, bus_rates};
 use crate::session::{CanCallback, Session};
+use crate::usb::CdcSink;
 use crate::vehicle::{VehicleSim, VehicleSpec};
 
 /// A CAN bus of the robot with the host endpoints on it.
@@ -74,6 +78,9 @@ pub struct Robot {
     pub images: Vec<String>,
     /// The bus each board is on.
     pub board_bus: Vec<Option<usize>>,
+    /// Each board's USB port: whether it is plugged into a host and where its CDC ports go (see
+    /// [`Robot::set_usb_cdc`]).
+    pub usb: Vec<UsbPorts>,
     pub buses: Vec<RobotBus>,
     pub bus_names: Vec<String>,
     /// The water the boards' transducers are in.
@@ -105,6 +112,7 @@ impl Default for Robot {
             client_ids: Vec::new(),
             images: Vec::new(),
             board_bus: Vec::new(),
+            usb: Vec::new(),
             buses: Vec::new(),
             bus_names: Vec::new(),
             medium: None,
@@ -138,6 +146,7 @@ impl Robot {
         self.client_ids.push(None);
         self.images.push(String::new());
         self.board_bus.push(bus);
+        self.usb.push(UsbPorts::default());
         self.power_on.push((Time::ZERO, true));
         self.boards.len() - 1
     }
@@ -194,6 +203,64 @@ impl Robot {
             }
         }
         None
+    }
+
+    /// Plugs board `i`'s USB port into a host controller model (once; the host enumerates whatever the firmware
+    /// presents), like `run --usb`.
+    pub fn plug_usb(&mut self, i: usize) {
+        let m = &mut self.boards[i].machine;
+        if m.sys.usb_host.is_none() {
+            let now = m.now;
+            m.sys.attach_usb_host(sim_devices::usb::host::HostController::new(), now);
+        }
+        self.usb[i].plugged = true;
+    }
+
+    /// Opens board `i`'s USB CDC port `port` (0, or 1 for titan_dual_stdio_usb's secondary port) from the host
+    /// (115200 8N1, DTR and RTS), plugging the board in first, and notes where it goes. The device's output on port
+    /// 0 is collected in [`Session::usb_cdc_text`] and passed to [`Session::on_usb_cdc_line`]; ptys are opened by
+    /// [`Robot::open_usb_ptys`]. Port 1 carries raw bytes (micro-ROS), so it takes only a pty.
+    pub fn set_usb_cdc(&mut self, i: usize, port: usize, sink: CdcSink) -> Result<(), String> {
+        let name = &self.names[i];
+        match port {
+            0 => {}
+            1 if sink == CdcSink::Stdout => {
+                return Err(format!("{name}: the second CDC port carries raw bytes (micro-ROS): use pty or pty:PATH"));
+            }
+            1 => {}
+            _ => return Err(format!("{name}: no CDC port {port} (0 or 1)")),
+        }
+        self.plug_usb(i);
+        let m = &mut self.boards[i].machine;
+        let now = m.now;
+        m.sys.with_usb_host(now, |h| h.cdc_open(port, 115_200));
+        let ports = &mut self.usb[i];
+        *(if port == 0 { &mut ports.cdc } else { &mut ports.cdc2 }) = Some(sink);
+        Ok(())
+    }
+
+    /// Opens a pseudo terminal for every CDC port set to `pty` or `pty:PATH` that has none yet (a snapshot has
+    /// none: ptys are not copied). Returns a line per terminal saying where it is.
+    pub fn open_usb_ptys(&mut self) -> Result<Vec<String>, String> {
+        let mut opened = Vec::new();
+        for i in 0..self.boards.len() {
+            let (name, ports, s) = (&self.names[i], &self.usb[i], &mut self.boards[i]);
+            for (port, sink) in [(0, &ports.cdc), (1, &ports.cdc2)] {
+                let Some(CdcSink::Pty(link)) = sink else { continue };
+                let slot = if port == 0 { &mut s.usb_cdc_pty } else { &mut s.usb_cdc2_pty };
+                if slot.is_some() {
+                    continue;
+                }
+                let pty = crate::pty::Pty::open_linked(link.as_deref())
+                    .map_err(|e| format!("{name}: USB CDC port {port}: {e}"))?;
+                opened.push(match link {
+                    Some(l) => format!("{name}: USB CDC port {port} on {} (linked from {})", pty.path, l.display()),
+                    None => format!("{name}: USB CDC port {port} on {}", pty.path),
+                });
+                *slot = Some(pty);
+            }
+        }
+        Ok(opened)
     }
 
     /// The thread each board ran on in the last run on threads (0: the calling thread; see [`crate::parallel`]).
@@ -288,6 +355,7 @@ impl Robot {
             client_ids: self.client_ids.clone(),
             images: self.images.clone(),
             board_bus: self.board_bus.clone(),
+            usb: self.usb.clone(),
             buses: self
                 .buses
                 .iter()
@@ -344,7 +412,7 @@ impl Robot {
             robot.vehicles.push(VehicleSim::new(v, dir, env.as_deref())?);
         }
         for b in &spec.board {
-            let board_file = dir.join(&b.board);
+            let board_file = dir.join(expand(&b.board)?);
             let mut board = Board::load(&board_file)?;
             if let Some(t) = &b.transducer {
                 board.transducer = Some(t.clone());
@@ -352,7 +420,7 @@ impl Robot {
             // Robot-level straps replace the board file's entries for the same pins
             board.gpio.retain(|g| !b.gpio.iter().any(|o| o.pin == g.pin));
             board.gpio.extend(b.gpio.iter().cloned());
-            let elf = crate::resolve_image(&dir.join(&b.elf));
+            let elf = crate::resolve_image(&dir.join(expand(&b.elf)?));
             let image = Image::load(&elf).map_err(|e| format!("{}: {e}", elf.display()))?;
             let mut m = Machine::new(MachineConfig {
                 bootrom: Some(rp2040::BOOTROM_B1.to_vec()),
@@ -416,12 +484,38 @@ impl Robot {
             {
                 robot.power_on[owner] = (Time::from_secs_f64(ms / 1000.0), false);
             }
+            if b.usb {
+                robot.plug_usb(owner);
+            }
+            for (port, sink) in [(0, &b.usb_cdc), (1, &b.usb_cdc2)] {
+                let sink = match sink {
+                    Some(CdcSink::Pty(Some(link))) => CdcSink::Pty(Some(dir.join(expand(link)?))),
+                    Some(s) => s.clone(),
+                    None => continue,
+                };
+                robot.set_usb_cdc(owner, port, sink)?;
+            }
         }
         for (v, s) in robot.vehicles.iter_mut().zip(&spec.vehicle) {
             v.wire(s, &robot.names, &robot.boards, &robot.inputs)?;
         }
         Ok(robot)
     }
+}
+
+/// [`crate::expand_path`] for a path from a robot file.
+fn expand(p: &Path) -> Result<PathBuf, String> {
+    crate::expand_path(&p.to_string_lossy())
+}
+
+/// A board's USB port in a robot: plugged into a host or not, and where the host's CDC ports go.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct UsbPorts {
+    pub plugged: bool,
+    /// CDC port 0 (pico-sdk stdio_usb, titan_dual_stdio_usb's text log).
+    pub cdc: Option<CdcSink>,
+    /// CDC port 1 (titan_dual_stdio_usb's secondary port: micro-ROS).
+    pub cdc2: Option<CdcSink>,
 }
 
 /// Switches `board` on if it is due by `t` (`power_on`: when, and whether it has been); whether it is on.
@@ -527,7 +621,8 @@ pub struct BoardSpec {
     pub name: String,
     /// Board file.
     pub board: PathBuf,
-    /// Firmware image (ELF or UF2).
+    /// Firmware image (ELF or UF2), relative to the robot file or absolute, with `~` and environment variables
+    /// expanded.
     pub elf: PathBuf,
     pub bus: Option<String>,
     #[serde(default)]
@@ -540,4 +635,11 @@ pub struct BoardSpec {
     /// Pin straps for this board (e.g. a board ID pin), as `[[board.gpio]]` entries of a board file.
     #[serde(default)]
     pub gpio: Vec<GpioEntry>,
+    /// Plug the board's USB port into a host (implied by `usb_cdc` and `usb_cdc2`).
+    #[serde(default)]
+    pub usb: bool,
+    /// Open the device's (first) USB CDC port: `stdout`, `pty` or `pty:PATH`.
+    pub usb_cdc: Option<CdcSink>,
+    /// Open its second CDC port (titan_dual_stdio_usb's micro-ROS port): `pty` or `pty:PATH`.
+    pub usb_cdc2: Option<CdcSink>,
 }

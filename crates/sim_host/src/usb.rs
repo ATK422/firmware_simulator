@@ -579,6 +579,39 @@ impl MscDrive {
     }
 }
 
+/// Where a USB CDC port of a board goes (`run --usb-cdc`, `robot --usb-cdc BOARD=SINK`, a robot file's `usb_cdc`):
+/// `stdout` (complete lines with their virtual time), `pty` (a pseudo terminal, like the device's `/dev/ttyACM`) or
+/// `pty:PATH` (the same, with a symlink at `PATH` so tools can use a fixed name).
+#[derive(Clone, Debug, PartialEq, Eq, serde::Deserialize)]
+#[serde(try_from = "String")]
+pub enum CdcSink {
+    Stdout,
+    Pty(Option<std::path::PathBuf>),
+}
+
+impl std::str::FromStr for CdcSink {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<CdcSink, String> {
+        match s {
+            "stdout" => Ok(CdcSink::Stdout),
+            "pty" => Ok(CdcSink::Pty(None)),
+            _ => match s.strip_prefix("pty:") {
+                Some(path) if !path.is_empty() => Ok(CdcSink::Pty(Some(path.into()))),
+                _ => Err(format!("expected stdout, pty or pty:PATH, not {s:?}")),
+            },
+        }
+    }
+}
+
+impl TryFrom<String> for CdcSink {
+    type Error = String;
+
+    fn try_from(s: String) -> Result<CdcSink, String> {
+        s.parse()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -602,5 +635,14 @@ mod tests {
         assert_eq!(p[0].1[300], 0xFF);
         assert_eq!(p[0].1[512], 2);
         assert_eq!((p[1].0, p[1].1.len()), (0x1000_1000, 256));
+    }
+
+    #[test]
+    fn cdc_sinks() {
+        assert_eq!("stdout".parse(), Ok(CdcSink::Stdout));
+        assert_eq!("pty".parse(), Ok(CdcSink::Pty(None)));
+        assert_eq!("pty:/tmp/x".parse(), Ok(CdcSink::Pty(Some("/tmp/x".into()))));
+        assert!("pty:".parse::<CdcSink>().is_err());
+        assert!("file".parse::<CdcSink>().unwrap_err().contains("stdout, pty or pty:PATH"));
     }
 }

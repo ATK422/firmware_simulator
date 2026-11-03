@@ -30,4 +30,14 @@ c_dual_usb:
 	ninja -C ../build/c/c_dual_usb
 	arm-none-eabi-strip --strip-debug -o c_dual_usb/c_dual_usb.elf ../build/c/c_dual_usb/c_dual_usb.elf
 
-.PHONY: all clean pico c_dual_usb
+# The C IVCBoard2 modem without micro-ROS (CMake, against titan_firmware; its sources from the submodule's
+# blake/ivc branch, extracted into build/c/src without touching the submodule's checkout)
+IVC_REV ?= a3463bd9d745f57eb7cf0e8a4120df0a6f957e7f
+c_ivc_modem:
+	mkdir -p ../build/c/src
+	git -C ../external/titan_firmware archive $(IVC_REV) talos/IVCBoard2 | tar -x -C ../build/c/src
+	cmake -G Ninja -S c_ivc_modem -B ../build/c/c_ivc_modem
+	ninja -C ../build/c/c_ivc_modem
+	arm-none-eabi-strip --strip-debug -o c_ivc_modem/c_ivc_modem.elf ../build/c/c_ivc_modem/c_ivc_modem.elf
+
+.PHONY: all clean pico c_dual_usb c_ivc_modem

@@ -23,6 +23,7 @@ and replay, log comparison, UDP tunnels, and the real host tools.
 | `robots/puddles.toml` | Puddles: the backplane over Ethernet, in the Puddles vehicle |
 | `robots/ivc_pool.toml` | Two vehicles in `pool.toml`, each with a first-generation IVCBoard on its own bus |
 | `robots/ivc2_pool.toml` | The same with IVCBoard2 |
+| `robots/ivc2_interop.toml` | The Rust `ivc_board2` and the C titan_firmware IVCBoard2 (your build, micro-ROS over USB) in the pool ([acoustics.md](acoustics.md#c-and-rust-ivcboard2-interop)) |
 
 ```toml
 [environment]                       # optional: the water the boards' transducers are in
@@ -43,6 +44,8 @@ bus = "internal"                    # default: the only bus, if there is one and
 power_on_ms = 3                     # switched on 3 ms after the others
 gpio = [{ pin = 29, level = "high" }]   # straps, replacing the board file's for those pins
 # rom_boot = true                   # boot through the bootrom and boot2
+# usb_cdc = "pty:/tmp/esc1-log"     # USB plugged into a host that opens CDC port 0: stdout, pty or pty:PATH
+# usb_cdc2 = "pty:/tmp/esc1-ros"    # and CDC port 1 (micro-ROS over titan_dual_stdio_usb); usb = true only plugs in
 # position_m = [5.0, 6.0, 1.5]      # in an environment: where its transducer is,
 # trajectory = { start_m = [...], velocity_mps = [...] }   # or how it moves
 # [board.transducer]                # replaces the board file's transducer
@@ -56,6 +59,13 @@ Paths are relative to the robot file. Unknown keys are errors. Several vehicles 
 (the IVC pool files). `elf` paths into `external/titan_firmware_rs/firmware/target/thumbv6m-none-eabi/release`
 are redirected to `$TITAN_RS_RELEASE_DIR` when it is set (a worktree, another checkout, CI).
 
+* **Images from anywhere.** `elf` takes an ELF or a UF2 (a C build's `NAME_with_bl.uf2`, bootloader and
+  application; give it `rom_boot = true` to boot it like a powered-on board), relative or absolute. `elf`, `board`
+  and pty paths may start with `~` and contain environment variables, `$NAME` or `${NAME}` (an unset one is an
+  error naming it). For C titan_firmware images the convention is **`TITAN_FIRMWARE_DIR`**, your titan_firmware
+  checkout, with each project built in its own `build/` as titan_firmware's docs do it:
+  `elf = "${TITAN_FIRMWARE_DIR}/talos/IVCBoard2/build/IVCBoard2_with_bl.uf2"`.
+
 * **Power-on offsets.** Boards never power up in perfect lockstep; `power_on_ms` keeps a board unpowered for that
   long. Talos's second ESC board starts 3 ms late, the IVC pools' second board 37 ms late.
 * **Straps.** `gpio` entries replace the board file's `[[gpio]]` for the same pins: Talos's `esc1` has its ID
@@ -64,6 +74,7 @@ are redirected to `$TITAN_RS_RELEASE_DIR` when it is set (a worktree, another ch
 * **Environments and positions**: a board with a transducer in a robot with an `[environment]` needs
   `position_m`, a `trajectory` or a vehicle that carries it ([acoustics.md](acoustics.md)).
 * **Vehicles**: `[[vehicle]]`, `[[vehicle.sensor]]`, `[[vehicle.transducer]]` ([vehicles.md](vehicles.md)).
+* **USB**: see [below](#usb-on-robot-boards).
 
 ## The `robot` command
 
@@ -85,6 +96,9 @@ as `[t] NAME uart0: ...`); the run ends with the stop time, the wall time and ea
 | `--can BUS=IFACE` | | Bridges a bus to a SocketCAN interface, e.g. `internal=vcan0` (repeatable) |
 | `--candump` | | Prints every frame with its bus |
 | `--candump-log FILE`, `--replay FILE`, `--replay-filter`, `--replay-offset`, `--replay-iface IFACE=BUS`, `--cannelloni BUS=LOCAL,PEER` | | [Below](#can-logs-recording-replaying-comparing) |
+| `--usb-cdc BOARD=SINK` | | Opens a board's USB CDC port (pico-sdk stdio_usb, titan_dual_stdio_usb's text log): `stdout` prints its lines as `[t] BOARD usb: ...`, `pty` or `pty:PATH` puts it on a terminal (repeatable; replaces the robot file's `usb_cdc`) |
+| `--usb-cdc2 BOARD=SINK` | | Opens its second CDC port (titan_firmware's micro-ROS USB transport) on `pty` or `pty:PATH` (repeatable; replaces `usb_cdc2`) |
+| `--ivc-send TIME@BOARD:BYTE` | | Makes an IVC board transmit a byte at a virtual time through its mock bridge, e.g. `4s@talos_ivc:0x5a` (repeatable; [below](#mock-bridges)) |
 | `--fault TIME@BOARD:FAULT` | | A fault on one board, e.g. `1.5s@camera_cage:can-unplug` (repeatable; bridge faults act on the first mock bridge on the board's bus; [faults.md](faults.md)) |
 | `--noise-db L` | | Replaces every hydrophone's ambient noise with white noise at `L` dB re 1 µPa²/Hz |
 | `--vehicle-csv FILE` | | Writes each vehicle's state every 10 ms (`NAME` in the file name for several vehicles) |
@@ -97,6 +111,28 @@ as `[t] NAME uart0: ...`); the run ends with the stop time, the wall time and ea
 | `--log-json FILE` | | Every log line, UART line, CAN frame and fault as JSON lines |
 
 It exits with an error if a board stops (a lockup, say) before `--time`.
+
+### USB on robot boards
+
+A board's USB port is plugged into its own host controller model ([running.md](running.md#usb-bootsel-picoboot-uf2-and-cdc))
+by `usb = true`, `usb_cdc` or `usb_cdc2` on its `[[board]]`, or by `--usb-cdc BOARD=SINK` / `--usb-cdc2 BOARD=SINK`,
+which replace the file's setting for that port. The host opens the CDC ports asked for (115200 8N1, DTR and RTS),
+so pico-sdk's stdio_usb and titan_firmware's `titan_dual_stdio_usb` (text on port 0, micro-ROS on port 1) talk to
+it as to a laptop. A port on `pty:PATH` gets a pseudo terminal with a symlink at `PATH` (replacing a symlink an
+earlier run left), which the micro-ROS agent or `picocom` open; the paths are printed at the start:
+
+```bash
+firmware_simulator robot robots/ivc2_interop.toml --mock-bridge talos:8 --realtime --time 600s \
+    --usb-cdc c_ivc=stdout --usb-cdc2 c_ivc=pty:/tmp/c_ivc-ros
+#   c_ivc: USB CDC port 1 on /dev/pts/4 (linked from /tmp/c_ivc-ros)
+#   [0.209900s] c_ivc usb: ...
+```
+
+The ports are polled after every slice, like the UARTs, on the calling thread, so a robot on `--threads` runs the
+same; what arrives from a terminal reaches the board at the next slice boundary after it was written, which depends
+on the wall clock (as with any host tool). Snapshots (`Robot::snapshot`) keep each board's USB host and its
+ports' settings but not the terminals; `Robot::open_usb_ptys` opens new ones for the copy. In code:
+`Robot::set_usb_cdc(board, port, sink)`, `Robot::plug_usb`, `Robot::usb`.
 
 ## Traces, profiles, waveforms and the dashboard
 
@@ -163,8 +199,26 @@ utility frames, decoding errors). On an Ethernet cable (`--eth-mock-bridge`, or 
 speaks the Puddles UDP transport from the robot computer's address. Like a Linux CAN socket it queues at most 10
 frames and drops pings that do not fit.
 
-In code it is `sim_host::mock_bridge::MockBridge` (`PuddlesBridge` for Ethernet): `send` a `HostToDevice`, read
-`state().received`, `stop`/`start` it, `set_kill`, `fork` it for a snapshot.
+**IVC bytes.** Each mock bridge of `robot` prints the IVC bytes its board received acoustically
+(`DeviceToHost::Ivc2(RxNew)` from IVCBoard2, `DeviceToHost::Ivc(Rx)` from the first-generation IVCBoard), named
+after the board: `[12.200999s] surface_ivc: IVC received 0x5a`. `--ivc-send TIME@BOARD:BYTE` (BYTE as `90` or
+`0x5a`) makes the board's bridge send `Ivc2(EnqueueData(BYTE))` to an `ivc_board2` image or `Ivc(Tx(BYTE))` to an
+`ivc_board` image at that virtual time; the board needs a `--mock-bridge` for its bus and client. IVCBoard2 hears
+nothing until its noise floor has settled (about 2.5 s after power-on), and a packet takes 9 s:
+
+```bash
+firmware_simulator robot robots/ivc2_pool.toml --mock-bridge talos:8 --mock-bridge surface:8 \
+    --ivc-send 3.5s@talos_ivc:0x5a --ivc-send 13s@surface_ivc:0xc3 --time 23s
+#   [3.561700s] talos_ivc: 3.426997 INFO  Transmitting 0x5a
+#   [12.200999s] surface_ivc: IVC received 0x5a
+#   [13.051400s] surface_ivc: 12.879642 INFO  Transmitting 0xc3
+#   [21.689465s] talos_ivc: IVC received 0xc3
+```
+
+In code it is `sim_host::mock_bridge::MockBridge` (`PuddlesBridge` for Ethernet): `send` a `HostToDevice` now or
+`send_at` a virtual time, read `state().received` (or get each message as it arrives with `on_message`),
+`stop`/`start` it, `set_kill`, `fork` it for a snapshot. `IvcModem::from_image(name).transmit(byte)` and
+`ivc_received(msg)` are the IVC messages above.
 
 ## CAN logs: recording, replaying, comparing
 
