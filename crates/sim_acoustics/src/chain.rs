@@ -178,6 +178,12 @@ impl Chain {
         (out + self.spec.bias_v.unwrap_or((lo + hi) / 2.0)).clamp(lo, hi)
     }
 
+    /// Whether `v`, an output of [`Chain::process`], sits at a rail: the signal was clipped.
+    pub fn at_rail(&self, v: f64) -> bool {
+        let [lo, hi] = self.spec.rails_v;
+        v <= lo || v >= hi
+    }
+
     pub fn reset(&mut self) {
         for (sections, _) in &mut self.paths {
             sections.iter_mut().for_each(Biquad::reset);

@@ -16,6 +16,7 @@ a new transducer, another modem scheme or a different acoustic board is a config
 - [Moving transducers and Doppler](#moving-transducers-and-doppler)
 - [IVC link tests and sweeps](#ivc-link-tests-and-sweeps)
 - [C and Rust IVCBoard2 interop](#c-and-rust-ivcboard2-interop)
+- [What the pinger amplitude does with distance and why](#what-the-pinger-amplitude-does-with-distance-and-why)
 - [Making a new environment](#making-a-new-environment)
 
 ## Environment files
@@ -139,7 +140,10 @@ as the environment's transmission loss predicts. The ADC reads the hydrophone vo
 conversion.
 
 In code, `sim_acoustics::Hydrophone::record` keeps every ADC sample a hydrophone produced and
-`recording_wav(rate)` turns them into a WAV file (`sim_acoustics::wav`) for inspection.
+`recording_wav(rate)` turns them into a WAV file (`sim_acoustics::wav`) for inspection; `Hydrophone::clipping`
+counts the samples the receive chain clipped at its rails. When a run's hydrophone clipped, `run` and `robot` say
+so at the end (`hydrophone: 0.7 % of the 9976152 samples the ADC took were clipped at the receive chain's rails`):
+what the firmware measures then no longer follows the sound.
 
 ## The shared medium: boards hearing each other
 
@@ -275,6 +279,60 @@ after the `ros2 topic pub` the C board logs `writing out: ...` per bit, and abou
 emulator, and whether the agent keeps its session while the emulator runs slower than the wall clock (the C modem
 alone runs at about 0.4x real time with the Rust board beside it, so `--realtime` cannot keep up; the firmware's
 own micro-ROS timeouts are on virtual time).
+
+## What the pinger amplitude does with distance and why
+
+A test campaign with the C IVCBoard2 (`blake/ivc`) in pinger mode in `pool.toml` found the pinger amplitude it
+publishes oddly flat with distance, and wondered whether the board file's assumed 40-60 kHz band-pass, which would
+attenuate the 25 kHz pinger, was the cause. Measured here with the C firmware's pinger path
+(`test_programs/c_ivc_pinger`: blake/ivc's sources, 25 kHz pinger mode, amplitudes printed instead of published)
+and the hydrophone model directly:
+
+**The filter is not in the path.** The assumed band-pass would put a 25 kHz pinger 15.4 dB and a 30 kHz one
+9.2 dB below the 51 kHz modem tones, but it is the GPIO 3 low path, and both the C (`tx_init`) and the Rust
+firmware drive GPIO 3 high from boot on: everything goes through the assumed 60 kHz low-pass, 40.0 dB at 25 kHz and
+39.1 dB at 51 kHz. So the band-pass was left as it is (`ivc_board_receive_paths_at_the_pinger_and_modem_frequencies`).
+
+**The ADC saturates.** With the competition pinger's 180 dB re 1 µPa, the assumed -190 dB re 1 V/µPa sensitivity and
+40 dB of gain, the direct path alone would swing the ADC pin by 22 V peak at 2 m and still 2.8 V at 16 m, against
+±1.65 V of rails. For a continuous 25 kHz tone (so that every capture hears it), the C firmware reports:
+
+| | 2 m | 8 m | 16 m | 45 m |
+|---|---|---|---|---|
+| Direct path loss (spreading and absorption) | 6.0 dB | 18.1 dB | 24.1 dB | 33.3 dB |
+| Pool, 40 dB gain: amplitude (samples clipped) | 30702 (92 %) | 30260 (80 %) | 30301 (90 %) | |
+| Open water, 40 dB gain | 30982 (98 %) | | 28270 (60 %) | 14269 (0 %) |
+| Pool, 0 dB gain | 4019 | 918 | 1294 | |
+| Open water, 0 dB gain | 3201 | | 473 | 116 |
+
+At the assumed gain the amplitude is the same at every distance the pool allows: a clipped tone. Only beyond about
+30 m in open water does it start to fall.
+
+**The pool's reverberation flattens it further.** With the gain 40 dB lower nothing clips. In open water the
+amplitude then follows the direct path (2 to 16 m: 16.6 dB measured, 18.2 dB predicted; at 45 m the direct pulse is
+below one step of the 8-bit samples the C firmware takes, and quantisation costs another 3 dB). In the pool it
+falls by 9.8 dB instead of 18.1 from 2 to 16 m and is higher at 16 m than at 8 m: the walls (reflection 0.6) and the
+bottom (0.5) return paths of order up to 3 that add to the direct one, so the field is a standing-wave pattern
+more than a falling direct wave. After a 4 ms ping the reverberation at the pin is still 1.0 to 1.4 V RMS 4 to
+20 ms later at 40 dB of gain, clipping like the ping itself. A 25 x 12 x 3 m concrete pool is that reverberant; how
+much exactly depends on the assumed reflection coefficients.
+
+**With the real 4 ms ping every 2 s the stream is mostly background.** The C firmware publishes one amplitude per
+main-loop pass (about every 58 ms, the newest 8.2 ms capture), so about one value in 35 contains the ping; the rest
+are the floor of noise and 8-bit quantisation, a median of 15 to 17 at every distance. The ping's own value
+depends on where the pulse falls in the Hann-windowed capture: over ten pings at 16 m it scattered from 330 to 24269
+(and one ping fell between the captures processed), far more than the 18 dB the distance makes (medians of the ten: 5953 at 2 m, 3354 at 8 m, 1952 at 16 m).
+
+So the flat curve comes from the board model's assumptions (the gain, with the sensitivity and source level,
+saturates the chain; the reflection coefficients set the reverberation) and from how the firmware samples a short
+ping, not from the band-pass. Nothing was changed to make the curve fall: the gain is a guess either way, and a
+board with 40 dB of preamp gain would clip as well. **To verify locally**: the real board's preamp gain and filter
+paths (a scope on ADC 1 with the pinger in the pool), and the pinger's source level. `run` and `robot` now report
+clipping at the end of a run; `c_ivc_board2_pinger_amplitude_against_distance` in
+`crates/sim_host/tests/acoustics.rs` pins these numbers down (`make -C test_programs c_ivc_pinger` rebuilds the
+program). For the firmware: a host that wants the pinger's amplitude needs the largest value over a ping period,
+and even that varies with the capture's alignment; detecting the ping and measuring over the whole pulse would
+not.
 
 ## Making a new environment
 

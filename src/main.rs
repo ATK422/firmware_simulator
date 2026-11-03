@@ -513,9 +513,12 @@ fn robot(args: RobotArgs) -> Result<()> {
     if let (Some(l), Some(path)) = (&json_log, &args.log_json) {
         l.finish(r.now, &why).with_context(|| format!("writing {}", path.display()))?;
     }
-    for (s, name) in r.boards.iter().zip(&r.names) {
+    for (s, name) in r.boards.iter_mut().zip(&r.names) {
         if s.lockups > 0 {
             eprintln!("{name}: {}", lockup_note(s));
+        }
+        for note in sim_host::acoustic::clipping_notes(&mut s.machine) {
+            eprintln!("{name}: {note}");
         }
     }
     if args.unmodelled != UnmodelledLog::Off {
@@ -1198,6 +1201,7 @@ fn run(args: RunArgs) -> Result<()> {
         }
     }
     let lockups = (session.lockups > 0).then(|| lockup_note(&session));
+    let clipping = sim_host::acoustic::clipping_notes(&mut session.machine);
     let machine = &mut session.machine;
     let where_ = |pc: u32| match machine.symbolize(pc) {
         Some(s) => {
@@ -1232,6 +1236,9 @@ fn run(args: RunArgs) -> Result<()> {
         elapsed
     );
     if let Some(note) = &lockups {
+        eprintln!("{note}");
+    }
+    for note in &clipping {
         eprintln!("{note}");
     }
     if machine.core_enabled[1] {

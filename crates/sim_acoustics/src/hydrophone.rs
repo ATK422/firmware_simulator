@@ -74,6 +74,9 @@ pub struct Hydrophone {
     last: f64,
     /// ADC samples (time, volts at the pin), when recording.
     pub recording: Option<Vec<(Time, f32)>>,
+    /// Samples taken, and how many of them the receive chain clipped at a rail.
+    samples: u64,
+    clipped: u64,
 }
 
 impl Hydrophone {
@@ -123,6 +126,8 @@ impl Hydrophone {
             step: None,
             last: 0.0,
             recording: None,
+            samples: 0,
+            clipped: 0,
         }
     }
 
@@ -306,6 +311,10 @@ impl Hydrophone {
             self.last = self.chain.process(raw, pins);
         }
         self.step = Some(k);
+        self.samples += 1;
+        if self.chain.at_rail(self.last) {
+            self.clipped += 1;
+        }
         if let Some(r) = &mut self.recording {
             r.push((t, self.last as f32));
         }
@@ -329,6 +338,12 @@ impl Hydrophone {
             * beam
             * self.transducer.sensitivity(hz)
             * self.chain.gain_at(hz, pins)
+    }
+
+    /// `(samples, clipped)`: how many samples the ADC took, and how many of them were at a rail of the receive
+    /// chain (the signal clipped: too loud for the chain's gain).
+    pub fn clipping(&self) -> (u64, u64) {
+        (self.samples, self.clipped)
     }
 
     /// The recording as a WAV file at `rate` (samples are placed at their times; gaps are silent).

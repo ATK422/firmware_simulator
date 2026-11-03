@@ -34,7 +34,7 @@ logs).
 |---|---|
 | titan_firmware_rs boards (`power_board`, `esc_board`, `ivc_board2`, `puddles_backplane`, `template`, ...) | `cd external/titan_firmware_rs/firmware && cargo build --workspace --release`; they land in `external/titan_firmware_rs/firmware/target/thumbv6m-none-eabi/release/` |
 | C titan_firmware (`basic_template`, the Titan bootloader, a small OTA app) | `scripts/build_c_firmware.sh` (needs `gcc-arm-none-eabi`, `cmake`, `ninja` and titan_firmware's pico-sdk submodule) into `build/c/` |
-| Hand-written test programs (`test_programs/*.elf`, `embassy_blinky.elf`, `pico/*.elf`, `c_dual_usb`, `c_ivc_modem`) | committed; `make -C test_programs` (Thumb and embassy), `make -C test_programs pico`, `make -C test_programs c_dual_usb`, `make -C test_programs c_ivc_modem` (the C IVCBoard2 modem from titan_firmware's `blake/ivc`) rebuild them |
+| Hand-written test programs (`test_programs/*.elf`, `embassy_blinky.elf`, `pico/*.elf`, `c_dual_usb`, `c_ivc_modem`, `c_ivc_pinger`) | committed; `make -C test_programs` (Thumb and embassy), `make -C test_programs pico`, `make -C test_programs c_dual_usb`, `make -C test_programs c_ivc_modem` and `c_ivc_pinger` (the C IVCBoard2 modem and its pinger mode from titan_firmware's `blake/ivc`) rebuild them |
 
 The C titan_firmware board applications need titan_firmware's prebuilt micro-ROS library (built in Docker), so the
 script does not build them; the C programs the tests run are the template, the bootloader and its test app.
@@ -61,7 +61,9 @@ core1 249575205 cycles, pc 0x00000176, Some(Wfe)
   with the ELF's `.defmt` table; RTT text that is not defmt is printed at the end as `[rtt0] ...`.
 * `[0.006337s] uart0: AB Hello, UART!` is a complete line from a UART (pico-sdk stdio, the C logger).
 * The last lines give the stop reason, both cores' cycle counts and PCs (with symbols) and the wall time taken,
-  then a table of every unmodelled register the firmware touched (see `--unmodelled`).
+  then a table of every unmodelled register the firmware touched (see `--unmodelled`), and, for a board in an
+  acoustic environment whose hydrophone signal clipped at the receive chain's rails, how much of it did
+  ([acoustics.md](acoustics.md#what-the-pinger-amplitude-does-with-distance-and-why)).
 
 Virtual time starts at power-on; the firmware's own timestamps start when its timer does, so the two columns
 differ by roughly the boot time.
