@@ -59,8 +59,7 @@ pub struct Session {
     pub eth_loss: Option<crate::fault::PacketLoss>,
     /// Keep virtual time from running ahead of the wall clock.
     pub realtime: bool,
-    pacing: Option<(std::time::Instant, Time)>,
-    behind_warned: std::time::Instant,
+    pacing: Pacing,
     /// A sampling profiler of the firmware (see [`crate::profile`]); `None` runs the machine directly.
     pub profiler: Option<crate::profile::Profiler>,
     /// When this is set, [`Session::run_until`] returns [`StopReason::Requested`] at the next slice boundary (the
@@ -110,8 +109,7 @@ impl Session {
             eth_endpoints: Vec::new(),
             eth_loss: None,
             realtime: false,
-            pacing: None,
-            behind_warned: std::time::Instant::now(),
+            pacing: Pacing::default(),
             profiler: None,
             stop_flag: None,
         }
@@ -162,8 +160,7 @@ impl Session {
             eth_endpoints: Vec::new(),
             eth_loss: self.eth_loss.clone(),
             realtime: self.realtime,
-            pacing: None,
-            behind_warned: std::time::Instant::now(),
+            pacing: Pacing::default(),
             profiler: None,
             stop_flag: None,
         }
@@ -392,25 +389,91 @@ impl Session {
     /// Starts pacing afresh from now (after virtual time was held, e.g. paused from the dashboard), so the run does
     /// not race to catch up with the wall clock.
     pub fn reset_pacing(&mut self) {
-        self.pacing = None;
+        self.pacing.reset();
     }
 
     /// Sleeps until the wall clock catches up with virtual time; warns when the emulation falls behind.
     fn pace(&mut self) {
-        let now = self.machine.now;
-        let (wall0, virt0) = *self.pacing.get_or_insert((std::time::Instant::now(), now));
-        let virt = std::time::Duration::from_nanos((now - virt0).as_ns());
-        let wall = wall0.elapsed();
-        if virt > wall {
-            std::thread::sleep(virt - wall);
-        } else if wall - virt > std::time::Duration::from_millis(50) && self.behind_warned.elapsed().as_secs() >= 5 {
-            self.behind_warned = std::time::Instant::now();
-            log::warn!("real-time mode: emulation is {:?} behind the wall clock", wall - virt);
-        }
+        self.pacing.pace(self.machine.now);
     }
 
     /// Whether any log line so far contains `text`.
     pub fn logged(&self, text: &str) -> bool {
         self.logs.iter().any(|(_, l)| l.message.contains(text))
+    }
+}
+
+/// Real-time pacing (`--realtime`) of a board or a robot: keeps virtual time from running ahead of the wall clock,
+/// counted from where pacing started, across calls (so runs in short pieces keep real time too), and warns when
+/// the emulation cannot keep up.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct Pacing {
+    /// The wall clock and virtual time pacing started from.
+    start: Option<(std::time::Instant, Time)>,
+    /// When the last "behind the wall clock" warning was given.
+    warned: Option<std::time::Instant>,
+}
+
+impl Pacing {
+    /// Virtual time ahead of the wall clock by less than this is not slept away (there is one call per slice).
+    const MIN_SLEEP: std::time::Duration = std::time::Duration::from_millis(2);
+    /// Falling behind by more than this is warned about...
+    const WARN_BEHIND: std::time::Duration = std::time::Duration::from_millis(100);
+    /// ...at most this often.
+    const WARN_EVERY: std::time::Duration = std::time::Duration::from_secs(5);
+
+    /// Sleeps while virtual time `now` is ahead of the wall clock. While it is behind by more than
+    /// [`Pacing::WARN_BEHIND`], warns (at most every [`Pacing::WARN_EVERY`]) and returns how far behind it is.
+    pub(crate) fn pace(&mut self, now: Time) -> Option<std::time::Duration> {
+        let (wall0, virt0) = *self.start.get_or_insert((std::time::Instant::now(), now));
+        let virt = std::time::Duration::from_nanos((now - virt0).as_ns());
+        let wall = wall0.elapsed();
+        if virt > wall {
+            if virt - wall > Self::MIN_SLEEP {
+                std::thread::sleep(virt - wall);
+            }
+            return None;
+        }
+        let behind = wall - virt;
+        if behind > Self::WARN_BEHIND && self.warned.is_none_or(|w| w.elapsed() >= Self::WARN_EVERY) {
+            self.warned = Some(std::time::Instant::now());
+            log::warn!("real-time mode: emulation is {behind:.2?} behind the wall clock");
+            return Some(behind);
+        }
+        None
+    }
+
+    /// Starts afresh from the next call (virtual time was held, e.g. paused from the dashboard).
+    pub(crate) fn reset(&mut self) {
+        self.start = None;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn pacing_warns_when_behind_the_wall_clock_at_most_every_five_seconds() {
+        let second_ago = Instant::now().checked_sub(Duration::from_secs(1)).unwrap();
+        let mut p = Pacing { start: Some((second_ago, Time::ZERO)), warned: None };
+        // 100 ms of virtual time in a second of wall time
+        let behind = p.pace(Time::from_ms(100)).expect("a warning");
+        assert!((Duration::from_millis(890)..Duration::from_millis(1500)).contains(&behind), "{behind:?}");
+        assert_eq!(p.pace(Time::from_ms(110)), None, "not again so soon");
+        p.warned = Instant::now().checked_sub(Duration::from_secs(6));
+        assert!(p.pace(Time::from_ms(120)).is_some(), "again after five seconds");
+    }
+
+    #[test]
+    fn pacing_sleeps_while_ahead() {
+        let mut p = Pacing::default();
+        let t0 = Instant::now();
+        assert_eq!(p.pace(Time::ZERO), None, "the first call starts the clock");
+        assert_eq!(p.pace(Time::from_ms(30)), None);
+        assert!(t0.elapsed() >= Duration::from_millis(28), "{:?}", t0.elapsed());
+        // A little behind is no reason for a warning
+        assert_eq!(p.pace(Time::from_ms(30)), None);
     }
 }

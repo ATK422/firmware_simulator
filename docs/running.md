@@ -83,7 +83,7 @@ differ by roughly the boot time.
 | `--environment FILE` | | Puts the board's `[transducer]` in an acoustic environment ([acoustics.md](acoustics.md)) |
 | `--position X,Y,Z` | `0,0,1` | Where the transducer is in the environment, metres (z is depth) |
 | `--screenshot FILE` | | Writes what the board's SSD1306 shows to a PNG at the end (and prints it as text) |
-| `--realtime` | off | Paces virtual time to the wall clock (needed with host tools); warns when the emulation falls behind |
+| `--realtime` | off | Paces virtual time to the wall clock (needed with host tools); warns when the emulation falls behind ([below](#options)) |
 | `--uart0`, `--uart1` | `stdout` | `stdout` (lines with their virtual time), `pty` (a pseudo terminal, input too) or `none` |
 | `--rom-boot` | off | Boots through the bootrom and boot2 instead of directly ([below](#boot-modes-and-the-flash)) |
 | `--flash-file FILE` | | Keeps the flash in a file between runs |
@@ -103,6 +103,16 @@ differ by roughly the boot time.
 | `--gdb ADDR` | | Waits for GDB on this address before running ([below](#debugging-with-gdb)) |
 
 `firmware_simulator run --help` has the same list.
+
+**Virtual time and the wall clock.** Without `--realtime` the emulator runs as fast as it can, which is not
+necessarily faster than real time: a board that mostly sleeps runs far ahead of the wall clock (the template about
+60x), a busy one can fall behind it (the ESC board runs at about 1.1x on its own, Talos as a whole at about 0.4x
+on one core, a C image that is busy in its main loop may run below 1x). A host tool talking to the board through a
+pty, socket or vcan (the micro-ROS agent, `titan_bridge`, `picocom`) then sees the firmware's time run faster or
+slower than its own, so give its timeouts plenty of room, several times what hardware needs, or use `--realtime`.
+With `--realtime` virtual time never runs ahead of the wall clock; when the emulation cannot keep up, `run` and
+`robot` warn, at most every 5 s, by how much it is behind (`real-time mode: emulation is 1.23s behind the wall
+clock`), and replies from host tools then reach the firmware late by about that much.
 
 ## Boot modes and the flash
 

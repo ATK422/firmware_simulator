@@ -235,3 +235,20 @@ fn sigterm_ends_a_robot_run_cleanly() {
     let last: serde_json::Value = serde_json::from_str(log.lines().last().unwrap()).unwrap();
     assert_eq!((&last["kind"], &last["reason"]), (&"end".into(), &"Interrupted".into()), "{log}");
 }
+
+#[test]
+fn a_robot_behind_real_time_says_so() {
+    if !sim_host::titan_rs_release_dir(&repo()).join("esc_board").exists() {
+        eprintln!("skipping: titan_firmware_rs images not built");
+        return;
+    }
+    // Talos's nine boards on one thread run at about half of real time
+    let out = Command::new(env!("CARGO_BIN_EXE_firmware_simulator"))
+        .args(["robot", repo().join("robots/talos.toml").to_str().unwrap(), "--realtime", "--threads", "1"])
+        .args(["--time", "0.5s"])
+        .output()
+        .unwrap();
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "{err}");
+    assert!(err.contains("real-time mode: emulation is ") && err.contains(" behind the wall clock"), "{err}");
+}

@@ -36,7 +36,7 @@ use std::time::{Duration, Instant};
 use rp2040::StopReason;
 use sim_core::time::Time;
 
-use crate::robot::{Robot, end_slice, pace, power_on_by};
+use crate::robot::{Robot, end_slice, power_on_by};
 use crate::session::Session;
 
 /// Threads for `threads` = 0: one per core.
@@ -398,7 +398,7 @@ pub(crate) fn run_until(robot: &mut Robot, end: Time) -> Option<(usize, StopReas
             *now = t;
             if *realtime {
                 let start = Instant::now();
-                pace(pacing, *now);
+                pacing.pace(*now);
                 paced += start.elapsed();
             }
             since_regroup += 1;

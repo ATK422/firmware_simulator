@@ -96,8 +96,8 @@ pub struct Robot {
     pub power_on: Vec<(Time, bool)>,
     /// Simulated vehicles moved by the boards' thrusters, stepped after every slice.
     pub vehicles: Vec<VehicleSim>,
-    /// Real-time pacing: the wall clock and virtual time it started from.
-    pub(crate) pacing: Option<(std::time::Instant, Time)>,
+    /// Real-time pacing, warning when the robot falls behind the wall clock.
+    pub(crate) pacing: crate::session::Pacing,
     /// How the boards were spread over threads last time, and what they cost (see [`crate::parallel`]).
     pub(crate) balance: crate::parallel::Balance,
     /// When this is set, [`Robot::run_until`] returns at the next slice boundary, before `end` (the command
@@ -125,7 +125,7 @@ impl Default for Robot {
             realtime: false,
             power_on: Vec::new(),
             vehicles: Vec::new(),
-            pacing: None,
+            pacing: Default::default(),
             balance: Default::default(),
             stop_flag: None,
         }
@@ -204,7 +204,7 @@ impl Robot {
             end_slice(&mut self.buses, &self.board_bus, &mut boards, &mut self.vehicles, t);
             self.now = t;
             if self.realtime {
-                pace(&mut self.pacing, self.now);
+                self.pacing.pace(self.now);
             }
         }
         None
@@ -284,7 +284,7 @@ impl Robot {
 
     /// Starts real-time pacing afresh from now (after virtual time was held, e.g. paused from the dashboard).
     pub fn reset_pacing(&mut self) {
-        self.pacing = None;
+        self.pacing.reset();
     }
 
     /// Puts board `i`'s transducer (projector and hydrophone) on `trajectory`, e.g. at another range between runs
@@ -374,7 +374,7 @@ impl Robot {
             realtime: self.realtime,
             power_on: self.power_on.clone(),
             vehicles,
-            pacing: None,
+            pacing: Default::default(),
             balance: self.balance.clone(),
             stop_flag: None,
         }
@@ -575,16 +575,6 @@ pub(crate) fn end_slice(
     }
     for v in vehicles {
         v.advance(t, boards);
-    }
-}
-
-/// Real-time pacing: sleeps while virtual time `now` is ahead of the wall clock, counted from where pacing started
-/// (`pacing`), across calls, so runs in short pieces keep real time too.
-pub(crate) fn pace(pacing: &mut Option<(std::time::Instant, Time)>, now: Time) {
-    let (wall, start) = *pacing.get_or_insert((std::time::Instant::now(), now));
-    let ahead = (now - start).as_secs_f64() - wall.elapsed().as_secs_f64();
-    if ahead > 0.002 {
-        std::thread::sleep(std::time::Duration::from_secs_f64(ahead));
     }
 }
 
