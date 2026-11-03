@@ -6,7 +6,7 @@
 //! `titan_link` message per datagram, port 2203 on both ends) with the 100 ms ping and kill switch forwarding of
 //! the CAN mock bridge, and records what the board sends, CANmore heartbeat broadcasts (port 2201) included.
 //! [`UdpRelay`] instead connects the board to a real UDP socket on the host, so the real `titan_bridge` can talk to
-//! it (see the README).
+//! it (see `docs/running.md`).
 
 use std::net::{SocketAddr, UdpSocket};
 use std::sync::{Arc, Mutex};
@@ -81,6 +81,9 @@ pub fn parse(frame: &[u8]) -> Parsed {
             }
             let u = &p[ihl..total];
             let len = (u16::from_be_bytes([u[4], u[5]]) as usize).min(u.len());
+            if len < 8 {
+                return Parsed::Other;
+            }
             Parsed::Udp(Udp {
                 src_mac,
                 src: (p[12..16].try_into().unwrap(), u16::from_be_bytes([u[0], u[1]])),
@@ -143,7 +146,7 @@ pub fn udp(dst_mac: [u8; 6], src: ([u8; 4], u16), dst: ([u8; 4], u16), payload: 
 }
 
 /// The robot computer's network presence: ARP for its address, and the board's MAC once known.
-#[derive(Debug, Default)]
+#[derive(Clone, Debug, Default)]
 struct Host {
     board_mac: Option<[u8; 6]>,
     arp_sent: Option<Time>,
@@ -180,7 +183,7 @@ impl Host {
 }
 
 /// What the Puddles mock bridge saw and is about to send.
-#[derive(Debug, Default)]
+#[derive(Clone, Debug, Default)]
 pub struct PuddlesState {
     pub running: bool,
     /// The `state/kill` value forwarded with every ping (`Some(false)` enables the vehicle).
@@ -213,12 +216,26 @@ impl PuddlesBridge {
         self.state().kill = kill;
     }
 
+    /// An independent bridge with a copy of this one's state (for a snapshot of the session it is attached to).
+    pub fn fork(&self) -> Self {
+        PuddlesBridge(Arc::new(Mutex::new(self.state().clone())))
+    }
+
     pub fn send(&self, msg: HostToDevice) {
         self.state().pending.push(msg);
     }
 
     pub fn stop(&self) {
         self.state().running = false;
+    }
+
+    /// Starts again (pinging from `at`), like restarting the `titan_bridge` process: it has to learn the board's
+    /// MAC address again.
+    pub fn start(&self, at: Time) {
+        let mut s = self.state();
+        s.running = true;
+        s.next_ping = at;
+        s.host = Host::default();
     }
 
     pub fn statuses(&self) -> Vec<(Time, titan_link::FirmwareStatus)> {
@@ -305,7 +322,8 @@ impl EthEndpoint for PuddlesBridge {
 
 /// Connects the board to a UDP socket on the host: the board's datagrams to the robot computer's port 2203 are sent
 /// to `peer` (where `titan_bridge` listens), and datagrams arriving on the local socket reach the board as if from
-/// the robot computer. Heartbeat broadcasts are forwarded to `peer`'s address on port 2201.
+/// the robot computer. Only datagrams from `peer`'s IP (any port; any sender if it is unspecified, `0.0.0.0`) are
+/// accepted, as cannelloni does. Heartbeat broadcasts are forwarded to `peer`'s address on port 2201.
 pub struct UdpRelay {
     socket: UdpSocket,
     peer: SocketAddr,
@@ -345,7 +363,13 @@ impl EthEndpoint for UdpRelay {
 
     fn take_tx(&mut self, until: Time) -> Vec<Vec<u8>> {
         let mut buf = [0u8; 2048];
-        while let Ok((n, _)) = self.socket.recv_from(&mut buf) {
+        while let Ok((n, from)) = self.socket.recv_from(&mut buf) {
+            // Only the peer talks to the board (from any port), as the board only accepts the robot computer's IP;
+            // an unspecified peer IP accepts every sender
+            if from.ip() != self.peer.ip() && !self.peer.ip().is_unspecified() {
+                log::debug!("UDP relay: ignoring a datagram from {from}");
+                continue;
+            }
             self.host.send(&buf[..n], until);
         }
         std::mem::take(&mut self.host.out)
@@ -381,6 +405,20 @@ mod tests {
         assert_eq!(checksum(u, pre), 0);
     }
 
+    /// A UDP header whose length field is below its own 8 bytes (a malformed datagram from the firmware) is not
+    /// a datagram; it used to panic slicing `u[8..len]`.
+    #[test]
+    fn udp_length_below_the_header_is_not_a_datagram() {
+        for bad in [0u16, 7] {
+            let mut f = udp([1, 2, 3, 4, 5, 6], (BOARD_IP, 1234), (ROBOT_COMPUTER_IP, LINK_PORT), b"TLhello");
+            f[38..40].copy_from_slice(&bad.to_be_bytes());
+            assert_eq!(parse(&f), Parsed::Other, "UDP length {bad}");
+        }
+        let mut f = udp([1, 2, 3, 4, 5, 6], (BOARD_IP, 1234), (ROBOT_COMPUTER_IP, LINK_PORT), b"TLhello");
+        f[38..40].copy_from_slice(&8u16.to_be_bytes());
+        assert!(matches!(parse(&f), Parsed::Udp(u) if u.payload.is_empty()), "an empty datagram");
+    }
+
     #[test]
     fn bridge_answers_arp_and_waits_for_the_board_mac() {
         let mut b = PuddlesBridge::new(Time::ZERO);
@@ -406,5 +444,31 @@ mod tests {
             }
             other => panic!("{other:?}"),
         }
+    }
+
+    /// Only the peer's IP may talk to the board through the relay (as the board itself only accepts the robot
+    /// computer's IP), from any port; a datagram from anywhere else on the network is dropped.
+    #[test]
+    fn relay_only_forwards_datagrams_from_the_peer() {
+        let bridge = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let other_port = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let stranger = UdpSocket::bind("127.0.0.2:0").unwrap();
+        let mut relay = UdpRelay::bind("127.0.0.1:0".parse().unwrap(), bridge.local_addr().unwrap()).unwrap();
+        let to = relay.local_addr().unwrap();
+        // The board has sent something: its MAC is known
+        relay.receive(&udp(HOST_MAC, (BOARD_IP, LINK_PORT), (ROBOT_COMPUTER_IP, LINK_PORT), b"TLup"), Time::ZERO);
+        stranger.send_to(b"TLstranger", to).unwrap();
+        bridge.send_to(b"TLbridge", to).unwrap();
+        other_port.send_to(b"TLother port", to).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        let got: Vec<Vec<u8>> = relay
+            .take_tx(Time::from_ms(1))
+            .iter()
+            .map(|f| match parse(f) {
+                Parsed::Udp(u) => u.payload,
+                other => panic!("{other:?}"),
+            })
+            .collect();
+        assert_eq!(got, [b"TLbridge".to_vec(), b"TLother port".to_vec()]);
     }
 }

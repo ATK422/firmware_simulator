@@ -12,6 +12,12 @@
 //!
 //! The motor follows the throttle with a first-order lag: throttle 48-1047 forward and 1049-2047 reverse (3D
 //! mode, as the UWRT ESCs are patched), `max_rpm` at full throttle; 0 and the special commands 1-47 stop it.
+//!
+//! When the frames stop, the ESC stops the motor [`Esc::signal_loss_timeout`] after the last valid one (it coasts
+//! down with the same lag), as the ESC firmwares do: BLHeli_S and Bluejay cut the motor after about 250 ms without
+//! a signal, AM32 after about half a second when armed. The 250 ms default is an assumption from those (the UWRT
+//! ESCs' exact firmware and settings are not known here). The real firmwares also disarm and want a zero throttle
+//! before they spin again; this model has no arming sequence and follows the next valid frame.
 
 use sim_core::time::Time;
 use sim_core::wire::{External, Level};
@@ -75,6 +81,10 @@ pub struct Esc {
     pub pole_pairs: u32,
     pub tau: Time,
     pub reply_delay: Time,
+    /// How long after the last valid frame the motor is stopped (`None`: it keeps the last throttle forever).
+    pub signal_loss_timeout: Option<Time>,
+    /// Times the signal was lost with the motor commanded to turn.
+    pub signal_losses: u32,
     /// Telemetry values (temperature °C, volts, amps; consumption is integrated).
     pub temperature_c: f64,
     pub voltage_v: f64,
@@ -88,6 +98,9 @@ pub struct Esc {
     pub rpm: f64,
     target_rpm: f64,
     last_update: Time,
+    /// When the last valid frame arrived, and when a wake-up to check for signal loss is due.
+    last_frame: Option<Time>,
+    loss_check: Option<Time>,
     consumption_mah: f64,
     // Decoder
     idle_high: Option<bool>,
@@ -108,6 +121,8 @@ impl Esc {
             pole_pairs: 7,
             tau: Time::from_ms(60),
             reply_delay: Time::from_us(30),
+            signal_loss_timeout: Some(Self::DEFAULT_SIGNAL_LOSS_TIMEOUT),
+            signal_losses: 0,
             temperature_c: 35.0,
             voltage_v: 16.0,
             current_per_krpm_a: 2.5,
@@ -119,6 +134,8 @@ impl Esc {
             rpm: 0.0,
             target_rpm: 0.0,
             last_update: Time::ZERO,
+            last_frame: None,
+            loss_check: None,
             consumption_mah: 0.0,
             idle_high: None,
             level: false,
@@ -129,15 +146,67 @@ impl Esc {
         }
     }
 
+    /// Assumed signal-loss timeout (see the module documentation).
+    pub const DEFAULT_SIGNAL_LOSS_TIMEOUT: Time = Time::from_ms(250);
+
+    /// When the signal counts as lost: the timeout after the last valid frame, if the motor is commanded to turn.
+    fn loss_at(&self) -> Option<Time> {
+        match (self.signal_loss_timeout, self.last_frame) {
+            (Some(timeout), Some(last)) if self.target_rpm != 0.0 => Some(last + timeout),
+            _ => None,
+        }
+    }
+
+    /// The lag towards `target` over `dt` seconds from `rpm`.
+    fn lag(&self, rpm: f64, target: f64, dt: f64) -> f64 {
+        rpm + (target - rpm) * (1.0 - (-dt / self.tau.as_secs_f64()).exp())
+    }
+
+    /// Brings the motor up to `now`, stopping it at the signal-loss time on the way.
     fn integrate(&mut self, now: Time) {
+        if let Some(lost) = self.loss_at()
+            && lost <= now
+        {
+            self.integrate_to(lost);
+            self.target_rpm = 0.0;
+            self.signal_losses += 1;
+        }
+        self.integrate_to(now);
+    }
+
+    fn integrate_to(&mut self, now: Time) {
         if now <= self.last_update {
             return;
         }
         let dt = (now - self.last_update).as_secs_f64();
-        let k = 1.0 - (-dt / self.tau.as_secs_f64()).exp();
-        self.rpm += (self.target_rpm - self.rpm) * k;
+        self.rpm = self.lag(self.rpm, self.target_rpm, dt);
         self.consumption_mah += self.current_a() * dt / 3.6;
         self.last_update = now;
+    }
+
+    /// The motor's signed mechanical RPM at `now`: the lag towards the last commanded speed carried on from the
+    /// last frame (`rpm` is only brought up to date when a frame arrives), and towards a stop once the signal has
+    /// been lost for the timeout. For a vehicle simulation reading the propeller speed between frames.
+    pub fn rpm_at(&self, now: Time) -> f64 {
+        if now <= self.last_update {
+            return self.rpm;
+        }
+        match self.loss_at() {
+            Some(lost) if lost < now => {
+                let at_loss =
+                    self.lag(self.rpm, self.target_rpm, (lost.max(self.last_update) - self.last_update).as_secs_f64());
+                self.lag(at_loss, 0.0, (now - lost.max(self.last_update)).as_secs_f64())
+            }
+            _ => self.lag(self.rpm, self.target_rpm, (now - self.last_update).as_secs_f64()),
+        }
+    }
+
+    /// Whether the motor has been stopped for lack of a signal (and no valid frame came since).
+    pub fn signal_lost(&self, now: Time) -> bool {
+        match (self.signal_loss_timeout, self.last_frame) {
+            (Some(timeout), Some(last)) => now >= last + timeout,
+            _ => false,
+        }
     }
 
     fn current_a(&self) -> f64 {
@@ -198,6 +267,14 @@ impl Esc {
         }
         self.integrate(now);
         self.apply_throttle(frame.throttle);
+        self.last_frame = Some(now);
+        // One wake-up per timeout at most, not one per frame: when it comes, it looks at the newest frame
+        if let Some(timeout) = self.signal_loss_timeout
+            && self.loss_check.is_none()
+        {
+            self.loss_check = Some(now + timeout);
+            ctx.wake_at(now + timeout);
+        }
         let frame_end = bits[15].0 + Time((period) as u64);
         if bidir {
             self.reply(ctx, frame_end + self.reply_delay, period / 1.25);
@@ -311,6 +388,23 @@ impl PinDevice for Esc {
         if self.bits.len() == 16 && self.edge.is_some_and(|e| ctx.now() - e >= Time::from_us(2)) {
             self.finish_frame(ctx);
         }
+        let now = ctx.now();
+        if self.loss_check.is_some_and(|t| now >= t) {
+            self.loss_check = None;
+            match self.loss_at() {
+                Some(lost) if lost <= now => {
+                    self.integrate(now);
+                    let ms = self.signal_loss_timeout.unwrap_or(Time::ZERO).as_secs_f64() * 1e3;
+                    ctx.report(format!("{}: no DShot frame for {ms:.0} ms, motor stopped", self.name));
+                }
+                // Frames came since: look again when the newest one times out
+                Some(lost) => {
+                    self.loss_check = Some(lost);
+                    ctx.wake_at(lost);
+                }
+                None => {}
+            }
+        }
     }
 
     fn clone_box(&self) -> Box<dyn PinDevice> {
@@ -319,6 +413,10 @@ impl PinDevice for Esc {
 
     fn as_any(&self) -> &dyn std::any::Any {
         self
+    }
+
+    fn as_any_mut(&mut self) -> Option<&mut dyn std::any::Any> {
+        Some(self)
     }
 }
 
@@ -396,6 +494,7 @@ mod tests {
             play(&mut e, &mut ctx, bidir_frame(548, false));
         }
         assert!((e.rpm - 2004.0).abs() < 50.0, "{}", e.rpm);
+
         assert!((e.period_us() as f64 - 60e6 / (e.rpm * 7.0)).abs() < 2.0);
         // Telemetry request: 10 bytes on GPIO 7
         ctx.scheduled.clear();
@@ -410,8 +509,103 @@ mod tests {
         ctx.now += Time::from_ms(2);
         play(&mut e, &mut ctx, bidir_frame(1548, false));
         assert!(e.target_rpm < 0.0);
+        // Between frames the speed carries on towards the new target, one time constant (60 ms) at a time
+        let (rpm, target) = (e.rpm, e.target_rpm);
+        assert!(rpm > 1900.0);
+        assert_eq!(e.rpm_at(ctx.now - Time::from_ms(5)), rpm);
+        let later = e.rpm_at(e.last_update + Time::from_ms(60));
+        assert!((later - (rpm + (target - rpm) * (1.0 - (-1f64).exp()))).abs() < 1e-6, "{later}");
+        assert_eq!(e.rpm, rpm, "reading it changes nothing");
         ctx.now += Time::from_us(400);
         play(&mut e, &mut ctx, bidir_frame(100, false) ^ 1);
         assert_eq!(e.bad_frames, 1);
+    }
+}
+
+#[cfg(test)]
+mod signal_loss {
+    use super::*;
+    use crate::TestCtx;
+
+    /// A bidirectional DShot600 frame at `ctx.now` (as `tests::play`), then 400 µs on.
+    fn frame(e: &mut Esc, ctx: &mut TestCtx, throttle: u16) {
+        let cmd = throttle << 1;
+        let value = cmd << 4 | checksum(cmd, true);
+        let bit = 1_666_667u64;
+        for i in (0..16).rev() {
+            let low = if value >> i & 1 != 0 { bit * 3 / 4 } else { bit * 3 / 8 };
+            e.pin_changed(ctx, 6, false);
+            ctx.now += Time(low);
+            e.pin_changed(ctx, 6, true);
+            ctx.now += Time(bit - low);
+        }
+        ctx.now += Time::from_us(5);
+        e.update(ctx);
+        ctx.now += Time::from_us(400) - Time(bit * 16) - Time::from_us(5);
+    }
+
+    fn spun_up() -> (Esc, TestCtx) {
+        let mut ctx = TestCtx { now: Time::from_ms(1), ..Default::default() };
+        let mut e = Esc::new("esc", 6, None);
+        e.pin_changed(&mut ctx, 6, true);
+        ctx.now += Time::from_us(100);
+        // Half throttle for 0.5 s: 2000 RPM
+        for _ in 0..1250 {
+            frame(&mut e, &mut ctx, 548);
+        }
+        assert!((e.rpm - 2004.0).abs() < 5.0, "{}", e.rpm);
+        (e, ctx)
+    }
+
+    #[test]
+    fn the_motor_stops_when_the_frames_stop() {
+        let (mut e, mut ctx) = spun_up();
+        assert_eq!(e.signal_loss_timeout, Some(Time::from_ms(250)));
+        let last = e.last_frame.unwrap();
+        // One wake-up per timeout while the frames come (on top of the decoder's one per frame), not one per frame
+        let checks = ctx.wakes.len() - e.frames.len();
+        assert!((1..=3).contains(&checks), "{checks}");
+        // Up to the timeout it holds its speed; after it, it coasts down with the motor's lag
+        assert!((e.rpm_at(last + Time::from_ms(249)) - 2004.0).abs() < 5.0);
+        let lost = last + Time::from_ms(250);
+        let one_tau = e.rpm_at(lost + e.tau);
+        assert!((one_tau - e.rpm_at(lost) * (-1f64).exp()).abs() < 1.0, "{one_tau}");
+        assert!(e.rpm_at(lost + Time::from_secs(1)).abs() < 1.0);
+        assert!(!e.signal_lost(lost - Time::from_ms(1)) && e.signal_lost(lost));
+        // The wake-up it asked for finds the newest frame timed out: the motor state follows, and it says so
+        while let Some(at) = e.loss_check {
+            assert!(at <= lost);
+            ctx.now = at;
+            e.update(&mut ctx);
+        }
+        assert_eq!(ctx.now, lost);
+        assert_eq!(e.signal_losses, 1);
+        assert!(ctx.reports.iter().any(|r| r.contains("no DShot frame for 250 ms")), "{:?}", ctx.reports);
+        assert_eq!(e.target_rpm, 0.0);
+        assert!((e.rpm - e.rpm_at(lost)).abs() < 1e-9);
+        // Frames again: it follows them (no arming sequence is modelled)
+        ctx.now = lost + Time::from_ms(500);
+        frame(&mut e, &mut ctx, 548);
+        assert!(e.target_rpm > 1900.0 && !e.signal_lost(ctx.now));
+    }
+
+    #[test]
+    fn a_stopped_motor_has_nothing_to_lose_and_the_timeout_can_be_off() {
+        // Throttle 0 last: nothing happens at the timeout
+        let (mut e, mut ctx) = spun_up();
+        frame(&mut e, &mut ctx, 0);
+        ctx.now += Time::from_secs(1);
+        e.update(&mut ctx);
+        assert_eq!(e.signal_losses, 0);
+        // Without a timeout, the old behaviour: the last throttle holds forever
+        let (mut e, mut ctx) = spun_up();
+        e.signal_loss_timeout = None;
+        let last = ctx.now;
+        assert!((e.rpm_at(last + Time::from_secs(10)) - 2004.0).abs() < 5.0);
+        ctx.now += Time::from_secs(10);
+        e.update(&mut ctx);
+        frame(&mut e, &mut ctx, 548);
+        assert_eq!(e.signal_losses, 0);
+        assert!((e.rpm - 2004.0).abs() < 5.0);
     }
 }

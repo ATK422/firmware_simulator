@@ -130,3 +130,89 @@ fn ivc_boards_exchange_bytes_across_the_pool() {
     assert!(r.boards[1].logged("Got response of true from receiver"));
     assert_eq!(ivc_bytes(&surface).len(), 2, "nothing heard twice");
 }
+
+/// The magnitudes `ivc_core::BandDetector` finds at 17 and 19 kHz (the single DFT bin in each band) in a capture
+/// of 8-bit samples, as the firmware computes them.
+fn band_magnitudes(capture: &[u8]) -> [f64; 2] {
+    let mean = capture.iter().map(|&x| x as f64).sum::<f64>() / capture.len() as f64;
+    [17, 19].map(|k| {
+        let c = 2.0 * (2.0 * std::f64::consts::PI * k as f64 / capture.len() as f64).cos();
+        let (mut s1, mut s2) = (0.0, 0.0);
+        for &x in capture {
+            let s0 = (x as f64 - mean) + c * s1 - s2;
+            s2 = s1;
+            s1 = s0;
+        }
+        (s1 * s1 + s2 * s2 - c * s1 * s2).max(0.0).sqrt()
+    })
+}
+
+/// The IVCBoard's 1 ms captures in an ADC recording, as `(end time, 8-bit samples)`. Each `read_many` converts
+/// back to back at 500 kS/s and the DMA takes the first 500 conversions; a few more convert before the firmware
+/// stops the ADC, and a gap of about 14 µs separates one capture from the next.
+fn captures(rec: &[(Time, f32)]) -> Vec<(f64, Vec<u8>)> {
+    let mut runs = vec![0];
+    runs.extend((1..rec.len()).filter(|&i| (rec[i].0 - rec[i - 1].0) > Time::from_ns(2500)));
+    runs.windows(2)
+        .filter(|w| w[1] - w[0] >= 500)
+        .map(|w| {
+            let samples = rec[w[0]..w[0] + 500].iter().map(|(_, v)| (v / 3.3 * 256.0).clamp(0.0, 255.0) as u8);
+            (rec[w[0] + 499].0.as_secs_f64(), samples.collect())
+        })
+        .collect()
+}
+
+/// Firmware finding: the first-generation IVC receiver can lose a packet to the pool's own reverberation at full
+/// signal strength, wherever it is, moving or not. `ivc_core::classify` takes a symbol as a 1 only if the 19 kHz
+/// band is above 300 *and* the 17 kHz band below 300 (and the other way round for a 0). Mid-slot, 25 ms after the
+/// tone switched, the previous symbol still arrives over the longer reflected paths (up to three bounces off the
+/// walls, bottom and surface: 30 m and more of path), about 30 dB below the direct tone. With the assumed 40 dB
+/// receive gain the direct tone reads 10000-20000, so that echo reads 100-450, around the fixed threshold: whether
+/// a 0-to-1 symbol is decoded depends on how the echoes add up where the board is. Talos's board at 5.0 m (the
+/// robot file) gets 0x5A through, at 5.6 m it does not; a board moving at 0.5 m/s goes through such spots during a
+/// packet, which is why the drifting-vehicle test (`tests/vehicle.rs`) loses 0x5A at that speed and not at 0.2 m/s.
+/// A threshold relative to the stronger band would not care.
+#[test]
+fn firmware_finding_ivc_symbols_lost_to_pool_reverberation() {
+    if common::titan_elf("ivc_board").is_none() {
+        return;
+    }
+    let (mut r, talos, surface) = robot("ivc_pool.toml", |spec| spec.board[0].position_m = Some([5.6, 6.0, 1.5]));
+    hydrophone(&mut r, 1).recording = Some(Vec::new());
+    r.run_until(Time::from_ms(600));
+    talos.send(HostToDevice::Ivc(titan_link::ivc::HostToDevice::Tx(0x5A)));
+    r.run_until(Time::from_ms(2400));
+    assert!(ivc_bytes(&surface).is_empty());
+    let bad = r.boards[1].logs.iter().rfind(|(_, l)| l.message.contains("Got CRC_BAD")).unwrap();
+    assert!(bad.1.message.contains("expected 8"), "{}", bad.1.message);
+
+    // What the receiver's detector saw at the middle of each symbol slot: it starts its ACK (and logs the CRC)
+    // 725 ms after the start symbol's onset
+    let onset = bad.0.as_secs_f64() - 0.725;
+    let caps = captures(&hydrophone(&mut r, 1).recording.take().unwrap());
+    let at = |t: f64| band_magnitudes(&caps[caps.partition_point(|c| c.0 <= t) - 1].1);
+    let word = ivc_core_word(0x5A);
+    let mut lost = 0;
+    for (i, bit) in word.iter().enumerate() {
+        let [low, high] = at(onset + 0.050 * (i + 1) as f64 + 0.025);
+        let (wanted, other) = if *bit { (high, low) } else { (low, high) };
+        // The wanted tone is far above the threshold every time ...
+        assert!(wanted > 5000.0, "symbol {i}: {low} {high}");
+        // ... the previous symbol's echo is only some 30 dB below it, and above the threshold on some 1s
+        assert!(other < wanted / 20.0, "symbol {i}: {low} {high}");
+        if other > 300.0 {
+            lost += 1;
+        }
+    }
+    assert!(lost >= 1, "no symbol lost");
+}
+
+/// The 13 symbols of a data packet after the start symbol (heartbeat flag, 8 data bits, 4 CRC bits), MSB first.
+fn ivc_core_word(data: u8) -> Vec<bool> {
+    let crc = (0..8).rev().fold(0u8, |crc, i| {
+        let c = (crc << 1) | ((data >> i) & 1);
+        if c & 0x10 != 0 { c ^ 0x1B } else { c }
+    }) & 0xF;
+    let word = (data as u16) << 4 | crc as u16;
+    (0..13).rev().map(|b| (word >> b) & 1 != 0).collect()
+}

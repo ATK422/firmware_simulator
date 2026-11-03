@@ -5,16 +5,27 @@
 //! oscillator/PLL (ready only if CLKIN really carries a clock), operating modes, RAM allocation of the TEF, TXQ and
 //! FIFOs, FIFO head/tail/user address semantics (UINC, TXREQ, FRESET), acceptance filters and masks, transmit
 //! priority and retransmission attempts, the transmit event FIFO with sequence numbers and timestamps, receive
-//! timestamps, the interrupt flag aggregation (C1INT, C1VEC, C1RXIF/TXIF/...) driving the INT pin, the error
-//! counters, IOCON GPIO inputs and the time base counter. Bit timing comes from NBTCFG/DBTCFG and SYSCLK, so a node
-//! configured for the wrong rate does not reach the bus. Not modelled: ECC errors (never reported), sleep and
+//! timestamps, the interrupt flag aggregation (C1INT, C1VEC, C1RXIF/TXIF/...) driving the INT pin, fault
+//! confinement, IOCON GPIO inputs and the time base counter. Bit timing comes from NBTCFG/DBTCFG and SYSCLK, so a
+//! node configured for the wrong rate does not reach the bus. Not modelled: ECC errors (never reported), sleep and
 //! wake-up, TDC, the INT0/INT1 pins, internal loopback.
+//!
+//! Fault confinement follows ISO 11898-1 as the datasheet's C1TREC describes it: TEC +8 for a transmit error
+//! (bit error, or an ACK error while error active), -1 for a frame sent; REC +1 for a receive error, -1 for a frame
+//! received (back to 120 from above 127); +8 for every 8 dominant bits after an error flag on a stuck bus.
+//! Warning above 95, error passive above 127, bus-off above 255 (TXBO): the node stops sending, receiving and
+//! acknowledging, and recovers by itself after 128 sequences of 11 recessive bits ("device went to bus-off and
+//! auto-recovered", C1BDIAG1.TXBOERR), with both counters back at 0. In configuration mode TXBO reads set ("the
+//! module is not on the bus"). Every change of the error state sets CERRIF; every error IVMIF; C1BDIAG0 counts the
+//! errors by phase and C1BDIAG1 flags their kind and counts error-free messages. While bus-off, TEC reads 255 (the
+//! datasheet does not say what it shows). Entering configuration mode resets the protocol engine, clearing both
+//! counters.
 
 use sim_core::time::Time;
 use sim_core::wire::{External, Level};
 
 use crate::DeviceCtx;
-use crate::can::{BitRates, CanFrame, CanNode, TxRequest, fd_dlc_to_len, fd_len_to_dlc};
+use crate::can::{BitRates, BusError, CanFrame, CanNode, TxRequest, fd_dlc_to_len, fd_len_to_dlc};
 use crate::spi::SpiDevice;
 
 /// How the controller is wired on the board.
@@ -74,6 +85,8 @@ const INT_TBCIF: u16 = 1 << 2;
 const INT_MODIF: u16 = 1 << 3;
 const INT_TEFIF: u16 = 1 << 4;
 const INT_SPICRCIF: u16 = 1 << 9;
+const INT_CERRIF: u16 = 1 << 13;
+const INT_IVMIF: u16 = 1 << 15;
 const INT_TXATIF: u16 = 1 << 10;
 const INT_RXOVIF: u16 = 1 << 11;
 /// Flags that latch and are cleared by writing 0 (the others mirror their sources).
@@ -170,7 +183,8 @@ impl Fifo {
             if count == 0 {
                 v |= 4; // TFERFFIF: empty
             }
-            v |= (self.tail as u32) << 8;
+            // FIFOCI: the message the FIFO will transmit next
+            v |= (self.head as u32) << 8;
         } else {
             if count > 0 {
                 v |= 1; // not empty
@@ -181,7 +195,8 @@ impl Fifo {
             if count == depth && depth > 0 {
                 v |= 4; // full
             }
-            v |= (self.head as u32) << 8;
+            // FIFOCI: the message the FIFO will save the next received message in
+            v |= (self.tail as u32) << 8;
         }
         v
     }
@@ -226,8 +241,15 @@ pub struct Mcp251xfd {
     tbc_time: Time,
     int_enable: u16,
     int_sticky: u16,
-    tec: u8,
-    rec: u8,
+    /// Error counters. TEC goes past 255 into bus-off.
+    tec: u16,
+    rec: u16,
+    bus_off: bool,
+    /// 11-recessive-bit sequences seen while bus-off.
+    recovery: u64,
+    /// Consecutive dominant bits on a stuck bus, and whether the node was transmitting when it got stuck.
+    dominant_run: u64,
+    stuck_transmitter: bool,
     bdiag: [u32; 2],
     tef: Fifo,
     /// Index 0 is the TXQ, 1-31 the FIFOs.
@@ -252,6 +274,29 @@ pub struct Mcp251xfd {
     /// Bus deliveries since the device last updated its pins.
     pub frames_received: u64,
     pub frames_sent: u64,
+    /// Times the controller went bus-off, and transmit and receive errors counted (for tests).
+    pub bus_off_events: u32,
+    pub tx_errors: u64,
+    pub rx_errors: u64,
+}
+
+/// Fault confinement state of a CAN controller.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ErrorState {
+    Active,
+    /// TEC or REC above 95.
+    Warning,
+    /// TEC or REC above 127: passive error flags, no ACK errors counted.
+    Passive,
+    BusOff,
+}
+
+/// The error counters and state, as C1TREC shows them.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct ErrorCounters {
+    pub tec: u8,
+    pub rec: u8,
+    pub state: ErrorState,
 }
 
 impl Mcp251xfd {
@@ -270,6 +315,10 @@ impl Mcp251xfd {
             int_sticky: 0,
             tec: 0,
             rec: 0,
+            bus_off: false,
+            recovery: 0,
+            dominant_run: 0,
+            stuck_transmitter: false,
             bdiag: [0; 2],
             tef: Fifo::default(),
             fifo: Default::default(),
@@ -290,6 +339,9 @@ impl Mcp251xfd {
             xfer_log: Vec::new(),
             frames_received: 0,
             frames_sent: 0,
+            bus_off_events: 0,
+            tx_errors: 0,
+            rx_errors: 0,
         };
         m.reset();
         m
@@ -306,8 +358,7 @@ impl Mcp251xfd {
         self.tbc_base = 0;
         self.int_enable = 0;
         self.int_sticky = 0;
-        self.tec = 0;
-        self.rec = 0;
+        self.reset_protocol_engine();
         self.bdiag = [0; 2];
         self.tef = Fifo { con: 0x0000_0400 & !FIFO_FRESET, ..Fifo::default() };
         for (i, f) in self.fifo.iter_mut().enumerate() {
@@ -322,6 +373,124 @@ impl Mcp251xfd {
         self.ecccon = 0;
         self.eccstat = 0;
         self.filhit = 0;
+    }
+
+    /// Power lost and restored (a brownout of the board's 3.3 V rail): a reset, with RAM contents lost and no
+    /// SPI transaction in progress.
+    pub fn power_on_reset(&mut self) {
+        self.reset();
+        let mut x = 0x2545_F491_4F6C_DD1Du64;
+        for b in self.ram.iter_mut() {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            *b = x as u8;
+        }
+        self.spi = Spi::Idle;
+        self.selected = false;
+        self.int_driven = None;
+    }
+
+    /// Clears fault confinement (device reset, or entering configuration mode).
+    fn reset_protocol_engine(&mut self) {
+        self.tec = 0;
+        self.rec = 0;
+        self.bus_off = false;
+        self.recovery = 0;
+        self.dominant_run = 0;
+        self.stuck_transmitter = false;
+    }
+
+    /// Error counters and state.
+    pub fn error_counters(&self) -> ErrorCounters {
+        let state = if self.bus_off {
+            ErrorState::BusOff
+        } else if self.tec > 127 || self.rec > 127 {
+            ErrorState::Passive
+        } else if self.tec > 95 || self.rec > 95 {
+            ErrorState::Warning
+        } else {
+            ErrorState::Active
+        };
+        ErrorCounters { tec: self.tec.min(255) as u8, rec: self.rec.min(255) as u8, state }
+    }
+
+    fn error_passive(&self) -> bool {
+        self.tec > 127 || self.rec > 127
+    }
+
+    /// The error state bits of C1TREC (EWARN to TXBO) from the counters alone.
+    fn trec_state_bits(&self) -> u32 {
+        let mut v = 0;
+        if self.rec > 95 && self.rec < 128 {
+            v |= 1 << 17;
+        }
+        if self.tec > 95 && self.tec < 128 {
+            v |= 1 << 18;
+        }
+        if v != 0 {
+            v |= 1 << 16;
+        }
+        if self.rec > 127 {
+            v |= 1 << 19;
+        }
+        if self.tec > 127 {
+            v |= 1 << 20;
+        }
+        if self.bus_off {
+            v |= 1 << 21;
+        }
+        v
+    }
+
+    /// Changes the counters with `f`, then handles bus-off and flags a change of error state (CERRIF).
+    fn confine(&mut self, f: impl FnOnce(&mut Self)) {
+        let before = self.trec_state_bits();
+        f(self);
+        self.rec = self.rec.min(255);
+        if self.tec > 255 && !self.bus_off {
+            self.bus_off = true;
+            self.recovery = 0;
+            self.bus_off_events += 1;
+            self.bdiag[1] |= 1 << 23; // TXBOERR
+            log::debug!("MCP251xFD bus-off");
+        }
+        if self.trec_state_bits() != before {
+            self.int_sticky |= INT_CERRIF;
+        }
+    }
+
+    /// Counts an error in C1BDIAG0 (`shift` selects NRERRCNT, NTERRCNT, DRERRCNT or DTERRCNT) and flags it in
+    /// C1BDIAG1.
+    fn diag(&mut self, shift: u32, flag: u32) {
+        let c = (self.bdiag[0] >> shift) & 0xFF;
+        if c < 0xFF {
+            self.bdiag[0] += 1 << shift;
+        }
+        self.bdiag[1] |= flag;
+        self.int_sticky |= INT_IVMIF;
+    }
+
+    fn error_free_message(&mut self) {
+        let n = (self.bdiag[1] & 0xFFFF).wrapping_add(1) & 0xFFFF;
+        self.bdiag[1] = (self.bdiag[1] & !0xFFFF) | n;
+    }
+
+    /// A transmission of FIFO `i` failed; gives up once the retransmission attempts are used up.
+    fn tx_failed(&mut self, i: usize) {
+        let limit = self.retransmit_limit(i);
+        let f = &mut self.fifo[i];
+        f.attempts = f.attempts.saturating_add(1);
+        if limit.is_some_and(|l| f.attempts >= l) {
+            f.sticky |= STA_TXATIF | 1 << 5;
+            f.tx_requested = None;
+            f.attempts = 0;
+        }
+    }
+
+    fn on_bus(&self) -> bool {
+        matches!(self.opmod, mode::NORMAL_FD | mode::NORMAL_CAN20 | mode::RESTRICTED | mode::EXT_LOOPBACK)
+            && self.sysclk > 0
     }
 
     // ------------------------------------------------------------------ clocks and timing
@@ -565,6 +734,7 @@ impl Mcp251xfd {
                 f.reset_contents();
             }
             self.tef.reset_contents();
+            self.reset_protocol_engine();
         }
         if leaving_config {
             self.allocate_ram();
@@ -579,7 +749,7 @@ impl Mcp251xfd {
     fn fifo_index(addr: u16) -> Option<(usize, u16)> {
         match addr {
             0x050..=0x058 => Some((0, addr - 0x050)),
-            0x05C..=0x1CB => Some((((addr - 0x05C) / 12 + 1) as usize, (addr - 0x05C) % 12)),
+            0x05C..=0x1CF => Some((((addr - 0x05C) / 12 + 1) as usize, (addr - 0x05C) % 12)),
             _ => None,
         }
     }
@@ -601,23 +771,10 @@ impl Mcp251xfd {
             0x02C => self.c1_txatif(),
             0x030 => self.txreq_bits(),
             0x034 => {
-                let tec = self.tec as u32;
-                let rec = self.rec as u32;
-                let mut v = rec | tec << 8;
-                if tec >= 96 || rec >= 96 {
-                    v |= 1 << 16;
-                }
-                if rec >= 96 {
-                    v |= 1 << 17;
-                }
-                if tec >= 96 {
-                    v |= 1 << 18;
-                }
-                if rec >= 128 {
-                    v |= 1 << 19;
-                }
-                if tec >= 128 {
-                    v |= 1 << 20;
+                let c = self.error_counters();
+                let mut v = c.rec as u32 | (c.tec as u32) << 8 | self.trec_state_bits();
+                if config {
+                    v |= 1 << 21; // TXBO: not on the bus
                 }
                 v
             }
@@ -892,14 +1049,15 @@ impl Mcp251xfd {
     // ------------------------------------------------------------------ CAN side helpers
 
     fn tx_allowed(&self) -> bool {
-        matches!(self.opmod, mode::NORMAL_FD | mode::NORMAL_CAN20 | mode::EXT_LOOPBACK)
+        matches!(self.opmod, mode::NORMAL_FD | mode::NORMAL_CAN20 | mode::EXT_LOOPBACK) && !self.bus_off
     }
 
     fn rx_allowed(&self) -> bool {
-        matches!(
-            self.opmod,
-            mode::NORMAL_FD | mode::NORMAL_CAN20 | mode::LISTEN_ONLY | mode::EXT_LOOPBACK | mode::RESTRICTED
-        )
+        !self.bus_off
+            && matches!(
+                self.opmod,
+                mode::NORMAL_FD | mode::NORMAL_CAN20 | mode::LISTEN_ONLY | mode::EXT_LOOPBACK | mode::RESTRICTED
+            )
     }
 
     fn next_tx(&self) -> Option<usize> {
@@ -1179,6 +1337,10 @@ impl SpiDevice for Mcp251xfd {
         Some(self)
     }
 
+    fn as_any_mut(&mut self) -> Option<&mut dyn std::any::Any> {
+        Some(self)
+    }
+
     fn clone_box(&self) -> Box<dyn SpiDevice> {
         Box::new(self.clone())
     }
@@ -1186,7 +1348,8 @@ impl SpiDevice for Mcp251xfd {
 
 impl CanNode for Mcp251xfd {
     fn bit_rates(&self) -> Option<BitRates> {
-        if !self.rx_allowed() || self.sysclk == 0 {
+        // A bus-off node is still attached to the wire, counting recessive bits to recover
+        if !(self.rx_allowed() || self.bus_off && self.on_bus()) || self.sysclk == 0 {
             return None;
         }
         let (nominal, data) = self.rates();
@@ -1194,7 +1357,9 @@ impl CanNode for Mcp251xfd {
     }
 
     fn acknowledges(&self) -> bool {
-        matches!(self.opmod, mode::NORMAL_FD | mode::NORMAL_CAN20 | mode::RESTRICTED) && self.sysclk > 0
+        matches!(self.opmod, mode::NORMAL_FD | mode::NORMAL_CAN20 | mode::RESTRICTED)
+            && self.sysclk > 0
+            && !self.bus_off
     }
 
     fn tx_request(&mut self) -> Option<TxRequest> {
@@ -1215,7 +1380,8 @@ impl CanNode for Mcp251xfd {
         let self_ack = self.opmod == mode::EXT_LOOPBACK;
         if acked || self_ack {
             self.frames_sent += 1;
-            self.tec = self.tec.saturating_sub(1);
+            self.confine(|m| m.tec = m.tec.saturating_sub(1));
+            self.error_free_message();
             if self_ack {
                 let (frame, _) = self.read_tx_object(i);
                 self.receive(&frame, at);
@@ -1232,17 +1398,92 @@ impl CanNode for Mcp251xfd {
                 self.push_tef(id_word, flags, at);
             }
         } else {
-            // No acknowledgement: error counters rise (an ACK error alone never goes beyond error passive)
-            if self.tec < 128 {
-                self.tec = (self.tec + 8).min(128);
+            // No acknowledgement: TEC + 8, except for an error passive transmitter whose passive error flag is not
+            // overwritten (ISO 11898-1 rule 3, exception 1), so an ACK error alone never leads to bus-off
+            self.tx_errors += 1;
+            if !self.error_passive() {
+                self.confine(|m| m.tec += 8);
             }
-            let limit = self.retransmit_limit(i);
-            let f = &mut self.fifo[i];
-            f.attempts = f.attempts.saturating_add(1);
-            if limit.is_some_and(|l| f.attempts >= l) {
-                f.sticky |= STA_TXATIF | 1 << 5;
-                f.tx_requested = None;
-                f.attempts = 0;
+            self.diag(8, 1 << 18); // NTERRCNT, NACKERR
+            self.tx_failed(i);
+        }
+    }
+
+    fn tx_error(&mut self, token: u64, _at: Time, error: BusError) {
+        if !self.on_bus() || self.opmod == mode::EXT_LOOPBACK {
+            return;
+        }
+        self.tx_errors += 1;
+        // The transmitter monitors every bit it sends: wanting recessive and seeing dominant is a bit-1 error
+        match error {
+            BusError::Bit { data_phase: true } => self.diag(24, 1 << 25), // DTERRCNT, DBIT1ERR
+            _ => self.diag(8, 1 << 17),                                   // NTERRCNT, NBIT1ERR
+        }
+        if error == BusError::StuckDominant {
+            self.stuck_transmitter = true;
+        }
+        self.confine(|m| m.tec += 8);
+        self.tx_failed(token as usize);
+    }
+
+    fn rx_error(&mut self, _at: Time, error: BusError) {
+        if !self.rx_allowed() || self.opmod == mode::LISTEN_ONLY {
+            return;
+        }
+        self.rx_errors += 1;
+        // Receivers see the transmitter's error flag as six equal bits: a stuff error
+        match error {
+            BusError::Bit { data_phase: true } => self.diag(16, 1 << 28), // DRERRCNT, DSTUFERR
+            _ => self.diag(0, 1 << 20),                                   // NRERRCNT, NSTUFERR
+        }
+        self.confine(|m| m.rec += 1);
+    }
+
+    fn dominant_bits(&mut self, _at: Time, bits: u64) {
+        if self.bus_off || !self.on_bus() || self.opmod == mode::LISTEN_ONLY {
+            return;
+        }
+        let before = self.dominant_run;
+        self.dominant_run += bits;
+        if before == 0 {
+            // The first six dominant bits are a stuff error (a frame cut off already counted its own)
+            if !self.stuck_transmitter {
+                self.rx_errors += 1;
+                self.diag(0, 1 << 20);
+                self.confine(|m| m.rec += 1);
+            }
+        }
+        // After the error flag, every sequence of 8 more dominant bits adds 8 (rule 6), to the TEC of a node that
+        // was transmitting and the REC of a receiver
+        let steps = (self.dominant_run.saturating_sub(12) / 8).saturating_sub(before.saturating_sub(12) / 8);
+        if steps > 0 {
+            let add = (8 * steps).min(1024) as u16;
+            if self.stuck_transmitter {
+                self.confine(|m| m.tec = m.tec.saturating_add(add));
+            } else {
+                self.confine(|m| m.rec = m.rec.saturating_add(add));
+            }
+        }
+    }
+
+    fn error_passive(&self) -> bool {
+        Mcp251xfd::error_passive(self) && !self.bus_off
+    }
+
+    fn recessive_sequences(&mut self, _at: Time, n: u64) {
+        self.dominant_run = 0;
+        self.stuck_transmitter = false;
+        if self.bus_off && self.on_bus() {
+            self.recovery += n;
+            if self.recovery >= 128 {
+                // Recovered: error active again with both counters cleared
+                self.confine(|m| {
+                    m.bus_off = false;
+                    m.tec = 0;
+                    m.rec = 0;
+                    m.recovery = 0;
+                });
+                log::debug!("MCP251xFD recovered from bus-off");
             }
         }
     }
@@ -1251,7 +1492,9 @@ impl CanNode for Mcp251xfd {
         if !self.rx_allowed() || (frame.fd && self.opmod == mode::NORMAL_CAN20) {
             return;
         }
-        self.rec = self.rec.saturating_sub(1);
+        // A frame received without error: REC - 1, or back into error active from error passive
+        self.confine(|m| m.rec = if m.rec > 127 { 120 } else { m.rec.saturating_sub(1) });
+        self.error_free_message();
         for n in 0..32 {
             let fc = self.fltcon[n];
             if fc & 0x80 != 0 && self.filter_match(n, frame) {
@@ -1407,6 +1650,46 @@ mod tests {
         assert_eq!(c.pins[22], External::Driven(Level::High));
     }
 
+    /// FIFO31's registers end at C1FIFOUA31 (0x1CC), just before C1FLTCON0 (0x1D0); the user address read as 0.
+    #[test]
+    fn fifo31_user_address() {
+        let mut c = ctx();
+        let mut d = Mcp251xfd::new(Mcp251xfdConfig::default());
+        xfer(&mut d, &mut c, &[0, 0]); // RESET: FIFO1-31 one 16-byte object each
+        write32(&mut d, &mut c, 0xE00, 1);
+        write(&mut d, &mut c, 0x003, &[mode::NORMAL_FD]);
+        let ua30 = read32(&mut d, &mut c, 0x1C0);
+        assert_eq!(read32(&mut d, &mut c, 0x1CC), ua30 + 16, "C1FIFOUA31 follows FIFO30's object");
+        // Route a frame to FIFO31 through filter 0 (mask 0: everything) and check its object lands at the UA
+        write(&mut d, &mut c, 0x003, &[mode::CONFIG]);
+        write(&mut d, &mut c, 0x1D0, &[0x80 | 31]);
+        write(&mut d, &mut c, 0x003, &[mode::NORMAL_FD]);
+        d.receive(&CanFrame::fd(0x55, false, &[1]), Time::ZERO);
+        assert_eq!(read32(&mut d, &mut c, 0x1C8) & 1, 1, "FIFO31 not empty");
+        let ua = read32(&mut d, &mut c, 0x1CC) as u16;
+        assert_eq!(read32(&mut d, &mut c, 0x400 + ua), 0x55);
+    }
+
+    /// FIFOCI (C1FIFOSTAm bits 12:8): for a transmit FIFO the message it will transmit next, for a receive FIFO
+    /// the one it will save the next message in (DS20005688, C1FIFOSTAm; the Linux mcp251xfd driver reads it as the
+    /// chip's TX tail and RX head). They used to show the user's pointers, which FIFOUA already gives.
+    #[test]
+    fn fifo_message_index() {
+        let (mut d, mut c) = configured();
+        let ci = |d: &mut Mcp251xfd, c: &mut TestCtx, a: u16| (read32(d, c, a) >> 8) & 0x1F;
+        queue_frame(&mut d, &mut c, 0x10, &[0], 1);
+        queue_frame(&mut d, &mut c, 0x11, &[0], 2);
+        assert_eq!(ci(&mut d, &mut c, 0x054), 0, "TXQCI: the first queued message is next to go");
+        let r = d.tx_request().unwrap();
+        d.tx_done(r.token, Time::from_us(10), true);
+        assert_eq!(ci(&mut d, &mut c, 0x054), 1, "TXQCI after one transmission");
+        assert_eq!(ci(&mut d, &mut c, 0x060), 0, "FIFO1 empty: saves into object 0");
+        d.receive(&CanFrame::fd(0x123, false, &[7]), Time::from_us(5));
+        assert_eq!(ci(&mut d, &mut c, 0x060), 1, "FIFO1CI: the next message goes into object 1");
+        write(&mut d, &mut c, 0x05D, &[0x01]); // UINC
+        assert_eq!(ci(&mut d, &mut c, 0x060), 1, "reading doesn't move where the next one is saved");
+    }
+
     #[test]
     fn retransmission_attempts_exhausted() {
         let (mut d, mut c) = configured();
@@ -1518,6 +1801,160 @@ mod tests {
         xfer(&mut d, &mut c, &[0, 0]);
         assert_eq!((read32(&mut d, &mut c, 0x000) >> 21) & 7, mode::CONFIG as u32);
         assert!(d.bit_rates().is_none());
+        assert_eq!(read32(&mut d, &mut c, 0x000), CON_RESET);
+    }
+
+    fn trec(d: &mut Mcp251xfd, c: &mut TestCtx) -> (u32, u32, u32) {
+        let v = read32(d, c, 0x034);
+        (v & 0xFF, (v >> 8) & 0xFF, v >> 16)
+    }
+
+    #[test]
+    fn ack_errors_stop_at_error_passive() {
+        let (mut d, mut c) = configured();
+        queue_frame(&mut d, &mut c, 0x10, &[0], 1);
+        write(&mut d, &mut c, 0x050 + 2, &[3 << 5]); // TXAT = unlimited, so it keeps trying
+        for n in 1..=40 {
+            let r = d.tx_request().expect("still requested");
+            d.tx_done(r.token, Time::from_us(10 * n), false);
+        }
+        let (rec, tec, state) = trec(&mut d, &mut c);
+        assert_eq!((rec, tec), (0, 128), "+8 per ACK error until error passive, then no more");
+        assert_eq!(state, 1 << 4, "TXBP only");
+        assert_eq!(d.error_counters().state, ErrorState::Passive);
+        assert_ne!(read32(&mut d, &mut c, 0x01C) & INT_CERRIF as u32, 0, "CERRIF on the state changes");
+        assert_ne!(read32(&mut d, &mut c, 0x01C) & INT_IVMIF as u32, 0);
+        let bdiag1 = read32(&mut d, &mut c, 0x03C);
+        assert_ne!(bdiag1 & 1 << 18, 0, "NACKERR");
+        assert_eq!((read32(&mut d, &mut c, 0x038) >> 8) & 0xFF, 40, "NTERRCNT");
+        // A frame that gets through counts down again
+        let r = d.tx_request().unwrap();
+        d.tx_done(r.token, Time::from_ms(1), true);
+        assert_eq!(trec(&mut d, &mut c).1, 127);
+        assert_eq!(d.error_counters().state, ErrorState::Warning);
+        assert_eq!(read32(&mut d, &mut c, 0x03C) & 0xFFFF, 1, "EFMSGCNT");
+    }
+
+    #[test]
+    fn bit_errors_lead_to_bus_off_and_automatic_recovery() {
+        let (mut d, mut c) = configured();
+        queue_frame(&mut d, &mut c, 0x10, &[0], 1);
+        write(&mut d, &mut c, 0x050 + 2, &[3 << 5]);
+        for n in 0..32 {
+            let r = d.tx_request().expect("sending until bus-off");
+            d.tx_error(r.token, Time::from_us(30 * n), BusError::Bit { data_phase: n % 2 == 1 });
+        }
+        assert_eq!(d.error_counters().state, ErrorState::BusOff, "TEC 256 > 255");
+        let (_, tec, state) = trec(&mut d, &mut c);
+        assert_eq!(tec, 255);
+        assert_eq!(state & (1 << 5), 1 << 5, "TXBO");
+        assert!(d.tx_request().is_none(), "a bus-off node does not send");
+        assert!(!d.acknowledges(), "or acknowledge");
+        assert!(d.bit_rates().is_some(), "but stays on the wire to count recessive bits");
+        d.receive(&CanFrame::fd(0x123, false, &[1]), Time::from_ms(1));
+        assert_eq!(read32(&mut d, &mut c, 0x060) & 1, 0, "or receive");
+        let bdiag0 = read32(&mut d, &mut c, 0x038);
+        assert_eq!(((bdiag0 >> 8) & 0xFF, bdiag0 >> 24), (16, 16), "NTERRCNT and DTERRCNT by phase");
+        assert_eq!(d.bus_off_events, 1);
+        // 128 sequences of 11 recessive bits
+        d.recessive_sequences(Time::from_ms(2), 100);
+        assert_eq!(d.error_counters().state, ErrorState::BusOff);
+        d.recessive_sequences(Time::from_ms(3), 28);
+        assert_eq!(d.error_counters(), ErrorCounters { tec: 0, rec: 0, state: ErrorState::Active });
+        assert_ne!(read32(&mut d, &mut c, 0x03C) & 1 << 23, 0, "TXBOERR: went bus-off and recovered");
+        assert!(d.tx_request().is_some(), "the queued frame goes out again");
+    }
+
+    /// Unplugged after going bus-off, the controller is alone on its stub: the stub is idle (recessive), so it
+    /// recovers after 128 x 11 recessive bits like a node on an idle bus.
+    #[test]
+    fn bus_off_node_recovers_on_its_stub_when_unplugged() {
+        let (mut d, mut c) = configured();
+        queue_frame(&mut d, &mut c, 0x10, &[0], 1);
+        write(&mut d, &mut c, 0x050 + 2, &[3 << 5]);
+        for n in 0..32 {
+            let r = d.tx_request().unwrap();
+            d.tx_error(r.token, Time::from_us(30 * n), BusError::Bit { data_phase: false });
+        }
+        assert_eq!(d.error_counters().state, ErrorState::BusOff);
+        let rates = d.bit_rates().unwrap();
+        let bit = Time::from_ps(1_000_000_000_000 / rates.nominal);
+        let mut bus = crate::can::CanBus::new("can0", rates);
+        let t0 = Time::from_ms(1);
+        bus.set_unplugged(0, true, t0);
+        bus.step(&mut [&mut d], &mut [], t0);
+        bus.step(&mut [&mut d], &mut [], t0 + Time::from_ps(bit.as_ps() * (128 * 11 - 1)));
+        assert_eq!(d.error_counters().state, ErrorState::BusOff, "not yet: 127 sequences");
+        bus.step(&mut [&mut d], &mut [], t0 + Time::from_ps(bit.as_ps() * 128 * 11));
+        assert_eq!(d.error_counters().state, ErrorState::Active, "recovered");
+        assert_ne!(read32(&mut d, &mut c, 0x03C) & 1 << 23, 0, "TXBOERR");
+    }
+
+    #[test]
+    fn receive_errors_and_recovery_from_error_passive() {
+        let (mut d, mut c) = configured();
+        for _ in 0..130 {
+            d.rx_error(Time::ZERO, BusError::Bit { data_phase: false });
+        }
+        assert_eq!(trec(&mut d, &mut c), (130, 0, 1 << 3), "RXBP");
+        assert_eq!(read32(&mut d, &mut c, 0x038) & 0xFF, 130, "NRERRCNT");
+        assert_ne!(read32(&mut d, &mut c, 0x03C) & 1 << 20, 0, "NSTUFERR");
+        assert!(d.acknowledges(), "error passive nodes still acknowledge");
+        d.receive(&CanFrame::fd(0x124, false, &[9]), Time::ZERO);
+        assert_eq!(trec(&mut d, &mut c).0, 120, "back to 119-127 after a good frame");
+        assert_eq!(d.error_counters().state, ErrorState::Warning);
+        d.receive(&CanFrame::fd(0x124, false, &[9]), Time::ZERO);
+        assert_eq!(trec(&mut d, &mut c).0, 119);
+    }
+
+    #[test]
+    fn stuck_dominant_bus() {
+        // A receiver: a stuff error, then +8 for every 8 dominant bits after its error flag
+        let (mut d, mut c) = configured();
+        d.dominant_bits(Time::ZERO, 6);
+        assert_eq!(trec(&mut d, &mut c).0, 1);
+        d.dominant_bits(Time::ZERO, 1000);
+        let (rec, tec, _) = trec(&mut d, &mut c);
+        assert!(rec > 127 && tec == 0, "error passive, never bus-off: {rec}");
+        assert_eq!(d.error_counters().state, ErrorState::Passive);
+        d.recessive_sequences(Time::ZERO, 1);
+        // A transmitter whose frame the bus cut off: its TEC climbs instead, to bus-off
+        let (mut d, mut c) = configured();
+        queue_frame(&mut d, &mut c, 0x10, &[0], 1);
+        let r = d.tx_request().unwrap();
+        d.tx_error(r.token, Time::ZERO, BusError::StuckDominant);
+        d.dominant_bits(Time::ZERO, 300);
+        assert_eq!(d.error_counters().state, ErrorState::BusOff);
+        assert_eq!(trec(&mut d, &mut c).0, 0);
+    }
+
+    #[test]
+    fn configuration_mode_and_error_interrupts() {
+        let (mut d, mut c) = configured();
+        assert_eq!(trec(&mut d, &mut c).2, 0);
+        for _ in 0..100 {
+            d.rx_error(Time::ZERO, BusError::Bit { data_phase: true });
+        }
+        assert_eq!(trec(&mut d, &mut c).2, 0b11, "RXWARN | EWARN");
+        assert!(!d.int_asserted(), "the titan driver leaves CERRIF and IVMIF disabled");
+        let int = read32(&mut d, &mut c, 0x01C);
+        write32(&mut d, &mut c, 0x01C, int | ((INT_CERRIF as u32) << 16));
+        assert!(d.int_asserted());
+        assert_eq!(read32(&mut d, &mut c, 0x018) & 0x7F, 0x41, "ICODE: error interrupt");
+        write(&mut d, &mut c, 0x01D, &[!(INT_CERRIF >> 8) as u8]);
+        assert!(!d.int_asserted(), "CERRIF clears by writing 0");
+        // Configuration mode resets the protocol engine; TXBO reads set while off the bus
+        write(&mut d, &mut c, 0x003, &[mode::CONFIG]);
+        assert_eq!(trec(&mut d, &mut c), (0, 0, 1 << 5));
+        write(&mut d, &mut c, 0x003, &[mode::NORMAL_FD]);
+        assert_eq!(trec(&mut d, &mut c), (0, 0, 0));
+    }
+
+    #[test]
+    fn power_loss_resets_the_controller() {
+        let (mut d, mut c) = configured();
+        d.power_on_reset();
+        assert!(d.bit_rates().is_none(), "back in configuration mode, off the bus");
         assert_eq!(read32(&mut d, &mut c, 0x000), CON_RESET);
     }
 }

@@ -2,6 +2,7 @@
 //! smoke test: the H-bridge board's DRV8243 wake-up, and the Dynamixel bench test without a CAN bus.
 
 use sim_devices::drv8243::{Drv8243, State};
+use sim_test::titan_link::DeviceToHost;
 use sim_test::{Bench, Time};
 
 #[test]
@@ -24,6 +25,40 @@ fn a_snapshot_runs_exactly_like_the_original() {
     b.run_for(Time::from_ms(500));
     a.run_for(Time::from_ms(500));
     assert!(b.logged("PANIC") && !a.logged("PANIC"));
+}
+
+#[test]
+fn snapshots_have_inputs_of_their_own() {
+    // Two copies of a power board with different port batteries, running side by side: each reports its own,
+    // and the original keeps its value
+    let Some(elf) = sim_test::titan_rs("power_board") else { return };
+    let mut base = Bench::builder(&elf).board("mk2/power_board").bridge(1).boot().unwrap();
+    base.run_until(Time::from_ms(800)).unwrap();
+    let before = base.get("port_battery");
+    let mut copies: Vec<(Bench, f64)> = [13.0, 15.5].into_iter().map(|v| (base.snapshot(), v)).collect();
+    for (b, v) in &copies {
+        b.set("port_battery", *v);
+    }
+    std::thread::scope(|s| {
+        for (b, _) in copies.iter_mut() {
+            s.spawn(move || b.run_for(Time::from_ms(1500)));
+        }
+    });
+    base.run_for(Time::from_ms(1500));
+    let port = |b: &Bench| {
+        b.picked(|m| match m {
+            DeviceToHost::Power(sim_test::titan_link::power::DeviceToHost::Electrical(e)) => Some(e.port_voltage),
+            _ => None,
+        })
+        .last()
+        .unwrap()
+        .1 as f64
+    };
+    for (b, v) in &copies {
+        assert!((port(b) - v).abs() < 0.1, "set {v}, reported {}", port(b));
+    }
+    assert_eq!(base.get("port_battery"), before);
+    assert!((port(&base) - before).abs() < 0.1, "{} {before}", port(&base));
 }
 
 fn hbridge(elf: &std::path::Path, fitted: [bool; 4]) -> Bench {

@@ -1,0 +1,7 @@
+# Build outputs stay out of the Docker build context (docker/*/Dockerfile build from the repository root)
+target
+build
+.git
+external/titan_firmware_rs/target
+external/titan_firmware_rs/firmware/target
+external/titan_firmware/lib/pico-sdk/.git

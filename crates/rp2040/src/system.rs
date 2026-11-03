@@ -8,7 +8,7 @@
 use sim_core::analog::{AnalogSource, Signal};
 use sim_core::bus::{Bus, BusFault, Size, WriteMode, mem};
 use sim_core::sched::Scheduler;
-use sim_core::time::{ClockPeriod, Time};
+use sim_core::time::{ClockPeriod, CycleClock, Time};
 use sim_core::trace::{Category, TraceEvent, TraceSink};
 use sim_core::wire::External;
 use sim_devices::DeviceCtx;
@@ -16,22 +16,24 @@ use sim_devices::i2c::I2cDevice;
 use sim_devices::pin::PinDevice;
 use sim_devices::spi::SpiDevice;
 use sim_devices::uart::UartDevice;
+use sim_devices::usb::host::HostController;
 
 use crate::irq;
 use crate::memmap::*;
 use crate::periph::adc::{self, Adc};
 use crate::periph::clocks::{Clocks, Freqs, Pll};
 use crate::periph::dma::{self, Dma, DmaBus};
-use crate::periph::gpio::{Drive, Gpio, func};
+use crate::periph::gpio::{BankDrive, Drive, Gpio, func};
 use crate::periph::i2c::{I2c, Step, StepResult};
 use crate::periph::pio::{self, Pio};
 use crate::periph::pwm::Pwm;
-use crate::periph::sio::Sio;
+use crate::periph::sio::{self, Sio};
 use crate::periph::spi::Spi;
 use crate::periph::ssi::{IoQspi, Ssi};
 use crate::periph::sysctl::{self, Psm, Resets, Vreg, bit, psm};
 use crate::periph::timer::{Timer, Watchdog, WatchdogReset};
 use crate::periph::uart::Uart;
+use crate::periph::usb::{self, Usb};
 use crate::unmodelled::Unmodelled;
 
 /// Scheduler keys. Each peripheral owns its keys; at most one event per key is pending.
@@ -57,6 +59,8 @@ pub enum Event {
     Wire,
     /// An ADC conversion ends or starts.
     Adc,
+    /// The USB host controller's next step (a transaction, SOF or port state change).
+    Usb,
     /// Core 1 comes out of reset after its PSM force-off was released (handled by the machine).
     Core1Boot,
     /// Wakes the run loop at a given time without doing anything (host input, test hooks).
@@ -114,10 +118,23 @@ pub struct System {
     /// The device addressed by the transfer in progress on each I2C bus (index into `i2c_devices`).
     i2c_target: [Option<usize>; 2],
     pub adc: Adc,
+    /// The USB controller and its DPRAM.
+    pub usb: Usb,
+    /// The USB host the chip's USB port is plugged into, if any (see [`System::attach_usb_host`]).
+    pub usb_host: Option<Box<HostController>>,
     pub pio: [Pio; 2],
     /// Time base of the PIO cycle count: `clk_sys` cycle `.1` was at time `.0`.
     pio_base: (Time, u64),
     in_pio: bool,
+    /// Reads of PIO registers that change nothing skip the second advance (on by default; off to check that it
+    /// changes nothing).
+    pub pio_fast_reads: bool,
+    /// SIO accesses other than to the FIFOs leave the interrupt lines alone (on by default; off to check that it
+    /// changes nothing).
+    pub sio_fast_irqs: bool,
+    /// Reads of XOSC registers skip the general peripheral path and count as quiet for busy-wait skipping, which
+    /// ends where STATUS would change (on by default; off to check that it changes nothing).
+    pub xosc_fast_reads: bool,
     /// PIO IRQ lines after the last advance.
     pio_lines: u8,
     /// Pin drives and wake-ups devices scheduled for later.
@@ -205,9 +222,14 @@ impl System {
             i2c_devices: Vec::new(),
             i2c_target: [None; 2],
             adc: Adc::default(),
+            usb: Usb::default(),
+            usb_host: None,
             pio: [Pio::new(0), Pio::new(1)],
             pio_base: (Time::ZERO, 0),
             in_pio: false,
+            pio_fast_reads: true,
+            sio_fast_irqs: true,
+            xosc_fast_reads: true,
             pio_lines: 0,
             wire: WireQueue::default(),
             pin_devices: Vec::new(),
@@ -247,7 +269,10 @@ impl System {
         let chip = std::mem::take(&mut self.ssi.chip);
         self.ssi = Ssi::default();
         self.ssi.chip = chip;
+        // BOOTSEL is a button on the board: it stays pressed through the reset
+        let bootsel = self.io_qspi.bootsel_pressed;
         self.io_qspi = IoQspi::default();
+        self.io_qspi.bootsel_pressed = bootsel;
         self.refresh_xip();
         self.sio = Sio::default();
         let observed = self.pwm.observed;
@@ -268,9 +293,12 @@ impl System {
         }
         self.dma = Dma::default();
         self.dreq_pulses = [0; 64];
+        self.usb.reset();
         self.unmodelled.reset();
         self.sched = Scheduler::new();
         self.update_clocks(now);
+        // The host notices the pull-up going away
+        self.usb_kicked(now);
         self.irq_dirty = true;
         self.reset_request = None;
     }
@@ -308,21 +336,29 @@ impl System {
 
     #[inline]
     fn flash_offset(&self, addr: u32) -> usize {
-        (addr & 0x00FF_FFFF) as usize % self.flash.len()
+        let len = self.flash.len();
+        let off = (addr & 0x00FF_FFFF) as usize;
+        // Flash sizes are powers of two in practice; a mask is much cheaper than the division
+        if len.is_power_of_two() { off & (len - 1) } else { off % len }
+    }
+
+    /// Whether flash reads at `now` and later work without looking further (the common case: the SSI is set up for
+    /// XIP and the chip is not busy). The same as [`System::xip_check`] succeeding at the first test.
+    #[inline]
+    fn xip_ready_from(&self, now: Time) -> bool {
+        self.xip_config.is_ok() && now >= self.xip_busy_until
     }
 
     /// IRQ lines seen by `core`'s NVIC.
     pub fn irq_lines(&self, core: u8) -> u32 {
-        let c = core as usize & 1;
+        self.irq_lines_both()[core as usize & 1]
+    }
+
+    /// IRQ lines seen by both cores' NVICs (the shared lines are collected once).
+    pub fn irq_lines_both(&self) -> [u32; 2] {
         let mut lines = self.timer.irq_lines();
         if self.pwm.irq_line() {
             lines |= 1 << irq::PWM_IRQ_WRAP;
-        }
-        if self.gpio.irq(c) {
-            lines |= 1 << irq::IO_IRQ_BANK0;
-        }
-        if self.sio.fifo_irq(c) {
-            lines |= 1 << (irq::SIO_IRQ_PROC0 + c as u32);
         }
         if self.uart[0].irq() {
             lines |= 1 << irq::UART0_IRQ;
@@ -345,6 +381,9 @@ impl System {
         if self.adc.irq() {
             lines |= 1 << irq::ADC_IRQ_FIFO;
         }
+        if self.usb.irq() {
+            lines |= 1 << irq::USBCTRL_IRQ;
+        }
         if self.i2c[0].irq() {
             lines |= 1 << irq::I2C0_IRQ;
         }
@@ -352,13 +391,19 @@ impl System {
             lines |= 1 << irq::I2C1_IRQ;
         }
         for (b, base) in [(0, irq::PIO0_IRQ_0), (1, irq::PIO1_IRQ_0)] {
-            for n in 0..2 {
-                if self.pio[b].irq_line(n) {
-                    lines |= 1 << (base + n as u32);
-                }
-            }
+            let [l0, l1] = self.pio[b].irq_lines();
+            lines |= (l0 as u32) << base | (l1 as u32) << (base + 1);
         }
-        lines
+        std::array::from_fn(|c| {
+            let mut lines = lines;
+            if self.gpio.irq(c) {
+                lines |= 1 << irq::IO_IRQ_BANK0;
+            }
+            if self.sio.fifo_irq(c) {
+                lines |= 1 << (irq::SIO_IRQ_PROC0 + c as u32);
+            }
+            lines
+        })
     }
 
     // ------------------------------------------------------------------ cross-block effects
@@ -398,6 +443,12 @@ impl System {
                 self.uart_advance(n, now);
             }
             self.clk_peri = ClockPeriod::from_hz(new.clk_peri);
+        }
+        if new.clk_usb != old.clk_usb {
+            self.usb.clk_ok = usb::clk_usb_ok(new.clk_usb);
+            if new.clk_usb != 0 && !self.usb.clk_ok {
+                log::warn!("[{now}] clk_usb = {} Hz: USB full speed needs 48 MHz", new.clk_usb);
+            }
         }
         self.freqs = new;
     }
@@ -474,7 +525,7 @@ impl System {
                 bit::IO_BANK0 => {
                     self.gpio.reset_io(true);
                 }
-                bit::PADS_BANK0 => self.gpio.pads = Gpio::default().pads,
+                bit::PADS_BANK0 => self.gpio.reset_pads(),
                 bit::PLL_SYS => self.clocks.pll_sys = Pll::default(),
                 bit::PLL_USB => self.clocks.pll_usb = Pll::default(),
                 bit::PWM => {
@@ -507,6 +558,10 @@ impl System {
                     self.uart[i].reset();
                     self.sched.cancel(Event::UartTx(i as u8));
                     self.sched.cancel(Event::UartRx(i as u8));
+                }
+                bit::USBCTRL => {
+                    self.usb.reset();
+                    self.usb_kicked(now);
                 }
                 bit::TIMER => {
                     self.timer = Timer::new();
@@ -567,7 +622,13 @@ impl System {
         let spis = &self.spi;
         let pios = &self.pio;
         let clk = self.clk_sys;
-        let changed = self.gpio.evaluate(|f, pin| match f {
+        let bank = BankDrive {
+            sio_out,
+            sio_oe,
+            pio_out: [pios[0].pad_out, pios[1].pad_out],
+            pio_oe: [pios[0].pad_oe, pios[1].pad_oe],
+        };
+        let changed = self.gpio.evaluate(bank, |f, pin| match f {
             func::SIO => Drive { out: sio_out & (1 << pin) != 0, oe: sio_oe & (1 << pin) != 0 },
             func::PWM if pwm.drives_pin(pin) => Drive { out: pwm.pin_output(&clk, now, pin), oe: true },
             func::PIO0 | func::PIO1 => {
@@ -613,8 +674,11 @@ impl System {
         let level = self.gpio.level;
         let mut immediate = false;
         for dev in &mut self.pin_devices {
-            for pin in 0..NUM_GPIOS as u8 {
-                if changed & (1 << pin) != 0 && dev.watches(pin) {
+            let mut pins = changed & ((1 << NUM_GPIOS) - 1);
+            while pins != 0 {
+                let pin = pins.trailing_zeros() as u8;
+                pins &= pins - 1;
+                if dev.watches(pin) {
                     let mut ctx =
                         DevPins { now, gpio: &mut self.gpio, freqs: &self.freqs, changed: false, wire: &mut self.wire };
                     dev.pin_changed(&mut ctx, pin, level & (1 << pin) != 0);
@@ -745,7 +809,7 @@ impl System {
             }
         }
         self.in_pio = false;
-        let lines = self.pio.iter().flat_map(|p| [p.irq_line(0), p.irq_line(1)]).fold(0u8, |a, l| a << 1 | l as u8);
+        let lines = self.pio.iter().flat_map(|p| p.irq_lines()).fold(0u8, |a, l| a << 1 | l as u8);
         if lines != self.pio_lines {
             self.pio_lines = lines;
             self.irq_dirty = true;
@@ -1131,7 +1195,85 @@ impl System {
                 self.apply_wire(trace, t);
             }
             Event::Adc => self.adc_advance(trace, t),
+            Event::Usb => self.usb_poll(trace, t),
             Event::Core1Boot | Event::External(_) => {}
+        }
+    }
+
+    // ------------------------------------------------------------------ USB
+
+    /// Plugs the chip's USB port into a host (VBUS comes up; the host enumerates the device once its pull-up
+    /// appears).
+    pub fn attach_usb_host(&mut self, host: HostController, now: Time) {
+        self.usb.set_vbus(true);
+        self.usb_host = Some(Box::new(host));
+        self.usb.kick = true;
+        self.usb_kicked(now);
+    }
+
+    /// Pulls the USB cable: VBUS drops, the device is disconnected, and the host (returned) is gone.
+    pub fn detach_usb_host(&mut self) -> Option<HostController> {
+        self.usb.set_vbus(false);
+        self.sched.cancel(Event::Usb);
+        self.irq_dirty = true;
+        self.usb_host.take().map(|h| *h)
+    }
+
+    /// The attached USB host, for queueing transfers. Call [`System::usb_reschedule`] after changing it.
+    pub fn usb_host_mut(&mut self) -> Option<&mut HostController> {
+        self.usb_host.as_deref_mut()
+    }
+
+    /// Runs `f` on the attached USB host and lets it pick up whatever `f` queued.
+    pub fn with_usb_host<R>(&mut self, now: Time, f: impl FnOnce(&mut HostController) -> R) -> Option<R> {
+        let r = f(self.usb_host.as_deref_mut()?);
+        self.usb_reschedule(now);
+        Some(r)
+    }
+
+    /// Tells the host that something changed (transfers queued from outside, firmware armed a buffer).
+    pub fn usb_reschedule(&mut self, now: Time) {
+        self.usb.kick = true;
+        self.usb_kicked(now);
+    }
+
+    fn usb_line_state(&self) -> u32 {
+        self.usb.line_state(self.gpio.inputs(), |p| self.gpio.funcsel(p))
+    }
+
+    /// The controller asked for the host's attention: let it retry NAKed pipes and see the pull-up.
+    fn usb_kicked(&mut self, now: Time) {
+        if !std::mem::take(&mut self.usb.kick) {
+            return;
+        }
+        let Some(host) = self.usb_host.as_deref_mut() else { return };
+        if let Some(t) = host.kick(now, &mut self.usb) {
+            let t = t.max(now);
+            if self.sched.due(Event::Usb).is_none_or(|d| d > t) {
+                self.sched.schedule(Event::Usb, t);
+            }
+        }
+        self.irq_dirty = true;
+    }
+
+    /// The host's scheduled step.
+    fn usb_poll(&mut self, trace: &mut dyn TraceSink, now: Time) {
+        let Some(host) = self.usb_host.as_deref_mut() else { return };
+        let next = host.poll(now, &mut self.usb);
+        self.usb.kick = false;
+        match next {
+            Some(t) => self.sched.schedule(Event::Usb, t.max(now)),
+            None => {
+                self.sched.cancel(Event::Usb);
+            }
+        }
+        self.irq_dirty = true;
+        let mut reports = host.take_reports();
+        reports.append(&mut self.usb.reports);
+        for (t, m) in reports {
+            if trace.wants(Category::Device) {
+                trace.event(t, TraceEvent::Device { source: "usb".into(), message: m });
+            }
         }
     }
 
@@ -1148,7 +1290,10 @@ impl System {
             }
             let gpio_in = self.gpio.inputs();
             if let Some(v) = self.sio.read(core, addr - SIO_BASE, gpio_in, self.io_qspi.levels()) {
-                self.irq_dirty = true;
+                // Of SIO's interrupts (the FIFOs'), only a FIFO pop can change one
+                if !self.sio_fast_irqs || addr - SIO_BASE == sio::FIFO_RD {
+                    self.irq_dirty = true;
+                }
                 return v;
             }
             return self.unmodelled.read(trace, now, core, addr);
@@ -1189,8 +1334,12 @@ impl System {
             PIO0_BASE | PIO1_BASE => {
                 self.pio_advance(trace, now);
                 let v = self.pio[(base == PIO1_BASE) as usize].read(off);
-                self.irq_dirty = true;
-                self.pio_advance(trace, now);
+                // A read that changed nothing needs nothing more (another advance at the same time would only find
+                // the same interrupt lines and schedule the same next advance)
+                if !(self.pio_fast_reads && Pio::read_is_pure(off)) {
+                    self.irq_dirty = true;
+                    self.pio_advance(trace, now);
+                }
                 v
             }
             I2C0_BASE | I2C1_BASE => {
@@ -1212,6 +1361,12 @@ impl System {
                 self.uart_advance(n, now);
                 v
             }
+            USBCTRL_REGS_BASE => {
+                let ls = self.usb_line_state();
+                let v = self.usb.read(off, ls);
+                self.irq_dirty = true;
+                v
+            }
             _ => None,
         };
         match value {
@@ -1226,7 +1381,10 @@ impl System {
                 self.pio_advance(trace, now);
             }
             if self.sio.write(core, addr - SIO_BASE, value) {
-                self.irq_dirty = true;
+                // Only the FIFOs' interrupts are SIO's (GPIO changes flag the lines in `update_pins`)
+                if !self.sio_fast_irqs || matches!(addr - SIO_BASE, sio::FIFO_ST | sio::FIFO_WR) {
+                    self.irq_dirty = true;
+                }
                 if addr - SIO_BASE < 0x50 {
                     self.update_pins(trace, now);
                 }
@@ -1364,6 +1522,12 @@ impl System {
                 self.uart_advance(n, now);
                 ok.then_some(())
             }
+            USBCTRL_REGS_BASE => {
+                let ok = self.usb.write(off, value, mode);
+                self.irq_dirty = true;
+                self.usb_kicked(now);
+                ok.then_some(())
+            }
             SYSINFO_BASE if off <= 0x40 => Some(()),
             _ => None,
         };
@@ -1409,6 +1573,8 @@ impl System {
                 Some(off) => Ok(mem::read(&self.sram, off, size)),
                 None => Err(BusFault::Unmapped(addr)),
             },
+            // The USB DPRAM is RAM on the AHB-lite bus: any access width, no atomic aliases
+            0x5 if addr >> 16 == USBCTRL_DPRAM_BASE >> 16 => Ok(self.usb.dpram_read((addr & 0xFFF) as usize, size)),
             0x4 | 0x5 | 0xD => {
                 let word = self.periph_read(trace, core, now, addr & !3);
                 Ok(mem::lane(word, addr, size))
@@ -1454,6 +1620,13 @@ impl System {
                 }
                 None => Err(BusFault::Unmapped(addr)),
             },
+            0x5 if addr >> 16 == USBCTRL_DPRAM_BASE >> 16 => {
+                self.usb.dpram_write((addr & 0xFFF) as usize, size, value);
+                if self.usb.kick {
+                    self.usb_kicked(now);
+                }
+                Ok(())
+            }
             0x4 | 0x5 | 0xD => {
                 self.periph_write(trace, core, now, addr & !3, mem::replicate(value, size));
                 Ok(())
@@ -1476,6 +1649,7 @@ impl System {
                 Some(mem::read(&self.xip_sram, (addr & 0x3FFF) as usize, size))
             }
             0x2 => sram_offset(addr).map(|o| mem::read(&self.sram, o, size)),
+            0x5 if addr >> 16 == USBCTRL_DPRAM_BASE >> 16 => Some(self.usb.dpram_read((addr & 0xFFF) as usize, size)),
             0x4 | 0x5 | 0xD | 0x1 => Some(mem::lane(self.peek_periph(core, addr & !3), addr, size)),
             _ => None,
         }
@@ -1509,6 +1683,7 @@ impl System {
             DMA_BASE => self.dma.read(off),
             WATCHDOG_BASE => self.watchdog.read(now, off),
             VREG_AND_CHIP_RESET_BASE => self.vreg.read(off),
+            USBCTRL_REGS_BASE => self.usb.peek(off, self.usb_line_state()),
             _ => None,
         };
         v.unwrap_or_else(|| self.unmodelled.peek(addr))
@@ -1529,6 +1704,9 @@ impl System {
                 Some(o) => mem::write(&mut self.sram, o, size, value),
                 None => return false,
             },
+            0x5 if addr >> 16 == USBCTRL_DPRAM_BASE >> 16 => {
+                mem::write(&mut self.usb.dpram, (addr & 0xFFF) as usize, size, value)
+            }
             _ => return false,
         }
         true
@@ -1820,6 +1998,423 @@ impl Bus for CoreBus<'_> {
     }
 }
 
+/// One core's view of the system bus while it runs a batch of instructions (`CortexM0Plus::run_batch`).
+///
+/// SRAM, ROM and flash (while XIP works) are read and written directly. Everything else goes through
+/// [`System::read`]/[`System::write`] at the exact time of the accessing instruction (the batch's start time plus
+/// the cycles the batch took before it). The run loop handles a few things after every instruction; the batch
+/// does what they amount to after each such access and ends ([`Bus::take_attention`]) only when the machine has
+/// to act:
+///
+/// * interrupt lines (`irq_dirty`): recomputed here; the batch goes on if the running core's lines are unchanged,
+///   and the machine hands the other core its lines when the batch ends (that core does not run meanwhile);
+/// * a new `clk_sys`, a reset request or a PSM change: the batch ends and the machine handles them as after a
+///   single step;
+/// * the XIP state: re-checked, as the access may have reconfigured the SSI.
+///
+/// Events the access scheduled need nothing: the run loop's time limit is fixed for the whole quantum.
+pub struct BatchBus<'a> {
+    pub sys: &'a mut System,
+    pub trace: &'a mut dyn TraceSink,
+    pub core: u8,
+    /// The core's clock at the start of the batch, and the period it counts.
+    clock: CycleClock,
+    period: ClockPeriod,
+    /// Cycles the batch has taken before the current instruction.
+    elapsed: u64,
+    /// What the last instruction's slow accesses left to do: [`BatchBus::ATTENTION`], [`BatchBus::CHECK_IRQS`].
+    after: u8,
+    /// Flash reads need no further checks (until the next peripheral access).
+    xip_ok: bool,
+    /// The flash size is a power of two: offsets are `addr & flash_mask` (else they go through `flash_offset`).
+    flash_mask: Option<usize>,
+    /// The running core's interrupt lines as its NVIC sees them.
+    core_lines: u32,
+    /// Interrupt lines computed during the batch, for the machine to hand to both cores.
+    lines: Option<[u32; 2]>,
+    /// What the batch did besides reading memory: see [`BatchBus::quiet`].
+    noisy: bool,
+    timer_ticks: Option<u64>,
+    ticked: bool,
+    /// The first time a register the batch read quietly (XOSC, see [`BatchBus::holds_until`]) would read
+    /// differently.
+    holds_until: Time,
+    /// An access since the last [`Bus::take_slow_access`] went through the general path.
+    slow: bool,
+    /// An access in the batch went through the general path or read the timer or XOSC.
+    touched: bool,
+    /// End the batch after an access that goes through the general path (a fused batch, see
+    /// `Machine::run_until`: such an access may schedule an event or wake the other core, which the machine must
+    /// look at by the end of the quantum).
+    pub end_on_slow: bool,
+}
+
+/// What a batch touched, for busy-wait skipping (see `Machine::run_until`).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Quiet {
+    /// It read memory (SRAM, ROM, flash with XIP working) and nothing else (but XOSC: see
+    /// [`BatchBus::holds_until`]).
+    Memory,
+    /// It also read the timer, and every read saw this tick count.
+    Timer(u64),
+    /// It also read the timer, which ticked in between: not a repeat, but the next batch may be.
+    Ticked,
+}
+
+impl<'a> BatchBus<'a> {
+    pub fn new(
+        sys: &'a mut System,
+        trace: &'a mut dyn TraceSink,
+        core: u8,
+        clock: CycleClock,
+        period: ClockPeriod,
+        core_lines: u32,
+    ) -> Self {
+        // Time only moves forward within the batch, so if XIP works at its start it works until something changes
+        // the SSI or flash (a peripheral access)
+        let xip_ok = sys.xip_ready_from(clock.now);
+        let len = sys.flash.len();
+        let flash_mask = len.is_power_of_two().then(|| len - 1);
+        BatchBus {
+            flash_mask,
+            sys,
+            trace,
+            core,
+            clock,
+            period,
+            elapsed: 0,
+            after: 0,
+            xip_ok,
+            core_lines,
+            lines: None,
+            noisy: false,
+            timer_ticks: None,
+            ticked: false,
+            holds_until: Time::MAX,
+            slow: false,
+            touched: false,
+            end_on_slow: false,
+        }
+    }
+
+    /// Whether an access in the batch went through the general path (reached a peripheral or found XIP not set
+    /// up) or read the timer or XOSC.
+    pub fn touched(&self) -> bool {
+        self.touched
+    }
+
+    /// Whether the batch only read memory (and the timer, always at the same tick count), writing nothing: then
+    /// running it again from the same core state does exactly the same, as long as the tick count holds.
+    pub fn quiet(&self) -> Option<Quiet> {
+        match (self.noisy, self.ticked, self.timer_ticks) {
+            (true, _, _) => None,
+            (false, true, _) => Some(Quiet::Ticked),
+            (false, false, None) => Some(Quiet::Memory),
+            (false, false, Some(t)) => Some(Quiet::Timer(t)),
+        }
+    }
+
+    /// For a quiet batch: the first time a register it read other than memory and the timer (XOSC.STATUS, while
+    /// the oscillator starts) would read differently. Running the batch again gives the same result only if it
+    /// ends before then (`Time::MAX`: nothing it read changes by itself).
+    pub fn holds_until(&self) -> Time {
+        self.holds_until
+    }
+
+    /// Interrupt lines recomputed during the batch, for cores 0 and 1.
+    pub fn take_lines(&mut self) -> Option<[u32; 2]> {
+        self.lines.take()
+    }
+
+    /// The start time of the current instruction.
+    #[inline]
+    fn now(&self) -> Time {
+        if self.elapsed == 0 { self.clock.now } else { self.clock.time_after(&self.period, self.elapsed) }
+    }
+
+    #[inline(always)]
+    fn flash(&mut self, addr: u32) -> Result<usize, BusFault> {
+        if self.xip_ok {
+            // What xip_check does when XIP works
+            self.sys.xip_failed = false;
+        } else {
+            self.xip_check(addr)?;
+        }
+        Ok(match self.flash_mask {
+            Some(mask) => addr as usize & mask,
+            None => self.sys.flash_offset(addr),
+        })
+    }
+
+    // The slow paths are kept out of line so that the fast ones stay small enough to inline into the interpreter
+
+    #[cold]
+    #[inline(never)]
+    fn xip_check(&mut self, addr: u32) -> Result<(), BusFault> {
+        self.noisy = true;
+        self.slow = true;
+        self.touched = true;
+        if self.end_on_slow {
+            self.after |= Self::ATTENTION;
+        }
+        let now = self.now();
+        self.sys.xip_check(now, addr)
+    }
+
+    /// Firmware polls the timer constantly (embassy-time, busy waits); reading it changes nothing the batch or the
+    /// machine would have to look at, so it skips the general peripheral path.
+    #[inline(never)]
+    fn timer_read(&mut self, addr: u32, size: Size) -> Result<u32, BusFault> {
+        let now = self.now();
+        match self.sys.timer.read(&self.sys.watchdog.tick, now, addr & 0xFFC) {
+            Some(v) => {
+                // A fused batch ends here too: polling the timer is what busy-waits do, and the machine only finds
+                // those at quantum boundaries
+                self.touched = true;
+                if self.end_on_slow {
+                    self.after |= Self::ATTENTION;
+                }
+                let ticks = self.sys.watchdog.tick.ticks(now);
+                if self.timer_ticks.is_some_and(|t| t != ticks) {
+                    self.ticked = true;
+                }
+                self.timer_ticks = Some(ticks);
+                Ok(mem::lane(v, addr, size))
+            }
+            None => self.slow_read_general(addr, size),
+        }
+    }
+
+    /// Firmware polls XOSC.STATUS until the crystal is stable (embassy-rp's `start_xosc`, for a long time on the
+    /// ring oscillator); reading XOSC changes nothing, so it skips the general path like the timer, and the batch
+    /// stays quiet (see [`BatchBus::holds_until`]).
+    #[inline(never)]
+    fn xosc_read(&mut self, addr: u32, size: Size) -> Result<u32, BusFault> {
+        let now = self.now();
+        let off = addr & 0xFFC;
+        match self.sys.clocks.xosc.read(now, off) {
+            Some(v) => {
+                // A fused batch ends here too, as after a timer read: busy-waits poll it
+                self.touched = true;
+                if self.end_on_slow {
+                    self.after |= Self::ATTENTION;
+                }
+                if let Some(t) = self.sys.clocks.xosc.read_changes_at(now, off) {
+                    self.holds_until = self.holds_until.min(t);
+                }
+                Ok(mem::lane(v, addr, size))
+            }
+            None => self.slow_read_general(addr, size),
+        }
+    }
+
+    #[inline(never)]
+    fn slow_read(&mut self, addr: u32, size: Size) -> Result<u32, BusFault> {
+        // (Checked here rather than in `read`, which is inlined into the interpreter.)
+        if addr & !0x3FFF == XOSC_BASE && self.sys.xosc_fast_reads {
+            return self.xosc_read(addr, size);
+        }
+        self.slow_read_general(addr, size)
+    }
+
+    #[inline(never)]
+    fn slow_read_general(&mut self, addr: u32, size: Size) -> Result<u32, BusFault> {
+        self.noisy = true;
+        self.slow = true;
+        let now = self.now();
+        let r = self.sys.read(self.trace, self.core, now, addr, size);
+        self.after_access(now);
+        r
+    }
+
+    #[inline(never)]
+    fn slow_write(&mut self, addr: u32, size: Size, value: u32) -> Result<(), BusFault> {
+        self.noisy = true;
+        self.slow = true;
+        let now = self.now();
+        let r = self.sys.write(self.trace, self.core, now, addr, size, value);
+        self.after_access(now);
+        r
+    }
+
+    /// What the run loop would do after the instruction, as far as this access is concerned (see the type's docs).
+    fn after_access(&mut self, now: Time) {
+        let s = &mut *self.sys;
+        self.xip_ok = s.xip_ready_from(now);
+        self.touched = true;
+        if self.end_on_slow {
+            // The machine takes over (the rest of the quantum is not fused) and refreshes the interrupt lines
+            self.after |= Self::ATTENTION;
+            return;
+        }
+        if s.clk_sys_changed || s.reset_request.is_some() || s.psm_forced_off != 0 || s.psm_released != 0 {
+            // The machine handles these, then refreshes the interrupt lines
+            self.after |= Self::ATTENTION;
+            return;
+        }
+        // The lines are recomputed once the whole instruction is done, as the run loop would
+        if s.irq_dirty {
+            self.after |= Self::CHECK_IRQS;
+        }
+    }
+
+    /// The machine must act before the next instruction.
+    const ATTENTION: u8 = 1;
+    /// An access left `irq_dirty` set: recompute the lines after the instruction.
+    const CHECK_IRQS: u8 = 2;
+
+    /// Does what an instruction's slow accesses left to do; returns whether the batch must end.
+    #[inline(never)]
+    fn settle(&mut self) -> bool {
+        let after = std::mem::take(&mut self.after);
+        // With ATTENTION the machine takes over, and refreshes the interrupt lines itself afterwards
+        after & Self::ATTENTION != 0 || self.refresh_irqs()
+    }
+
+    fn refresh_irqs(&mut self) -> bool {
+        let s = &mut *self.sys;
+        if s.irq_dirty {
+            s.irq_dirty = false;
+            let lines = s.irq_lines_both();
+            self.lines = Some(lines);
+            if lines[self.core as usize] != self.core_lines {
+                self.core_lines = lines[self.core as usize];
+                return true;
+            }
+        }
+        false
+    }
+}
+
+impl Bus for BatchBus<'_> {
+    #[inline(always)]
+    fn read(&mut self, addr: u32, size: Size) -> Result<u32, BusFault> {
+        let sram = addr.wrapping_sub(SRAM_BASE) as usize;
+        if sram < SRAM_SIZE {
+            return Ok(mem::read(&self.sys.sram, sram, size));
+        }
+        if addr >> 26 == XIP_BASE >> 26 {
+            let off = self.flash(addr)?;
+            return Ok(mem::read(&self.sys.flash, off, size));
+        }
+        if (addr as usize) < ROM_SIZE {
+            return Ok(mem::read(&self.sys.rom, addr as usize, size));
+        }
+        if addr & !0x3FFF == TIMER_BASE {
+            return self.timer_read(addr, size);
+        }
+        self.slow_read(addr, size)
+    }
+
+    #[inline(always)]
+    fn write(&mut self, addr: u32, size: Size, value: u32) -> Result<(), BusFault> {
+        let sram = addr.wrapping_sub(SRAM_BASE) as usize;
+        if sram < SRAM_SIZE {
+            self.noisy = true;
+            mem::write(&mut self.sys.sram, sram, size, value);
+            return Ok(());
+        }
+        self.slow_write(addr, size, value)
+    }
+
+    #[inline(always)]
+    fn fetch16_fast(&mut self, addr: u32) -> Option<u16> {
+        fn half(buf: &[u8], off: usize) -> Option<u16> {
+            buf.get(off..off + 2).map(|b| u16::from_le_bytes([b[0], b[1]]))
+        }
+        if addr >> 26 == XIP_BASE >> 26 {
+            if self.xip_ok && self.flash_mask.is_some() {
+                // What xip_check does when XIP works
+                self.sys.xip_failed = false;
+                return half(&self.sys.flash, addr as usize & self.flash_mask.unwrap_or(0));
+            }
+            return None;
+        }
+        let sram = addr.wrapping_sub(SRAM_BASE) as usize;
+        if sram < SRAM_SIZE {
+            return half(&self.sys.sram, sram);
+        }
+        if (addr as usize) < ROM_SIZE {
+            return half(&self.sys.rom, addr as usize);
+        }
+        None
+    }
+
+    #[inline(always)]
+    fn code_at(&mut self, addr: u32) -> Option<&[u8]> {
+        // Exactly where fetch16_fast serves halfwords from
+        let (buf, off) = if addr >> 26 == XIP_BASE >> 26 {
+            let mask = self.flash_mask.filter(|_| self.xip_ok)?;
+            // What xip_check does when XIP works
+            self.sys.xip_failed = false;
+            (&self.sys.flash, addr as usize & mask)
+        } else if addr.wrapping_sub(SRAM_BASE) < SRAM_SIZE as u32 {
+            (&self.sys.sram, addr.wrapping_sub(SRAM_BASE) as usize)
+        } else if (addr as usize) < ROM_SIZE {
+            (&self.sys.rom, addr as usize)
+        } else {
+            return None;
+        };
+        buf.get(off..).filter(|b| b.len() >= 2)
+    }
+
+    #[inline]
+    fn take_slow_access(&mut self) -> bool {
+        std::mem::take(&mut self.slow)
+    }
+
+    #[inline(always)]
+    fn ram(&mut self, addr: u32, len: u32, write: bool) -> Option<&mut [u8]> {
+        let off = addr.wrapping_sub(SRAM_BASE) as usize;
+        if off < SRAM_SIZE && len as usize <= SRAM_SIZE - off {
+            // What write does for SRAM
+            self.noisy |= write;
+            return Some(&mut self.sys.sram[off..off + len as usize]);
+        }
+        None
+    }
+
+    #[inline(always)]
+    fn fetch16(&mut self, addr: u32) -> Result<u16, BusFault> {
+        // Halfword aligned (the PC always is), so the second byte is in range whenever the first is
+        fn half(buf: &[u8], off: usize) -> Option<u16> {
+            buf.get(off..off + 2).map(|b| u16::from_le_bytes([b[0], b[1]]))
+        }
+        if addr >> 26 == XIP_BASE >> 26 {
+            let off = self.flash(addr)?;
+            if let Some(v) = half(&self.sys.flash, off) {
+                return Ok(v);
+            }
+        }
+        let sram = addr.wrapping_sub(SRAM_BASE) as usize;
+        if sram < SRAM_SIZE
+            && let Some(v) = half(&self.sys.sram, sram)
+        {
+            return Ok(v);
+        }
+        if (addr as usize) < ROM_SIZE
+            && let Some(v) = half(&self.sys.rom, addr as usize)
+        {
+            return Ok(v);
+        }
+        self.slow_read_general(addr, Size::Half).map(|v| v as u16)
+    }
+
+    #[inline]
+    fn set_elapsed(&mut self, cycles: u64) {
+        self.elapsed = cycles;
+    }
+
+    #[inline]
+    fn take_attention(&mut self) -> bool {
+        self.after != 0 && self.settle()
+    }
+
+    fn peek(&mut self, addr: u32, size: Size) -> Option<u32> {
+        self.sys.peek_core(self.core, addr, size)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1919,6 +2514,50 @@ mod tests {
         assert_eq!(r(&mut sys, Time::ZERO, SIO_BASE + 4) & (1 << 25), 0, "GPIO_IN follows the pin");
         let mut t = NullSink;
         assert_eq!(sys.read(&mut t, 1, Time::ZERO, SIO_BASE, Size::Word), Ok(1), "CPUID of core 1");
+    }
+
+    /// XOSC reads in a batch take the fast path (`System::xosc_fast_reads`): the same values as the general path,
+    /// a quiet batch, and the time STATUS would change.
+    #[test]
+    fn batch_xosc_reads_are_quiet_until_stable() {
+        for fast in [true, false] {
+            let mut sys = quiet();
+            sys.xosc_fast_reads = fast;
+            w(&mut sys, Time::ZERO, XOSC_BASE + 0x0C, 47);
+            w(&mut sys, Time::ZERO, XOSC_BASE, 0xFAB << 12 | 0xAA0);
+            // (As the machine would have handled it)
+            sys.clk_sys_changed = false;
+            let stable = Time::ZERO + ClockPeriod::from_hz(12_000_000).cycles(47 * 256);
+            let period = ClockPeriod::from_hz(125_000_000);
+            let mut t = NullSink;
+            let mut batch = |at: Time, addrs: &[(u32, Size)]| {
+                let mut reference = sys.clone();
+                let clock = CycleClock::new(at);
+                let mut bus = BatchBus::new(&mut sys, &mut t, 0, clock, period, 0);
+                let values: Vec<u32> = addrs.iter().map(|&(a, size)| bus.read(a, size).unwrap()).collect();
+                let quiet = (bus.quiet(), bus.holds_until(), bus.touched(), bus.take_attention());
+                for (&(a, size), &v) in addrs.iter().zip(&values) {
+                    assert_eq!(reference.read(&mut NullSink, 0, at, a, size), Ok(v), "{a:#x} at {at}");
+                }
+                (values, quiet)
+            };
+            let status = [(XOSC_BASE + 4, Size::Word), (XOSC_BASE + 0x2007, Size::Byte), (XOSC_BASE + 0xC, Size::Half)];
+            let (v, (q, holds, touched, attention)) = batch(Time::from_us(100), &status);
+            assert_eq!(v, [1 << 12, 0, 47]);
+            assert!(touched && !attention);
+            if fast {
+                assert_eq!((q, holds), (Some(Quiet::Memory), stable));
+            } else {
+                assert_eq!((q, holds), (None, Time::MAX));
+            }
+            let (v, (q, holds, _, _)) = batch(stable, &status);
+            assert_eq!(v, [1 << 31 | 1 << 12, 0x80, 47]);
+            assert_eq!(holds, Time::MAX, "stable: holds until a write");
+            assert_eq!(q.is_some(), fast);
+            // An offset XOSC does not have goes through the general path (unmodelled)
+            let (_, (q, _, _, _)) = batch(stable, &[(XOSC_BASE + 0x40, Size::Word)]);
+            assert_eq!(q, None);
+        }
     }
 
     #[test]
@@ -2109,5 +2748,107 @@ mod tests {
             sys.update_pins(&mut NullSink, Time::from_us(10 * i + 10));
         }
         assert_eq!(r(&mut sys, Time::from_us(60), PWM_BASE + 8), 5);
+    }
+
+    /// PIO reads that change nothing skip the second advance (`System::pio_fast_reads`): the interrupt lines the run
+    /// loop sees, the next PIO advance and what is read must be as with it. A state machine fills its RX FIFO and
+    /// stalls; the CPU polls FSTAT and pops the FIFO (unstalling the machine and dropping RX-not-empty), with and
+    /// without time passing in between.
+    #[test]
+    fn pio_fast_reads_change_nothing() {
+        let run = |fast: bool| {
+            let mut sys = quiet();
+            sys.pio_fast_reads = fast;
+            let mut log = Vec::new();
+            w(&mut sys, Time::ZERO, RESETS_BASE + 0x3000, 1 << 10); // PIO0 out of reset
+            w(&mut sys, Time::ZERO, PIO0_BASE + pio::INSTR_MEM0, 0x8020); // push block (then jmp 0 from empty memory)
+            w(&mut sys, Time::ZERO, PIO0_BASE + 0x12C, 1); // IRQ0_INTE: SM0 RX not empty
+            w(&mut sys, Time::ZERO, PIO0_BASE + pio::CTRL, 1);
+            // The run loop's view of the interrupt lines
+            let mut seen = sys.irq_lines_both();
+            sys.irq_dirty = false;
+            let mut t = Time::from_us(5);
+            for i in 0..40u64 {
+                let off = match i % 5 {
+                    0 | 2 => pio::FSTAT,
+                    1 => pio::FLEVEL,
+                    _ => pio::RXF0,
+                };
+                let v = r(&mut sys, t, PIO0_BASE + off);
+                if sys.irq_dirty {
+                    sys.irq_dirty = false;
+                    seen = sys.irq_lines_both();
+                }
+                assert_eq!(seen, sys.irq_lines_both(), "read {i}: the lines changed without irq_dirty");
+                log.push((t, off, v, seen, sys.sched.next_time()));
+                if i % 7 == 6 {
+                    t += Time::from_ns(40);
+                }
+            }
+            log
+        };
+        let fast = run(true);
+        assert!(fast.iter().any(|e| e.1 == pio::RXF0 && e.3[0] & 1 << irq::PIO0_IRQ_0 == 0), "{fast:?}");
+        assert!(fast.iter().any(|e| e.3[0] & 1 << irq::PIO0_IRQ_0 != 0), "{fast:?}");
+        assert_eq!(fast, run(false));
+    }
+
+    /// SIO accesses other than to the FIFOs leave the interrupt lines alone (`System::sio_fast_irqs`): after every
+    /// access the lines the run loop would see must be the current ones, and everything read the same as with every
+    /// access flagging the lines. The cores pass words through the FIFOs (raising and dropping SIO_IRQ_PROCn, with
+    /// overflow and underflow errors) between GPIO, spinlock and divider accesses.
+    #[test]
+    fn sio_fast_irqs_change_nothing() {
+        let run = |fast: bool| {
+            let mut sys = quiet();
+            sys.sio_fast_irqs = fast;
+            let mut seen = sys.irq_lines_both();
+            sys.irq_dirty = false;
+            let mut log = Vec::new();
+            let accesses: &[(u8, bool, u32, u32)] = &[
+                (0, true, sio::FIFO_WR, 1),
+                (0, false, 0x100, 0), // SPINLOCK0
+                (1, false, sio::FIFO_ST, 0),
+                (0, true, 0x024, 1 << 3), // GPIO_OE_SET
+                (1, false, sio::FIFO_RD, 0),
+                (1, false, sio::FIFO_RD, 0), // underflow: ROE
+                (0, true, 0x100, 0),
+                (1, true, sio::FIFO_ST, 0), // clears the errors
+                (0, true, sio::FIFO_WR, 2),
+                (0, true, sio::FIFO_WR, 3),
+                (0, false, 0x004, 0), // GPIO_IN
+                (0, true, sio::FIFO_WR, 4),
+                (0, true, sio::FIFO_WR, 5),
+                (0, true, sio::FIFO_WR, 6), // overflow: WOF
+                (0, true, 0x060, 7),        // DIV_UDIVIDEND
+                (0, false, 0x070, 0),       // DIV_QUOTIENT
+                (0, true, 0x014, 1 << 3),   // GPIO_OUT_SET
+                (1, false, sio::FIFO_RD, 0),
+                (0, true, sio::FIFO_ST, 0),
+                (1, false, sio::FIFO_RD, 0),
+                (1, false, sio::FIFO_RD, 0),
+                (1, false, sio::FIFO_RD, 0),
+            ];
+            for (i, &(core, write, off, v)) in accesses.iter().enumerate() {
+                let t = Time::from_ns(10 * i as u64);
+                let r = if write {
+                    sys.write(&mut NullSink, core, t, SIO_BASE + off, Size::Word, v).unwrap();
+                    0
+                } else {
+                    sys.read(&mut NullSink, core, t, SIO_BASE + off, Size::Word).unwrap()
+                };
+                if sys.irq_dirty {
+                    sys.irq_dirty = false;
+                    seen = sys.irq_lines_both();
+                }
+                assert_eq!(seen, sys.irq_lines_both(), "access {i}: the lines changed without irq_dirty");
+                log.push((r, seen));
+            }
+            log
+        };
+        let fast = run(true);
+        let fifo = |l: &[u32; 2]| l[0] >> irq::SIO_IRQ_PROC0 & 1 | l[1] >> irq::SIO_IRQ_PROC1 & 1;
+        assert!(fast.iter().any(|e| fifo(&e.1) != 0) && fast.iter().any(|e| fifo(&e.1) == 0), "{fast:?}");
+        assert_eq!(fast, run(false));
     }
 }

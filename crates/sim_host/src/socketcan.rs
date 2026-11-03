@@ -78,7 +78,18 @@ pub struct SocketCan {
 }
 
 impl SocketCan {
+    /// SocketCAN is Linux only: elsewhere (macOS) opening an interface fails with [`io::ErrorKind::Unsupported`].
+    /// Use the in-process bus, mock bridges or a cannelloni tunnel (`can-tunnel`) to a Linux machine instead.
+    #[cfg(not(target_os = "linux"))]
+    pub fn open(interface: &str) -> io::Result<SocketCan> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            format!("{interface}: SocketCAN needs Linux (on macOS, tunnel CAN to a Linux machine with can-tunnel)"),
+        ))
+    }
+
     /// Opens a raw CAN socket on `interface` with CAN FD frames enabled.
+    #[cfg(target_os = "linux")]
     pub fn open(interface: &str) -> io::Result<SocketCan> {
         let name = std::ffi::CString::new(interface).map_err(|_| io::Error::other("bad interface name"))?;
         // SAFETY: plain socket API calls with checked return values and correctly sized structures
@@ -167,6 +178,12 @@ impl CanEndpoint for SocketCan {
         if let Err(e) = self.write(frame) {
             log::warn!("{}: write failed: {e}", self.interface);
         }
+    }
+
+    /// What host tools write waits for the bus in a bounded queue, as a real interface's `txqueuelen` bounds it
+    /// (vcan itself never refuses a write), so a stuck or flooded bus does not collect it without end.
+    fn tx_queue_limit(&self) -> Option<usize> {
+        Some(sim_devices::can::BRIDGE_TX_QUEUE)
     }
 }
 

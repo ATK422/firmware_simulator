@@ -11,8 +11,8 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
-use cpu_armv6m::CortexM0Plus;
 use cpu_armv6m::disasm;
+use cpu_armv6m::{CortexM0Plus, SpinState};
 use sim_core::bus::Size;
 use sim_core::cpu::{Cpu, StepOutcome};
 use sim_core::image::Image;
@@ -23,7 +23,7 @@ use crate::hle::{self, RomFn};
 use crate::memmap::*;
 use crate::periph::sysctl::psm;
 use crate::periph::timer::WatchdogReset;
-use crate::system::{CoreBus, Event, ResetRequest, System};
+use crate::system::{BatchBus, CoreBus, Event, Quiet, ResetRequest, System};
 
 /// Time from releasing core 1's PSM force-off until it executes its first instruction (a few `clk_ref` cycles of
 /// PSM sequencing). Firmware relies on this: the bootrom's core 1 handshake starts with an unconditional FIFO read
@@ -103,16 +103,79 @@ pub struct Machine {
     pub hle: BTreeMap<u32, RomFn>,
     /// Whether ROM flash functions are trapped. Off once the flash chip is modelled at the SSI level.
     pub hle_enabled: bool,
-    /// Firmware asked to reboot into BOOTSEL mode.
+    /// Firmware asked to reboot into BOOTSEL mode (`reset_usb_boot`); the machine then really goes through the
+    /// bootrom's USB boot (see [`Machine::watchdog_reset`]).
     pub usb_boot_requested: bool,
     /// `External` events that fired, as `(time, id)`, for the host to collect.
     pub external_fired: Vec<(Time, u32)>,
     /// Skip the breakpoint check for this core's next instruction (resuming from a breakpoint).
     skip_breakpoint: [bool; 2],
     trace_instructions: bool,
+    /// Watchdog ticks each core's SysTick has counted, while it counts the reference clock (see
+    /// [`Machine::sync_systick_reference`]).
+    systick_ref: [Option<u64>; 2],
+    /// The cycle budget a quantum ended with: `(core, limit, clock, clk_sys Hz, cycles)`, the cycles core `core`
+    /// still needed from `clock` to reach `limit` (saves recomputing it, a division, when the next quantum is the
+    /// same core's with the same limit).
+    budget_carry: Option<(usize, Time, CycleClock, u64, u64)>,
+    /// The core whose last quantum was quiet (see [`Machine::skip_spin`]): its next one is checked for a loop.
+    spin_watch: Option<usize>,
+    /// The watched core's quanta since the state a loop would come back to (see [`SpinWindow`]).
+    spin_window: Option<SpinWindow>,
+    /// Busy-wait skipping (on by default; off to check that it changes nothing).
+    pub skip_spins: bool,
+    /// Instructions skipped that way (counted in the cores' instruction counts too).
+    pub spin_skipped: u64,
+    /// Quantum fusing (on by default; off to check that it changes nothing): while only one core can run, nothing
+    /// is due before the quantum's limit and the core touches nothing but memory and the timer, one batch runs
+    /// through several quanta (see [`Machine::run_until`]).
+    pub fuse_quanta: bool,
+    /// Quantum boundaries crossed inside fused batches (statistics).
+    pub quanta_fused: u64,
+    /// The last quantum wrote memory and reached no peripheral (other than SRAM): its core is computing, so the next
+    /// quantum may be fused. After a quiet one (a busy-wait, maybe) the next is left to the busy-wait check, and
+    /// after one that reached a peripheral the next is likely to again.
+    fuse_next: bool,
 }
 
-/// A snapshot of a machine: everything except the trace sink.
+/// Consecutive quiet quanta of one core looked at for a loop that spans several (see [`SpinWindow`]): a loop
+/// whose length does not divide the quantum comes back to a state only after several quanta.
+const SPIN_WINDOW: u32 = 16;
+
+/// Busy-wait detection over several quanta of one core: the state at the start of the first, and what the quanta
+/// since did together. Only quanta that follow each other with nothing in between (no other core ran, no event
+/// fired, the host changed nothing) are counted; a window is started again from the current state when it reaches
+/// `period` quanta, which doubles up to [`SPIN_WINDOW`] (Brent's cycle detection: a loop of up to that many quanta
+/// is found soon after it is entered).
+#[derive(Clone, Copy, Debug)]
+struct SpinWindow {
+    core: usize,
+    /// The state at the start of the window (`None`: the next quantum's start).
+    start: Option<SpinState>,
+    quiet: Quiet,
+    holds: Time,
+    steps: u32,
+    cycles: u64,
+    quanta: u32,
+    period: u32,
+}
+
+impl SpinWindow {
+    fn new(core: usize, period: u32) -> Self {
+        SpinWindow { core, start: None, quiet: Quiet::Memory, holds: Time::MAX, steps: 0, cycles: 0, quanta: 0, period }
+    }
+
+    /// Starts again at the next quantum's start.
+    fn restart(&mut self, period: u32) {
+        *self = SpinWindow::new(self.core, period);
+    }
+}
+
+/// Quanta one fused batch may run through at most (bounds how long busy-wait detection waits, see
+/// [`Machine::run_until`]).
+const FUSE_QUANTA: u32 = 64;
+
+/// A snapshot of a machine: everything except the trace sink (and the host's settings: breakpoints, HLE, quantum).
 #[derive(Clone)]
 pub struct Snapshot {
     cores: [CortexM0Plus; 2],
@@ -121,6 +184,13 @@ pub struct Snapshot {
     sys: System,
     now: Time,
     clk_sys: ClockPeriod,
+    systick_ref: [Option<u64>; 2],
+    /// How resets boot, and what they have done so far.
+    boot_vtor: Option<u32>,
+    rom_boot: bool,
+    usb_boot_requested: bool,
+    resets: u32,
+    last_ran: usize,
 }
 
 impl Machine {
@@ -154,6 +224,15 @@ impl Machine {
             usb_boot_requested: false,
             skip_breakpoint: [false; 2],
             trace_instructions: false,
+            systick_ref: [None; 2],
+            budget_carry: None,
+            spin_watch: None,
+            spin_window: None,
+            skip_spins: true,
+            spin_skipped: 0,
+            fuse_quanta: true,
+            quanta_fused: 0,
+            fuse_next: false,
         };
         m.clk_sys = m.sys.clk_sys;
         m.sys.clk_sys_changed = false;
@@ -273,19 +352,23 @@ impl Machine {
     fn refresh_irqs(&mut self) {
         if self.sys.irq_dirty {
             self.sys.irq_dirty = false;
-            for c in 0..2 {
-                self.cores[c].set_irq_lines(self.sys.irq_lines(c as u8));
+            let lines = self.sys.irq_lines_both();
+            for (core, l) in self.cores.iter_mut().zip(lines) {
+                core.set_irq_lines(l);
             }
         }
     }
 
     fn fire_events(&mut self, until: Time) {
+        // Events change what a loop over several quanta would find
+        self.spin_window = None;
         while let Some((t, ev)) = self.sys.sched.pop_due(until) {
             self.now = self.now.max(t);
             self.sys.fire_event(&mut *self.trace, t, ev);
             match ev {
                 Event::External(id) => self.external_fired.push((t, id)),
-                Event::Core1Boot => self.boot_core1_rom_at(t),
+                // (Not while the PSM holds core 1 in reset again: its release schedules another start)
+                Event::Core1Boot if self.sys.psm.frce_off & (1 << psm::PROC1) == 0 => self.boot_core1_rom_at(t),
                 _ => {}
             }
             self.after_system_change();
@@ -325,6 +408,21 @@ impl Machine {
     pub fn watchdog_reset(&mut self, kind: WatchdogReset) {
         let t = self.clocks[0].now.max(self.clocks[1].now).max(self.now);
         log::info!("[{t}] watchdog reset ({kind:?})");
+        // WATCHDOG.SCRATCH4-7 holding the bootrom's magic make the bootrom jump to SCRATCH7 after the reset
+        // (pico-sdk `watchdog_reboot` with a PC, the bootrom's `reset_usb_boot`, PICOBOOT REBOOT with a PC). Only
+        // the bootrom honours them, so even a direct-booted machine goes through it from now on.
+        let s = self.sys.watchdog.scratch;
+        if s[4] == 0xB007_C0D3 && s[5] == s[7] ^ 0xB007_C0D3u32.wrapping_neg() {
+            if (s[7] as usize) < ROM_SIZE {
+                // The only ROM entry point used this way is the USB boot wrapper
+                self.usb_boot_requested = true;
+                log::info!("[{t}] rebooting into USB boot (BOOTSEL)");
+            }
+            if !self.rom_boot && self.has_bootrom() {
+                self.rom_boot = true;
+                self.boot_vtor = None;
+            }
+        }
         self.resets += 1;
         self.sys.watchdog.record_reset(kind);
         self.sys.watchdog_reset(t);
@@ -428,24 +526,20 @@ impl Machine {
             }
             RomFn::FlashRangeProgram => {
                 log::debug!("[{now}] core{c} flash_range_program({r0:#x}, {r1:#010x}, {r2:#x})");
+                // Only what lands in flash is read (the count is the guest's); the time is that of every page
+                let n = (r2 as usize).min(self.sys.flash.len().saturating_sub(r0 as usize)) as u32;
                 let data: Vec<u8> =
-                    (0..r2).map(|i| self.sys.peek(r1.wrapping_add(i), Size::Byte).unwrap_or(0xFF) as u8).collect();
-                hle::program(&mut self.sys.flash, r0, &data)
+                    (0..n).map(|i| self.sys.peek(r1.wrapping_add(i), Size::Byte).unwrap_or(0xFF) as u8).collect();
+                hle::program(&mut self.sys.flash, r0, &data);
+                hle::program_time(r0, r2)
             }
-            RomFn::ResetToUsbBoot => {
-                log::warn!("[{now}] core{c} called reset_usb_boot (BOOTSEL mode is not emulated)");
-                self.usb_boot_requested = true;
-                self.request_stop();
-                Time::from_us(1)
-            }
-            RomFn::ConnectInternalFlash | RomFn::FlashExitXip => {
-                // Leave the SSI as the ROM does, so firmware can send its own commands (pico-sdk's flash_do_cmd)
-                self.sys.ssi.enter_command_mode();
-                self.sys.refresh_xip();
+            RomFn::ResetToUsbBoot => unreachable!("reset_usb_boot is not trapped"),
+            RomFn::ConnectInternalFlash | RomFn::FlashExitXip | RomFn::FlashFlushCache | RomFn::FlashEnterCmdXip => {
                 Time::from_us(2)
             }
-            RomFn::FlashFlushCache | RomFn::FlashEnterCmdXip => Time::from_us(2),
         };
+        // The SSI, pins and chip as the real function leaves them, for firmware that goes on to use them
+        hle::leave_as_rom(&mut self.sys, f, now);
         self.cores[c].set_pc(lr & !1);
         let cycles = self.clk_sys.cycles_in(duration);
         self.cores[c].advance_idle(cycles);
@@ -490,7 +584,11 @@ impl Machine {
                 self.cores[0].reset(&mut bus, vtor);
             }
         } else {
+            // Core 1 comes out of reset in the bootrom, as when its PSM force-off is released, and waits there for
+            // the launch sequence
             self.core_enabled[1] = false;
+            let t = self.clocks[1].now.max(self.now);
+            self.sys.sched.schedule(Event::Core1Boot, t + CORE1_RELEASE_LATENCY);
         }
     }
 
@@ -529,32 +627,112 @@ impl Machine {
 
     /// Whether core `c` can make progress now (running, and awake or wakeable).
     fn runnable(&mut self, c: usize) -> bool {
-        self.core_enabled[c] && !self.cores[c].is_locked_up() && self.cores[c].would_wake()
+        if !self.core_enabled[c] || self.cores[c].is_locked_up() {
+            return false;
+        }
+        let t = self.clocks[c].now.max(self.now);
+        if self.cores[c].is_sleeping() && self.clocks[c].now < self.now && self.cores[c].systick.counts_core_clock() {
+            // A sleeping core's SysTick counts the cycles the other core ran meanwhile (without moving its clock
+            // past them: whole cycles, so that doing this every quantum loses none)
+            let cycles = self.idle_cycles(c, self.now);
+            self.cores[c].advance_idle(cycles);
+            self.clocks[c].advance(&self.clk_sys, cycles);
+        }
+        self.sync_systick_reference(c, t);
+        self.cores[c].would_wake()
     }
 
     /// Brings a core that slept up to the current time, letting SysTick count the idle cycles.
     fn catch_up(&mut self, c: usize) {
         if self.clocks[c].now < self.now {
-            let idle = self.now - self.clocks[c].now;
-            let cycles = self.clk_sys.cycles_in(idle);
+            let cycles = self.idle_cycles(c, self.now);
             self.cores[c].advance_idle(cycles);
             self.clocks[c].jump_to(self.now);
         }
+        let t = self.clocks[c].now;
+        self.sync_systick_reference(c, t);
+    }
+
+    /// Whole `clk_sys` cycles core `c`'s clock (with its fraction of a picosecond) completes by `t`: the cycles an
+    /// idle core counts up to then. A fast-forward to a SysTick wrap `n` cycles ahead ends at
+    /// `clocks[c].time_after(n)`, and this gives exactly `n` there.
+    fn idle_cycles(&self, c: usize, t: Time) -> u64 {
+        let clock = &self.clocks[c];
+        if self.clk_sys.is_stopped() || t <= clock.now {
+            return 0;
+        }
+        let n = clock.cycles_until(&self.clk_sys, t);
+        if clock.time_after(&self.clk_sys, n) > t { n - 1 } else { n }
+    }
+
+    /// Feeds core `c`'s SysTick, while it counts the reference clock (CLKSOURCE clear), the watchdog ticks
+    /// generated by time `t` (on the RP2040 the reference is the watchdog's 1 µs tick). Done lazily before the core
+    /// steps or is asked whether it wakes; batches end at the next tick (see [`Machine::run_batch`]) and idle
+    /// fast-forward stops when the counter would wrap, so the counter and its exception are as if fed tick by tick.
+    #[inline(always)]
+    fn sync_systick_reference(&mut self, c: usize, t: Time) {
+        // Almost always off, or on the core clock: one test
+        if self.cores[c].systick.counts_reference_clock() || self.systick_ref[c].is_some() {
+            self.feed_systick_reference(c, t);
+        }
+    }
+
+    #[inline(never)]
+    fn feed_systick_reference(&mut self, c: usize, t: Time) {
+        if !self.cores[c].systick.counts_reference_clock() {
+            self.systick_ref[c] = None;
+            return;
+        }
+        let ticks = self.sys.watchdog.tick.ticks(t);
+        match self.systick_ref[c] {
+            // Counting starts now (ticks while SysTick was off or on the core clock are not its)
+            None => self.systick_ref[c] = Some(ticks),
+            Some(seen) if ticks > seen => {
+                self.cores[c].tick_systick_reference(ticks - seen);
+                self.systick_ref[c] = Some(ticks);
+            }
+            // The tick generator restarted (a chip reset)
+            Some(seen) if ticks < seen => self.systick_ref[c] = Some(ticks),
+            Some(_) => {}
+        }
+    }
+
+    /// When core `c`'s SysTick on the reference clock gets its next tick (minus a picosecond: `time_of_tick` may
+    /// be that late), if it counts the reference clock.
+    fn next_systick_reference_tick(&self, c: usize) -> Option<Time> {
+        let seen = self.systick_ref[c]?;
+        self.sys.watchdog.tick.time_of_tick(seen + 1).map(|t| t.saturating_sub(Time(1)))
+    }
+
+    /// When core `c`'s SysTick on the reference clock wraps and pends its exception, if it will.
+    fn systick_reference_wrap(&self, c: usize) -> Option<Time> {
+        let seen = self.systick_ref[c]?;
+        let n = self.cores[c].systick.reference_ticks_until_wrap()?;
+        self.sys.watchdog.tick.time_of_tick(seen + n)
     }
 
     /// Executes one instruction (or exception entry) on `core`.
     fn step_core(&mut self, c: usize) -> StepOutcome {
         let now = self.clocks[c].now;
+        self.sync_systick_reference(c, now);
         let pc = self.cores[c].pc();
         if (pc as usize) < ROM_SIZE
             && self.hle_enabled
             && !self.cores[c].is_sleeping()
             && let Some(f) = self.hle.get(&pc).copied()
         {
-            return self.run_hle(c, f);
+            if f != RomFn::ResetToUsbBoot {
+                return self.run_hle(c, f);
+            }
+            // reset_usb_boot runs for real (the bootrom reboots itself into USB boot through the watchdog); only
+            // note that it was called
+            if !self.usb_boot_requested {
+                log::info!("[{now}] core{c} called reset_usb_boot");
+            }
+            self.usb_boot_requested = true;
         }
         let mut bus = CoreBus { sys: &mut self.sys, trace: &mut *self.trace, core: c as u8, now };
-        let outcome = self.cores[c].step(&mut bus);
+        let outcome = self.cores[c].step_on(&mut bus);
         match outcome {
             StepOutcome::Ran(cycles) => {
                 self.clocks[c].advance(&self.clk_sys, cycles as u64);
@@ -594,6 +772,145 @@ impl Machine {
         outcome
     }
 
+    /// Whether core `c`'s steps can be batched: nothing needs to see every instruction (breakpoints, instruction
+    /// or exception tracing).
+    #[inline]
+    fn can_batch(&self, c: usize) -> bool {
+        self.breakpoints.is_empty() && !self.trace_instructions && !self.cores[c].log_exceptions
+    }
+
+    /// Runs up to `max_steps` steps of core `c` as one batch (see [`CortexM0Plus::run_batch`]), ending once its
+    /// time reaches `limit`, and handles the batch's last step as [`Machine::step_core`] would. Instructions in
+    /// the middle of a batch touched nothing but memory, so they needed no handling of their own.
+    ///
+    /// `budget` carries the cycles left until `limit` between batches of one quantum: it is used if set, and set
+    /// again afterwards unless something other than the batch's own cycles may have moved the core's clock.
+    ///
+    /// Also returns whether the batch was quiet (see [`BatchBus::quiet`]) and needed no handling afterwards, with
+    /// the time until which what it read holds ([`BatchBus::holds_until`]), and whether it reached a peripheral
+    /// other than by reading the timer or XOSC. With `fused`, the batch ends after such an access (see
+    /// [`BatchBus::end_on_slow`]).
+    fn run_batch(
+        &mut self,
+        c: usize,
+        max_steps: u32,
+        limit: Time,
+        budget: &mut Option<u64>,
+        fused: bool,
+    ) -> (cpu_armv6m::Batch, Option<(Quiet, Time)>, bool) {
+        let cycles = match budget.take() {
+            Some(b) => b,
+            None => self.clocks[c].cycles_until(&self.clk_sys, limit),
+        };
+        self.sync_systick_reference(c, self.clocks[c].now);
+        // A SysTick on the reference clock is fed between batches: end this one by its next tick
+        let run_cycles = match self.systick_ref[c].and_then(|_| self.next_systick_reference_tick(c)) {
+            Some(t) => cycles.min(self.clocks[c].cycles_until(&self.clk_sys, t)),
+            None => cycles,
+        };
+        // Trapped ROM functions are entered by the single step path
+        let trap_below = if self.hle_enabled { ROM_SIZE as u32 } else { 0 };
+        let lines = self.cores[c].irq_lines();
+        let mut bus = BatchBus::new(&mut self.sys, &mut *self.trace, c as u8, self.clocks[c], self.clk_sys, lines);
+        bus.end_on_slow = fused;
+        let b = self.cores[c].run_batch(&mut bus, max_steps, run_cycles, trap_below);
+        let mut quiet = bus.quiet().map(|q| (q, bus.holds_until()));
+        let touched = bus.touched();
+        if let Some(lines) = bus.take_lines() {
+            for (core, l) in self.cores.iter_mut().zip(lines) {
+                core.set_irq_lines(l);
+            }
+        }
+        if b.steps == 0 {
+            *budget = Some(cycles);
+            return (b, None, touched);
+        }
+        self.clocks[c].advance(&self.clk_sys, b.cycles);
+        match b.stop {
+            None => {
+                let mut undisturbed = true;
+                if self.sys.clk_sys_changed
+                    || self.sys.reset_request.is_some()
+                    || self.sys.psm_forced_off != 0
+                    || self.sys.psm_released != 0
+                {
+                    self.after_system_change();
+                    undisturbed = false;
+                }
+                if self.cores[c].take_sev() {
+                    self.cores[1 - c].signal_event();
+                    quiet = None;
+                }
+                if self.cores[c].take_reset_request() {
+                    self.core_reset(c);
+                    undisturbed = false;
+                }
+                if undisturbed {
+                    *budget = Some(cycles.saturating_sub(b.cycles));
+                } else {
+                    quiet = None;
+                }
+            }
+            Some(StepOutcome::Breakpoint(_)) if self.bkpt_policy == BkptPolicy::HardFault => {
+                let now = self.clocks[c].now;
+                let mut bus = CoreBus { sys: &mut self.sys, trace: &mut *self.trace, core: c as u8, now };
+                self.cores[c].escalate_breakpoint(&mut bus);
+                quiet = None;
+            }
+            Some(_) => quiet = None,
+        }
+        (b, quiet, touched)
+    }
+
+    /// After a quantum (or a few in a row, see [`SpinWindow`]) in which core `c` ran `steps` instructions taking
+    /// `cycles`, quietly (see [`BatchBus::quiet`]), and came back to the state it started in: a busy-wait, polling
+    /// the timer, XOSC or nothing. Every further repeat would do exactly the same while nothing else happens, so
+    /// whole repeats are skipped: as many as end before the next event, the end of the run and the next timer
+    /// tick, and before `holds`, when another register they read would read differently (XOSC.STATUS as the
+    /// oscillator becomes stable), while the other core cannot run (asleep with nothing to wake it, or off) and
+    /// neither core's SysTick counts. The quantum boundaries in between would have changed nothing but the
+    /// machine's time.
+    fn skip_spin(&mut self, c: usize, steps: u32, cycles: u64, quiet: Quiet, holds: Time, end: Time) {
+        let o = 1 - c;
+        let counts = |m: &Machine, k: usize| {
+            m.cores[k].systick.counts_core_clock()
+                || m.cores[k].systick.counts_reference_clock()
+                || m.systick_ref[k].is_some()
+        };
+        if cycles == 0 || counts(self, c) {
+            return;
+        }
+        let other_still = !self.core_enabled[o]
+            || self.cores[o].is_locked_up()
+            || (self.cores[o].is_sleeping() && !counts(self, o) && !self.cores[o].would_wake());
+        if !other_still {
+            return;
+        }
+        let clock = self.clocks[c];
+        let limit = self.sys.sched.next_time().min(end).min(holds);
+        // Repeat j (from 1) ends `j * cycles` from now; it must end before the limit (else it would stop early)...
+        let mut room = clock.cycles_until(&self.clk_sys, limit).saturating_sub(1);
+        // ...and before the timer ticks on (its reads would then see another count)
+        if let Quiet::Timer(ticks) = quiet {
+            let tick = &self.sys.watchdog.tick;
+            if tick.ticks(clock.now) != ticks {
+                return;
+            }
+            let hold = tick.holds_until(ticks);
+            room = room.min(clock.cycles_until(&self.clk_sys, hold + Time(1)).saturating_sub(1));
+        }
+        let skip = room / cycles;
+        if skip == 0 {
+            return;
+        }
+        self.clocks[c].advance(&self.clk_sys, skip * cycles);
+        self.cores[c].account_skipped(skip * cycles, skip * steps as u64);
+        self.spin_skipped += skip * steps as u64;
+        // What the quantum boundaries would have left
+        self.now = self.now.max(self.clocks[c].now);
+        self.budget_carry = None;
+    }
+
     fn trace_instruction(&mut self, c: usize, now: Time) {
         let cpu = &self.cores[c];
         let pc = cpu.last_pc;
@@ -609,6 +926,8 @@ impl Machine {
     /// Runs until virtual time `end` (or something stops the machine).
     pub fn run_until(&mut self, end: Time) -> StopReason {
         self.stop_requested = false;
+        // The host may have changed something since the last quantum
+        self.spin_window = None;
         loop {
             if self.stop_requested {
                 self.stop_requested = false;
@@ -619,8 +938,10 @@ impl Machine {
 
             // Pick the runnable core furthest behind
             let mut pick: Option<usize> = None;
+            let mut runnable = 0;
             for c in 0..2 {
                 if self.runnable(c) {
+                    runnable += 1;
                     self.catch_up(c);
                     // Ties go to the core that did not run last, so a core woken at the other core's current
                     // time is not starved by a busy-waiting partner
@@ -639,9 +960,17 @@ impl Machine {
                 let mut target = next_event.min(end);
                 for c in 0..2 {
                     if self.core_enabled[c]
+                        && !self.clk_sys.is_stopped()
                         && let Some(cycles) = self.cores[c].cycles_until_systick()
                     {
-                        let t = self.clocks[c].now.max(self.now) + self.clk_sys.cycles(cycles);
+                        // From the core's own clock, fraction included: catching it up to there counts exactly
+                        // `cycles` (see `idle_cycles`)
+                        let t = self.clocks[c].time_after(&self.clk_sys, cycles).max(self.now);
+                        target = target.min(t);
+                    }
+                    if self.core_enabled[c]
+                        && let Some(t) = self.systick_reference_wrap(c)
+                    {
                         target = target.min(t);
                     }
                 }
@@ -677,7 +1006,103 @@ impl Machine {
             // Run core c for a quantum, stopping at the next event or the end
             self.last_ran = c;
             let limit = next_event.min(end);
-            for _ in 0..self.quantum {
+            let mut left = self.quantum;
+            // Cycles until core c reaches `limit`, carried from one batch to the next (and one quantum to the next)
+            // while nothing else moved its clock
+            let mut budget = match &self.budget_carry {
+                Some((core, l, clock, hz, b))
+                    if *core == c && *l == limit && *clock == self.clocks[c] && *hz == self.clk_sys.hz() =>
+                {
+                    Some(*b)
+                }
+                _ => None,
+            };
+            // Busy-wait skipping: after a quiet quantum, the window this one adds to (with the core's state at its
+            // start), and how quiet this quantum is (instructions, cycles, until when what it read holds)
+            // (Kept in place: quanta are short and the window is not small.)
+            let watched = self.spin_watch == Some(c);
+            if !watched {
+                self.spin_window = None;
+            } else {
+                let w = match &mut self.spin_window {
+                    Some(w) if w.core == c => w,
+                    other => other.insert(SpinWindow::new(c, 1)),
+                };
+                if w.start.is_none() {
+                    w.start = Some(self.cores[c].spin_state());
+                }
+            }
+            let mut spin = Some((Quiet::Memory, 0u32, 0u64, Time::MAX));
+            // Quantum fusing: the first batch may run on through further quanta when the boundaries between them
+            // would change nothing. The other core cannot run, and nothing that could wake it happens inside a
+            // batch that touches only memory (the batch ends after any other access, which may also schedule an
+            // event); no SysTick counts (fed at boundaries); events are not due before `limit`, which ends the
+            // batch. Only the busy-wait check looks at quantum boundaries, and skipping a loop is the same as
+            // running it; so that loops are still found, only quanta that follow one that wrote memory and touched
+            // nothing else are fused, and a timer read (busy-waits poll the timer) ends a fused batch too.
+            let counts = |m: &Machine, k: usize| {
+                m.cores[k].systick.counts_core_clock()
+                    || m.cores[k].systick.counts_reference_clock()
+                    || m.systick_ref[k].is_some()
+            };
+            // (A debugger's BKPT stop would come back with the machine's time at a quantum boundary not crossed.)
+            let mut fuse = self.fuse_quanta
+                && self.bkpt_policy == BkptPolicy::HardFault
+                && !watched
+                && self.fuse_next
+                && runnable == 1
+                && !counts(self, c)
+                && !counts(self, 1 - c);
+            let mut touched = false;
+            while left > 0 {
+                if self.can_batch(c) {
+                    let extra = if fuse { self.quantum.saturating_mul(FUSE_QUANTA - 1) } else { 0 };
+                    let (b, quiet, slow) = self.run_batch(c, left.saturating_add(extra), limit, &mut budget, fuse);
+                    touched |= slow;
+                    fuse = false;
+                    let merged = match (spin.map(|s| s.0), quiet.map(|q| q.0)) {
+                        (Some(Quiet::Memory), Some(q)) | (Some(q), Some(Quiet::Memory)) => Some(q),
+                        (Some(Quiet::Timer(a)), Some(Quiet::Timer(t))) if a == t => Some(Quiet::Timer(a)),
+                        (Some(_), Some(_)) => Some(Quiet::Ticked),
+                        _ => None,
+                    };
+                    spin = merged
+                        .zip(spin.zip(quiet))
+                        .map(|(q, ((_, n, cy, h), (_, hb)))| (q, n + b.steps, cy + b.cycles, h.min(hb)));
+                    if b.steps > left {
+                        // Ran through the end of this quantum into fused ones: what follows concerns the quantum the
+                        // batch ended in, `into` steps of it (its cycles only matter to a loop check, which it is not)
+                        let over = b.steps - left;
+                        let into = (over - 1) % self.quantum + 1;
+                        self.quanta_fused += ((over - 1) / self.quantum + 1) as u64;
+                        spin = quiet.map(|(q, h)| (q, into, 0, h));
+                        left = self.quantum - into;
+                    } else {
+                        left -= b.steps;
+                    }
+                    if b.steps > 0 {
+                        match b.stop {
+                            Some(StepOutcome::Breakpoint(imm)) if self.bkpt_policy == BkptPolicy::Stop => {
+                                return StopReason::BkptInstruction { core: c as u8, pc: self.cores[c].pc(), imm };
+                            }
+                            Some(StepOutcome::Lockup) => {
+                                log::error!("core{c} locked up at {:#010x}", self.cores[c].pc());
+                                return StopReason::Lockup { core: c as u8, pc: self.cores[c].pc() };
+                            }
+                            _ => {}
+                        }
+                        self.refresh_irqs();
+                        if self.clocks[c].now >= limit || self.cores[c].is_sleeping() || self.stop_requested {
+                            break;
+                        }
+                        continue;
+                    }
+                }
+                left -= 1;
+                budget = None;
+                spin = None;
+                touched = true;
+                fuse = false;
                 let pc = self.cores[c].pc();
                 if !self.breakpoints.is_empty() && self.breakpoints.contains(&pc) && !self.cores[c].is_sleeping() {
                     if self.skip_breakpoint[c] {
@@ -706,6 +1131,42 @@ impl Machine {
                 }
             }
 
+            self.budget_carry = match budget {
+                Some(b) => Some((c, limit, self.clocks[c], self.clk_sys.hz(), b)),
+                None => None,
+            };
+            self.fuse_next = !touched && spin.is_none();
+            // A whole quantum that only read memory and the timer: watch the next one, and if the quanta since the
+            // window's start came back to where it started, skip the ones that would repeat them
+            let spin = spin.filter(|&(_, n, _, _)| n == self.quantum);
+            self.spin_watch = spin.filter(|_| self.skip_spins).map(|_| c);
+            let mut closed = None;
+            if let (Some(w), Some((q, n, cy, h))) = (self.spin_window.as_mut(), spin) {
+                w.quiet = match (w.quiet, q) {
+                    (Quiet::Memory, q) | (q, Quiet::Memory) => q,
+                    (Quiet::Timer(a), Quiet::Timer(t)) if a == t => Quiet::Timer(a),
+                    _ => Quiet::Ticked,
+                };
+                w.holds = w.holds.min(h);
+                w.steps += n;
+                w.cycles += cy;
+                w.quanta += 1;
+                if w.quiet == Quiet::Ticked {
+                    // Not a repeat: look again from the next quantum
+                    w.restart(1);
+                } else if w.start.as_ref().is_some_and(|start| *start == self.cores[c].spin_state()) {
+                    closed = Some((w.quiet, w.steps, w.cycles, w.holds));
+                    let quanta = w.quanta;
+                    w.restart(quanta);
+                } else if w.quanta >= w.period {
+                    let period = (w.period * 2).min(SPIN_WINDOW);
+                    w.restart(period);
+                }
+            } else {
+                self.spin_window = None;
+            }
+            let ran = c;
+
             // Fire events every running core has reached
             let mut horizon = Time::MAX;
             for c in 0..2 {
@@ -720,6 +1181,9 @@ impl Machine {
                 self.fire_events(horizon);
             } else {
                 self.now = self.now.max(horizon.min(next_event));
+                if let Some((quiet, steps, cycles, holds)) = closed {
+                    self.skip_spin(ran, steps, cycles, quiet, holds, end);
+                }
             }
         }
     }
@@ -769,6 +1233,15 @@ impl Machine {
             external_fired: self.external_fired.clone(),
             skip_breakpoint: self.skip_breakpoint,
             trace_instructions: false,
+            systick_ref: self.systick_ref,
+            budget_carry: None,
+            spin_watch: None,
+            spin_window: None,
+            skip_spins: self.skip_spins,
+            spin_skipped: self.spin_skipped,
+            fuse_quanta: self.fuse_quanta,
+            quanta_fused: self.quanta_fused,
+            fuse_next: false,
         }
     }
 
@@ -781,6 +1254,12 @@ impl Machine {
             sys: self.sys.clone(),
             now: self.now,
             clk_sys: self.clk_sys,
+            systick_ref: self.systick_ref,
+            boot_vtor: self.boot_vtor,
+            rom_boot: self.rom_boot,
+            usb_boot_requested: self.usb_boot_requested,
+            resets: self.resets,
+            last_ran: self.last_ran,
         }
     }
 
@@ -792,7 +1271,18 @@ impl Machine {
         self.sys = s.sys.clone();
         self.now = s.now;
         self.clk_sys = s.clk_sys;
+        self.systick_ref = s.systick_ref;
+        self.boot_vtor = s.boot_vtor;
+        self.rom_boot = s.rom_boot;
+        self.usb_boot_requested = s.usb_boot_requested;
+        self.resets = s.resets;
+        self.last_ran = s.last_ran;
         self.sys.irq_dirty = true;
+        // The run loop's caches describe the state before the restore (as in `fork`, the copy starts without them)
+        self.budget_carry = None;
+        self.spin_watch = None;
+        self.spin_window = None;
+        self.fuse_next = false;
     }
 
     /// Lets attached devices update their outputs (after the host delivered something to them).
@@ -809,6 +1299,8 @@ impl Machine {
     /// Debugger memory read from `core`'s point of view (its PPB registers included).
     pub fn debug_read(&mut self, core: usize, addr: u32, size: Size) -> Option<u32> {
         self.sys.peek_time = self.clocks[core].now.max(self.now);
+        let t = self.sys.peek_time;
+        self.sync_systick_reference(core, t);
         let mut trace = NullSink;
         let mut bus = CoreBus { sys: &mut self.sys, trace: &mut trace, core: core as u8, now: self.now };
         self.cores[core].debug_read(&mut bus, addr, size)

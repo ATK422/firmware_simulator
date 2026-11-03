@@ -1,0 +1,82 @@
+# Talos, UWRT's competition AUV, for the vehicle simulation (`sim_physics`).
+#
+# EVERY NUMBER HERE IS ASSUMED: there is no CAD model, weighing or tank test behind them. They describe a plausible
+# 32 kg open-frame AUV of about 0.85 x 0.6 x 0.45 m with eight Blue Robotics T200 thrusters (four vectored
+# horizontally at 45 degrees, four vertical), trimmed slightly positive with the buoyancy above the weight. Replace
+# them with measured values when there are some; tests that use them check behaviour, not these numbers.
+#
+# Frames: body x forward, y starboard, z down, from the centre of gravity (m). Thruster `direction` is the way it
+# pushes the vehicle with its propeller turning the efficient way: positive motor RPM, or negative for an
+# `inverted` thruster (a counter-rotating propeller). Thrusters 1 and 4 of each ESC board are inverted, matching the
+# boards' default invert mask (`esc_core`'s `Param::InvertMask(0b1001)`), so in RPM mode a positive target pushes
+# every thruster along its `direction`; raw throttle commands turn those four the other way.
+name = "talos"
+
+mass_kg = 32.0
+# 2 N of net buoyancy in fresh water (997 kg/m3)
+volume_m3 = 0.0323008
+# A box of this size and mass would have about [1.5, 2.45, 2.9]; the mass is concentrated in the hulls
+inertia_kg_m2 = [1.0, 1.7, 2.0]
+# Buoyancy (foam, the main hull) 3 cm above the weight (batteries low in the frame): righting in roll and pitch
+cob_m = [0.0, 0.0, -0.03]
+height_m = 0.45
+# Surge, sway, heave (kg), roll, pitch, yaw (kg m2): roughly the water a 0.85 x 0.6 x 0.45 m box carries along
+added_mass = [8.0, 25.0, 30.0, 0.5, 1.2, 1.0]
+# Linear terms dominate only at low speed; the quadratic ones are 1/2 rho Cd A with Cd about 1 and frontal areas
+# of 0.27 (surge), 0.38 (sway) and 0.51 m2 (heave)
+linear_drag = [10.0, 15.0, 20.0, 2.0, 3.0, 3.0]
+quadratic_drag = [120.0, 190.0, 280.0, 3.0, 5.0, 5.0]
+# The potential-flow Munk moment would pitch it over at full speed (heave added mass well above surge); an open
+# frame sheds the flow and feels much less of it
+munk_moment_scale = 0.25
+
+# T200 at 16 V (Blue Robotics' published curve): about 5.25 kgf forward, 4.1 kgf reverse near 3800 RPM
+thruster_model = { forward_n = 51.5, reverse_n = 40.2, at_rpm = 3800.0 }
+
+# ESC board 0 (thrusters 1-4): the horizontal thrusters at the corners, angled 45 degrees so that all four ahead
+# drive the vehicle forward. The starboard pair ahead and the port pair astern turn it to port; diagonally
+# opposite corners together push it sideways and forward.
+[[thruster]]
+name = "fwd_stbd"
+inverted = true
+position_m = [0.33, 0.24, 0.0]
+direction = [1.0, -1.0, 0.0]
+
+[[thruster]]
+name = "fwd_port"
+position_m = [0.33, -0.24, 0.0]
+direction = [1.0, 1.0, 0.0]
+
+[[thruster]]
+name = "aft_stbd"
+position_m = [-0.33, 0.24, 0.0]
+direction = [1.0, 1.0, 0.0]
+
+[[thruster]]
+name = "aft_port"
+inverted = true
+position_m = [-0.33, -0.24, 0.0]
+direction = [1.0, -1.0, 0.0]
+
+# ESC board 1 (thrusters 5-8): vertical thrusters; positive RPM pushes the vehicle down (dives)
+[[thruster]]
+name = "heave_fwd_stbd"
+inverted = true
+position_m = [0.25, 0.28, -0.05]
+direction = [0.0, 0.0, 1.0]
+
+[[thruster]]
+name = "heave_fwd_port"
+position_m = [0.25, -0.28, -0.05]
+direction = [0.0, 0.0, 1.0]
+
+[[thruster]]
+name = "heave_aft_stbd"
+position_m = [-0.25, 0.28, -0.05]
+direction = [0.0, 0.0, 1.0]
+
+[[thruster]]
+name = "heave_aft_port"
+inverted = true
+position_m = [-0.25, -0.28, -0.05]
+direction = [0.0, 0.0, 1.0]

@@ -1,0 +1,263 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>firmware_simulator</title>
+<style>
+:root {
+  --bg: #f6f7f9; --card: #ffffff; --fg: #1d2330; --muted: #667085; --line: #d9dde5;
+  --accent: #2563eb; --ok: #15803d; --warn: #b45309; --bad: #b91c1c; --hi: #16a34a; --lo: #cbd2dc;
+  --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+}
+@media (prefers-color-scheme: dark) {
+  :root { --bg: #11151c; --card: #1a202a; --fg: #e6e9ef; --muted: #98a2b3; --line: #2c3442;
+          --accent: #60a5fa; --ok: #4ade80; --warn: #fbbf24; --bad: #f87171; --hi: #4ade80; --lo: #3a4352; }
+}
+* { box-sizing: border-box; }
+body { margin: 0; background: var(--bg); color: var(--fg); font: 14px/1.4 system-ui, sans-serif; }
+header { position: sticky; top: 0; z-index: 2; background: var(--card); border-bottom: 1px solid var(--line);
+         padding: 8px 16px; display: flex; flex-wrap: wrap; gap: 8px 20px; align-items: center; }
+header h1 { font-size: 16px; margin: 0 8px 0 0; }
+.stat b { font-variant-numeric: tabular-nums; }
+main { padding: 12px 16px; display: grid; gap: 12px; }
+section h2 { font-size: 14px; margin: 4px 0 8px; color: var(--muted); text-transform: uppercase; letter-spacing: .04em; }
+.grid { display: grid; gap: 12px; grid-template-columns: repeat(auto-fill, minmax(min(100%, 420px), 1fr)); }
+.card { background: var(--card); border: 1px solid var(--line); border-radius: 8px; padding: 10px 12px; min-width: 0; }
+.card h3 { margin: 0 0 6px; font-size: 15px; display: flex; gap: 8px; align-items: baseline; flex-wrap: wrap; }
+.muted { color: var(--muted); }
+.mono { font-family: var(--mono); font-size: 12px; }
+.badge { display: inline-block; padding: 0 6px; border-radius: 10px; font-size: 12px; border: 1px solid var(--line); }
+.ok { color: var(--ok); } .warn { color: var(--warn); } .bad { color: var(--bad); }
+table { border-collapse: collapse; width: 100%; }
+td, th { padding: 2px 6px 2px 0; text-align: left; vertical-align: top; }
+th { color: var(--muted); font-weight: normal; }
+.pins { display: grid; grid-template-columns: repeat(15, 1fr); gap: 2px; margin: 4px 0; }
+.pin { font: 10px var(--mono); text-align: center; border-radius: 3px; padding: 2px 0; background: var(--lo); color: var(--fg); }
+.pin.h { background: var(--hi); color: #fff; }
+.pin.in { opacity: .55; }
+.dot { display: inline-block; width: 10px; height: 10px; border-radius: 50%; background: var(--lo); vertical-align: middle; }
+.dot.on { background: var(--hi); box-shadow: 0 0 6px var(--hi); }
+.strip span { display: inline-block; width: 14px; height: 14px; border: 1px solid var(--line); margin-right: 1px; }
+.log { height: 180px; overflow: auto; background: var(--bg); border: 1px solid var(--line); border-radius: 4px;
+       padding: 4px; white-space: pre-wrap; word-break: break-all; }
+.log .error, .log .err { color: var(--bad); } .log .warn { color: var(--warn); } .log .uart0, .log .uart1 { color: var(--accent); }
+.bar { height: 8px; background: var(--lo); border-radius: 4px; overflow: hidden; position: relative; min-width: 60px; }
+.bar i { position: absolute; top: 0; bottom: 0; background: var(--accent); }
+form { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; margin: 4px 0; }
+input, select, button { font: inherit; color: var(--fg); background: var(--bg); border: 1px solid var(--line);
+                        border-radius: 4px; padding: 3px 6px; min-width: 0; }
+button { cursor: pointer; background: var(--accent); color: #fff; border-color: var(--accent); }
+button.secondary { background: var(--bg); color: var(--fg); border-color: var(--line); }
+#msg { min-height: 1.4em; }
+.frames { max-height: 160px; overflow: auto; }
+</style>
+</head>
+<body>
+<header>
+  <h1>firmware_simulator</h1>
+  <span class="stat">virtual <b id="time">-</b></span>
+  <span class="stat">wall <b id="wall">-</b></span>
+  <span class="stat">speed <b id="speed">-</b></span>
+  <span id="mode" class="badge"></span>
+  <button id="pause" class="secondary" type="button">Pause</button>
+  <span id="conn" class="muted"></span>
+</header>
+<main>
+  <section class="card">
+    <h2>Controls</h2>
+    <form id="faultform">
+      <select id="fboard" aria-label="board"></select>
+      <input id="fault" list="faults" placeholder="fault, e.g. can-stuck" size="24" aria-label="fault">
+      <datalist id="faults"></datalist>
+      <button type="submit">Inject fault</button>
+    </form>
+    <form id="inputform">
+      <select id="iboard" aria-label="board"></select>
+      <select id="iname" aria-label="input"></select>
+      <input id="ivalue" placeholder="value" size="10" aria-label="value">
+      <button type="submit">Set input</button>
+    </form>
+    <div id="msg" class="muted"></div>
+    <div id="faultlog" class="mono muted"></div>
+  </section>
+  <section id="vehicles-section" hidden><h2>Vehicles</h2><div id="vehicles" class="grid"></div></section>
+  <section id="buses-section" hidden><h2>CAN buses and bridges</h2><div id="buses" class="grid"></div></section>
+  <section><h2>Boards</h2><div id="boards" class="grid"></div></section>
+</main>
+<script>
+"use strict";
+// Plain DOM code, polling /api/state twice a second. Every value from the emulator is inserted as text.
+const $ = (id) => document.getElementById(id);
+let state = null, logSeen = {}, cards = {};
+
+function el(tag, attrs, ...kids) {
+  const e = document.createElement(tag);
+  for (const [k, v] of Object.entries(attrs || {})) {
+    if (k === "class") e.className = v; else if (k === "text") e.textContent = v; else e.setAttribute(k, v);
+  }
+  for (const k of kids) e.append(k);
+  return e;
+}
+function fmt(x, d) { return (x === null || x === undefined) ? "-" : Number(x).toFixed(d); }
+function secs(x) { return fmt(x, 3) + " s"; }
+
+async function post(path, body) {
+  try {
+    const r = await fetch(path, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
+    const j = await r.json();
+    $("msg").textContent = j.ok ? j.message : ("error: " + j.error);
+    $("msg").className = j.ok ? "ok" : "bad";
+  } catch (e) { $("msg").textContent = "error: " + e; $("msg").className = "bad"; }
+  poll();
+}
+
+$("pause").onclick = () => post("/api/pause", { paused: !(state && state.paused) });
+$("faultform").onsubmit = (e) => { e.preventDefault(); post("/api/fault", { board: $("fboard").value, fault: $("fault").value }); };
+$("inputform").onsubmit = (e) => {
+  e.preventDefault();
+  post("/api/input", { board: $("iboard").value, name: $("iname").value, value: Number($("ivalue").value) });
+};
+$("iboard").onchange = () => fillInputs();
+
+function fillSelect(sel, values) {
+  const cur = sel.value;
+  if (sel.options.length === values.length && [...sel.options].every((o, i) => o.value === values[i])) return;
+  sel.replaceChildren(...values.map((v) => el("option", { value: v, text: v })));
+  if (values.includes(cur)) sel.value = cur;
+}
+function fillInputs() {
+  if (!state) return;
+  const b = state.boards.find((x) => x.name === $("iboard").value) || state.boards[0];
+  fillSelect($("iname"), b ? b.inputs.map((i) => i.name) : []);
+}
+
+function boardCard(b) {
+  const c = el("div", { class: "card" });
+  c.head = el("h3", {}, el("span", { text: b.name }));
+  c.sub = el("span", { class: "muted mono" });
+  c.head.append(c.sub);
+  c.cores = el("div", { class: "mono" });
+  c.status = el("div");
+  c.leds = el("div");
+  c.pins = el("div", { class: "pins" });
+  c.extra = el("div");
+  c.logs = el("div", { class: "log mono" });
+  c.append(c.head, c.cores, c.status, c.leds, c.pins, c.extra, c.logs);
+  return c;
+}
+
+function statusLines(link) {
+  const out = el("div", { class: "mono" });
+  if (!link) return out;
+  const s = link.status;
+  const kill = link.kill === null ? "not forwarded" : (link.kill ? "asserting kill" : "enabled");
+  out.append(el("div", { class: link.running ? "" : "warn",
+    text: `bridge ${link.running ? "running" : "stopped"}, client ${link.client ?? "-"}, kill switch ${kill}, ` +
+          `${link.heartbeats} heartbeats` + (link.last_heartbeat_age_s !== null ? ` (last ${fmt(link.last_heartbeat_age_s, 2)} s ago)` : "") }));
+  if (s) {
+    const ks = s.kill_switches;
+    out.append(el("div", { text: `${s.board_name} ${s.version}, up ${fmt(s.uptime_s, 1)} s, status ${fmt(s.age_s, 1)} s old` }));
+    out.append(el("div", { class: s.faults.length ? "bad" : "ok",
+      text: s.faults.length ? "faults: " + s.faults.join(", ") : "no faults" }));
+    out.append(el("div", { class: ks.asserting_kill || ks.timed_out ? "warn" : "muted",
+      text: `kill switches enabled ${ks.enabled.toString(2)}b, asserting ${ks.asserting_kill.toString(2)}b, timed out ${ks.timed_out.toString(2)}b` }));
+  } else {
+    out.append(el("div", { class: "muted", text: "no firmware status yet" }));
+  }
+  return out;
+}
+
+function updateBoard(b) {
+  let c = cards[b.name];
+  if (!c) { c = cards[b.name] = boardCard(b); $("boards").append(c); logSeen[b.name] = 0; }
+  c.sub.textContent = `${b.image}  ${b.powered ? "" : "(off) "}resets ${b.resets}`;
+  c.cores.replaceChildren(...b.cores.map((k, i) => el("div", {
+    class: k.state === "locked up" ? "bad" : (k.state === "running" ? "" : "muted"),
+    text: `core${i} ${k.state.padEnd(9)} ${k.function || k.pc}` })));
+  c.status.replaceChildren(statusLines(b.link));
+  const leds = b.leds.map((l) => el("span", { title: `GPIO ${l.pin}` }, el("span", { class: "dot" + (l.on ? " on" : "") }), " " + l.name + "  "));
+  const strips = b.strips.map((s) => el("div", { class: "strip", title: `${s.name} (GPIO ${s.pin})` },
+    s.name + " ", ...s.colors.map((col) => { const x = el("span"); x.style.background = "#" + col; return x; })));
+  c.leds.replaceChildren(...leds, ...strips);
+  const g = b.gpio;
+  c.pins.replaceChildren(...g.labels.map((lab, p) => el("div", {
+    class: "pin" + ((g.level >>> p) & 1 ? " h" : "") + ((g.oe >>> p) & 1 ? "" : " in"),
+    title: `${lab}: ${(g.level >>> p) & 1 ? "high" : "low"}, ${g.funcs[p] || "-"}${(g.oe >>> p) & 1 ? ", output" : ", input"}`,
+    text: String(p) })));
+  const rows = [];
+  for (const i of b.inputs) rows.push(el("tr", {}, el("th", { text: i.name }), el("td", { class: "mono", text: fmt(i.value, 3) })));
+  for (const e of b.escs) rows.push(el("tr", {}, el("th", { text: e.name + " rpm" }), el("td", { class: "mono", text: fmt(e.rpm, 0) })));
+  c.extra.replaceChildren(rows.length ? el("table", {}, ...rows) : "");
+  const atBottom = c.logs.scrollTop + c.logs.clientHeight >= c.logs.scrollHeight - 4;
+  for (const l of b.logs) {
+    if (l.seq <= logSeen[b.name]) continue;
+    logSeen[b.name] = l.seq;
+    c.logs.append(el("div", { class: l.kind, text: `[${fmt(l.t, 6)}] ${l.kind.startsWith("uart") ? l.kind + ": " : ""}${l.text}` }));
+  }
+  while (c.logs.childNodes.length > 500) c.logs.firstChild.remove();
+  if (atBottom) c.logs.scrollTop = c.logs.scrollHeight;
+}
+
+function render(s) {
+  $("time").textContent = secs(s.time_s);
+  $("wall").textContent = fmt(s.wall_s, 1) + " s";
+  $("speed").textContent = fmt(s.speed, 2) + "x";
+  $("mode").textContent = s.finished ? ("finished: " + s.finished) : (s.paused ? "paused" : (s.realtime ? "real time" : "as fast as possible"));
+  $("mode").className = "badge " + (s.finished ? "warn" : (s.paused ? "warn" : "ok"));
+  $("pause").textContent = s.paused ? "Resume" : "Pause";
+  const names = s.boards.map((b) => b.name);
+  fillSelect($("fboard"), names); fillSelect($("iboard"), names); fillInputs();
+  const dl = $("faults");
+  if (!dl.options.length) dl.replaceChildren(...s.fault_help.map((f) => el("option", { value: f.fault, text: f.help })));
+  $("faultlog").replaceChildren(...s.faults.slice(-8).reverse().map((f) => el("div", { class: f.ok ? "" : "bad",
+    text: `[${fmt(f.t, 3)}] ${f.board}: ${f.fault} ${f.ok ? "applied" : "failed: " + f.error} (${f.from})` })));
+  s.boards.forEach(updateBoard);
+
+  $("vehicles-section").hidden = !s.vehicles.length;
+  $("vehicles").replaceChildren(...s.vehicles.map((v) => {
+    const max = Math.max(1000, ...v.thrusters.map((t) => Math.abs(t.rpm)));
+    const thr = v.thrusters.map((t) => {
+      const bar = el("div", { class: "bar" }); const i = el("i");
+      const w = 50 * Math.abs(t.rpm) / max;
+      i.style.left = (t.rpm >= 0 ? 50 : 50 - w) + "%"; i.style.width = w + "%"; bar.append(i);
+      return el("tr", {}, el("th", { text: t.name }), el("td", { class: "mono", text: fmt(t.rpm, 0) }), el("td", { style: "width:40%" }, bar));
+    });
+    const p = v.position_m, r = v.rpy_deg, u = v.velocity_mps;
+    return el("div", { class: "card" }, el("h3", { text: v.name }),
+      el("div", { class: "mono", text: `depth ${fmt(v.depth_m, 3)} m   speed ${fmt(v.speed_mps, 3)} m/s` }),
+      el("div", { class: "mono", text: `position N ${fmt(p[0], 2)} E ${fmt(p[1], 2)} D ${fmt(p[2], 2)} m` }),
+      el("div", { class: "mono", text: `roll ${fmt(r[0], 1)} pitch ${fmt(r[1], 1)} yaw ${fmt(r[2], 1)} deg` }),
+      el("div", { class: "mono", text: `velocity surge ${fmt(u[0], 3)} sway ${fmt(u[1], 3)} heave ${fmt(u[2], 3)} m/s` }),
+      el("table", {}, ...thr));
+  }));
+
+  $("buses-section").hidden = !s.buses.length && !s.links.length;
+  const busCards = s.buses.map((b) => el("div", { class: "card" },
+    el("h3", { text: b.name }),
+    el("div", { class: "mono", text: `${b.frames} frames, ${fmt(b.rate_fps, 1)} frames/s, load ${fmt(100 * b.load, 1)}%` }),
+    el("div", { class: "mono " + (b.errors ? "bad" : "muted"), text: `${b.errors} destroyed by errors, ${b.unacked} without ACK` }),
+    el("div", { class: "frames mono" }, ...b.recent.map((f) => el("div", { text: `[${fmt(f.t, 6)}] ${f.frame}` })))));
+  const linkCards = s.links.filter((l) => !l.board || s.boards.length > 1).map((l) => el("div", { class: "card" },
+    el("h3", { text: `mock bridge${l.bus ? " on " + l.bus : ""}${l.board ? " (" + l.board + ")" : ""}` }), statusLines(l)));
+  $("buses").replaceChildren(...busCards, ...linkCards);
+}
+
+let inFlight = false;
+async function poll() {
+  if (inFlight) return;
+  inFlight = true;
+  try {
+    const r = await fetch("/api/state", { cache: "no-store" });
+    state = await r.json();
+    if (state.boards) render(state);
+    $("conn").textContent = "";
+  } catch (e) {
+    $("conn").textContent = "not connected (the run may be over)";
+  } finally { inFlight = false; }
+}
+poll();
+setInterval(poll, 500);
+</script>
+</body>
+</html>

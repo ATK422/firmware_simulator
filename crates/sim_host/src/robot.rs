@@ -28,6 +28,9 @@
 //! ```
 //!
 //! Paths are relative to the robot file. Several vehicles go in one file as several buses.
+//!
+//! A `[[vehicle]]` section (see [`crate::vehicle`]) adds a simulated vehicle that the boards' thrusters move, with
+//! the depth sensors and transducers of the boards on it following its motion.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -41,6 +44,7 @@ use sim_devices::can::{CanBus, CanEndpoint, CanNode};
 
 use crate::board::{Board, GpioEntry, Inputs, TransducerEntry, bus_rates};
 use crate::session::{CanCallback, Session};
+use crate::vehicle::{VehicleSim, VehicleSpec};
 
 /// A CAN bus of the robot with the host endpoints on it.
 pub struct RobotBus {
@@ -62,6 +66,12 @@ pub struct Robot {
     pub names: Vec<String>,
     /// Each board's physical inputs (sensor values), from its board file.
     pub inputs: Vec<Inputs>,
+    /// Each board's named pins (its board file's `[pins]` table).
+    pub pins: Vec<std::collections::BTreeMap<String, u8>>,
+    /// Each board's CANmore client ID (its board file's `[can] client_id`).
+    pub client_ids: Vec<Option<u8>>,
+    /// Each board's firmware image file name.
+    pub images: Vec<String>,
     /// The bus each board is on.
     pub board_bus: Vec<Option<usize>>,
     pub buses: Vec<RobotBus>,
@@ -69,11 +79,18 @@ pub struct Robot {
     /// The water the boards' transducers are in.
     pub medium: Option<SharedMedium>,
     pub slice: Time,
+    /// Threads the boards run on within a slice (1, the default: the calling thread; 0: one per core). Boards in
+    /// an acoustic medium always take turns on one (see [`crate::parallel`]).
+    pub threads: usize,
     pub now: Time,
     /// Pace virtual time to the wall clock.
     pub realtime: bool,
     /// When each board is switched on (it stays unpowered before), and whether it has been.
     pub power_on: Vec<(Time, bool)>,
+    /// Simulated vehicles moved by the boards' thrusters, stepped after every slice.
+    pub vehicles: Vec<VehicleSim>,
+    /// Real-time pacing: the wall clock and virtual time it started from.
+    pacing: Option<(std::time::Instant, Time)>,
 }
 
 impl Default for Robot {
@@ -82,14 +99,20 @@ impl Default for Robot {
             boards: Vec::new(),
             names: Vec::new(),
             inputs: Vec::new(),
+            pins: Vec::new(),
+            client_ids: Vec::new(),
+            images: Vec::new(),
             board_bus: Vec::new(),
             buses: Vec::new(),
             bus_names: Vec::new(),
             medium: None,
             slice: Time::from_us(100),
+            threads: 1,
             now: Time::ZERO,
             realtime: false,
             power_on: Vec::new(),
+            vehicles: Vec::new(),
+            pacing: None,
         }
     }
 }
@@ -108,6 +131,9 @@ impl Robot {
         self.boards.push(session);
         self.names.push(name.to_string());
         self.inputs.push(Inputs::default());
+        self.pins.push(Default::default());
+        self.client_ids.push(None);
+        self.images.push(String::new());
         self.board_bus.push(bus);
         self.power_on.push((Time::ZERO, true));
         self.boards.len() - 1
@@ -123,6 +149,11 @@ impl Robot {
         self.names.iter().position(|n| n == name)
     }
 
+    /// The vehicle called `name`.
+    pub fn vehicle(&mut self, name: &str) -> Option<&mut VehicleSim> {
+        self.vehicles.iter_mut().find(|v| v.vehicle.name == name)
+    }
+
     /// The bus called `name`.
     pub fn bus(&mut self, name: &str) -> Option<&mut RobotBus> {
         let i = self.bus_names.iter().position(|n| n == name)?;
@@ -131,25 +162,34 @@ impl Robot {
 
     /// Runs every board until `end`. Returns the first board that stopped for another reason, with the reason.
     pub fn run_until(&mut self, end: Time) -> Option<(usize, StopReason)> {
-        let wall = std::time::Instant::now();
-        let start = self.now;
+        // The sensors see a vehicle moved since the last run (a scenario putting it elsewhere) from the start
+        for v in &self.vehicles {
+            v.update_outputs();
+        }
         while self.now < end {
             let t = (self.now + self.slice).min(end);
-            for (i, b) in self.boards.iter_mut().enumerate() {
-                let (on_at, on) = &mut self.power_on[i];
-                if !*on {
-                    if t <= *on_at {
-                        continue;
+            if self.medium.is_none() {
+                // Nothing couples the boards within a slice: they can run side by side
+                if let Some(stop) = crate::parallel::run_boards(&mut self.boards, &mut self.power_on, t, self.threads) {
+                    return Some(stop);
+                }
+            } else {
+                for (i, b) in self.boards.iter_mut().enumerate() {
+                    let (on_at, on) = &mut self.power_on[i];
+                    if !*on {
+                        if t <= *on_at {
+                            continue;
+                        }
+                        b.machine.power_on_at(*on_at);
+                        *on = true;
                     }
-                    b.machine.power_on_at(*on_at);
-                    *on = true;
-                }
-                match b.machine.run_until(t) {
-                    StopReason::TimeLimit => {}
-                    other => return Some((i, other)),
-                }
-                if let Some(m) = &self.medium {
-                    m.lock().unwrap().progress(i, t);
+                    match b.run_machine(t) {
+                        StopReason::TimeLimit => {}
+                        other => return Some((i, other)),
+                    }
+                    if let Some(m) = &self.medium {
+                        m.lock().unwrap().progress(i, t);
+                    }
                 }
             }
             for (j, rb) in self.buses.iter_mut().enumerate() {
@@ -163,9 +203,13 @@ impl Robot {
                     rb.endpoints.iter_mut().map(|e| &mut **e as &mut dyn CanEndpoint).collect();
                 let before = rb.bus.record.as_ref().map_or(0, |r| r.len());
                 rb.bus.step(&mut nodes, &mut eps, t);
-                if let (Some(rec), Some(hook)) = (&rb.bus.record, &mut rb.on_can) {
+                if let (Some(rec), Some(hook)) = (&mut rb.bus.record, &mut rb.on_can) {
                     for r in &rec[before..] {
                         hook(r);
+                    }
+                    // The callback has seen the history; keep memory bounded on long runs (`--candump-log`)
+                    if rec.len() > 100_000 {
+                        rec.drain(..50_000);
                     }
                 }
             }
@@ -176,7 +220,12 @@ impl Robot {
                 b.poll_uarts();
             }
             self.now = t;
+            for v in &mut self.vehicles {
+                v.advance(t, &self.boards);
+            }
             if self.realtime {
+                // Paced from where pacing started, across calls, so runs in short pieces keep real time too
+                let (wall, start) = *self.pacing.get_or_insert((std::time::Instant::now(), self.now));
                 let ahead = (self.now - start).as_secs_f64() - wall.elapsed().as_secs_f64();
                 if ahead > 0.002 {
                     std::thread::sleep(std::time::Duration::from_secs_f64(ahead));
@@ -184,6 +233,11 @@ impl Robot {
             }
         }
         None
+    }
+
+    /// Starts real-time pacing afresh from now (after virtual time was held, e.g. paused from the dashboard).
+    pub fn reset_pacing(&mut self) {
+        self.pacing = None;
     }
 
     /// Puts board `i`'s transducer (projector and hydrophone) on `trajectory`, e.g. at another range between runs
@@ -208,22 +262,56 @@ impl Robot {
         }
     }
 
-    /// A deep copy of the whole robot: every machine, device, bus and the acoustic medium, re-linked so the copy's
-    /// hydrophones and projectors use the copy's medium. Host endpoints are not copied (they are often handles to
-    /// shared state, like a mock bridge); give the copy its own. Physical inputs stay shared: setting one affects
-    /// the original and the copy, so set them after restoring, before running.
+    /// A deep copy of the whole robot: every machine, device, bus, the acoustic medium and the vehicles, re-linked
+    /// so the copy's hydrophones and projectors use the copy's medium and vehicles, and its devices (and the sensor
+    /// inputs its vehicles drive) read the copy's own physical inputs. The original and any number of copies can
+    /// run side by side, each with its own inputs. Host endpoints are not copied (they are often handles to shared
+    /// state, like a mock bridge); give the copy its own.
     pub fn snapshot(&self) -> Robot {
         let medium = self.medium.as_ref().map(|m| Arc::new(std::sync::Mutex::new(m.lock().unwrap().clone())));
-        let mut boards: Vec<Session> = self.boards.iter().map(Session::snapshot).collect();
+        let mut boards = Vec::new();
+        let mut inputs = Vec::new();
+        let mut map = sim_core::analog::Relink::new();
+        for (b, i) in self.boards.iter().zip(&self.inputs) {
+            let mut s = b.snapshot();
+            let (copy, m) = i.deep_copy();
+            crate::board::relink_inputs(&mut s.machine, &m);
+            map.merge(&m);
+            boards.push(s);
+            inputs.push(copy);
+        }
         if let (Some(old), Some(new)) = (&self.medium, &medium) {
             for b in &mut boards {
                 crate::acoustic::relink(&mut b.machine, old, new);
             }
         }
+        // The copy's transducers follow the copy's vehicles
+        let mut vehicles = Vec::new();
+        for v in &self.vehicles {
+            let (mut copy, pairs) = v.deep_copy();
+            copy.relink_inputs(&map);
+            for (old, new) in pairs {
+                let (old, new) = (Trajectory::Live(old), Trajectory::Live(new));
+                if let Some(m) = &medium {
+                    for p in m.lock().unwrap().projectors.iter_mut().filter(|p| p.trajectory == old) {
+                        p.trajectory = new.clone();
+                    }
+                }
+                for b in &mut boards {
+                    for h in crate::acoustic::hydrophones(&mut b.machine).filter(|h| h.trajectory == old) {
+                        h.set_trajectory(new.clone());
+                    }
+                }
+            }
+            vehicles.push(copy);
+        }
         Robot {
             boards,
             names: self.names.clone(),
-            inputs: self.inputs.clone(),
+            inputs,
+            pins: self.pins.clone(),
+            client_ids: self.client_ids.clone(),
+            images: self.images.clone(),
             board_bus: self.board_bus.clone(),
             buses: self
                 .buses
@@ -233,9 +321,12 @@ impl Robot {
             bus_names: self.bus_names.clone(),
             medium,
             slice: self.slice,
+            threads: self.threads,
             now: self.now,
             realtime: self.realtime,
             power_on: self.power_on.clone(),
+            vehicles,
+            pacing: None,
         }
     }
 
@@ -268,6 +359,13 @@ impl Robot {
             }
             robot.bus_names.push(b.name.clone());
             robot.buses.push(RobotBus::new(bus));
+        }
+        for v in &spec.vehicle {
+            if robot.vehicles.iter().any(|o| o.vehicle.name == v.name) {
+                return Err(format!("two vehicles called {}", v.name));
+            }
+            let env = robot.medium.as_ref().map(|m| m.lock().unwrap().env.clone());
+            robot.vehicles.push(VehicleSim::new(v, dir, env.as_deref())?);
         }
         for b in &spec.board {
             let board_file = dir.join(&b.board);
@@ -310,10 +408,18 @@ impl Robot {
             if let Some(medium) = &robot.medium
                 && board.transducer.is_some()
             {
-                let trajectory = match (&b.trajectory, b.position_m) {
-                    (Some(t), _) => t.clone(),
-                    (None, Some(p)) => Trajectory::Fixed(p),
-                    (None, None) => return Err(format!("{}: needs position_m or trajectory in the water", b.name)),
+                let carried =
+                    robot.vehicles.iter_mut().zip(&spec.vehicle).find_map(|(v, s)| v.carries(s, &b.name, owner));
+                let trajectory = match (carried, &b.trajectory, b.position_m) {
+                    (Some(_), Some(_), _) | (Some(_), _, Some(_)) => {
+                        return Err(format!("{}: on a vehicle, so it takes no position_m or trajectory", b.name));
+                    }
+                    (Some(t), None, None) => t,
+                    (None, Some(t), _) => t.clone(),
+                    (None, None, Some(p)) => Trajectory::Fixed(p),
+                    (None, None, None) => {
+                        return Err(format!("{}: needs position_m, a trajectory or a vehicle in the water", b.name));
+                    }
                 };
                 board.place_in_medium(&mut m, medium, owner, trajectory)?;
             }
@@ -326,11 +432,17 @@ impl Robot {
             let session = Session::new(m, &image);
             robot.add(&b.name, session, bus);
             robot.inputs[owner] = inputs;
+            robot.pins[owner] = board.pins.clone();
+            robot.client_ids[owner] = board.can.as_ref().and_then(|c| c.client_id);
+            robot.images[owner] = elf.file_name().map(|f| f.to_string_lossy().into_owned()).unwrap_or_default();
             if let Some(ms) = b.power_on_ms
                 && ms > 0.0
             {
                 robot.power_on[owner] = (Time::from_secs_f64(ms / 1000.0), false);
             }
+        }
+        for (v, s) in robot.vehicles.iter_mut().zip(&spec.vehicle) {
+            v.wire(s, &robot.names, &robot.boards, &robot.inputs)?;
         }
         Ok(robot)
     }
@@ -345,6 +457,9 @@ pub struct RobotSpec {
     pub bus: Vec<BusSpec>,
     #[serde(default)]
     pub board: Vec<BoardSpec>,
+    /// Simulated vehicles the boards are on.
+    #[serde(default)]
+    pub vehicle: Vec<VehicleSpec>,
 }
 
 #[derive(Debug, Clone, Deserialize)]

@@ -1,0 +1,73 @@
+# Robot in a box: the emulated boards of a robot file and a robot computer container running one titan_bridge per
+# board, on the host's vcan interfaces.
+#
+#   scripts/vcan_up.sh                                   # vcan0 and vcan1, CAN FD MTU (needs the vcan module)
+#   docker compose -f docker/robot_computer/compose.yaml up --build
+#   ROBOT=robots/talos.toml docker compose -f docker/robot_computer/compose.yaml up
+#
+# Both services use the host's network namespace (network_mode: host): that is where the vcan interfaces live,
+# so the emulator, the bridges and anything on the host (candump vcan0, ros2 topic echo) see the same buses and
+# the same ROS graph. vcan interfaces are network interfaces, not /dev devices, so nothing else needs passing in;
+# SocketCAN raw sockets need no extra capabilities.
+#
+# UNVERIFIED: written and checked as YAML only (no Docker daemon, no vcan in the environment it was written in).
+name: robot-in-a-box
+
+x-ros-env: &ros-env
+  ROS_DOMAIN_ID: ${ROS_DOMAIN_ID:-0}
+  RMW_IMPLEMENTATION: ${RMW_IMPLEMENTATION:-rmw_fastrtps_cpp}
+
+services:
+  emulator:
+    build:
+      context: ../..
+      dockerfile: docker/emulator/Dockerfile
+    image: firmware_simulator:latest
+    network_mode: host
+    volumes:
+      - shared:/shared
+    environment:
+      ROBOT: ${ROBOT:-robots/talos.toml}
+      RUST_LOG: ${RUST_LOG:-info}
+      # e.g. CANDUMP_LOG=/shared/robot.log to keep a candump -l log of both buses (it grows ~0.3 GB an hour)
+      CANDUMP_LOG: ${CANDUMP_LOG:-}
+    # Writes the bridges script for the robot computer, then runs the robot in real time (for a long while: --time
+    # is virtual time, and titan_bridge needs real-time pacing)
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - >-
+        firmware_simulator bridges "$$ROBOT" --format script --output /shared/bridges.sh &&
+        exec firmware_simulator robot "$$ROBOT" --can internal=vcan0 --can external=vcan1 --realtime
+        --time 1000000s $${CANDUMP_LOG:+--candump-log "$$CANDUMP_LOG"}
+
+  robot_computer:
+    build:
+      context: ../..
+      dockerfile: docker/robot_computer/Dockerfile
+    image: robot_computer:humble
+    network_mode: host
+    depends_on:
+      - emulator
+    volumes:
+      - shared:/shared
+    environment:
+      <<: *ros-env
+    command: ["wait-for", "/shared/bridges.sh"]
+
+  # A shell on the robot computer side: docker compose -f docker/robot_computer/compose.yaml run --rm tools
+  # then e.g. `candump vcan0`, `canmore_cli`, `upload_tool -b talos/ivc_board ...`, `ros2 topic list`
+  tools:
+    image: robot_computer:humble
+    profiles: ["tools"]
+    network_mode: host
+    volumes:
+      - shared:/shared
+    environment:
+      <<: *ros-env
+    stdin_open: true
+    tty: true
+    command: ["bash"]
+
+volumes:
+  # The generated bridges script and the emulator's candump log
+  shared:

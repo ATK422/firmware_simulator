@@ -3,7 +3,8 @@
 #
 # external/titan_firmware_rs is the private repository ATK422/titan_firmware_rs: give the workflow a token that can
 # read it as the repository secret TITAN_FIRMWARE_RS_TOKEN (a fine-grained token with "Contents: read" on that
-# repository). Without it the firmware tests skip themselves and the "firmware images" step fails loudly.
+# repository). Both jobs need it (the emulator's workspace uses its host crates). Without it the "firmware images"
+# step fails loudly and the C job can't build the tests.
 name: CI
 
 on:
@@ -60,17 +61,61 @@ jobs:
         if: always()
         run: grep -E "^(board|[a-z_0-9]+ +[0-9n]|IVC| +[0-9]+ m )" test.log || true
 
+  macos:
+    # The emulator also builds and runs natively on macOS (Apple silicon). SocketCAN (vcan, titan_bridge) is Linux
+    # only: there, opening an interface reports that, and CAN reaches a Linux machine through `can-tunnel`.
+    runs-on: macos-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - name: Submodules
+        env:
+          TOKEN: ${{ secrets.TITAN_FIRMWARE_RS_TOKEN }}
+        run: |
+          git submodule update --init external/titan_firmware
+          if [ -n "$TOKEN" ]; then
+            git config --global url."https://x-access-token:${TOKEN}@github.com/".insteadOf "https://github.com/"
+          fi
+          git submodule update --init external/titan_firmware_rs || echo "::warning::could not fetch external/titan_firmware_rs (set the TITAN_FIRMWARE_RS_TOKEN secret)"
+      - name: Rust
+        run: |
+          rustup toolchain install stable --profile minimal --component clippy
+          rustup target add thumbv6m-none-eabi
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            .
+            external/titan_firmware_rs/firmware
+      - name: Firmware images
+        run: cd external/titan_firmware_rs/firmware && cargo build --workspace --release
+      - name: Lint
+        run: cargo clippy --workspace --all-targets --release -- -D warnings
+      - name: Tests
+        run: cargo test --release --workspace
+
   c-firmware:
     # The C titan_firmware programs the emulator runs (basic_template, the Titan bootloader, the OTA test app),
     # built against titan_firmware's pico-sdk, and the tests that boot them
     runs-on: ubuntu-latest
     timeout-minutes: 60
+    env:
+      # pico-sdk's bundled pioasm and elf2uf2 projects ask for CMake < 3.5, which CMake 4 (on the runners since
+      # 2025) refuses unless told the minimum policy version to assume
+      CMAKE_POLICY_VERSION_MINIMUM: "3.5"
     steps:
       - uses: actions/checkout@v4
       - name: Submodules
+        env:
+          TOKEN: ${{ secrets.TITAN_FIRMWARE_RS_TOKEN }}
         run: |
           git submodule update --init external/titan_firmware
           git -C external/titan_firmware submodule update --init --recursive
+          # The emulator's workspace uses titan_firmware_rs's host crates (canmore, titan_link), so the tests need it
+          # too (not its firmware images)
+          if [ -n "$TOKEN" ]; then
+            git config --global url."https://x-access-token:${TOKEN}@github.com/".insteadOf "https://github.com/"
+          fi
+          git submodule update --init external/titan_firmware_rs || echo "::warning::could not fetch external/titan_firmware_rs (set the TITAN_FIRMWARE_RS_TOKEN secret)"
       - name: Toolchain
         run: |
           sudo apt-get update

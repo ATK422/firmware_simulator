@@ -57,9 +57,17 @@ impl DefmtDecoder {
                     message: frame.display_message().to_string(),
                 }),
                 Err(DecodeError::UnexpectedEof) => break,
-                Err(DecodeError::Malformed) => {
+                Err(DecodeError::Malformed) if self.table.encoding().can_recover() => {
+                    // rzCOBS: the decoder dropped the frame up to its separator
                     log::warn!("malformed defmt frame");
                     continue;
+                }
+                Err(DecodeError::Malformed) => {
+                    // Raw frames have no separator to resynchronise on, and the decoder keeps the bad bytes
+                    // buffered: drop them rather than decode the same frame again forever
+                    log::warn!("malformed defmt frame in a raw stream; dropping the buffered bytes");
+                    self.decoder = self.table.new_stream_decoder();
+                    break;
                 }
             }
         }
@@ -78,4 +86,33 @@ pub mod anyhow_free {
     }
     impl std::error::Error for Error {}
     pub type Result<T> = std::result::Result<T, Error>;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn decoder(encoding: &str) -> DefmtDecoder {
+        let json = format!(r#"{{"timestamp":null,"entries":{{}},"bitflags":{{}},"encoding":"{encoding}"}}"#);
+        let table: &'static Table = Box::leak(Box::new(serde_json::from_str(&json).unwrap()));
+        DefmtDecoder { table, decoder: table.new_stream_decoder() }
+    }
+
+    /// A malformed frame in a raw-encoded stream (here an index the table doesn't have, as after RTT dropped
+    /// bytes) can't be skipped: the raw decoder keeps it buffered and returns `Malformed` again, so retrying spun
+    /// forever and hung the emulator. rzCOBS frames are skipped to the next separator as before.
+    #[test]
+    fn malformed_frames_do_not_hang_the_decoder() {
+        for encoding in ["Raw", "Rzcobs"] {
+            let (tx, rx) = std::sync::mpsc::channel();
+            std::thread::spawn(move || {
+                let mut d = decoder(encoding);
+                let lines = d.feed(&[0x05, 0x00, 0x01, 0x02, 0x00]);
+                let more = d.feed(&[0x07, 0x00, 0x00]);
+                tx.send((lines.len(), more.len())).unwrap();
+            });
+            let got = rx.recv_timeout(std::time::Duration::from_secs(5));
+            assert_eq!(got, Ok((0, 0)), "{encoding}: feed must return");
+        }
+    }
 }

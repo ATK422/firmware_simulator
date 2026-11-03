@@ -426,10 +426,12 @@ dependencies = [
  "env_logger",
  "log",
  "rp2040",
+ "serde_json",
  "sim_acoustics",
  "sim_core",
  "sim_devices",
  "sim_host",
+ "sim_physics",
 ]
 
 [[package]]
@@ -947,16 +949,27 @@ dependencies = [
  "canmore",
  "cpu_armv6m",
  "defmt-decoder",
+ "gimli",
  "libc",
  "log",
  "object",
  "rp2040",
  "serde",
+ "serde_json",
  "sim_acoustics",
  "sim_core",
  "sim_devices",
+ "sim_physics",
  "thiserror",
  "titan_link",
+ "toml",
+]
+
+[[package]]
+name = "sim_physics"
+version = "0.1.0"
+dependencies = [
+ "serde",
  "toml",
 ]
 

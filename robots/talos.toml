@@ -67,3 +67,27 @@ name = "battery"
 board = "../boards/mk2/sbh_mcu.toml"
 elf = "../external/titan_firmware_rs/firmware/target/thumbv6m-none-eabi/release/smart_battery"
 bus = "external"
+
+# The vehicle the boards are in: ESC board 0's thrusters are the horizontal ones, ESC board 1's the vertical ones
+# (an assumed wiring, like the geometry in the vehicle file). The camera cage's depth sensor sees the depth of its
+# port. Talos starts afloat at the surface; the sensor zeroes there at boot, like on the dock.
+[[vehicle]]
+name = "talos"
+file = "../vehicles/talos.toml"
+position_m = [5.0, 6.0, 0.0]
+floating = true
+thrusters = [
+    { thruster = "fwd_stbd", board = "esc0", esc = "esc1" },
+    { thruster = "fwd_port", board = "esc0", esc = "esc2" },
+    { thruster = "aft_stbd", board = "esc0", esc = "esc3" },
+    { thruster = "aft_port", board = "esc0", esc = "esc4" },
+    { thruster = "heave_fwd_stbd", board = "esc1", esc = "esc1" },
+    { thruster = "heave_fwd_port", board = "esc1", esc = "esc2" },
+    { thruster = "heave_aft_stbd", board = "esc1", esc = "esc3" },
+    { thruster = "heave_aft_port", board = "esc1", esc = "esc4" },
+]
+
+[[vehicle.sensor]]
+board = "camera_cage"
+input = "depth.pressure_pa"
+mount_m = [0.30, 0.0, 0.10]

@@ -35,6 +35,15 @@ pub struct Session {
     uart_line: [String; 2],
     /// Pseudo terminals attached to the UARTs.
     pub uart_pty: [Option<crate::pty::Pty>; 2],
+    /// Everything the device sent on its USB CDC ACM port (when the USB host has opened it), as text.
+    pub usb_cdc_text: String,
+    /// Callback for complete lines from the USB CDC port.
+    pub on_usb_cdc_line: Option<LineHook>,
+    usb_cdc_line: String,
+    /// A pseudo terminal attached to the USB CDC port (host side of the device's serial port).
+    pub usb_cdc_pty: Option<crate::pty::Pty>,
+    /// A USB/IP server exporting the board's USB device to the real host.
+    pub usbip: Option<crate::usbip::UsbIpServer>,
     /// The CAN bus the board's CAN controllers sit on, if any.
     pub can_bus: Option<CanBus>,
     /// Host participants on that bus (bridges, mocks).
@@ -43,11 +52,18 @@ pub struct Session {
     pub on_can: Option<CanCallback>,
     /// Host participants on the board's Ethernet cable (Puddles), if it has one.
     pub eth_endpoints: Vec<Box<dyn crate::ethernet::EthEndpoint>>,
+    /// Frames lost on the way between the board's Ethernet cable and the host endpoints (fault injection).
+    pub eth_loss: Option<crate::fault::PacketLoss>,
     /// Keep virtual time from running ahead of the wall clock.
     pub realtime: bool,
     pacing: Option<(std::time::Instant, Time)>,
     behind_warned: std::time::Instant,
+    /// A sampling profiler of the firmware (see [`crate::profile`]); `None` runs the machine directly.
+    pub profiler: Option<crate::profile::Profiler>,
 }
+
+/// Callback for complete lines of text: `(virtual time, line)`.
+pub type LineHook = Box<dyn FnMut(Time, &str) + Send>;
 
 /// Callback for complete UART output lines.
 pub type UartHook = Box<dyn FnMut(Time, usize, &str) + Send>;
@@ -76,18 +92,26 @@ impl Session {
             on_uart_line: None,
             uart_line: [String::new(), String::new()],
             uart_pty: [None, None],
+            usb_cdc_text: String::new(),
+            on_usb_cdc_line: None,
+            usb_cdc_line: String::new(),
+            usb_cdc_pty: None,
+            usbip: None,
             can_bus: None,
             can_endpoints: Vec::new(),
             on_can: None,
             eth_endpoints: Vec::new(),
+            eth_loss: None,
             realtime: false,
             pacing: None,
             behind_warned: std::time::Instant::now(),
+            profiler: None,
         }
     }
 
     /// A copy of the session that runs on independently: the machine (see [`Machine::fork`]), the RTT position,
-    /// the logs and UART text so far, and the CAN bus. Hooks, host endpoints and ptys are not copied.
+    /// the logs and UART text so far, and the CAN bus. Hooks, host endpoints and ptys are not copied. The copied
+    /// devices still read the board's physical inputs; [`Session::snapshot_with_inputs`] gives the copy its own.
     pub fn snapshot(&self) -> Session {
         let mut machine = self.machine.fork();
         if let Some(old) = &self.machine.sys.ethernet {
@@ -118,14 +142,31 @@ impl Session {
             on_uart_line: None,
             uart_line: self.uart_line.clone(),
             uart_pty: [None, None],
+            usb_cdc_text: self.usb_cdc_text.clone(),
+            on_usb_cdc_line: None,
+            usb_cdc_line: self.usb_cdc_line.clone(),
+            usb_cdc_pty: None,
+            usbip: None,
             can_bus: self.can_bus.clone(),
             can_endpoints: Vec::new(),
             on_can: None,
             eth_endpoints: Vec::new(),
+            eth_loss: self.eth_loss.clone(),
             realtime: self.realtime,
             pacing: None,
             behind_warned: std::time::Instant::now(),
+            profiler: None,
         }
+    }
+
+    /// [`Session::snapshot`] for a board whose devices read `inputs` (from [`crate::board::Board::apply`]): the
+    /// copy gets inputs of its own with the same values, returned with it, and its devices read those, so the
+    /// original and the copy can run side by side with different inputs.
+    pub fn snapshot_with_inputs(&self, inputs: &crate::board::Inputs) -> (Session, crate::board::Inputs) {
+        let mut s = self.snapshot();
+        let (copy, map) = inputs.deep_copy();
+        crate::board::relink_inputs(&mut s.machine, &map);
+        (s, copy)
     }
 
     pub fn has_defmt(&self) -> bool {
@@ -163,6 +204,39 @@ impl Session {
         }
     }
 
+    /// Collects what the device sent on its (first) USB CDC port and passes pty input to it. Does nothing unless
+    /// the USB host has opened the port ([`sim_devices::usb::host::HostController::cdc_open`]).
+    pub fn poll_usb_cdc(&mut self) {
+        let now = self.machine.now;
+        if let Some(pty) = &self.usb_cdc_pty {
+            let input = pty.read();
+            if !input.is_empty() {
+                self.machine.sys.with_usb_host(now, |h| h.cdc_write(0, &input));
+            }
+        }
+        let Some(host) = self.machine.sys.usb_host_mut() else { return };
+        let rx = host.cdc_take_rx(0);
+        if rx.is_empty() {
+            return;
+        }
+        if let Some(pty) = &self.usb_cdc_pty {
+            pty.write(&rx);
+        }
+        for b in rx {
+            let c = b as char;
+            self.usb_cdc_text.push(c);
+            match b {
+                b'\n' => {
+                    let line = std::mem::take(&mut self.usb_cdc_line);
+                    if let Some(hook) = &mut self.on_usb_cdc_line {
+                        hook(now, line.trim_end_matches('\r'));
+                    }
+                }
+                _ => self.usb_cdc_line.push(c),
+            }
+        }
+    }
+
     /// Flushes partial UART lines to the hook (end of a run).
     pub fn flush_uarts(&mut self) {
         let now = self.machine.now;
@@ -179,6 +253,7 @@ impl Session {
     /// Drains RTT now.
     pub fn poll_rtt(&mut self) {
         self.poll_uarts();
+        self.poll_usb_cdc();
         let Some(rtt) = &self.rtt else { return };
         let now = self.machine.now;
         for (ch, bytes) in rtt.poll(&mut self.machine) {
@@ -229,13 +304,20 @@ impl Session {
         let now = self.machine.now;
         let frames = std::mem::take(&mut wire.lock().unwrap().from_device);
         for (t, f) in &frames {
+            if self.eth_loss.as_mut().is_some_and(|l| l.drop_from_board()) {
+                continue;
+            }
             for e in self.eth_endpoints.iter_mut() {
                 e.receive(f, *t);
             }
         }
         let mut w = wire.lock().unwrap();
         for e in self.eth_endpoints.iter_mut() {
-            w.to_device.extend(e.take_tx(now));
+            for f in e.take_tx(now) {
+                if !self.eth_loss.as_mut().is_some_and(|l| l.drop_to_board()) {
+                    w.to_device.push_back(f);
+                }
+            }
         }
         if w.to_device.len() > 1000 {
             w.to_device.clear();
@@ -246,9 +328,12 @@ impl Session {
     pub fn run_until(&mut self, end: Time) -> StopReason {
         loop {
             let target = (self.machine.now + self.slice).min(end);
-            let reason = self.machine.run_until(target);
+            let reason = self.run_machine(target);
             self.step_can();
             self.poll_rtt();
+            if let Some(u) = &mut self.usbip {
+                u.poll(&mut self.machine);
+            }
             if self.realtime {
                 self.pace();
             }
@@ -260,9 +345,28 @@ impl Session {
         }
     }
 
+    /// Runs just the machine until `end` (through the profiler, if there is one), without polling anything.
+    pub fn run_machine(&mut self, end: Time) -> StopReason {
+        match &mut self.profiler {
+            None => self.machine.run_until(end),
+            Some(p) => p.run_until(&mut self.machine, end),
+        }
+    }
+
+    /// Starts profiling the firmware with a sample every `interval` (on average).
+    pub fn start_profile(&mut self, interval: Time) {
+        self.profiler = Some(crate::profile::Profiler::new(&self.machine, interval));
+    }
+
     pub fn run_for(&mut self, d: Time) -> StopReason {
         let end = self.machine.now + d;
         self.run_until(end)
+    }
+
+    /// Starts pacing afresh from now (after virtual time was held, e.g. paused from the dashboard), so the run does
+    /// not race to catch up with the wall clock.
+    pub fn reset_pacing(&mut self) {
+        self.pacing = None;
     }
 
     /// Sleeps until the wall clock catches up with virtual time; warns when the emulation falls behind.

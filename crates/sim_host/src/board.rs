@@ -6,7 +6,8 @@
 //!
 //! Physical inputs (sensor temperatures, rail voltages) are given as starting values. [`Board::apply`] returns them
 //! as named [`Inputs`] that a test or host tool changes while the machine runs: `sht41.temperature_c`,
-//! `mcp3426.ch1`, or an analog input's `name`.
+//! `mcp3426.ch1`, or an analog input's `name`. A snapshot of the machine gets its own copy of them
+//! ([`Inputs::deep_copy`] and [`relink_inputs`]).
 
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -14,7 +15,7 @@ use std::sync::{Arc, Mutex};
 
 use rp2040::Machine;
 use serde::Deserialize;
-use sim_core::analog::Signal;
+use sim_core::analog::{Relink, Signal};
 use sim_core::wire::{External, Level};
 use sim_devices::can::BitRates;
 use sim_devices::cd74hc4051::Cd74hc4051;
@@ -100,6 +101,9 @@ pub struct EscEntry {
     /// Mechanical RPM at full throttle.
     pub max_rpm: Option<f64>,
     pub pole_pairs: Option<u32>,
+    /// How long after the last DShot frame the ESC stops the motor (250 ms by default, an assumption; see
+    /// `sim_devices::dshot`); 0 keeps the last throttle forever.
+    pub signal_loss_ms: Option<f64>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -259,8 +263,50 @@ impl Inputs {
     fn add(&mut self, name: String, value: f64, ratio: f64) -> Signal {
         let h = Arc::new(Mutex::new(value));
         self.0.insert(name, h.clone());
-        if ratio == 1.0 { Signal::Shared(h) } else { Signal::func(move |_| *h.lock().unwrap() * ratio) }
+        if ratio == 1.0 { Signal::Shared(h) } else { Signal::Shared(h).scaled(ratio) }
     }
+
+    /// Independent inputs with the same names and current values, and the map from these inputs to them, for
+    /// pointing a copy of the machine's devices at the copy ([`relink_inputs`]).
+    pub fn deep_copy(&self) -> (Inputs, Relink) {
+        let mut map = Relink::new();
+        let copy = self
+            .0
+            .iter()
+            .map(|(name, h)| {
+                let new = Arc::new(Mutex::new(*h.lock().unwrap()));
+                map.insert(h, new.clone());
+                (name.clone(), new)
+            })
+            .collect();
+        (Inputs(copy), map)
+    }
+}
+
+/// Points every device of `m` that reads a shared input in `map` at its replacement: the SPI, UART and I2C
+/// devices, the pin devices, the ADC inputs and the die temperature. A machine copied with [`Machine::fork`] still
+/// reads the original's inputs until this is done.
+pub fn relink_inputs(m: &mut Machine, map: &Relink) {
+    if map.is_empty() {
+        return;
+    }
+    let sys = &mut m.sys;
+    for a in &mut sys.spi_devices {
+        a.dev.relink_inputs(map);
+    }
+    for d in sys.uart_devices.iter_mut().flatten() {
+        d.relink_inputs(map);
+    }
+    for a in &mut sys.i2c_devices {
+        a.dev.relink_inputs(map);
+    }
+    for d in &mut sys.pin_devices {
+        d.relink_inputs(map);
+    }
+    for a in sys.analog_inputs.iter_mut().flatten() {
+        a.relink_inputs(map);
+    }
+    sys.chip_temp_c.relink(map);
 }
 
 /// A W5500 on an SPI bus.
@@ -380,6 +426,9 @@ impl Board {
             let mut esc = sim_devices::dshot::Esc::new(&name, e.signal_pin, e.telemetry_pin);
             esc.max_rpm = e.max_rpm.unwrap_or(esc.max_rpm);
             esc.pole_pairs = e.pole_pairs.unwrap_or(esc.pole_pairs);
+            if let Some(ms) = e.signal_loss_ms {
+                esc.signal_loss_timeout = (ms > 0.0).then(|| sim_core::Time::from_secs_f64(ms / 1000.0));
+            }
             m.sys.attach_pin_device(Box::new(esc));
         }
         for e in &self.soft_i2c {
@@ -431,6 +480,9 @@ impl Board {
             }
         }
         if let Some(e) = &self.w5500 {
+            if e.bus > 1 {
+                return Err(format!("SPI bus {} does not exist", e.bus));
+            }
             let wire = sim_devices::w5500::wire();
             m.sys.attach_spi(e.bus, e.cs, Box::new(sim_devices::w5500::W5500::new(wire.clone(), e.int_pin)));
             m.sys.ethernet = Some(wire);
@@ -441,6 +493,9 @@ impl Board {
             for b in &d.bridges {
                 let out = match (b.nfault_pin, &b.nfault_input) {
                     (Some(p), None) => {
+                        if p as usize >= rp2040::memmap::NUM_GPIOS {
+                            return Err(format!("DRV8243 nFAULT: GPIO {p} does not exist"));
+                        }
                         m.sys.gpio.external[p as usize] = External::Driven(Level::High);
                         sim_devices::drv8243::Nfault::Pin(p)
                     }
@@ -570,6 +625,9 @@ fn i2c_device(e: &I2cEntry, inputs: &mut Inputs) -> Result<Box<dyn I2cDevice>, S
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rp2040::system::I2cAttachment;
+    use sim_devices::drv8243::Drv8243;
+    use sim_devices::fault::{FaultyAnalog, FaultyI2c};
 
     #[test]
     fn generated_power_board() {
@@ -636,5 +694,117 @@ mux = { select_pins = [3, 4, 5], inputs = [{ volts = 1.0 }, { volts = 2.0 }] }
         let v = m.sys.analog_inputs[2].as_mut().unwrap().voltage(sim_core::Time::ZERO, 1 << 3);
         assert_eq!(v, 2.0);
         assert!(Board::parse("name = \"x\"\n[[i2c]]\nbus = 0\ndevice = \"nope\"\n").unwrap().apply(&mut m).is_err());
+    }
+
+    /// Board-file values that name a GPIO or bus the chip doesn't have are errors, like the other sections'
+    /// checks: a DRV8243 `nfault_pin` past GPIO 29 used to panic indexing the pin array, and a W5500 on SPI bus 2
+    /// was attached to nothing without a word.
+    #[test]
+    fn out_of_range_pins_and_buses_are_errors() {
+        for text in [
+            "name = \"x\"\n[[drv8243]]\nnsleep_pin = 25\nbridges = [{ nfault_pin = 30 }]\n",
+            "name = \"x\"\n[w5500]\nbus = 2\ncs = 1\nint_pin = 4\n",
+        ] {
+            let b = Board::parse(text).unwrap();
+            let mut m = Machine::new(Default::default());
+            let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| b.apply(&mut m).map(|_| ())));
+            assert!(matches!(r, Ok(Err(_))), "{text}: {r:?}");
+        }
+    }
+
+    #[test]
+    fn esc_signal_loss_timeout() {
+        let b = Board::parse(
+            "name = \"x\"\n[[dshot_esc]]\nsignal_pin = 1\n[[dshot_esc]]\nsignal_pin = 2\nsignal_loss_ms = 100\n\
+             [[dshot_esc]]\nsignal_pin = 3\nsignal_loss_ms = 0\n",
+        )
+        .unwrap();
+        let mut m = Machine::new(Default::default());
+        b.apply(&mut m).unwrap();
+        let t: Vec<_> = m
+            .sys
+            .pin_devices
+            .iter()
+            .map(|d| d.as_any().downcast_ref::<sim_devices::dshot::Esc>().unwrap().signal_loss_timeout)
+            .collect();
+        assert_eq!(
+            t,
+            [Some(sim_devices::dshot::Esc::DEFAULT_SIGNAL_LOSS_TIMEOUT), Some(sim_core::Time::from_ms(100)), None]
+        );
+    }
+
+    #[test]
+    fn a_copy_gets_inputs_of_its_own() {
+        let b = Board::parse(
+            r#"
+name = "x"
+[[i2c]]
+bus = 0
+device = "sht41"
+[[i2c]]
+bus = 1
+device = "mcp3426"
+channels = [{ volts = 12.0, divider_ohms = [10_000, 1_000], name = "rail12" }]
+[[soft_i2c]]
+sda = 7
+scl = 6
+device = "bq40z80"
+name = "gauge"
+[[analog]]
+adc = 1
+name = "battery"
+volts = 16.5
+divider_ohms = [10_000, 1_000]
+[[analog]]
+adc = 2
+mux = { select_pins = [3, 4, 5], inputs = [{ volts = 3.3, name = "h0.nfault_v" }, { volts = 2.0 }] }
+[[drv8243]]
+nsleep_pin = 25
+bridges = [{ nfault_input = "h0.nfault_v" }]
+"#,
+        )
+        .unwrap();
+        let mut m = Machine::new(Default::default());
+        let inputs = b.apply(&mut m).unwrap();
+        // A fault wrapper in between (as fault injection leaves it) is looked through
+        let sht = m.sys.i2c_devices.remove(0);
+        m.sys.i2c_devices.insert(0, I2cAttachment { bus: 0, dev: Box::new(FaultyI2c::new(sht.dev)) });
+        let adc1 = m.sys.analog_inputs[1].take().unwrap();
+        m.sys.analog_inputs[1] = Some(Box::new(FaultyAnalog::new(adc1, 1)));
+
+        let mut copy = m.fork();
+        let (copy_inputs, map) = inputs.deep_copy();
+        assert_eq!(map.len(), inputs.0.len());
+        relink_inputs(&mut copy, &map);
+        assert_eq!(copy_inputs.get("rail12"), 12.0, "same values to start with");
+        for (name, v) in [("sht41.temperature_c", 40.0), ("rail12", 11.0), ("gauge.voltage_mv", 15_000.0)] {
+            copy_inputs.set(name, v);
+        }
+        copy_inputs.set("battery", 11.0);
+        copy_inputs.set("adc2.in1", 1.0);
+
+        let t = sim_core::Time::ZERO;
+        let sht41 =
+            |m: &Machine| m.sys.i2c_devices[0].dev.as_any().downcast_ref::<Sht41>().unwrap().temperature_c.at(t);
+        let rail = |m: &Machine| m.sys.i2c_devices[1].dev.as_any().downcast_ref::<Mcp342x>().unwrap().inputs[0].at(t);
+        let gauge = |m: &Machine| {
+            let p = m.sys.pin_devices[0].as_any().downcast_ref::<sim_devices::i2c_pins::I2cPinTarget>().unwrap();
+            p.dev.as_any().downcast_ref::<sim_devices::bq40z80::Bq40z80>().unwrap().voltage_mv.at(t)
+        };
+        assert_eq!((sht41(&m), sht41(&copy)), (25.0, 40.0));
+        assert_eq!((rail(&m), rail(&copy)), (12.0 / 11.0, 1.0));
+        assert_eq!((gauge(&m), gauge(&copy)), (16_400.0, 15_000.0));
+        let adc = |m: &mut Machine, i: usize, pins: u32| m.sys.analog_inputs[i].as_mut().unwrap().voltage(t, pins);
+        assert!((adc(&mut m, 1, 0) - 1.5).abs() < 1e-9 && (adc(&mut copy, 1, 0) - 1.0).abs() < 1e-9);
+        assert_eq!((adc(&mut m, 2, 1 << 3), adc(&mut copy, 2, 1 << 3)), (2.0, 1.0));
+        // The copy's DRV8243 pulls the copy's nFAULT input, not the original's
+        let drv = |m: &Machine| match &m.sys.pin_devices[1].as_any().downcast_ref::<Drv8243>().unwrap().bridges[0].0 {
+            sim_devices::drv8243::Nfault::Volts(h) => h.clone(),
+            _ => unreachable!(),
+        };
+        assert!(Arc::ptr_eq(&drv(&m), inputs.handle("h0.nfault_v")));
+        assert!(Arc::ptr_eq(&drv(&copy), copy_inputs.handle("h0.nfault_v")));
+        // The original's inputs are untouched
+        assert_eq!(inputs.get("sht41.temperature_c"), 25.0);
     }
 }

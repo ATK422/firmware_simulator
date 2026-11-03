@@ -1,4 +1,6 @@
-//! Host bridges: RTT and defmt (M1), the GDB remote protocol (M1), SocketCAN and UDP (M3, M7), UART ptys.
+//! Host bridges: RTT and defmt (M1), the GDB remote protocol (M1), SocketCAN and UDP (M3, M7), UART ptys; and the
+//! host side of CAN testing: candump logs and replay ([`canlog`]), comparing logs ([`candiff`]), tunnels over UDP
+//! ([`cannelloni`]) and titan_bridge command lines for a robot ([`bridges`]).
 //!
 //! Bridges see the target through [`TargetMemory`] (debug-probe style memory access) so they work with any machine.
 
@@ -25,17 +27,32 @@ pub fn resolve_image(path: &std::path::Path) -> std::path::PathBuf {
     }
 }
 pub mod board;
+pub mod bridges;
+pub mod candiff;
+pub mod canlog;
+pub mod cannelloni;
+pub mod dashboard;
 pub mod defmt;
+pub mod demangle;
 pub mod ethernet;
+pub mod fault;
 pub mod gdb;
+pub mod jsonlog;
 pub mod mock_bridge;
+pub mod parallel;
+pub mod profile;
 pub mod pty;
 pub mod robot;
 pub mod rtt;
 pub mod session;
 pub mod socketcan;
 pub mod target;
+pub mod unwind;
 pub mod upload;
+pub mod usb;
+pub mod usbip;
+pub mod vcd;
+pub mod vehicle;
 
 pub use session::Session;
 pub use target::TargetMemory;

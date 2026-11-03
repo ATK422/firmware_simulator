@@ -58,9 +58,62 @@ pub trait Bus {
         self.read(addr, Size::Half).map(|v| v as u16)
     }
 
+    /// Instruction fetch from memory that needs no checks (no faults, no side effects), or `None` to go through
+    /// [`Bus::fetch16`]. Lets an interpreter keep its fast path free of error handling.
+    #[inline]
+    fn fetch16_fast(&mut self, addr: u32) -> Option<u16> {
+        let _ = addr;
+        None
+    }
+
+    /// The memory that [`Bus::fetch16_fast`] serves `addr` from, from `addr` to its end, with the same side effects
+    /// as a fast fetch at `addr`; `None` where `fetch16_fast` would return `None`. Lets an interpreter decode a run
+    /// of instructions at once (and see later whether they are still the same). Every fast fetch from the returned
+    /// bytes must be one that `fetch16_fast` would have served (with no further side effects) until an access
+    /// reports [`Bus::take_slow_access`]. A bus that serves code must also answer [`Bus::take_attention`] for
+    /// accesses only: an interpreter running decoded instructions does not ask it after those that access nothing.
+    #[inline]
+    fn code_at(&mut self, addr: u32) -> Option<&[u8]> {
+        let _ = addr;
+        None
+    }
+
+    /// Whether an access since the last call went anywhere but plain memory (a peripheral register, a checked flash
+    /// access): it may have changed what [`Bus::code_at`] returned, or whether fast fetches are still allowed. The
+    /// default says yes after every access.
+    #[inline]
+    fn take_slow_access(&mut self) -> bool {
+        true
+    }
+
+    /// Plain memory at `addr..addr + len` (word aligned) that a CPU may read or (with `write`) write directly, as
+    /// word accesses through [`Bus::read`]/[`Bus::write`] would, in address order and with no other effect than
+    /// they would have; `None` to go through them. For multi-word transfers (`PUSH`, `POP`, `LDM`, `STM`).
+    #[inline]
+    fn ram(&mut self, addr: u32, len: u32, write: bool) -> Option<&mut [u8]> {
+        let _ = (addr, len, write);
+        None
+    }
+
     /// Extra stall cycles accumulated by accesses since the last call (e.g. XIP cache misses).
     fn take_stall_cycles(&mut self) -> u32 {
         0
+    }
+
+    /// Called by a CPU running a batch of instructions (see `CortexM0Plus::run_batch`) before each instruction,
+    /// with the cycles the batch has taken so far, so that accesses can be stamped with the time they happen at.
+    #[inline]
+    fn set_elapsed(&mut self, cycles: u64) {
+        let _ = cycles;
+    }
+
+    /// Whether an access since the last call reached something other than plain memory (a peripheral register),
+    /// after which the machine must look at the system before the CPU goes on: interrupt lines, clocks, resets may
+    /// have changed. A batch of instructions ends after such an access. The default ends every batch after one
+    /// instruction.
+    #[inline]
+    fn take_attention(&mut self) -> bool {
+        true
     }
 
     /// Reads without side effects, for debuggers and tracing. `None` if the location cannot be peeked.
@@ -129,16 +182,26 @@ pub trait Peripheral<Ctx> {
 pub mod mem {
     use super::Size;
 
-    #[inline]
+    #[inline(always)]
     pub fn read(buf: &[u8], off: usize, size: Size) -> u32 {
         match size {
             Size::Byte => buf[off] as u32,
-            Size::Half => u16::from_le_bytes([buf[off], buf[off + 1]]) as u32,
-            Size::Word => u32::from_le_bytes([buf[off], buf[off + 1], buf[off + 2], buf[off + 3]]),
+            // One bounds check and one load (indexing each byte checks each)
+            Size::Half => u16::from_le_bytes(*chunk(buf, off)) as u32,
+            Size::Word => u32::from_le_bytes(*chunk(buf, off)),
         }
     }
 
-    #[inline]
+    /// The `N` bytes at `off`; panics out of range, as indexing does.
+    #[inline(always)]
+    fn chunk<const N: usize>(buf: &[u8], off: usize) -> &[u8; N] {
+        match buf.get(off..).and_then(|b| b.first_chunk::<N>()) {
+            Some(c) => c,
+            None => panic!("{N} bytes at {off} out of range for a slice of {}", buf.len()),
+        }
+    }
+
+    #[inline(always)]
     pub fn write(buf: &mut [u8], off: usize, size: Size, value: u32) {
         match size {
             Size::Byte => buf[off] = value as u8,
