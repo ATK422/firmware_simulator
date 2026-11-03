@@ -173,9 +173,9 @@ impl Interp {
             let (b0, b1) = (self.base[0] as i64, self.base[1] as i64);
             (b0 + (alpha * (b1 - b0)).div_euclid(256)) as u32
         };
-        let msb = c0.force_msb() << 28;
-        self.result[0] = if do_blend { alpha as u32 } else { (if do_clamp { clamp0 } else { add0 }) | msb };
-        self.result[1] = (if do_blend { blend1 } else { add1 }) | msb;
+        let (msb0, msb1) = (c0.force_msb() << 28, c1.force_msb() << 28);
+        self.result[0] = if do_blend { alpha as u32 } else { (if do_clamp { clamp0 } else { add0 }) | msb0 };
+        self.result[1] = (if do_blend { blend1 } else { add1 }) | msb1;
         self.result[2] = add2;
     }
 
@@ -566,6 +566,18 @@ mod tests {
         assert_eq!(s.read(0, INTERP1 + 0x20, 0, 0), Some((-10i32) as u32));
         s.write(0, INTERP1, 0x05);
         assert_eq!(s.read(0, INTERP1 + 0x20, 0, 0), Some(5));
+    }
+
+    #[test]
+    fn interp_force_msb_is_per_lane() {
+        // CTRL_LANEn.FORCE_MSB is ORed into bits 29:28 of lane n's result (datasheet 2.3.1.6)
+        let mut s = Sio::default();
+        s.write(0, INTERP0 + 0x2C, 31 << 10); // lane 0: full mask, no force
+        s.write(0, INTERP0 + 0x30, 31 << 10 | 1 << 19); // lane 1: full mask, FORCE_MSB 1
+        s.write(0, INTERP0, 4);
+        s.write(0, INTERP0 + 0x04, 8);
+        assert_eq!(s.read(0, INTERP0 + 0x20, 0, 0), Some(4), "PEEK_LANE0 untouched");
+        assert_eq!(s.read(0, INTERP0 + 0x24, 0, 0), Some(1 << 28 | 8), "PEEK_LANE1 forced");
     }
 
     #[test]
