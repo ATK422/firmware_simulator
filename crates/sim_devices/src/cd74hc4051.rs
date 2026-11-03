@@ -51,6 +51,12 @@ impl AnalogSource for Cd74hc4051 {
     fn clone_box(&self) -> Box<dyn AnalogSource> {
         Box::new(self.clone())
     }
+
+    fn relink_inputs(&mut self, map: &sim_core::analog::Relink) {
+        for s in &mut self.inputs {
+            s.relink(map);
+        }
+    }
 }
 
 #[cfg(test)]

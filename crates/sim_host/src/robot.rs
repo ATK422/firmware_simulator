@@ -149,7 +149,7 @@ impl Robot {
     pub fn run_until(&mut self, end: Time) -> Option<(usize, StopReason)> {
         let wall = std::time::Instant::now();
         let start = self.now;
-        // The sensor inputs may have been set by a snapshot of this robot since (they are shared)
+        // The sensors see a vehicle moved since the last run (a scenario putting it elsewhere) from the start
         for v in &self.vehicles {
             v.update_outputs();
         }
@@ -242,15 +242,24 @@ impl Robot {
         }
     }
 
-    /// A deep copy of the whole robot: every machine, device, bus and the acoustic medium, re-linked so the copy's
-    /// hydrophones and projectors use the copy's medium. Host endpoints are not copied (they are often handles to
-    /// shared state, like a mock bridge); give the copy its own. Physical inputs stay shared: setting one affects
-    /// the original and the copy, so set them after restoring, before running. That includes the pressure inputs
-    /// a vehicle drives: copies of a robot with a vehicle can take turns (each run starts by writing its own
-    /// vehicle's pressures), but must not run at the same time.
+    /// A deep copy of the whole robot: every machine, device, bus, the acoustic medium and the vehicles, re-linked
+    /// so the copy's hydrophones and projectors use the copy's medium and vehicles, and its devices (and the sensor
+    /// inputs its vehicles drive) read the copy's own physical inputs. The original and any number of copies can
+    /// run side by side, each with its own inputs. Host endpoints are not copied (they are often handles to shared
+    /// state, like a mock bridge); give the copy its own.
     pub fn snapshot(&self) -> Robot {
         let medium = self.medium.as_ref().map(|m| Arc::new(std::sync::Mutex::new(m.lock().unwrap().clone())));
-        let mut boards: Vec<Session> = self.boards.iter().map(Session::snapshot).collect();
+        let mut boards = Vec::new();
+        let mut inputs = Vec::new();
+        let mut map = sim_core::analog::Relink::new();
+        for (b, i) in self.boards.iter().zip(&self.inputs) {
+            let mut s = b.snapshot();
+            let (copy, m) = i.deep_copy();
+            crate::board::relink_inputs(&mut s.machine, &m);
+            map.merge(&m);
+            boards.push(s);
+            inputs.push(copy);
+        }
         if let (Some(old), Some(new)) = (&self.medium, &medium) {
             for b in &mut boards {
                 crate::acoustic::relink(&mut b.machine, old, new);
@@ -259,7 +268,8 @@ impl Robot {
         // The copy's transducers follow the copy's vehicles
         let mut vehicles = Vec::new();
         for v in &self.vehicles {
-            let (copy, pairs) = v.deep_copy();
+            let (mut copy, pairs) = v.deep_copy();
+            copy.relink_inputs(&map);
             for (old, new) in pairs {
                 let (old, new) = (Trajectory::Live(old), Trajectory::Live(new));
                 if let Some(m) = &medium {
@@ -278,7 +288,7 @@ impl Robot {
         Robot {
             boards,
             names: self.names.clone(),
-            inputs: self.inputs.clone(),
+            inputs,
             board_bus: self.board_bus.clone(),
             buses: self
                 .buses

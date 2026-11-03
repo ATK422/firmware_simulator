@@ -144,6 +144,11 @@ impl I2cDevice for Sht41 {
     fn as_any(&self) -> &dyn std::any::Any {
         self
     }
+
+    fn relink_inputs(&mut self, map: &sim_core::analog::Relink) {
+        self.temperature_c.relink(map);
+        self.humidity_rh.relink(map);
+    }
 }
 
 #[cfg(test)]

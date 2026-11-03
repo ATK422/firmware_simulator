@@ -12,7 +12,10 @@
 //!
 //! In a shared [`Medium`](crate::medium::Medium) the hydrophone also hears the other boards' projectors. When
 //! the hydrophone or a projector moves, every path is recomputed each [`BLOCK_STEPS`] and the delays and gains are
-//! interpolated in between, which produces Doppler shifts.
+//! interpolated in between, which produces Doppler shifts. Both ends' positions are taken at the time the sound
+//! arrives rather than when it left, which is exact to second order in v/c (a relative frequency error of 1e-7 at
+//! 0.5 m/s). The tests check the interpolated paths against paths recomputed at every step, at the block
+//! boundaries too, and the received frequency of a moving tone against v/c.
 
 use std::sync::Arc;
 
@@ -274,9 +277,20 @@ impl Hydrophone {
         v
     }
 
+    /// The grid step holding time `t`. Computed in integer picoseconds: in floating point, a time exactly on a
+    /// step (every ADC sample of a board sampling at 500 kS/s from a whole microsecond) can come out a hair short
+    /// and read the step before, which jitters those samples by a whole step.
+    fn step_at(&self, t: Time) -> u64 {
+        if self.rate.fract() == 0.0 {
+            (t.as_ps() as u128 * self.rate as u128 / 1_000_000_000_000) as u64
+        } else {
+            (t.as_secs_f64() * self.rate).floor() as u64
+        }
+    }
+
     /// Advances the chain to `t` and returns the voltage at the ADC pin.
     pub fn sample(&mut self, t: Time, pins: u32) -> f64 {
-        let k = (t.as_secs_f64() * self.rate).floor() as u64;
+        let k = self.step_at(t);
         let from = match self.step {
             Some(s) if k <= s => return self.last,
             Some(s) if k - s <= MAX_GAP_STEPS => s + 1,
@@ -406,6 +420,163 @@ mod tests {
         // A long gap, then sampling again: the filter restarts with preroll and reads the same level
         let c = peak(&mut far, Time::from_secs(3), 1000);
         assert!((c / b - 1.0).abs() < 0.03, "{c} {b}");
+    }
+
+    /// A projector at 18 kHz (the first-generation IVC modem's band) and a hydrophone in `env`, either of them on a
+    /// trajectory, the projector driven with a square wave for 400 ms.
+    fn moving_link(env: Environment, tx: Trajectory, rx: Trajectory) -> Hydrophone {
+        use crate::medium::{DriveSpec, Medium};
+        let medium = Medium::shared(Arc::new(env));
+        let t: Transducer =
+            toml::from_str("tvr = { resonance_hz = 18_000, q = 4, peak_db = 140 }\nrvs_db = -190").unwrap();
+        {
+            let mut m = medium.lock().unwrap();
+            let id = m.add_projector(0, "tx", t.clone(), tx, &DriveSpec { pin: 7, supply_v: 12.0, nominal_hz: None });
+            let half = Time::from_ps(1_000_000_000_000 / 36_000);
+            let mut at = Time::ZERO;
+            let mut level = true;
+            while at < Time::from_ms(400) {
+                m.edge(id, at, level);
+                level = !level;
+                at += half;
+            }
+            m.progress(0, Time::from_ms(500));
+        }
+        let chain = ChainSpec { gain_db: 40.0, bandpass_hz: Some([12_000.0, 25_000.0]), ..Default::default() };
+        let env = medium.lock().unwrap().env.clone();
+        Hydrophone::new(env, [0.0; 3], t, chain).in_medium(medium, 1).moving(rx)
+    }
+
+    /// The hydrophone's output before the chain, summed over every path computed exactly for the positions at
+    /// time `t` (what the per-block taps approximate by interpolation).
+    fn exact_raw(h: &Hydrophone, n: u64) -> f64 {
+        let t = n as f64 / h.rate;
+        let medium = h.medium().unwrap().clone();
+        let mut m = medium.lock().unwrap();
+        let p = &mut m.projectors[0];
+        let src = p.trajectory.at(t);
+        let paths = h.env.paths(src, h.trajectory.at(t), p.nominal_hz);
+        let sens = h.transducer.sensitivity(p.nominal_hz);
+        paths.iter().map(|path| path.gain * sens * p.pressure(t - path.delay_s)).sum()
+    }
+
+    fn pool() -> Environment {
+        let mut env = Environment::parse(
+            "kind = \"tank\"\nsize_m = [25.0, 12.0, 3.0]\nwall_reflection = 0.6\nbottom_reflection = 0.5\n\
+             multipath = { max_order = 3 }\n",
+            std::path::Path::new("."),
+        )
+        .unwrap();
+        env.noise = crate::noise::Noise::None;
+        env
+    }
+
+    #[test]
+    fn moving_taps_follow_the_exact_paths_across_block_boundaries() {
+        // Talos's IVC board closing on the surface vehicle's at 0.5 m/s in the pool (63 paths), with either end the
+        // one that moves: the interpolated taps match every path recomputed at every grid step, at the block
+        // boundaries (where the taps are rebuilt) as much as anywhere else
+        let moving = Trajectory::Linear { start_m: [5.0, 6.0, 1.5], velocity_mps: [0.5, 0.0, 0.0] };
+        let fixed = Trajectory::Fixed([10.0, 6.0, 1.5]);
+        for (tx, rx) in [(moving.clone(), fixed.clone()), (fixed, moving)] {
+            let mut h = moving_link(pool(), tx, rx);
+            let medium = h.medium().unwrap().clone();
+            let (mut worst, mut peak, mut worst_at_boundary) = (0f64, 0f64, 0f64);
+            for n in 50_000..150_000u64 {
+                let got = h.raw(n, Some(&mut medium.lock().unwrap()));
+                let want = exact_raw(&h, n);
+                peak = peak.max(want.abs());
+                worst = worst.max((got - want).abs());
+                if n % BLOCK_STEPS == 0 {
+                    worst_at_boundary = worst_at_boundary.max((got - want).abs());
+                }
+            }
+            assert!(peak > 1e-3, "{peak}");
+            assert!(worst < 1e-6 * peak, "{worst} of {peak}");
+            assert!(worst_at_boundary <= worst);
+        }
+    }
+
+    /// Zero crossings (upwards, linearly interpolated) of the hydrophone's output at the pin, sampled at 1 MS/s
+    /// from `from` for `ms`.
+    fn crossings(h: &mut Hydrophone, from: Time, ms: u64) -> Vec<f64> {
+        let mut out = Vec::new();
+        let mut prev: Option<(f64, f64)> = None;
+        for i in 0..ms * 1000 {
+            let t = from + Time::from_us(i);
+            let v = h.sample(t, 0) - 1.65;
+            if let Some((tp, vp)) = prev
+                && vp < 0.0
+                && v >= 0.0
+            {
+                out.push(tp + (t.as_secs_f64() - tp) * (-vp / (v - vp)));
+            }
+            prev = Some((t.as_secs_f64(), v));
+        }
+        out
+    }
+
+    #[test]
+    fn walking_speed_doppler_is_smooth() {
+        // 0.5 m/s in open water, either end moving, closing or opening: the received frequency is 18 kHz shifted by
+        // v/c (6 Hz), and the phase follows it without a jump at any block boundary (zero crossings within a few
+        // nanoseconds of a constant frequency over 200 ms, where one tap rebuild out of step would show as a
+        // microsecond)
+        let mut open = Environment::open_water(crate::water::Water {
+            sound_speed_mps: Some(1500.0),
+            ..crate::water::Water::default()
+        });
+        open.noise = crate::noise::Noise::None;
+        let fixed = Trajectory::Fixed([0.0, 0.0, 1.0]);
+        let mover = |v: f64| Trajectory::Linear { start_m: [5.0, 0.0, 1.0], velocity_mps: [v, 0.0, 0.0] };
+        let f0 = 1e12 / (2 * (1_000_000_000_000u64 / 36_000)) as f64;
+        for (tx_moves, v) in [(true, -0.5), (true, 0.5), (false, -0.5), (false, 0.5), (false, 0.0)] {
+            let (tx, rx) = if tx_moves { (mover(v), fixed.clone()) } else { (fixed.clone(), mover(v)) };
+            let mut h = moving_link(open.clone(), tx, rx);
+            let xs = crossings(&mut h, Time::from_ms(100), 200);
+            // Least-squares line through the crossing times: its slope is the period
+            let n = xs.len() as f64;
+            let (mi, mx) = ((n - 1.0) / 2.0, xs.iter().sum::<f64>() / n);
+            let (mut sxy, mut sxx) = (0.0, 0.0);
+            for (i, x) in xs.iter().enumerate() {
+                sxy += (i as f64 - mi) * (x - mx);
+                sxx += (i as f64 - mi) * (i as f64 - mi);
+            }
+            let period = sxy / sxx;
+            let hz = 1.0 / period;
+            // Range opening (v > 0, away from the other end at the origin) lowers the frequency, closing raises it
+            let expected = if tx_moves { f0 / (1.0 + v / 1500.0) } else { f0 * (1.0 - v / 1500.0) };
+            assert!((hz - expected).abs() < 0.05, "tx moves {tx_moves}, {v} m/s: {hz} Hz, expected {expected}");
+            let worst =
+                xs.iter().enumerate().map(|(i, x)| (x - mx - (i as f64 - mi) * period).abs()).fold(0.0, f64::max);
+            assert!(worst < 5e-9, "tx moves {tx_moves}, {v} m/s: crossings off by {worst:e} s");
+        }
+    }
+
+    #[test]
+    fn a_time_on_a_grid_step_reads_that_step() {
+        // 57 us is step 57, but in f64 seconds times 1e6 it comes out a hair short (as about one in eight whole
+        // microseconds do)
+        assert!((Time::from_us(57).as_secs_f64() * 1e6).floor() < 57.0);
+        let h = Hydrophone::new(
+            tone_env(30_000.0, 160.0, [10.0, 0.0, 1.0]),
+            [0.0, 0.0, 1.0],
+            Transducer::hydrophone(-190.0),
+            ChainSpec::default(),
+        );
+        for us in [0, 1, 25, 57, 125_014, 1_234_567, 9_999_999] {
+            assert_eq!(h.step_at(Time::from_us(us)), us);
+            assert_eq!(h.step_at(Time::from_us(us) + Time::from_ps(999_999)), us);
+        }
+        let slow = Hydrophone::with_rate(
+            tone_env(30_000.0, 160.0, [10.0, 0.0, 1.0]),
+            [0.0, 0.0, 1.0],
+            Transducer::hydrophone(-190.0),
+            ChainSpec::default(),
+            250_000.0,
+        );
+        assert_eq!(slow.step_at(Time::from_us(100_004)), 25_001);
+        assert_eq!(slow.step_at(Time::from_us(100_003)), 25_000);
     }
 
     #[test]

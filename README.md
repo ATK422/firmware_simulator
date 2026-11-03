@@ -31,7 +31,9 @@ sequence on the SIO FIFO. With `--rom-boot` both cores start in the bootrom as a
 continuous quad read mode before jumping to the image. Either way the flash is a QSPI chip behind the SSI: XIP
 reads fault while the SSI is not set up for them, and the bootrom's flash routines (`flash_range_erase`,
 `flash_range_program`, ...) run for real against the chip's command set, with its erase and program times.
-`--hle-flash` traps those routines and performs them directly instead (faster, less faithful). `--flash-file
+`--hle-flash` traps those routines and performs them directly instead (faster, less faithful), leaving the SSI, the
+QSPI pins and the chip as the real ones do, so code that talks to the chip afterwards (pico-sdk's unique ID read)
+still works. `--flash-file
 FILE` keeps the flash in a file: loaded before the image is written over it, saved at the end, so what the firmware
 writes (or what the C Titan bootloader flashes) persists between runs.
 UART output is printed per line (or attached to
@@ -80,8 +82,9 @@ The PIO blocks are modelled cycle by cycle (the full instruction set, FIFOs and 
 IRQ flags, EXEC, DMA requests, pin overrides) and advanced lazily, skipping delays and stalled state machines.
 Devices on PIO-driven pins watch the pin waveforms and answer on the pins: board files list `[[ws2812]]` strips
 (frames are decoded and reported to the `device` trace), `[[dshot_esc]]` ESCs (DShot frames, bidirectional eRPM
-replies, KISS telemetry, a motor model), `[[dynamixel]]` and `[[hiwonder]]` servos on half-duplex serial pins, and
-`[[soft_i2c]]` devices on bit-banged I2C/SMBus pins (the smart battery's BQ40Z80 gauge).
+replies, KISS telemetry, a motor model that stops when the frames stop for `signal_loss_ms`, 250 ms by default),
+`[[dynamixel]]` and `[[hiwonder]]` servos on half-duplex serial pins, and `[[soft_i2c]]` devices on bit-banged
+I2C/SMBus pins (the smart battery's BQ40Z80 gauge).
 
 `test_programs/pio/*.pio` (pico-examples programs and a handshake test) and the ESC board's own `.pio` files are
 assembled by pioasm: `scripts/build_pioasm.sh` builds it from titan_firmware's pico-sdk and
@@ -393,8 +396,9 @@ cargo test --release --workspace
 
 `crates/sim_test` is the harness for firmware tests: `Bench` boots one image on its board next to a mock bridge,
 sets inputs, injects faults (see [Fault injection](#fault-injection)) and reads what the bridge received;
-`RobotBench` does the same for a robot file; both snapshot in a few milliseconds, and `sweep` runs a scenario from
-a snapshot over a set of parameters in parallel. Its tests are the smoke test of every board image
+`RobotBench` does the same for a robot file; both snapshot in a few milliseconds (each copy with physical inputs of
+its own, so copies run side by side with different ones), and `sweep` runs a scenario from a snapshot over a set of
+parameters in parallel. Its tests are the smoke test of every board image
 (`tests/smoke.rs`), the whole of Talos on its buses (`tests/robot.rs`), Puddles over UDP (`tests/puddles.rs`), the
 H-bridge and harness checks (`tests/harness.rs`), the fault injection tests (`tests/faults.rs`) and the IVC range
 and noise sweeps (`tests/ivc_sweep.rs`, run with `--nocapture` to see the tables). CI (`.github/workflows/ci.yml`)
@@ -415,7 +419,8 @@ committed, `make -C test_programs` rebuilds them (`arm-none-eabi-as`, and the `t
 Tests that boot titan_firmware_rs images skip themselves unless the firmware has been built
 (`cd external/titan_firmware_rs/firmware && cargo build --workspace --release`); tests that boot C titan_firmware
 programs skip unless `scripts/build_c_firmware.sh` has built them into `build/c`. `test_programs/pico` holds
-pico-sdk programs equivalent to pico-examples' `hello_uart`, `hello_multicore` and `flash/program`
+pico-sdk programs equivalent to pico-examples' `hello_uart`, `hello_multicore` and `flash/program`, and one that
+reads the flash's unique ID
 (`make -C test_programs pico` rebuilds them against titan_firmware's pico-sdk).
 
 ## Performance

@@ -224,6 +224,10 @@ impl I2cDevice for FaultyI2c {
     fn faulty(&mut self) -> Option<&mut FaultyI2c> {
         Some(self)
     }
+
+    fn relink_inputs(&mut self, map: &sim_core::analog::Relink) {
+        self.inner.relink_inputs(map);
+    }
 }
 
 // ---------------------------------------------------------------------------------------------------- analog
@@ -293,6 +297,10 @@ impl AnalogSource for FaultyAnalog {
 
     fn as_any_mut(&mut self) -> Option<&mut dyn std::any::Any> {
         Some(self)
+    }
+
+    fn relink_inputs(&mut self, map: &sim_core::analog::Relink) {
+        self.inner.relink_inputs(map);
     }
 }
 

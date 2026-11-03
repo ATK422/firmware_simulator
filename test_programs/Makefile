@@ -22,7 +22,7 @@ embassy_blinky.elf: embassy_blinky/src/main.rs embassy_blinky/Cargo.toml
 pico:
 	cmake -G Ninja -S pico -B ../build/pico
 	ninja -C ../build/pico
-	for p in hello_uart hello_multicore flash_program hello_usb hello_usb_ram; do arm-none-eabi-strip --strip-debug -o pico/$$p.elf ../build/pico/$$p.elf; done
+	for p in hello_uart hello_multicore flash_program hello_usb hello_usb_ram unique_id; do arm-none-eabi-strip --strip-debug -o pico/$$p.elf ../build/pico/$$p.elf; done
 
 # titan_firmware's dual CDC stdio library in a small program (CMake, against titan_firmware)
 c_dual_usb:

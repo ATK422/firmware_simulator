@@ -10,9 +10,7 @@ use sim_test::{RobotBench, Time};
 fn puddles() -> Option<(RobotBench, PuddlesBridge)> {
     sim_test::titan_rs("puddles_backplane")?;
     let mut r = RobotBench::load("puddles.toml", &[], |_| {}).unwrap();
-    let bridge = PuddlesBridge::new(Time::ZERO);
-    bridge.set_kill(Some(false));
-    r.robot.boards[0].eth_endpoints.push(Box::new(bridge.clone()));
+    let bridge = r.eth_bridge("backplane");
     Some((r, bridge))
 }
 
@@ -150,4 +148,39 @@ fn puddles_runs_reproduce_exactly() {
     assert!(a.0.position[2] > 0.2, "{:?}", a.0);
     assert!(a.0.attitude.euler()[2].abs() > 1e-3, "turning: {:?}", a.0);
     assert_eq!(a, b);
+}
+
+/// Puddles robots sweep like CAN robots: each snapshot gets its own copy of the Ethernet bridge (and vehicle), so
+/// points with different thruster commands run side by side, each reporting its own dive to its own bridge, and
+/// exactly as a lone copy would.
+#[test]
+fn puddles_dives_sweep_in_parallel() {
+    let Some((mut base, bridge)) = puddles() else { return };
+    base.run_until(Time::from_ms(5100));
+    let seen = bridge.state().received.len();
+    let dive = |mut b: RobotBench, throttle: &i16| {
+        // The copy's own bridge, not the original's
+        let bridge = b.eth_bridge("backplane");
+        for _ in 0..75 {
+            let t = *throttle;
+            bridge.send(HostToDevice::PuddlesBackplane(pb::HostToDevice::Dshot([0, 0, 0, 0, t, t, t, t])));
+            b.run_for(Time::from_ms(20));
+        }
+        let truth = b.robot.vehicle("puddles").unwrap().vehicle.point([-0.2, 0.0, 0.0])[2];
+        (reported_depths(&bridge).last().unwrap().1, truth)
+    };
+    let throttles = [200i16, 400, 600];
+    let results = sim_test::sweep(&base, &throttles, throttles.len(), dive);
+    let zero = base.robot.vehicle("puddles").unwrap().vehicle.point([-0.2, 0.0, 0.0])[2];
+    for w in results.windows(2) {
+        assert!(w[1].1 > w[0].1 + 0.05, "more thrust, deeper: {results:?}");
+    }
+    // Each reading within a poll's motion of the truth (it sinks at up to 0.4 m/s)
+    for (got, truth) in &results {
+        assert!((got - (truth - zero)).abs() < 0.06, "reported {got} vs {}", truth - zero);
+    }
+    assert_eq!(dive(base.snapshot(), &throttles[1]), results[1], "the same as a copy run on its own");
+    // The original's bridge heard nothing of it, and the original did not move
+    assert_eq!(bridge.state().received.len(), seen);
+    assert!(sensor_depth(&mut base, zero).abs() < 1e-3);
 }
