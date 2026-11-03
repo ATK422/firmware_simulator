@@ -15,6 +15,7 @@ a new transducer, another modem scheme or a different acoustic board is a config
 - [The shared medium: boards hearing each other](#the-shared-medium-boards-hearing-each-other)
 - [Moving transducers and Doppler](#moving-transducers-and-doppler)
 - [IVC link tests and sweeps](#ivc-link-tests-and-sweeps)
+- [C and Rust IVCBoard2 interop](#c-and-rust-ivcboard2-interop)
 - [Making a new environment](#making-a-new-environment)
 
 ## Environment files
@@ -171,6 +172,15 @@ IVCBoard2s) put one board on each of two vehicles' buses, 5 m apart in the pool:
 firmware_simulator robot robots/ivc2_pool.toml --mock-bridge talos:8 --mock-bridge surface:8 --time 15s
 ```
 
+`--ivc-send TIME@BOARD:BYTE` makes a board transmit through its mock bridge, and each mock bridge prints the bytes
+its board receives ([robots.md](robots.md#mock-bridges)):
+
+```bash
+firmware_simulator robot robots/ivc2_pool.toml --mock-bridge talos:8 --mock-bridge surface:8 \
+    --ivc-send 3.5s@talos_ivc:0x5a --time 13s
+#   [12.200999s] surface_ivc: IVC received 0x5a
+```
+
 `robot --noise-db L` replaces every hydrophone's ambient noise with white noise at `L` dB re 1 µPa²/Hz.
 
 ## Moving transducers and Doppler
@@ -192,7 +202,7 @@ snapshot and move a board to its range).
 
 | Test | What it shows |
 |---|---|
-| `crates/sim_host/tests/ivc_link.rs` | IVCBoard to IVCBoard and IVCBoard2 to IVCBoard2 exchange bytes across `pool.toml`; the first-generation modem's reverberation finding |
+| `crates/sim_host/tests/ivc_link.rs` | IVCBoard to IVCBoard and IVCBoard2 to IVCBoard2 exchange bytes across `pool.toml`; the C IVCBoard2 modem and the Rust one exchange bytes both ways ([below](#c-and-rust-ivcboard2-interop)); the first-generation modem's reverberation finding and the C IVCBoard2's overwritten packet |
 | `crates/sim_host/tests/acoustics.rs` | IVCBoard2's pinger amplitude against distance |
 | `crates/sim_host/tests/vehicle.rs` (`ivc_boards_talk_from_a_drifting_vehicle`) | First-generation IVC boards still link with one of them on a drifting vehicle |
 | `crates/sim_test/tests/ivc_sweep.rs` | Delivery against range and noise for both generations, in open water: boot once, snapshot, run every point in parallel from the snapshot; asserts that delivery degrades monotonically |
@@ -214,6 +224,57 @@ reached by the previous symbol's reverberation at the assumed 40 dB receive gain
 (`firmware_finding_ivc_symbols_lost_to_pool_reverberation` in `ivc_link.rs`, [faults.md](faults.md#firmware-findings-so-far)).
 The hydrophone unit tests check the moving paths against exact recomputation at every sample and the Doppler
 shift of a walking-speed source.
+
+## C and Rust IVCBoard2 interop
+
+The C IVCBoard2 firmware (titan_firmware branch `blake/ivc`, `talos/IVCBoard2`: micro-ROS over USB through
+`titan_dual_stdio_usb`) and the Rust `ivc_board2` (titan_firmware_rs, titan_link over CAN) are meant to speak the
+same acoustic modem. On paper they do: the Rust modem is a port of the C one and keeps its waveform.
+
+| | C (`ivc.h`, `tx.c`, `rx.c`, `consensus.c`, `fft/`) | Rust (`ivc2_core`, `firmware/ivc_board2`) |
+|---|---|---|
+| Tones | sync 50.5 kHz, `0` 51 kHz, `1` 51.5 kHz: a 50 % PWM square wave on GPIO 7, wrap 99, divider truncated to 1/16 | the same, same wrap and divider |
+| Packet | one byte, LSB first, sync before and after every bit; 18 slots of 500 ms (9 s) | the same |
+| Slot 0 | whatever the PWM was left at: the undivided 1.26 MHz square wave for the first packet after boot, the last sync after that | sync |
+| CRC, ACK, retries | none (`calculate_crc`, `send_ack`, `process_packet` exist but are never called) | none |
+| Receiver | 4096 samples at 500 kS/s, 64-tap FIR, decimate by 4, Hann, 1024-point FFT; SNR against a noise floor from 4 reference bands (EMA 0.05, settled after 50 frames); min SNR 4, dominance 1 | the same numbers (Goertzel on the band bins instead of the FFT) |
+| Symbol decisions | consensus: 3 stable, 2 to switch; a symbol is emitted when the next tone starts | the same (the stable count saturates instead of wrapping at 255) |
+| Observation rate | the newest capture once per main loop pass, about 40 to 50 ms (estimated), DMA free-running into two swap buffers | one capture on demand per pass, about 25 ms |
+| Transmit queue | 8 bytes; **dequeues every pass even mid-packet**, so a second byte overwrites the packet in flight | 8 bytes; waits for the packet to end |
+| Host side | ROS: `/talos/ivc/enqueue_data` and `/talos/ivc/rx_new`, `std_msgs/Int8` (bytes above 0x7f are negative) | titan_link: `Ivc2(EnqueueData)`, `Ivc2(RxNew)` |
+
+Two checks in the emulator, without micro-ROS (`crates/sim_host/tests/ivc_link.rs`):
+
+* `c_and_rust_ivc_board2_modems_exchange_bytes`: `test_programs/c_ivc_modem` is the C IVCBoard2 with its modem
+  sources from `blake/ivc` unmodified and micro-ROS replaced by UART0 (a byte on the UART is enqueued, a received
+  packet is printed as `ROS ivc/rx_new N`; `make -C test_programs c_ivc_modem` rebuilds it). In
+  `robots/ivc2_pool.toml`, the C board sends 0xC3 to the Rust board and the Rust board sends 0x5A back, each
+  arriving about 8.7 s after its packet started.
+* `firmware_finding_c_ivc_board2_overwrites_the_packet_in_flight`: two bytes enqueued together on the C board
+  arrive as one packet carrying the second; the first is lost.
+
+`robots/ivc2_interop.toml` runs the real C firmware next to the Rust one, with the C board's image from your
+titan_firmware build (`$TITAN_FIRMWARE_DIR`, [robots.md](robots.md#robot-files)) and its USB ports on fixed
+terminals. The micro-ROS agent connects to the emulated board as to a real one:
+
+```bash
+export TITAN_FIRMWARE_DIR=~/titan_firmware     # on blake/ivc, with talos/IVCBoard2/build/IVCBoard2_with_bl.uf2 built
+firmware_simulator robot robots/ivc2_interop.toml --mock-bridge talos:8 --realtime --time 600s \
+    --ivc-send 30s@talos_ivc:0x5a
+# in other terminals, with ROS 2 sourced:
+ros2 run micro_ros_agent micro_ros_agent serial --dev /tmp/c_ivc-ros
+ros2 topic echo /talos/ivc/rx_new
+ros2 topic pub --once /talos/ivc/enqueue_data std_msgs/msg/Int8 "{data: 90}"
+```
+
+Rust to C: the Rust board logs `Transmitting 0x5a` at 30 s and the C board `packet read complete with: 90` (on
+`/tmp/c_ivc-log` and as `c_ivc uart0:` lines) about 8.7 s later, and publishes 90 on `/talos/ivc/rx_new`. C to Rust:
+after the `ros2 topic pub` the C board logs `writing out: ...` per bit, and about 9 s later the emulator prints
+`[t] talos_ivc: IVC received 0x5a`. Send one byte at a time, at least 10 s apart, and not from both boards at once.
+**To verify locally** (the micro-ROS library could not be built where this was written): the real C image in the
+emulator, and whether the agent keeps its session while the emulator runs slower than the wall clock (the C modem
+alone runs at about 0.4x real time with the Rust board beside it, so `--realtime` cannot keep up; the firmware's
+own micro-ROS timeouts are on virtual time).
 
 ## Making a new environment
 

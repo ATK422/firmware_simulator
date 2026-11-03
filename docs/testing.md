@@ -228,7 +228,7 @@ pass) without them.
 | `crates/rp2040` unit tests (`src/periph/*`) | Register-level peripheral behaviour from the datasheet |
 | `crates/rp2040/tests/` | Hand-written programs (`m0_blink`, `m1_watchdog`, `m6_resets`), pioasm-assembled PIO programs (`pio_programs`), the bootrom's USB boot (`usb_boot`), and the performance work's equivalence checks (`batching`, `busy_wait`, `systick_reference`) |
 | `crates/sim_devices`, `sim_acoustics`, `sim_physics` unit tests | Each device model, the acoustic channel, the vehicle physics |
-| `crates/sim_host/tests/` | Firmware on boards built by hand, per milestone: `template`, `embassy_blinky`, `gdb`, `pico_sdk`, `can`, `sensors`, `pio`, `flash`, `hle` (`--hle-flash` leaves the flash as the ROM does), `acoustics`, `ivc_link`, `usb`, `vehicle`, `parallel` (threaded robots run as in turn) |
+| `crates/sim_host/tests/` | Firmware on boards built by hand, per milestone: `template`, `embassy_blinky`, `gdb`, `pico_sdk`, `can`, `sensors`, `pio`, `flash`, `hle` (`--hle-flash` leaves the flash as the ROM does), `acoustics`, `ivc_link` (also the C IVCBoard2 modem against the Rust one), `usb`, `robot_usb` (USB on robot boards, images from environment variable paths), `vehicle`, `parallel` (threaded robots run as in turn) |
 | `crates/sim_test/tests/smoke.rs` | Every titan_firmware_rs board image on its board: connects, reports its identity, no link errors, no panic |
 | `crates/sim_test/tests/robot.rs` | All of Talos on its two buses |
 | `crates/sim_test/tests/puddles.rs` | Puddles over Ethernet/UDP |
@@ -241,8 +241,8 @@ pass) without them.
 | `tests/host_cli.rs` (root package) | The command line: robot record/replay/diff, `bridges` outputs, `scripts/vcan_up.sh` with stand-ins, the Docker files' consistency |
 | `tests/docs.rs` (root package) | Every command line option the docs and the README mention exists |
 
-`test_programs/` holds the hand-written Thumb programs, a small embassy firmware and pico-sdk programs used by
-these tests; their ELFs are committed (`make -C test_programs` rebuilds them).
+`test_programs/` holds the hand-written Thumb programs, a small embassy firmware, pico-sdk programs and small C
+titan_firmware programs (`c_dual_usb`, `c_ivc_modem`) used by these tests; their ELFs are committed (`make -C test_programs` rebuilds them).
 
 When the firmware rather than the emulator looks wrong, write a test that asserts today's behaviour, name it
 `firmware_finding_*`, and explain it in a comment and in [faults.md](faults.md#firmware-findings-so-far).

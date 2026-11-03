@@ -108,6 +108,22 @@ struct RobotArgs {
     /// bridge on the board's bus.
     #[arg(long = "fault", value_parser = parse_robot_fault)]
     faults: Vec<(Time, String, sim_host::fault::Fault)>,
+    /// Plug a board's USB port into a host that opens its CDC ACM port (pico-sdk stdio_usb, titan_dual_stdio_usb's
+    /// text log): `BOARD=stdout` prints its lines prefixed with the board's name, `BOARD=pty` puts it on a pseudo
+    /// terminal, `BOARD=pty:PATH` also links PATH to it (repeatable; replaces the robot file's `usb_cdc`).
+    #[arg(long = "usb-cdc", value_parser = parse_board_cdc_sink)]
+    usb_cdcs: Vec<(String, CdcSink)>,
+    /// Open a board's second CDC port (titan_dual_stdio_usb's secondary port, which titan_firmware's micro-ROS USB
+    /// transport uses) on a pseudo terminal: `BOARD=pty` or `BOARD=pty:PATH` (repeatable; replaces the robot file's
+    /// `usb_cdc2`).
+    #[arg(long = "usb-cdc2", value_parser = parse_board_cdc_sink)]
+    usb_cdc2s: Vec<(String, CdcSink)>,
+    /// Make an IVC board transmit a byte acoustically at a virtual time: `TIME@BOARD:BYTE`, e.g. `4s@talos_ivc:0x5a`
+    /// (repeatable). The board's mock bridge sends `Ivc2(EnqueueData)` to an `ivc_board2` image and `Ivc(Tx)` to an
+    /// `ivc_board` image, so the board needs `--mock-bridge` on its bus. Every mock bridge prints the IVC bytes its
+    /// board receives (`[t] BOARD: IVC received 0x5a`).
+    #[arg(long = "ivc-send", value_parser = parse_ivc_send)]
+    ivc_sends: Vec<(Time, String, u8)>,
     #[command(flatten)]
     can_host: host_tools::CanHostArgs,
     /// Trace categories to print for the boards (comma separated), each line prefixed with the board's name.
@@ -201,17 +217,62 @@ fn robot(args: RobotArgs) -> Result<()> {
         s.on_log = Some(Box::new(move |t, line| println!("[{t}] {n}: {line}")));
         s.on_uart_line = Some(Box::new(move |t, u, line| println!("[{t}] {name} uart{u}: {line}")));
     }
+    for (port, sinks) in [(0, &args.usb_cdcs), (1, &args.usb_cdc2s)] {
+        for (board, sink) in sinks {
+            let opt = if port == 0 { "--usb-cdc" } else { "--usb-cdc2" };
+            let i = r.index(board).with_context(|| format!("{opt}: no board {board:?}"))?;
+            r.set_usb_cdc(i, port, sink.clone()).map_err(anyhow::Error::msg)?;
+        }
+    }
+    for i in 0..r.boards.len() {
+        if r.usb[i].cdc == Some(CdcSink::Stdout) {
+            let name = r.names[i].clone();
+            r.boards[i].on_usb_cdc_line = Some(Box::new(move |t, line| println!("[{t}] {name} usb: {line}")));
+        }
+        if r.usb[i].plugged {
+            log::info!("{}: USB port plugged into a host", r.names[i]);
+        }
+    }
+    for line in r.open_usb_ptys().map_err(anyhow::Error::msg)? {
+        eprintln!("{line}");
+    }
     let mut bridges: Vec<Option<sim_host::mock_bridge::MockBridge>> = vec![None; r.buses.len()];
     let mut all_bridges = Vec::new();
     for (bus, client) in &args.mock_bridges {
         let j = r.bus_names.iter().position(|n| n == bus).with_context(|| format!("no bus {bus:?}"))?;
-        let rb = &mut r.buses[j];
-        let b = sim_host::mock_bridge::MockBridge::new(*client, rb.bus.rates.data.is_some(), Time::ZERO);
+        let b = sim_host::mock_bridge::MockBridge::new(*client, r.buses[j].bus.rates.data.is_some(), Time::ZERO);
         b.set_kill(Some(false));
+        // Named after the board it serves
+        let name = (0..r.boards.len())
+            .find(|&i| r.board_bus[i] == Some(j) && r.client_ids[i] == Some(*client))
+            .map_or_else(|| format!("{bus}:{client} bridge"), |i| r.names[i].clone());
+        b.on_message(move |t, m| {
+            if let Some(byte) = sim_host::mock_bridge::ivc_received(m) {
+                println!("[{t}] {name}: IVC received {byte:#04x}");
+            }
+        });
+        let rb = &mut r.buses[j];
         rb.endpoints.push(Box::new(b.clone()));
         all_bridges.push((j, *client, b.clone()));
         bridges[j].get_or_insert(b);
         log::info!("mock bridge for client {client} on {bus}");
+    }
+    for (t, board, byte) in &args.ivc_sends {
+        let i = r.index(board).with_context(|| format!("--ivc-send: no board {board:?}"))?;
+        let modem = sim_host::mock_bridge::IvcModem::from_image(&r.images[i]).with_context(|| {
+            format!("--ivc-send: {board} runs {}, not an IVC image (ivc_board or ivc_board2)", r.images[i])
+        })?;
+        let (j, client) = (r.board_bus[i], r.client_ids[i]);
+        let bridge = all_bridges.iter().find(|(jj, c, _)| Some(*jj) == j && Some(*c) == client).map(|x| &x.2);
+        let Some(bridge) = bridge else {
+            let hint = match (j, client) {
+                (Some(j), Some(c)) => format!(" (add --mock-bridge {}:{c})", r.bus_names[j]),
+                _ => String::new(),
+            };
+            bail!("--ivc-send: {board} has no mock bridge{hint}");
+        };
+        bridge.send_at(*t, modem.transmit(*byte));
+        log::info!("{board} transmits {byte:#04x} at {t} ({modem:?})");
     }
     let mut faults = Vec::new();
     for (t, board, fault) in args.faults {
@@ -528,37 +589,35 @@ enum UartSink {
     None,
 }
 
-/// Where a USB CDC port goes: `stdout` (complete lines with their virtual time), `pty` (a pseudo terminal, like the
-/// device's /dev/ttyACM) or `pty:PATH` (the same, with a symlink at PATH so tools can use a fixed name).
-#[derive(Clone, PartialEq, Eq)]
-enum CdcSink {
-    Stdout,
-    Pty(Option<PathBuf>),
-}
+use sim_host::usb::CdcSink;
 
 fn parse_cdc_sink(s: &str) -> Result<CdcSink, String> {
-    match s {
-        "stdout" => Ok(CdcSink::Stdout),
-        "pty" => Ok(CdcSink::Pty(None)),
-        _ => match s.strip_prefix("pty:") {
-            Some(path) if !path.is_empty() => Ok(CdcSink::Pty(Some(PathBuf::from(path)))),
-            _ => Err(format!("expected stdout, pty or pty:PATH, not {s:?}")),
-        },
+    s.parse()
+}
+
+/// `BOARD=SINK` for a robot board's USB CDC port.
+fn parse_board_cdc_sink(s: &str) -> Result<(String, CdcSink), String> {
+    let (board, sink) = s.split_once('=').ok_or("expected BOARD=SINK (SINK: stdout, pty or pty:PATH)")?;
+    Ok((board.to_string(), sink.parse()?))
+}
+
+/// `TIME@BOARD:BYTE`, e.g. `4s@talos_ivc:0x5a`.
+fn parse_ivc_send(s: &str) -> Result<(Time, String, u8), String> {
+    let (at, rest) = s.split_once('@').ok_or("expected TIME@BOARD:BYTE")?;
+    let (board, byte) = rest.rsplit_once(':').ok_or("expected TIME@BOARD:BYTE")?;
+    let byte = match byte.strip_prefix("0x").or_else(|| byte.strip_prefix("0X")) {
+        Some(hex) => u8::from_str_radix(hex, 16),
+        None => byte.parse(),
     }
+    .map_err(|e| format!("byte {byte:?}: {e} (0-255 or 0x00-0xff)"))?;
+    Ok((parse_time(at)?, board.to_string(), byte))
 }
 
 /// Opens a pseudo terminal and, if asked, points a symlink at it (replacing an earlier run's symlink).
 fn open_pty(link: Option<&Path>, what: &str) -> Result<sim_host::pty::Pty> {
-    let pty = sim_host::pty::Pty::open().context("opening a pty")?;
+    let pty = sim_host::pty::Pty::open_linked(link).context("opening a pty")?;
     match link {
-        Some(link) => {
-            if std::fs::symlink_metadata(link).is_ok_and(|m| m.file_type().is_symlink()) {
-                std::fs::remove_file(link).with_context(|| format!("replacing {}", link.display()))?;
-            }
-            std::os::unix::fs::symlink(&pty.path, link)
-                .with_context(|| format!("linking {} to {}", link.display(), pty.path))?;
-            eprintln!("{what} on {} (linked from {})", pty.path, link.display());
-        }
+        Some(link) => eprintln!("{what} on {} (linked from {})", pty.path, link.display()),
         None => eprintln!("{what} on {}", pty.path),
     }
     Ok(pty)
