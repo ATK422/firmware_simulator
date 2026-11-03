@@ -39,7 +39,8 @@ a pseudo terminal with `--uart0 pty`). defmt logs are decoded from RTT (the `_SE
 and the ELF's `.defmt` table) and printed with the virtual time they were read and the firmware's own timestamp.
 
 Options: `--time` (virtual time to run, e.g. `500ms`), `--trace instr,exc,gpio,unmodelled,device`, `--trace-file`,
-`--quantum` (instructions per core before switching), `--uart0/--uart1 stdout|pty|none`, `--unmodelled first|every|off` (logging of registers the
+`--quantum` (instructions per core before switching), `--uart0/--uart1 stdout|pty|none`, `--profile FILE`,
+`--vcd FILE`, `--dashboard ADDR` (see [Profiling](#profiling), [Waveforms](#waveforms), [Dashboard](#dashboard)), `--unmodelled first|every|off` (logging of registers the
 emulator does not model yet; each is named from the SVD), `--stop-on-bkpt`, `--crystal-hz`, `--gdb ADDR`, `--rom-boot`, `--hle-flash`, `--flash-file FILE`,
 and for USB `--usb`, `--bootsel`, `--usb-cdc stdout|pty`, `--picoboot-load FILE`, `--load-via picoboot|drive`, `--usbip ADDR` (see [USB](#usb-bootsel-picoboot-uf2-and-cdc)).
 
@@ -280,6 +281,82 @@ and register access, and `monitor reset` / `monitor time` work. Virtual time sto
 
 ```bash
 gdb-multiarch -ex "target remote :3333" -ex "break main" -ex continue path/to/firmware.elf
+```
+
+### Profiling
+
+`--profile FILE` samples both cores every `--profile-interval` of virtual time (10 µs by default, jittered by ±50 %
+so periodic firmware work does not alias with the samples) and writes a table of functions by time per core to
+FILE and folded stacks (`core0;Reset;main;...;leaf 123`) next to it as `FILE.folded`, for `flamegraph.pl`,
+`inferno-flamegraph` or speedscope. `robot --profile-dir DIR` writes `DIR/BOARD.txt` and `DIR/BOARD.folded` for
+every board.
+
+```bash
+cargo run --release -- run path/to/esc_board --board boards/mk2/esc_board.toml --mock-bridge 2 --time 3s --profile esc.txt
+inferno-flamegraph < esc.folded > esc.svg     # or: flamegraph.pl esc.folded > esc.svg
+cargo run --release -- robot robots/talos.toml --mock-bridge internal:1 --time 3s --profile-dir prof/
+```
+
+The table gives, per core, the share of samples running and sleeping (`WFI`/`WFE`), the time in each exception
+handler, and for each function its self time (`self%`, of all samples; `of-run%`, of the samples the core was
+running) and its total time with callees (`total%`). Sleeping samples are left out of the functions' times; in
+the folded stacks they end in `[sleep]` under the code that went to sleep. Stacks are walked as a debug probe
+would: through the ELF's `.debug_frame`, through the prologue of code without it (compiler-builtins assembly, the
+bootrom) and through exception frames into the interrupted code, checking every return address. Names are
+demangled (Rust's legacy and v0 schemes); bootrom code is named from the ROM's function and soft float/double
+tables (`rom:fmul`, `rom:memcpy`). The profiler only splits the run at the sample times, so a program runs the
+same (the two cores' interleaving can shift, as with a different `--quantum`). At 10 µs it adds a few percent to a
+busy board (the ESC board's core 1); an idle board, which otherwise fast-forwards between events, takes about twice
+as long.
+
+### Waveforms
+
+`--vcd FILE` writes the GPIO levels as a VCD file for GTKWave, Surfer or PulseView, in 1 ns steps, with whatever
+drives each pin: SIO, PWM, PIO (DShot, WS2812, PIO UARTs), devices and injected faults. `--vcd-pins` picks the pins:
+numbers, ranges and names from the board file's `[pins]` table (`--vcd-pins 0-7,25,status_ledr`); the wires are
+named after the board's pins (`gpio6_esc1_pwm`). `--vcd-events` adds string variables with the decoded traffic:
+defmt log lines, UART lines, CAN frames (candump notation) and device reports such as WS2812 frames (GTKWave and
+Surfer show them; PulseView reads only the pins). For a robot each board is a scope, and each bus gets one with its
+frames.
+
+```bash
+cargo run --release -- run path/to/esc_board --board boards/mk2/esc_board.toml --mock-bridge 2 --time 1s \
+    --vcd esc.vcd --vcd-pins esc1_pwm,esc1_telem,status_ledg --vcd-events
+gtkwave esc.vcd
+cargo run --release -- robot robots/talos.toml --mock-bridge internal:1 --time 2s --vcd talos.vcd --vcd-pins 0-15
+```
+
+### Dashboard
+
+`--dashboard 127.0.0.1:8080` (for `run` and `robot`) serves a live page at that address while the boards run: per
+board the cores and where they are, the log and UART lines, the firmware status a mock bridge decoded (titan_link
+`FirmwareStatus`, with the board's own fault names), the GPIO levels and functions, LEDs and status strip colours,
+ESC RPMs and the physical inputs; per bus the frame rate, load, errors and the latest frames; the vehicle's pose,
+velocity and thruster RPMs; virtual time and the emulation speed. Its controls inject a fault (the `--fault`
+syntax), set an input and pause virtual time. It works with and without `--realtime`; `--dashboard-hold` keeps
+serving the final state after the run. The page is self-contained (no external scripts) and polls
+`GET /api/state`; scripts can use the same JSON API: `POST /api/fault` with `{"board": "esc0", "fault":
+"can-stuck"}`, `POST /api/input` with `{"board": "camera_cage", "name": "depth.pressure_pa", "value": 120000}`,
+`POST /api/pause` with `{"paused": true}`; each answers once the run loop has applied it. There is no
+authentication: bind it to a loopback address.
+
+```bash
+cargo run --release -- robot robots/talos.toml --mock-bridge internal:1 --realtime --time 600s --dashboard 127.0.0.1:8080
+curl -s -X POST -d '{"board": "camera_cage", "fault": "i2c-absent:0x76"}' http://127.0.0.1:8080/api/fault
+```
+
+### Robot traces and structured logs
+
+`robot` takes `--trace` too, with `--trace-board esc0,camera_cage` to trace only some boards (all by default) and
+`--trace-file`; each line starts with the board's name, and lines of different boards are in time order within
+each 100 µs slice. `--log-json FILE` (`run` and `robot`) writes every defmt log line, UART and USB serial line,
+CAN frame and injected fault as one JSON object per line, with its board or bus and its virtual time (`t` in
+seconds, `t_ns` exact), and an `end` record with why the run stopped, for scripts and CI checks:
+
+```bash
+cargo run --release -- robot robots/talos.toml --mock-bridge internal:1 --time 5s --log-json talos.jsonl \
+    --trace gpio --trace-board led --trace-file led.trace
+jq -c 'select(.kind == "log" and .level == "error")' talos.jsonl
 ```
 
 ## Tests

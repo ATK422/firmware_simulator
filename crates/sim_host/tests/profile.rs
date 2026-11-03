@@ -180,3 +180,24 @@ fn esc_board_profiles_both_cores() {
     assert_walked(&p, 1, "esc_board");
     assert!(p.cores[1].functions.iter().any(|f| f.name.contains("core1")), "{}", p.flat_text("esc_board", 30));
 }
+
+/// IVCBoard2 listens all the time: its receive task runs the spectrum analyzer over every block of ADC samples, in
+/// soft float (the bootrom's `fadd`/`fmul` through embassy-rp's intrinsics). That is where the profile must put
+/// the time.
+#[test]
+fn ivc_board2_time_is_in_the_receive_spectrum() {
+    let Some(elf) = common::titan_elf("ivc_board2") else { return };
+    let mut s = on_board(&elf, "talos/ivc_board", 8);
+    s.start_profile(Time::from_us(20));
+    s.run_for(Time::from_ms(1000));
+    let p = s.profiler.as_ref().unwrap().report();
+    let c0 = &p.cores[0];
+    let text = p.flat_text("ivc_board2", 15);
+    assert!(c0.running > 3 * c0.sleeping, "IVC2 keeps core 0 busy: {text}");
+    assert_walked(&p, 0, "ivc_board2");
+    let rx = c0.functions.iter().find(|f| f.name.contains("modem::__rx_task_task")).expect(&text);
+    assert!(rx.total_samples as f64 > 0.7 * c0.running as f64, "{text}");
+    assert!(c0.total_fraction("prepare") > 0.2, "{text}");
+    let top3: Vec<&str> = c0.functions.iter().take(3).map(|f| f.name.as_str()).collect();
+    assert!(top3.contains(&"rom:fadd"), "soft float addition dominates: {top3:?}");
+}

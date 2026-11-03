@@ -94,6 +94,15 @@ struct RobotArgs {
     /// bridge on the board's bus.
     #[arg(long = "fault", value_parser = parse_robot_fault)]
     faults: Vec<(Time, String, sim_host::fault::Fault)>,
+    /// Trace categories to print for the boards (comma separated), each line prefixed with the board's name.
+    #[arg(long, value_delimiter = ',')]
+    trace: Vec<TraceKind>,
+    /// Only trace these boards (comma separated names; all by default).
+    #[arg(long, value_delimiter = ',')]
+    trace_board: Vec<String>,
+    /// Write the trace to this file instead of stderr.
+    #[arg(long)]
+    trace_file: Option<PathBuf>,
     /// Profile every board's firmware: write `DIR/BOARD.txt` (functions by time, per core) and `DIR/BOARD.folded`
     /// (folded stacks for flamegraph tools).
     #[arg(long)]
@@ -119,6 +128,9 @@ struct RobotArgs {
     /// Keep serving the dashboard after the run ends (until interrupted).
     #[arg(long, requires = "dashboard")]
     dashboard_hold: bool,
+    /// Write every log line, UART line, CAN frame and fault as one JSON object per line to this file, for tools.
+    #[arg(long)]
+    log_json: Option<PathBuf>,
 }
 
 fn parse_board_udp(s: &str) -> Result<(String, String, String), String> {
@@ -231,6 +243,20 @@ fn robot(args: RobotArgs) -> Result<()> {
         }
     }
     r.realtime = args.realtime;
+    if !args.trace.is_empty() {
+        for b in &args.trace_board {
+            anyhow::ensure!(r.index(b).is_some(), "--trace-board: no board {b:?}");
+        }
+        let out = SharedWriter::open(args.trace_file.as_deref())?;
+        let categories = trace_categories(&args.trace);
+        for (s, name) in r.boards.iter_mut().zip(&r.names) {
+            if args.trace_board.is_empty() || args.trace_board.contains(name) {
+                let sink = WriterSink { categories: categories.clone(), out: out.clone(), prefix: format!("{name}: ") };
+                let old = std::mem::replace(&mut s.machine.trace, Box::new(sim_core::trace::NullSink));
+                s.machine.set_trace(sim_core::trace::MultiSink::combine(old, Box::new(sink)));
+            }
+        }
+    }
     let vcd = match &args.vcd {
         Some(path) => {
             let mut scopes = Vec::new();
@@ -299,6 +325,20 @@ fn robot(args: RobotArgs) -> Result<()> {
         }
         None => None,
     };
+    let json_log = match &args.log_json {
+        Some(path) => {
+            let log =
+                sim_host::jsonlog::JsonLog::create(path).with_context(|| format!("creating {}", path.display()))?;
+            for (s, name) in r.boards.iter_mut().zip(&r.names) {
+                log.tap_session(name, None, s);
+            }
+            for (rb, name) in r.buses.iter_mut().zip(&r.bus_names) {
+                log.tap_bus(name, rb);
+            }
+            Some(log)
+        }
+        None => None,
+    };
     let wall = std::time::Instant::now();
     let mut faults = faults.into_iter().peekable();
     let mut pending: Option<(Time, usize, sim_host::fault::Fault)> = None;
@@ -330,6 +370,9 @@ fn robot(args: RobotArgs) -> Result<()> {
             let name = r.names[i].clone();
             d.note_fault(r.now, &name, &format!("{fault:?}"), &applied);
         }
+        if let Some(l) = &json_log {
+            l.fault(r.now, &r.names[i], &format!("{fault:?}"), &applied);
+        }
         if let Err(e) = applied {
             bail!("fault {fault:?} on {}: {e}", r.names[i]);
         }
@@ -347,6 +390,13 @@ fn robot(args: RobotArgs) -> Result<()> {
     eprintln!("stopped at {}; {:.2?} wall", r.now, wall.elapsed());
     if let (Some(v), Some(path)) = (&vcd, &args.vcd) {
         finish_vcd(v, path, r.now)?;
+    }
+    if let (Some(l), Some(path)) = (&json_log, &args.log_json) {
+        let why = match &stopped {
+            Some((i, why)) => format!("{} stopped: {why:?}", r.names[*i]),
+            None => "TimeLimit".into(),
+        };
+        l.finish(r.now, &why).with_context(|| format!("writing {}", path.display()))?;
     }
     for v in &r.vehicles {
         let s = &v.vehicle.state;
@@ -405,6 +455,44 @@ enum TraceKind {
     Unmodelled,
     /// Device messages (CAN frames, UART bytes, ...).
     Device,
+}
+
+fn trace_categories(kinds: &[TraceKind]) -> Vec<Category> {
+    kinds
+        .iter()
+        .map(|t| match t {
+            TraceKind::Instr => Category::Instruction,
+            TraceKind::Exc => Category::Exception,
+            TraceKind::Gpio => Category::Gpio,
+            TraceKind::Unmodelled => Category::Unmodelled,
+            TraceKind::Device => Category::Device,
+        })
+        .collect()
+}
+
+/// A trace output several boards' sinks write to: a file (buffered) or stderr.
+#[derive(Clone)]
+struct SharedWriter(std::sync::Arc<std::sync::Mutex<Box<dyn std::io::Write + Send>>>);
+
+impl SharedWriter {
+    fn open(path: Option<&std::path::Path>) -> Result<SharedWriter> {
+        let out: Box<dyn std::io::Write + Send> = match path {
+            Some(p) => Box::new(std::io::BufWriter::new(
+                std::fs::File::create(p).with_context(|| format!("creating {}", p.display()))?,
+            )),
+            None => Box::new(std::io::stderr()),
+        };
+        Ok(SharedWriter(std::sync::Arc::new(std::sync::Mutex::new(out))))
+    }
+}
+
+impl std::io::Write for SharedWriter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap().write(buf)
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.0.lock().unwrap().flush()
+    }
 }
 
 #[derive(Clone, Copy, ValueEnum, PartialEq, Eq)]
@@ -562,6 +650,9 @@ struct RunArgs {
     /// Keep serving the dashboard after the run ends (until interrupted).
     #[arg(long, requires = "dashboard")]
     dashboard_hold: bool,
+    /// Write every log line, UART line, CAN frame and fault as one JSON object per line to this file, for tools.
+    #[arg(long)]
+    log_json: Option<PathBuf>,
 }
 
 fn parse_input(s: &str) -> Result<(String, f64), String> {
@@ -626,17 +717,7 @@ fn run(args: RunArgs) -> Result<()> {
     if args.stop_on_bkpt {
         machine.bkpt_policy = BkptPolicy::Stop;
     }
-    let categories: Vec<Category> = args
-        .trace
-        .iter()
-        .map(|t| match t {
-            TraceKind::Instr => Category::Instruction,
-            TraceKind::Exc => Category::Exception,
-            TraceKind::Gpio => Category::Gpio,
-            TraceKind::Unmodelled => Category::Unmodelled,
-            TraceKind::Device => Category::Device,
-        })
-        .collect();
+    let categories = trace_categories(&args.trace);
     if !categories.is_empty() {
         let out: Box<dyn std::io::Write + Send> = match &args.trace_file {
             Some(p) => Box::new(std::io::BufWriter::new(
@@ -838,6 +919,17 @@ fn run(args: RunArgs) -> Result<()> {
         }
         None => None,
     };
+    let json_log = match &args.log_json {
+        Some(path) => {
+            let log =
+                sim_host::jsonlog::JsonLog::create(path).with_context(|| format!("creating {}", path.display()))?;
+            let name = board.as_ref().map_or("board", |b| b.name.as_str());
+            let bus = session.can_bus.as_ref().map(|b| b.name.clone());
+            log.tap_session(name, bus.as_deref(), &mut session);
+            Some(log)
+        }
+        None => None,
+    };
     let mut faults = args.faults.clone();
     faults.sort_by_key(|f| f.0);
     let mut faults = faults.into_iter().peekable();
@@ -868,6 +960,10 @@ fn run(args: RunArgs) -> Result<()> {
         if let Some(d) = &mut dash {
             d.note_fault(session.machine.now, "", &format!("{fault:?}"), &applied);
         }
+        if let Some(l) = &json_log {
+            let name = board.as_ref().map_or("board", |b| b.name.as_str());
+            l.fault(session.machine.now, name, &format!("{fault:?}"), &applied);
+        }
         if let Err(e) = applied {
             bail!("fault {fault:?}: {e}");
         }
@@ -882,6 +978,9 @@ fn run(args: RunArgs) -> Result<()> {
     }
     if let (Some(v), Some(path)) = (&vcd, &args.vcd) {
         finish_vcd(v, path, session.machine.now)?;
+    }
+    if let (Some(l), Some(path)) = (&json_log, &args.log_json) {
+        l.finish(session.machine.now, &format!("{reason:?}")).with_context(|| format!("writing {}", path.display()))?;
     }
     if let (Some(path), Some(p)) = (&args.profile, &session.profiler) {
         let title = args.image.as_ref().or(args.picoboot_load.as_ref()).and_then(|p| p.file_name());

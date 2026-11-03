@@ -343,8 +343,9 @@ const ROM_END: usize = 0x4000;
 /// The deepest stack followed.
 pub const MAX_DEPTH: usize = 64;
 
+/// The EXC_RETURN values of ARMv6-M (handler mode, thread mode on MSP, thread mode on PSP).
 fn is_exc_return(v: u32) -> bool {
-    v & 0xFFFF_FFF0 == 0xFFFF_FFF0
+    matches!(v, 0xFFFF_FFF1 | 0xFFFF_FFF9 | 0xFFFF_FFFD)
 }
 
 /// Whether `ra` is a plausible return address: Thumb, in code, right after a `BL` or `BLX Rm`.
@@ -634,6 +635,14 @@ mod tests {
     fn the_final_pop_of_a_function_without_cfi() {
         assert_eq!(epilogue_pop(0xbd10), Prologue { depth: 8, lr: Some(-4), saved: vec![(4, -8)] });
         assert_eq!(epilogue_pop(0xbd00), Prologue { depth: 4, lr: Some(-4), saved: vec![] });
+    }
+
+    #[test]
+    fn lr_after_reset_ends_the_walk() {
+        // LR is 0xFFFFFFFF out of reset: not an exception return, and the end of the stack
+        let s = unwind(&UnwindTable::default(), &Fake::default(), &regs(0x1000_0028, 0x2004_2000, 0xFFFF_FFFF));
+        assert_eq!(s.frames, vec![0x1000_0028]);
+        assert!(!s.truncated, "{s:?}");
     }
 
     #[test]

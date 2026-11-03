@@ -31,6 +31,7 @@ pub mod demangle;
 pub mod ethernet;
 pub mod fault;
 pub mod gdb;
+pub mod jsonlog;
 pub mod mock_bridge;
 pub mod profile;
 pub mod pty;
