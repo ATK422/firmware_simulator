@@ -65,6 +65,15 @@ pub struct Session {
     /// When this is set, [`Session::run_until`] returns [`StopReason::Requested`] at the next slice boundary (the
     /// command line's [`crate::signal::STOP`], set by SIGINT or SIGTERM).
     pub stop_flag: Option<&'static std::sync::atomic::AtomicBool>,
+    /// Whether [`Session::run_until`] (and [`Session::run_machine_through_lockups`]) return
+    /// [`StopReason::Lockup`] as soon as a core locks up (the default, for tests), or keep the board running as
+    /// the chip does, until the watchdog resets it, and return it only when nothing on the chip can
+    /// ([`Machine::lockup_is_final`]).
+    pub stop_on_lockup: bool,
+    /// Lockups the board went through without stopping (`stop_on_lockup` off).
+    pub lockups: u64,
+    /// The current lockup was returned as final (it is returned once; running on, the board stays locked up).
+    final_lockup_reported: bool,
 }
 
 /// Callback for complete lines of text: `(virtual time, line)`.
@@ -112,6 +121,9 @@ impl Session {
             pacing: Pacing::default(),
             profiler: None,
             stop_flag: None,
+            stop_on_lockup: true,
+            lockups: 0,
+            final_lockup_reported: false,
         }
     }
 
@@ -163,6 +175,9 @@ impl Session {
             pacing: Pacing::default(),
             profiler: None,
             stop_flag: None,
+            stop_on_lockup: self.stop_on_lockup,
+            lockups: self.lockups,
+            final_lockup_reported: self.final_lockup_reported,
         }
     }
 
@@ -351,7 +366,7 @@ impl Session {
                 return StopReason::Requested;
             }
             let target = (self.machine.now + self.slice).min(end);
-            let reason = self.run_machine(target);
+            let reason = self.run_machine_through_lockups(target);
             self.step_can();
             self.poll_rtt();
             if let Some(u) = &mut self.usbip {
@@ -373,6 +388,53 @@ impl Session {
         match &mut self.profiler {
             None => self.machine.run_until(end),
             Some(p) => p.run_until(&mut self.machine, end),
+        }
+    }
+
+    /// [`Session::run_machine`], going on past a lockup unless [`Session::stop_on_lockup`] is set: the locked-up
+    /// core stays stopped, the other core and the peripherals (the watchdog among them) go on, as on the chip.
+    /// Returns [`StopReason::Lockup`] once when the lockup is final ([`Machine::lockup_is_final`]: nothing on the
+    /// chip can end it), which is checked at the lockup and at `end`; called again, it runs on with the core locked
+    /// up (until something outside, a power cycle, restarts the chip).
+    pub fn run_machine_through_lockups(&mut self, end: Time) -> StopReason {
+        loop {
+            let reason = self.run_machine(end);
+            if self.stop_on_lockup {
+                return reason;
+            }
+            match reason {
+                StopReason::Lockup { core, pc } => {
+                    self.lockups += 1;
+                    self.final_lockup_reported = self.machine.lockup_is_final();
+                    if self.final_lockup_reported {
+                        return reason;
+                    }
+                    let wd = match self.machine.sys.watchdog.timeout_due(self.machine.now) {
+                        Some(t) => format!(" until the watchdog resets the chip at {t}"),
+                        None => String::new(),
+                    };
+                    log::warn!(
+                        "[{}] core{core} locked up at {pc:#010x}: it stays stopped{wd}; the rest of the chip runs on",
+                        self.machine.now
+                    );
+                }
+                StopReason::TimeLimit => {
+                    // The chip may have run out of ways to end a lockup since (the watchdog stopped, the other
+                    // core went to sleep in the bootrom)
+                    let locked = (0..2).find(|&c| self.machine.core_enabled[c] && self.machine.cores[c].is_locked_up());
+                    match locked {
+                        None => self.final_lockup_reported = false,
+                        Some(c) if !self.final_lockup_reported && self.machine.lockup_is_final() => {
+                            self.final_lockup_reported = true;
+                            let pc = sim_core::cpu::Cpu::pc(&self.machine.cores[c]);
+                            return StopReason::Lockup { core: c as u8, pc };
+                        }
+                        Some(_) => {}
+                    }
+                    return reason;
+                }
+                other => return other,
+            }
         }
     }
 

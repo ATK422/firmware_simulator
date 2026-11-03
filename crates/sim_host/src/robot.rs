@@ -192,7 +192,7 @@ impl Robot {
                 if !power_on_by(b, &mut self.power_on[i], t) {
                     continue;
                 }
-                match b.run_machine(t) {
+                match b.run_machine_through_lockups(t) {
                     StopReason::TimeLimit => {}
                     other => return Some((i, other)),
                 }

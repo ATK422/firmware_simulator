@@ -3,7 +3,7 @@
 //! cycle keeps neither. VREG_AND_CHIP_RESET.CHIP_RESET says which chip-level reset happened last. The flash keeps
 //! its contents through all of them, and across processes through a flash file.
 
-use rp2040::{Machine, MachineConfig};
+use rp2040::{Machine, MachineConfig, StopReason};
 use sim_core::bus::Size;
 use sim_core::cpu::Cpu;
 use sim_core::image::Image;
@@ -163,4 +163,63 @@ fn snapshot_restores_the_boot_settings() {
     assert!(rom.boots_from_rom());
     rom.power_cycle();
     assert!(rom.cores[0].pc() < 0x4000, "the power-on reset starts in the bootrom");
+}
+
+/// `test_programs/lockup.S` arms the watchdog on its first two boots and locks up (a fault in HardFault). The
+/// machine reports the lockup, and running on, the locked-up core stays stopped while the watchdog counts down and
+/// resets the chip, as on an RP2040; the third boot leaves the watchdog off, and that lockup is final.
+#[test]
+fn a_lockup_lasts_until_the_watchdog_resets_the_chip() {
+    let bytes = std::fs::read(concat!(env!("CARGO_MANIFEST_DIR"), "/../../test_programs/lockup.elf")).unwrap();
+    let mut m = Machine::new(MachineConfig::default());
+    m.load(&Image::parse(&bytes).unwrap()).unwrap();
+    m.direct_boot().unwrap();
+    let scratch0 = |m: &mut Machine| m.debug_read(0, 0x4005_800C, Size::Word).unwrap();
+    assert!(matches!(m.run_until(Time::from_ms(5)), StopReason::Lockup { core: 0, .. }));
+    assert!(m.cores[0].is_locked_up());
+    assert!(!m.lockup_is_final(), "the watchdog is counting down");
+    // Running on: core 0 executes nothing, the watchdog bites at 10 ms and the program boots again
+    assert!(matches!(m.run_until(Time::from_ms(5)), StopReason::TimeLimit), "nothing more to report until then");
+    assert!(matches!(m.run_until(Time::from_ms(15)), StopReason::Lockup { core: 0, .. }));
+    assert_eq!((m.resets, scratch0(&mut m)), (1, 2), "reset by the watchdog, second boot");
+    assert!(matches!(m.run_until(Time::from_ms(25)), StopReason::Lockup { core: 0, .. }));
+    assert_eq!((m.resets, scratch0(&mut m)), (2, 3));
+    // Third boot: no watchdog, and once core 1 is back asleep in the bootrom nothing can end the lockup
+    assert_eq!(m.run_until(Time::from_ms(40)), StopReason::TimeLimit);
+    assert_eq!(m.resets, 2);
+    assert!(m.lockup_is_final());
+}
+
+/// What the real bootrom makes of a flash that is still erasing when the chip boots (a watchdog reset in the middle
+/// of a long erase): the chip ignores boot2's reads, so the bootrom finds no valid boot2 and falls back to USB boot,
+/// and stays there after the erase ends.
+#[test]
+fn a_rom_boot_while_the_flash_is_erasing_falls_back_to_usb_boot() {
+    let bytes =
+        std::fs::read(concat!(env!("CARGO_MANIFEST_DIR"), "/../../test_programs/pico/flash_program.elf")).unwrap();
+    let mut m = Machine::new(MachineConfig { bootrom: Some(rp2040::BOOTROM_B1.to_vec()), ..Default::default() });
+    m.load(&Image::parse(&bytes).unwrap()).unwrap();
+    m.rom_boot().unwrap();
+    // Write enable, chip erase: busy for seconds
+    let mut data = std::mem::take(&mut m.sys.flash);
+    let chip = &mut m.sys.ssi.chip;
+    for cmd in [0x06u8, 0xC7] {
+        chip.select(true, Time::ZERO, &mut data);
+        chip.exchange(cmd, Time::ZERO, &data);
+        chip.select(false, Time::ZERO, &mut data);
+    }
+    m.sys.flash = data;
+    assert!(m.sys.ssi.chip.busy_until() > Time::from_secs(1));
+    let usb = |m: &mut Machine, off: u32| m.debug_read(0, 0x5011_0000 + off, Size::Word).unwrap();
+    let in_usb_boot = |m: &mut Machine| usb(m, 0x40) & 1 != 0 && usb(m, 0x4C) & (1 << 16) != 0;
+    let mut t = Time::ZERO;
+    while !in_usb_boot(&mut m) && t < Time::from_secs(10) {
+        t += Time::from_ms(10);
+        m.run_until(t);
+    }
+    // After about half a second of trying (0.49 s here), long before the erase ends
+    assert!(in_usb_boot(&mut m) && t < Time::from_secs(1), "USB controller on, pull-up enabled: BOOTSEL mode ({t})");
+    m.run_until(m.sys.ssi.chip.busy_until() + Time::from_ms(500));
+    assert!(in_usb_boot(&mut m) && m.cores[0].pc() < 0x4000, "still in the bootrom's USB boot");
+    assert!(m.sys.uart[0].output.is_empty(), "the program never ran");
 }

@@ -166,6 +166,10 @@ struct RobotArgs {
     /// How to log the boards' accesses to registers the emulator does not model.
     #[arg(long, value_enum, default_value = "summary")]
     unmodelled: UnmodelledLog,
+    /// Stop the run when a core of any board locks up, instead of keeping the board running (as the chip does)
+    /// until its watchdog resets it.
+    #[arg(long)]
+    stop_on_lockup: bool,
 }
 
 fn parse_board_udp(s: &str) -> Result<(String, String, String), String> {
@@ -216,6 +220,7 @@ fn robot(args: RobotArgs) -> Result<()> {
     for (i, s) in r.boards.iter_mut().enumerate() {
         let name = r.names[i].clone();
         s.machine.sys.unmodelled.log_mode = args.unmodelled.mode();
+        s.stop_on_lockup = args.stop_on_lockup;
         s.keep_logs = false;
         let n = name.clone();
         s.on_log = Some(Box::new(move |t, line| println!("[{t}] {n}: {line}")));
@@ -284,6 +289,13 @@ fn robot(args: RobotArgs) -> Result<()> {
         faults.push((t, i, fault));
     }
     faults.sort_by_key(|f| f.0);
+    // When each board's last fault that restarts the chip is due: a lockup no watchdog will end lasts until then
+    let mut restart_by = vec![None; r.boards.len()];
+    for (t, i, f) in &faults {
+        if restarts_the_chip(f) {
+            restart_by[*i] = Some(*t);
+        }
+    }
     for (bus, iface) in &args.cans {
         let sock = sim_host::socketcan::SocketCan::open(iface).with_context(|| format!("opening {iface}"))?;
         r.bus(bus).with_context(|| format!("no bus {bus:?}"))?.endpoints.push(Box::new(sock));
@@ -440,6 +452,14 @@ fn robot(args: RobotArgs) -> Result<()> {
                 d.service_robot(&mut r, &bridges);
             }
         }
+        if let Some((i, StopReason::Lockup { .. })) = stopped
+            && !args.stop_on_lockup
+            && restart_by[i].is_some_and(|t| t >= r.now)
+        {
+            // The board stays locked up until a scheduled fault restarts it; the others go on
+            log::warn!("[{}] {} stays locked up until a fault restarts it", r.now, r.names[i]);
+            continue;
+        }
         if let Some(s) = stopped {
             break Some(s);
         }
@@ -483,6 +503,11 @@ fn robot(args: RobotArgs) -> Result<()> {
     }
     if let (Some(l), Some(path)) = (&json_log, &args.log_json) {
         l.finish(r.now, &why).with_context(|| format!("writing {}", path.display()))?;
+    }
+    for (s, name) in r.boards.iter().zip(&r.names) {
+        if s.lockups > 0 {
+            eprintln!("{name}: {}", lockup_note(s));
+        }
     }
     if args.unmodelled != UnmodelledLog::Off {
         for (s, name) in r.boards.iter().zip(&r.names) {
@@ -670,6 +695,10 @@ struct RunArgs {
     /// Stop on BKPT instructions instead of escalating them to HardFault.
     #[arg(long)]
     stop_on_bkpt: bool,
+    /// Stop the run when a core locks up, instead of keeping the board running (as the chip does) until the
+    /// watchdog resets it.
+    #[arg(long)]
+    stop_on_lockup: bool,
     /// Where UART0 goes.
     #[arg(long, value_enum, default_value = "stdout")]
     uart0: UartSink,
@@ -994,6 +1023,7 @@ fn run(args: RunArgs) -> Result<()> {
         bail!("--can and --mock-bridge need a --board with a CAN bus (or Ethernet), --udp one with Ethernet");
     }
     session.realtime = args.realtime;
+    session.stop_on_lockup = args.stop_on_lockup;
     let can_host = host_tools::attach_run(&args.can_host, &mut session)?;
 
     let wall = std::time::Instant::now();
@@ -1071,6 +1101,8 @@ fn run(args: RunArgs) -> Result<()> {
     };
     let mut faults = args.faults.clone();
     faults.sort_by_key(|f| f.0);
+    // A lockup no watchdog will end lasts until the last fault that restarts the chip, if there is one
+    let restart_by = faults.iter().filter(|f| restarts_the_chip(&f.1)).map(|f| f.0).max();
     let mut faults = faults.into_iter().peekable();
     let mut pending: Option<(Time, sim_host::fault::Fault)> = None;
     // From here on SIGINT and SIGTERM end the run cleanly, at the next slice boundary
@@ -1089,6 +1121,13 @@ fn run(args: RunArgs) -> Result<()> {
                 std::thread::sleep(std::time::Duration::from_millis(20));
                 d.service_session(&mut session);
             }
+        }
+        if matches!(reason, StopReason::Lockup { .. })
+            && !args.stop_on_lockup
+            && restart_by.is_some_and(|t| t >= session.machine.now)
+        {
+            log::warn!("[{}] the board stays locked up until a fault restarts it", session.machine.now);
+            continue;
         }
         if !matches!(reason, StopReason::TimeLimit) {
             break reason;
@@ -1144,6 +1183,7 @@ fn run(args: RunArgs) -> Result<()> {
             None => eprintln!("no SSD1306 on this board"),
         }
     }
+    let lockups = (session.lockups > 0).then(|| lockup_note(&session));
     let machine = &mut session.machine;
     let where_ = |pc: u32| match machine.symbolize(pc) {
         Some(s) => {
@@ -1162,7 +1202,11 @@ fn run(args: RunArgs) -> Result<()> {
         StopReason::BkptInstruction { core, pc, imm } => {
             eprintln!("core{core} BKPT {imm:#x} at {}", where_(pc))
         }
-        StopReason::Lockup { core, pc } => eprintln!("core{core} locked up at {}", where_(pc)),
+        StopReason::Lockup { core, pc } if args.stop_on_lockup => eprintln!("core{core} locked up at {}", where_(pc)),
+        StopReason::Lockup { core, pc } => eprintln!(
+            "core{core} locked up at {} with nothing to reset the chip (the watchdog is not running); stopping",
+            where_(pc)
+        ),
         StopReason::Deadlock => eprintln!("deadlock: every core sleeps and nothing is scheduled"),
         StopReason::Requested => {}
     }
@@ -1173,6 +1217,9 @@ fn run(args: RunArgs) -> Result<()> {
         where_(machine.cores[0].pc()),
         elapsed
     );
+    if let Some(note) = &lockups {
+        eprintln!("{note}");
+    }
     if machine.core_enabled[1] {
         eprintln!(
             "core1 {} cycles, pc {}, {:?}",
@@ -1200,6 +1247,24 @@ fn run(args: RunArgs) -> Result<()> {
         bail!("core locked up");
     }
     Ok(())
+}
+
+/// Whether a fault restarts the chip (and so ends a lockup).
+fn restarts_the_chip(f: &sim_host::fault::Fault) -> bool {
+    use sim_host::fault::Fault;
+    matches!(f, Fault::Brownout { .. } | Fault::WatchdogTimeout)
+}
+
+/// How many times a board that kept running through lockups locked up, how often the chip was reset, and
+/// whether a core is locked up now.
+fn lockup_note(s: &Session) -> String {
+    let m = &s.machine;
+    let now: Vec<String> = (0..2)
+        .filter(|&c| m.core_enabled[c] && m.cores[c].is_locked_up())
+        .map(|c| format!("core{c} is locked up now"))
+        .collect();
+    let now = if now.is_empty() { String::new() } else { format!("; {}", now.join(", ")) };
+    format!("{} lockup(s), {} chip reset(s){now}", s.lockups, m.resets)
 }
 
 /// Virtual time run between dashboard updates.

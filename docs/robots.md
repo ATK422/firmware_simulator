@@ -111,7 +111,9 @@ as `[t] NAME uart0: ...`); the run ends with the stop time, the wall time and ea
 | `--log-json FILE` | | Every log line, UART line, CAN frame and fault as JSON lines |
 | `--unmodelled MODE` | `summary` | Registers the emulator does not model, as for `run` ([running.md](running.md#traces)): one note, then a line per board at the end listing them; `first`, `every` or `off` |
 
-It exits with an error if a board stops (a lockup, say) before `--time`. Ctrl-C or SIGTERM ends the run cleanly
+A board whose core locks up runs on until its watchdog resets it, as on the chip (`--stop-on-lockup` stops the
+robot at the first lockup instead; [faults.md](faults.md#what-the-models-do)). It exits with an error if a board
+stops before `--time` (a lockup nothing can end, say). Ctrl-C or SIGTERM ends the run cleanly
 at the next slice boundary, as for `run` ([running.md](running.md#exit-status)): logs, waveform, profiles, candump
 log and vehicle CSV are written, and the stop line says `(Interrupted)`.
 

@@ -275,7 +275,7 @@ impl Shared<'_> {
             let mut board = lock(board);
             let start = Instant::now();
             // A panic goes on on the calling thread, once every thread is done with the slice
-            match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| board.run_machine(until))) {
+            match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| board.run_machine_through_lockups(until))) {
                 Ok(StopReason::TimeLimit) => {}
                 Ok(other) => lock(&self.stops).push((i, other)),
                 Err(panic) => {

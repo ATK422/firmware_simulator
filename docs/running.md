@@ -100,6 +100,7 @@ differ by roughly the boot time.
 | `--unmodelled MODE` | `summary` | Logging of registers the emulator does not model: `summary` (one note at the first access, the table at the end), `first` (a warning at the first access to each, and the table), `every` (a warning at every access) or `off` (nothing) |
 | `--quantum N` | 16 | Instructions a core runs before the other gets a turn (1 for lockstep debugging) |
 | `--stop-on-bkpt` | off | A `BKPT` stops the run instead of escalating to HardFault |
+| `--stop-on-lockup` | off | A lockup stops the run, instead of the board running on (locked up) until the watchdog resets it ([faults.md](faults.md#what-the-models-do)) |
 | `--gdb ADDR` | | Waits for GDB on this address before running ([below](#debugging-with-gdb)) |
 
 `firmware_simulator run --help` has the same list.
@@ -318,8 +319,10 @@ Puddles in its simulated vehicle is `robots/puddles.toml` ([robots.md](robots.md
 ## Exit status
 
 `run` exits with 0 when it reached `--time` (or stopped at a breakpoint, a `BKPT` with `--stop-on-bkpt`, or a
-deadlock: every core asleep with nothing scheduled, reported on stderr), and with an error when a core locked up,
-an option does not fit the board (`--input` of an input the board does not have, `--mock-bridge` without a bus) or a
+deadlock: every core asleep with nothing scheduled, reported on stderr), also when a core locked up on the way and
+the watchdog reset the chip (the end says how often: `2 lockup(s), 1 chip reset(s)`); with an error when a core
+locked up and nothing can end it (the watchdog not running; any lockup with `--stop-on-lockup`,
+[faults.md](faults.md#what-the-models-do)), when an option does not fit the board (`--input` of an input the board does not have, `--mock-bridge` without a bus) or a
 fault could not be applied.
 
 SIGINT (Ctrl-C) or SIGTERM (`kill`, `timeout`) ends a `run` or `robot` cleanly: the emulator stops at the next
