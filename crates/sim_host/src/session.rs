@@ -83,6 +83,31 @@ impl Session {
         }
     }
 
+    /// A copy of the session that runs on independently: the machine (see [`Machine::fork`]), the RTT position,
+    /// the logs and UART text so far, and the CAN bus. Hooks, host endpoints and ptys are not copied.
+    pub fn snapshot(&self) -> Session {
+        Session {
+            machine: self.machine.fork(),
+            rtt: self.rtt.clone(),
+            defmt: self.defmt.as_ref().map(DefmtDecoder::fresh),
+            logs: self.logs.clone(),
+            rtt_text: self.rtt_text.clone(),
+            on_log: None,
+            slice: self.slice,
+            keep_logs: self.keep_logs,
+            uart_text: self.uart_text.clone(),
+            on_uart_line: None,
+            uart_line: self.uart_line.clone(),
+            uart_pty: [None, None],
+            can_bus: self.can_bus.clone(),
+            can_endpoints: Vec::new(),
+            on_can: None,
+            realtime: self.realtime,
+            pacing: None,
+            behind_warned: std::time::Instant::now(),
+        }
+    }
+
     pub fn has_defmt(&self) -> bool {
         self.defmt.is_some()
     }

@@ -2,6 +2,7 @@
 //!
 //! Bridges see the target through [`TargetMemory`] (debug-probe style memory access) so they work with any machine.
 
+pub mod acoustic;
 pub mod board;
 pub mod defmt;
 pub mod gdb;

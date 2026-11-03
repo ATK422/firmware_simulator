@@ -164,7 +164,7 @@ impl Machine {
     pub fn set_trace(&mut self, trace: Box<dyn TraceSink>) {
         self.trace_instructions = trace.wants(Category::Instruction);
         // Tracing GPIO makes every PWM edge visible
-        self.sys.pwm.observed = if trace.wants(Category::Gpio) { 0xFF } else { 0 };
+        self.sys.pwm.observed = if trace.wants(Category::Gpio) { 0xFF } else { self.sys.pwm_device_slices };
         let exceptions = trace.wants(Category::Exception);
         for c in &mut self.cores {
             c.log_exceptions = exceptions;
@@ -363,6 +363,17 @@ impl Machine {
     /// data and its non-volatile status bits; attached devices stay attached.
     pub fn power_cycle(&mut self) {
         self.chip_reset(crate::periph::sysctl::ChipResetCause::PowerOn);
+    }
+
+    /// Powers the chip on at virtual time `t` instead of 0 (boards in one robot that are switched on at different
+    /// moments): time jumps to `t` and the chip goes through a power-on reset there. Call before the first run.
+    pub fn power_on_at(&mut self, t: Time) {
+        self.now = t;
+        for c in 0..2 {
+            self.clocks[c] = CycleClock::new(t);
+        }
+        self.chip_reset(crate::periph::sysctl::ChipResetCause::PowerOn);
+        self.resets = 0;
     }
 
     /// Pulls the RUN pin low and releases it: a chip reset like power-on, except that SRAM keeps its contents.
@@ -730,6 +741,35 @@ impl Machine {
         }
         self.skip_breakpoint[core] = false;
         outcome
+    }
+
+    /// A complete copy of the machine that runs on independently: cores, peripherals, memories, attached devices
+    /// (each device's own `clone_box`), breakpoints and boot settings. The copy has no trace sink.
+    pub fn fork(&self) -> Machine {
+        Machine {
+            cores: self.cores.clone(),
+            clocks: self.clocks,
+            core_enabled: self.core_enabled,
+            sys: self.sys.clone(),
+            trace: Box::new(NullSink),
+            now: self.now,
+            quantum: self.quantum,
+            clk_sys: self.clk_sys,
+            image: self.image.clone(),
+            breakpoints: self.breakpoints.clone(),
+            bkpt_policy: self.bkpt_policy,
+            stop_requested: false,
+            last_ran: self.last_ran,
+            boot_vtor: self.boot_vtor,
+            rom_boot: self.rom_boot,
+            resets: self.resets,
+            hle: self.hle.clone(),
+            hle_enabled: self.hle_enabled,
+            usb_boot_requested: self.usb_boot_requested,
+            external_fired: self.external_fired.clone(),
+            skip_breakpoint: self.skip_breakpoint,
+            trace_instructions: false,
+        }
     }
 
     /// Takes a snapshot of the machine's state.

@@ -108,6 +108,10 @@ pub trait AnalogSource: Send {
     /// Voltage at time `t`. `pins` holds the SoC's resolved GPIO levels (for analog muxes selected by GPIOs).
     fn voltage(&mut self, t: Time, pins: u32) -> f64;
     fn clone_box(&self) -> Box<dyn AnalogSource>;
+    /// For finding a source of a particular type again (e.g. to re-link a snapshot's copy).
+    fn as_any_mut(&mut self) -> Option<&mut dyn std::any::Any> {
+        None
+    }
 }
 
 crate::clone_box!(AnalogSource);

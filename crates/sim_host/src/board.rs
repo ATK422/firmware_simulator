@@ -117,8 +117,8 @@ pub struct TransducerEntry {
     #[serde(flatten)]
     pub transducer: sim_acoustics::transducer::Transducer,
     pub receive: Option<ReceiveEntry>,
-    /// Projector drive (used from M7): the output pin and the driver's supply.
-    pub drive: Option<toml::Value>,
+    /// Projector drive: the output pin and the driver's supply.
+    pub drive: Option<sim_acoustics::medium::DriveSpec>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -414,6 +414,35 @@ impl Board {
         }
         let h = sim_acoustics::Hydrophone::new(env, position, t.transducer.clone(), rx.chain.clone());
         m.sys.attach_analog(rx.adc, Box::new(h));
+        Ok(())
+    }
+
+    /// Puts the board as board `owner` in a medium shared with other boards, moving along `trajectory`: its
+    /// projector (if the transducer has a `drive`) radiates what its drive pin outputs, and its hydrophone (if it has
+    /// a `receive` chain) hears the environment and the other boards' projectors.
+    pub fn place_in_medium(
+        &self,
+        m: &mut Machine,
+        medium: &sim_acoustics::medium::SharedMedium,
+        owner: usize,
+        trajectory: sim_acoustics::medium::Trajectory,
+    ) -> Result<(), String> {
+        let t = self.transducer.as_ref().ok_or_else(|| format!("{} has no [transducer]", self.name))?;
+        let env = medium.lock().unwrap().env.clone();
+        let start = trajectory.at(0.0);
+        if !env.boundaries.contains(start) {
+            return Err(format!("{:?} is outside the water", start));
+        }
+        if let Some(rx) = &t.receive {
+            let h = sim_acoustics::Hydrophone::new(env, start, t.transducer.clone(), rx.chain.clone())
+                .in_medium(medium.clone(), owner)
+                .moving(trajectory.clone());
+            m.sys.attach_analog(rx.adc, Box::new(h));
+        }
+        if let Some(drive) = &t.drive {
+            let id = medium.lock().unwrap().add_projector(owner, &self.name, t.transducer.clone(), trajectory, drive);
+            m.sys.attach_pin_device(Box::new(crate::acoustic::ProjectorPin::new(medium.clone(), id, drive.pin)));
+        }
         Ok(())
     }
 
