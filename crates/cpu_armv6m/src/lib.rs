@@ -112,6 +112,8 @@ pub struct CortexM0Plus {
     pub(crate) sleep: Option<Sleep>,
     pub(crate) event_reg: bool,
     pub(crate) cycles: u64,
+    /// Instructions executed since reset (for benchmarks).
+    pub(crate) instructions: u64,
     pub(crate) lockup: bool,
     /// Set when the last instruction was `SEV`; the machine forwards the event to the other cores.
     pub(crate) sev_out: bool,
@@ -154,6 +156,7 @@ impl CortexM0Plus {
             sleep: None,
             event_reg: false,
             cycles: 0,
+            instructions: 0,
             lockup: false,
             sev_out: false,
             cpuid: 0x410C_C601,
@@ -243,6 +246,11 @@ impl CortexM0Plus {
         if before != self.using_psp() {
             std::mem::swap(&mut self.r[13], &mut self.other_sp);
         }
+    }
+
+    /// Instructions executed since reset (exception entries not counted).
+    pub fn instructions(&self) -> u64 {
+        self.instructions
     }
 
     pub fn is_locked_up(&self) -> bool {
@@ -587,6 +595,7 @@ impl CortexM0Plus {
             Ok(cycles) => {
                 let cycles = cycles + bus.take_stall_cycles();
                 self.cycles += cycles as u64;
+                self.instructions += 1;
                 self.tick(cycles);
                 StepOutcome::Ran(cycles)
             }
