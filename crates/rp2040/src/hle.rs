@@ -1,14 +1,21 @@
-//! High-level emulation of the bootrom's flash functions (PLAN.md M2).
+//! High-level emulation of the bootrom's flash functions (PLAN.md M2), with `--hle-flash`.
 //!
-//! The ROM's flash routines drive the SSI and the QSPI flash chip, which are only modelled from M6 on. Until then
-//! their entry points, found through the ROM function table exactly as firmware finds them, are trapped: when a
-//! core is about to execute one, the operation is carried out directly on the flash array and the core returns to
-//! its caller. Erase and program take the time a W25Q16JV typically needs, charged to the calling core, so
-//! firmware that paces its flash work against the watchdog sees realistic timing.
+//! The ROM's flash routines drive the SSI and the QSPI flash chip, and run for real against their models by
+//! default. With HLE their entry points, found through the ROM function table exactly as firmware finds them, are
+//! trapped instead: when a core is about to execute one, the operation is carried out directly on the flash array
+//! and the core returns to its caller. Erase and program take the time a W25Q16JV typically needs, charged to the
+//! calling core, so firmware that paces its flash work against the watchdog sees realistic timing.
+//!
+//! Firmware goes on to talk to the chip itself after these calls (pico-sdk's `flash_do_cmd`, used for the unique
+//! ID, sends its own commands; boot2 re-enables XIP), so each trap leaves the SSI, the QSPI pins and the chip as
+//! the real function does ([`leave_as_rom`]); `tests/hle.rs` in `sim_host` compares the two function by function.
 
 use std::collections::BTreeMap;
 
 use sim_core::time::Time;
+
+use crate::periph::ssi::CsOverride;
+use crate::system::System;
 
 use crate::memmap::ROM_SIZE;
 
@@ -34,6 +41,37 @@ impl RomFn {
         (RomFn::FlashEnterCmdXip, *b"CX"),
         (RomFn::ResetToUsbBoot, *b"UB"),
     ];
+}
+
+/// Leaves the SSI, IO_QSPI and the chip the way the real ROM function `f` does (as measured against the B1 ROM
+/// running on the models):
+///
+/// * `connect_internal_flash` resets IO_QSPI and hands the pins to the XIP block (the chip select released), and
+///   leaves the SSI alone.
+/// * `flash_exit_xip` puts the SSI in 8-bit standard SPI command mode and the chip out of continuous read.
+/// * `flash_range_erase` and `flash_range_program` leave that mode, with the chip select forced high: memory
+///   mapped flash does not work again until the cache is flushed and XIP set up.
+/// * `flash_flush_cache` releases the forced chip select (pico-sdk's `flash_do_cmd` relies on that before it
+///   calls boot2).
+/// * `flash_enter_cmd_xip` sets up XIP through serial 03h reads; it leaves the chip select alone.
+pub fn leave_as_rom(sys: &mut System, f: RomFn, now: Time) {
+    match f {
+        RomFn::ConnectInternalFlash => sys.io_qspi.connect_internal_flash(),
+        RomFn::FlashExitXip => {
+            sys.ssi.enter_command_mode(now, &mut sys.flash);
+            sys.io_qspi.set_cs_override(CsOverride::Normal);
+        }
+        RomFn::FlashRangeErase | RomFn::FlashRangeProgram => {
+            sys.ssi.enter_command_mode(now, &mut sys.flash);
+            sys.io_qspi.set_cs_override(CsOverride::High);
+        }
+        RomFn::FlashFlushCache => sys.io_qspi.set_cs_override(CsOverride::Normal),
+        RomFn::FlashEnterCmdXip => sys.ssi.enter_cmd_xip(now, &mut sys.flash),
+        RomFn::ResetToUsbBoot => return,
+    }
+    let o = sys.io_qspi.cs_override();
+    sys.ssi.set_cs_override(o, now, &mut sys.flash);
+    sys.refresh_xip();
 }
 
 /// Typical W25Q16JV timings (datasheet 9.6): sector erase 45 ms, 64 KiB block erase 150 ms, page program 0.4 ms.

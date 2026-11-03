@@ -22,6 +22,6 @@ embassy_blinky.elf: embassy_blinky/src/main.rs embassy_blinky/Cargo.toml
 pico:
 	cmake -G Ninja -S pico -B ../build/pico
 	ninja -C ../build/pico
-	for p in hello_uart hello_multicore flash_program; do arm-none-eabi-strip --strip-debug -o pico/$$p.elf ../build/pico/$$p.elf; done
+	for p in hello_uart hello_multicore flash_program unique_id; do arm-none-eabi-strip --strip-debug -o pico/$$p.elf ../build/pico/$$p.elf; done
 
 .PHONY: all clean pico

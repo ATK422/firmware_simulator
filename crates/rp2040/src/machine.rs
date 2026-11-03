@@ -438,14 +438,12 @@ impl Machine {
                 self.request_stop();
                 Time::from_us(1)
             }
-            RomFn::ConnectInternalFlash | RomFn::FlashExitXip => {
-                // Leave the SSI as the ROM does, so firmware can send its own commands (pico-sdk's flash_do_cmd)
-                self.sys.ssi.enter_command_mode();
-                self.sys.refresh_xip();
+            RomFn::ConnectInternalFlash | RomFn::FlashExitXip | RomFn::FlashFlushCache | RomFn::FlashEnterCmdXip => {
                 Time::from_us(2)
             }
-            RomFn::FlashFlushCache | RomFn::FlashEnterCmdXip => Time::from_us(2),
         };
+        // The SSI, pins and chip as the real function leaves them, for firmware that goes on to use them
+        hle::leave_as_rom(&mut self.sys, f, now);
         self.cores[c].set_pc(lr & !1);
         let cycles = self.clk_sys.cycles_in(duration);
         self.cores[c].advance_idle(cycles);
