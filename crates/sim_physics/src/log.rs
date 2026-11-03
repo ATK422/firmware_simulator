@@ -27,7 +27,8 @@ pub struct StateLog {
     pub interval_s: f64,
     pub rows: Vec<Row>,
     pub thruster_names: Vec<String>,
-    next: f64,
+    /// Samples taken so far: the next is due at `samples * interval_s` (counted, not summed, so it does not drift).
+    samples: u64,
 }
 
 impl StateLog {
@@ -36,17 +37,17 @@ impl StateLog {
             interval_s,
             rows: Vec::new(),
             thruster_names: vehicle.thrusters.iter().map(|t| t.name.clone()).collect(),
-            next: 0.0,
+            samples: 0,
         }
     }
 
     /// Takes a sample if one is due.
     pub fn record(&mut self, v: &Vehicle) {
         // Half a step of slack: a sample due at a step's time is taken at that step despite rounding
-        if v.time + v.dt / 2.0 < self.next {
+        if v.time + v.dt / 2.0 < self.samples as f64 * self.interval_s {
             return;
         }
-        self.next += self.interval_s;
+        self.samples += 1;
         let s = &v.state;
         self.rows.push(Row {
             time_s: v.time,
