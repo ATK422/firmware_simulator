@@ -23,7 +23,7 @@ use crate::hle::{self, RomFn};
 use crate::memmap::*;
 use crate::periph::sysctl::psm;
 use crate::periph::timer::WatchdogReset;
-use crate::system::{BatchBus, CoreBus, Event, ResetRequest, System};
+use crate::system::{BatchBus, CoreBus, Event, Quiet, ResetRequest, System};
 
 /// Time from releasing core 1's PSM force-off until it executes its first instruction (a few `clk_ref` cycles of
 /// PSM sequencing). Firmware relies on this: the bootrom's core 1 handshake starts with an unconditional FIFO read
@@ -117,6 +117,12 @@ pub struct Machine {
     /// needed from `clock` to reach `limit` (saves recomputing it, a division, when the next quantum is the same
     /// core's with the same limit).
     budget_carry: Option<(usize, Time, CycleClock, ClockPeriod, u64)>,
+    /// The core whose last quantum was quiet (see [`Machine::skip_spin`]): its next one is checked for a loop.
+    spin_watch: Option<usize>,
+    /// Busy-wait skipping (on by default; off to check that it changes nothing).
+    pub skip_spins: bool,
+    /// Instructions skipped that way (counted in the cores' instruction counts too).
+    pub spin_skipped: u64,
 }
 
 /// A snapshot of a machine: everything except the trace sink.
@@ -164,6 +170,9 @@ impl Machine {
             trace_instructions: false,
             systick_ref: [None; 2],
             budget_carry: None,
+            spin_watch: None,
+            skip_spins: true,
+            spin_skipped: 0,
         };
         m.clk_sys = m.sys.clk_sys;
         m.sys.clk_sys_changed = false;
@@ -672,7 +681,15 @@ impl Machine {
     ///
     /// `budget` carries the cycles left until `limit` between batches of one quantum: it is used if set, and set
     /// again afterwards unless something other than the batch's own cycles may have moved the core's clock.
-    fn run_batch(&mut self, c: usize, max_steps: u32, limit: Time, budget: &mut Option<u64>) -> cpu_armv6m::Batch {
+    ///
+    /// Also returns whether the batch was quiet (see [`BatchBus::quiet`]) and needed no handling afterwards.
+    fn run_batch(
+        &mut self,
+        c: usize,
+        max_steps: u32,
+        limit: Time,
+        budget: &mut Option<u64>,
+    ) -> (cpu_armv6m::Batch, Option<Quiet>) {
         let cycles = match budget.take() {
             Some(b) => b,
             None => self.clocks[c].cycles_until(&self.clk_sys, limit),
@@ -688,6 +705,7 @@ impl Machine {
         let lines = self.cores[c].irq_lines();
         let mut bus = BatchBus::new(&mut self.sys, &mut *self.trace, c as u8, self.clocks[c], self.clk_sys, lines);
         let b = self.cores[c].run_batch(&mut bus, max_steps, run_cycles, trap_below);
+        let mut quiet = bus.quiet();
         if let Some(lines) = bus.take_lines() {
             for (core, l) in self.cores.iter_mut().zip(lines) {
                 core.set_irq_lines(l);
@@ -695,7 +713,7 @@ impl Machine {
         }
         if b.steps == 0 {
             *budget = Some(cycles);
-            return b;
+            return (b, None);
         }
         self.clocks[c].advance(&self.clk_sys, b.cycles);
         match b.stop {
@@ -711,6 +729,7 @@ impl Machine {
                 }
                 if self.cores[c].take_sev() {
                     self.cores[1 - c].signal_event();
+                    quiet = None;
                 }
                 if self.cores[c].take_reset_request() {
                     self.core_reset(c);
@@ -718,16 +737,66 @@ impl Machine {
                 }
                 if undisturbed {
                     *budget = Some(cycles.saturating_sub(b.cycles));
+                } else {
+                    quiet = None;
                 }
             }
             Some(StepOutcome::Breakpoint(_)) if self.bkpt_policy == BkptPolicy::HardFault => {
                 let now = self.clocks[c].now;
                 let mut bus = CoreBus { sys: &mut self.sys, trace: &mut *self.trace, core: c as u8, now };
                 self.cores[c].escalate_breakpoint(&mut bus);
+                quiet = None;
             }
-            Some(_) => {}
+            Some(_) => quiet = None,
         }
-        b
+        (b, quiet)
+    }
+
+    /// After a quantum in which core `c` ran `steps` instructions taking `cycles`, quietly (see
+    /// [`BatchBus::quiet`]), and came back to the state it started in: a busy-wait, polling the timer or nothing.
+    /// Every further quantum would do exactly the same while nothing else happens, so whole quanta are skipped:
+    /// as many as end before the next event, the end of the run and the next timer tick, while the other core
+    /// cannot run (asleep with nothing to wake it, or off) and neither core's SysTick counts. The quantum
+    /// boundaries in between would have changed nothing but the machine's time.
+    fn skip_spin(&mut self, c: usize, steps: u32, cycles: u64, quiet: Quiet, end: Time) {
+        let o = 1 - c;
+        let counts = |m: &Machine, k: usize| {
+            m.cores[k].systick.counts_core_clock()
+                || m.cores[k].systick.counts_reference_clock()
+                || m.systick_ref[k].is_some()
+        };
+        if cycles == 0 || counts(self, c) {
+            return;
+        }
+        let other_still = !self.core_enabled[o]
+            || self.cores[o].is_locked_up()
+            || (self.cores[o].is_sleeping() && !counts(self, o) && !self.cores[o].would_wake());
+        if !other_still {
+            return;
+        }
+        let clock = self.clocks[c];
+        let limit = self.sys.sched.next_time().min(end);
+        // Quantum j (from 1) ends `j * cycles` from now; it must end before the limit (else it would stop early)...
+        let mut room = clock.cycles_until(&self.clk_sys, limit).saturating_sub(1);
+        // ...and before the timer ticks on (its reads would then see another count)
+        if let Quiet::Timer(ticks) = quiet {
+            let tick = &self.sys.watchdog.tick;
+            if tick.ticks(clock.now) != ticks {
+                return;
+            }
+            let hold = tick.holds_until(ticks);
+            room = room.min(clock.cycles_until(&self.clk_sys, hold + Time(1)).saturating_sub(1));
+        }
+        let skip = room / cycles;
+        if skip == 0 {
+            return;
+        }
+        self.clocks[c].advance(&self.clk_sys, skip * cycles);
+        self.cores[c].account_skipped(skip * cycles, skip * steps as u64);
+        self.spin_skipped += skip * steps as u64;
+        // What the quantum boundaries would have left
+        self.now = self.now.max(self.clocks[c].now);
+        self.budget_carry = None;
     }
 
     fn trace_instruction(&mut self, c: usize, now: Time) {
@@ -829,9 +898,20 @@ impl Machine {
                 }
                 _ => None,
             };
+            // Busy-wait skipping: the core's state at the start of a quantum that follows a quiet one, and how
+            // quiet this quantum is (instructions, cycles)
+            let spin_start = (self.spin_watch == Some(c)).then(|| self.cores[c].spin_state());
+            let mut spin = Some((Quiet::Memory, 0u32, 0u64));
             while left > 0 {
                 if self.can_batch(c) {
-                    let b = self.run_batch(c, left, limit, &mut budget);
+                    let (b, quiet) = self.run_batch(c, left, limit, &mut budget);
+                    let merged = match (spin, quiet) {
+                        (Some((Quiet::Memory, _, _)), Some(q)) | (Some((q, _, _)), Some(Quiet::Memory)) => Some(q),
+                        (Some((Quiet::Timer(a), _, _)), Some(Quiet::Timer(t))) if a == t => Some(Quiet::Timer(a)),
+                        (Some(_), Some(_)) => Some(Quiet::Ticked),
+                        _ => None,
+                    };
+                    spin = merged.zip(spin).map(|(q, (_, n, cy))| (q, n + b.steps, cy + b.cycles));
                     if b.steps > 0 {
                         left -= b.steps;
                         match b.stop {
@@ -853,6 +933,7 @@ impl Machine {
                 }
                 left -= 1;
                 budget = None;
+                spin = None;
                 let pc = self.cores[c].pc();
                 if !self.breakpoints.is_empty() && self.breakpoints.contains(&pc) && !self.cores[c].is_sleeping() {
                     if self.skip_breakpoint[c] {
@@ -882,6 +963,19 @@ impl Machine {
             }
 
             self.budget_carry = budget.map(|b| (c, limit, self.clocks[c], self.clk_sys, b));
+            // A whole quantum that only read memory and the timer: watch the next one, and if this one came back
+            // to where it started, skip the ones that would repeat it
+            let spin = spin.filter(|&(_, n, _)| n == self.quantum);
+            self.spin_watch = spin.filter(|_| self.skip_spins).map(|_| c);
+            let closed = match (spin, spin_start) {
+                (Some(s @ (Quiet::Memory | Quiet::Timer(_), _, _)), Some(start))
+                    if start == self.cores[c].spin_state() =>
+                {
+                    Some(s)
+                }
+                _ => None,
+            };
+            let ran = c;
 
             // Fire events every running core has reached
             let mut horizon = Time::MAX;
@@ -897,6 +991,9 @@ impl Machine {
                 self.fire_events(horizon);
             } else {
                 self.now = self.now.max(horizon.min(next_event));
+                if let Some((quiet, steps, cycles)) = closed {
+                    self.skip_spin(ran, steps, cycles, quiet, end);
+                }
             }
         }
     }
@@ -948,6 +1045,9 @@ impl Machine {
             trace_instructions: false,
             systick_ref: self.systick_ref,
             budget_carry: None,
+            spin_watch: None,
+            skip_spins: self.skip_spins,
+            spin_skipped: self.spin_skipped,
         }
     }
 

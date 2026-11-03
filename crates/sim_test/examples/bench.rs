@@ -9,7 +9,8 @@
 //!
 //! For each case: the virtual time run, the best wall time over the repeats, virtual/wall (above 1 keeps up with
 //! `--realtime`), the CPU time of that run (less disturbed than the wall clock by a busy machine), instructions
-//! executed by both cores and the emulated MIPS. The fingerprint hashes what the run
+//! executed by both cores (and the share of them in busy-waits that were skipped rather than interpreted) and the
+//! emulated MIPS. The fingerprint hashes what the run
 //! produced (log lines and when they were read, every message the mock bridges received, UART and RTT text, final
 //! CPU registers, cycle counts and SRAM) so a change to the emulator can be checked to leave behaviour and timing
 //! exactly as they were: the fingerprints before and after must match. They are also checked to match between the
@@ -51,6 +52,8 @@ const CASES: &[Case] = &[
 
 struct Outcome {
     wall: Duration,
+    /// Of `instructions`, those not interpreted (busy-waits skipped).
+    skipped: u64,
     /// CPU time the process used (all threads), when the OS tells.
     cpu: Option<Duration>,
     instructions: u64,
@@ -77,6 +80,10 @@ fn hash_session(h: &mut Fnv, s: &Session) {
     m.sys.sram.hash(h);
 }
 
+fn skipped(s: &Session) -> u64 {
+    s.machine.spin_skipped
+}
+
 fn instructions(s: &Session) -> u64 {
     s.machine.cores.iter().map(|c| c.instructions()).sum()
 }
@@ -95,7 +102,13 @@ fn run(case: &Case, time: Time) -> Result<Outcome, String> {
                 t.hash(&mut h);
                 format!("{m:?}").hash(&mut h);
             }
-            Ok(Outcome { wall, cpu, instructions: instructions(&b.session), fingerprint: h.finish() })
+            Ok(Outcome {
+                wall,
+                skipped: skipped(&b.session),
+                cpu,
+                instructions: instructions(&b.session),
+                fingerprint: h.finish(),
+            })
         }
         Kind::Robot { file, bridges, threads } => {
             let mut r = RobotBench::load(file, bridges, |_| {})?;
@@ -113,7 +126,8 @@ fn run(case: &Case, time: Time) -> Result<Outcome, String> {
                 }
             }
             let instructions = r.robot.boards.iter().map(instructions).sum();
-            Ok(Outcome { wall, cpu, instructions, fingerprint: h.finish() })
+            let skipped = r.robot.boards.iter().map(skipped).sum();
+            Ok(Outcome { wall, skipped, cpu, instructions, fingerprint: h.finish() })
         }
     }
 }
@@ -159,8 +173,8 @@ fn main() {
         }
     }
     println!(
-        "{:<11} {:>8} {:>9} {:>9} {:>8} {:>14} {:>8}  fingerprint",
-        "case", "virtual", "wall", "virt/wall", "cpu", "instructions", "MIPS"
+        "{:<11} {:>8} {:>9} {:>9} {:>8} {:>14} {:>8} {:>8}  fingerprint",
+        "case", "virtual", "wall", "virt/wall", "cpu", "instructions", "skipped", "MIPS"
     );
     for case in CASES {
         if only.as_ref().is_some_and(|o| !o.iter().any(|n| n == case.name)) {
@@ -186,13 +200,14 @@ fn main() {
         let wall = b.wall.as_secs_f64();
         let cpu = b.cpu.map_or("-".to_string(), |c| format!("{:.2}s", c.as_secs_f64()));
         println!(
-            "{:<11} {:>8} {:>8.3}s {:>9.2} {:>8} {:>14} {:>8.1}  {:016x}",
+            "{:<11} {:>8} {:>8.3}s {:>9.2} {:>8} {:>14} {:>7.1}% {:>8.1}  {:016x}",
             case.name,
             time.to_string(),
             wall,
             time.as_secs_f64() / wall,
             cpu,
             b.instructions,
+            100.0 * b.skipped as f64 / b.instructions.max(1) as f64,
             b.instructions as f64 / wall / 1e6,
             b.fingerprint
         );

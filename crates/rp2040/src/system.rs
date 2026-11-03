@@ -1875,6 +1875,21 @@ pub struct BatchBus<'a> {
     lines: Option<[u32; 2]>,
     /// An access left `irq_dirty` set: recompute the lines after the instruction.
     check_irqs: bool,
+    /// What the batch did besides reading memory: see [`BatchBus::quiet`].
+    noisy: bool,
+    timer_ticks: Option<u64>,
+    ticked: bool,
+}
+
+/// What a batch touched, for busy-wait skipping (see `Machine::run_until`).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Quiet {
+    /// It read memory (SRAM, ROM, flash with XIP working) and nothing else.
+    Memory,
+    /// It also read the timer, and every read saw this tick count.
+    Timer(u64),
+    /// It also read the timer, which ticked in between: not a repeat, but the next batch may be.
+    Ticked,
 }
 
 impl<'a> BatchBus<'a> {
@@ -1904,6 +1919,20 @@ impl<'a> BatchBus<'a> {
             core_lines,
             lines: None,
             check_irqs: false,
+            noisy: false,
+            timer_ticks: None,
+            ticked: false,
+        }
+    }
+
+    /// Whether the batch only read memory (and the timer, always at the same tick count), writing nothing: then
+    /// running it again from the same core state does exactly the same, as long as the tick count holds.
+    pub fn quiet(&self) -> Option<Quiet> {
+        match (self.noisy, self.ticked, self.timer_ticks) {
+            (true, _, _) => None,
+            (false, true, _) => Some(Quiet::Ticked),
+            (false, false, None) => Some(Quiet::Memory),
+            (false, false, Some(t)) => Some(Quiet::Timer(t)),
         }
     }
 
@@ -1937,6 +1966,7 @@ impl<'a> BatchBus<'a> {
     #[cold]
     #[inline(never)]
     fn xip_check(&mut self, addr: u32) -> Result<(), BusFault> {
+        self.noisy = true;
         let now = self.now();
         self.sys.xip_check(now, addr)
     }
@@ -1947,13 +1977,21 @@ impl<'a> BatchBus<'a> {
     fn timer_read(&mut self, addr: u32, size: Size) -> Result<u32, BusFault> {
         let now = self.now();
         match self.sys.timer.read(&self.sys.watchdog.tick, now, addr & 0xFFC) {
-            Some(v) => Ok(mem::lane(v, addr, size)),
+            Some(v) => {
+                let ticks = self.sys.watchdog.tick.ticks(now);
+                if self.timer_ticks.is_some_and(|t| t != ticks) {
+                    self.ticked = true;
+                }
+                self.timer_ticks = Some(ticks);
+                Ok(mem::lane(v, addr, size))
+            }
             None => self.slow_read(addr, size),
         }
     }
 
     #[inline(never)]
     fn slow_read(&mut self, addr: u32, size: Size) -> Result<u32, BusFault> {
+        self.noisy = true;
         let now = self.now();
         let r = self.sys.read(self.trace, self.core, now, addr, size);
         self.after_access(now);
@@ -1962,6 +2000,7 @@ impl<'a> BatchBus<'a> {
 
     #[inline(never)]
     fn slow_write(&mut self, addr: u32, size: Size, value: u32) -> Result<(), BusFault> {
+        self.noisy = true;
         let now = self.now();
         let r = self.sys.write(self.trace, self.core, now, addr, size, value);
         self.after_access(now);
@@ -2022,6 +2061,7 @@ impl Bus for BatchBus<'_> {
     fn write(&mut self, addr: u32, size: Size, value: u32) -> Result<(), BusFault> {
         let sram = addr.wrapping_sub(SRAM_BASE) as usize;
         if sram < SRAM_SIZE {
+            self.noisy = true;
             mem::write(&mut self.sys.sram, sram, size, value);
             return Ok(());
         }

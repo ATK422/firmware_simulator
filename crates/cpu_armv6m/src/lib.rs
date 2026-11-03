@@ -90,6 +90,21 @@ pub struct Batch {
     pub stop: Option<StepOutcome>,
 }
 
+/// What instructions can change of a core without taking an exception (and without touching its PPB registers, which
+/// ends a batch): equal states before and after a stretch of instructions that wrote nothing mean the core is in a
+/// closed loop (see `rp2040::Machine`'s busy-wait skipping).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct SpinState {
+    r: [u32; 16],
+    other_sp: u32,
+    flags: (bool, bool, bool, bool),
+    primask: bool,
+    control: (bool, bool),
+    ipsr: u32,
+    event_reg: bool,
+    pending: u32,
+}
+
 /// Information about the last fault that led to a HardFault, for logging.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct FaultRecord {
@@ -271,6 +286,28 @@ impl CortexM0Plus {
     /// Instructions executed since reset (exception entries not counted).
     pub fn instructions(&self) -> u64 {
         self.instructions
+    }
+
+    /// The state a closed loop comes back to (see [`SpinState`]).
+    pub fn spin_state(&self) -> SpinState {
+        SpinState {
+            r: self.r,
+            other_sp: self.other_sp,
+            flags: (self.n, self.z, self.c, self.v),
+            primask: self.primask,
+            control: (self.spsel, self.npriv),
+            ipsr: self.ipsr,
+            event_reg: self.event_reg,
+            pending: self.nvic.pending,
+        }
+    }
+
+    /// Counts `instructions` taking `cycles` that a machine skipped because they would have repeated the state the
+    /// core is in (a busy-wait). Only for a core whose SysTick does not count the core clock.
+    pub fn account_skipped(&mut self, cycles: u64, instructions: u64) {
+        debug_assert!(!self.systick.counts_core_clock());
+        self.cycles += cycles;
+        self.instructions += instructions;
     }
 
     pub fn is_locked_up(&self) -> bool {

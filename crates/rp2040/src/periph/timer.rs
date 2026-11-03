@@ -98,6 +98,16 @@ impl TickGen {
         self.base_ticks + self.ref_period.cycles_in(now - self.base_time) / self.cycles as u64
     }
 
+    /// A time up to which (inclusive) the count stays `ticks`, given that it is `ticks` now: a little before the
+    /// next tick (`time_of_tick` may be a picosecond late), or `Time::MAX` if ticks are not running.
+    pub fn holds_until(&self, ticks: u64) -> Time {
+        match self.time_of_tick(ticks + 1) {
+            Some(t) => t.saturating_sub(Time(2)),
+            None if !self.running() => Time::MAX,
+            None => Time::ZERO,
+        }
+    }
+
     /// Earliest time at which [`TickGen::ticks`] reaches `k`, if ticks are running.
     pub fn time_of_tick(&self, k: u64) -> Option<Time> {
         if k <= self.base_ticks {
