@@ -90,7 +90,8 @@ impl Session {
     }
 
     /// A copy of the session that runs on independently: the machine (see [`Machine::fork`]), the RTT position,
-    /// the logs and UART text so far, and the CAN bus. Hooks, host endpoints and ptys are not copied.
+    /// the logs and UART text so far, and the CAN bus. Hooks, host endpoints and ptys are not copied. The copied
+    /// devices still read the board's physical inputs; [`Session::snapshot_with_inputs`] gives the copy its own.
     pub fn snapshot(&self) -> Session {
         let mut machine = self.machine.fork();
         if let Some(old) = &self.machine.sys.ethernet {
@@ -130,6 +131,16 @@ impl Session {
             pacing: None,
             behind_warned: std::time::Instant::now(),
         }
+    }
+
+    /// [`Session::snapshot`] for a board whose devices read `inputs` (from [`crate::board::Board::apply`]): the
+    /// copy gets inputs of its own with the same values, returned with it, and its devices read those, so the
+    /// original and the copy can run side by side with different inputs.
+    pub fn snapshot_with_inputs(&self, inputs: &crate::board::Inputs) -> (Session, crate::board::Inputs) {
+        let mut s = self.snapshot();
+        let (copy, map) = inputs.deep_copy();
+        crate::board::relink_inputs(&mut s.machine, &map);
+        (s, copy)
     }
 
     pub fn has_defmt(&self) -> bool {

@@ -143,6 +143,14 @@ impl PinDevice for Drv8243 {
     fn as_any(&self) -> &dyn std::any::Any {
         self
     }
+
+    fn relink_inputs(&mut self, map: &sim_core::analog::Relink) {
+        for (out, _) in &mut self.bridges {
+            if let Nfault::Volts(h) = out {
+                map.apply(h);
+            }
+        }
+    }
 }
 
 #[cfg(test)]

@@ -251,9 +251,16 @@ impl VehicleSim {
         }
     }
 
-    /// Whether the vehicle drives any board inputs (which robot snapshots share, see [`crate::robot::Robot::snapshot`]).
+    /// Whether the vehicle drives any board inputs.
     pub fn has_sensors(&self) -> bool {
         !self.sensors.is_empty()
+    }
+
+    /// Points the sensor inputs the vehicle writes at their replacements in `map` (a robot snapshot's inputs).
+    pub fn relink_inputs(&mut self, map: &sim_core::analog::Relink) {
+        for (h, _) in &mut self.sensors {
+            map.apply(h);
+        }
     }
 
     /// Writes the pressure at each sensor's port to its input.

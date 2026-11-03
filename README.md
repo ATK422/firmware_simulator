@@ -248,8 +248,9 @@ cargo test --release --workspace
 
 `crates/sim_test` is the harness for firmware tests: `Bench` boots one image on its board next to a mock bridge,
 sets inputs, injects faults (see [Fault injection](#fault-injection)) and reads what the bridge received;
-`RobotBench` does the same for a robot file; both snapshot in a few milliseconds, and `sweep` runs a scenario from
-a snapshot over a set of parameters in parallel. Its tests are the smoke test of every board image
+`RobotBench` does the same for a robot file; both snapshot in a few milliseconds (each copy with physical inputs of
+its own, so copies run side by side with different ones), and `sweep` runs a scenario from a snapshot over a set of
+parameters in parallel. Its tests are the smoke test of every board image
 (`tests/smoke.rs`), the whole of Talos on its buses (`tests/robot.rs`), Puddles over UDP (`tests/puddles.rs`), the
 H-bridge and harness checks (`tests/harness.rs`), the fault injection tests (`tests/faults.rs`) and the IVC range
 and noise sweeps (`tests/ivc_sweep.rs`, run with `--nocapture` to see the tables). CI (`.github/workflows/ci.yml`)

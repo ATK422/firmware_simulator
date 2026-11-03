@@ -11,6 +11,9 @@ pub trait UartDevice: Send {
     fn receive(&mut self, ctx: &mut dyn DeviceCtx, byte: u8) -> Vec<u8>;
     fn clone_box(&self) -> Box<dyn UartDevice>;
     fn as_any(&self) -> &dyn std::any::Any;
+    /// Points the shared input values the device reads at their counterparts in `map` (a snapshot's own inputs,
+    /// see [`sim_core::analog::Relink`]). Devices that read inputs implement it; the default reads none.
+    fn relink_inputs(&mut self, _map: &sim_core::analog::Relink) {}
 }
 
 sim_core::clone_box!(UartDevice);

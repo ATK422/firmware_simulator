@@ -126,17 +126,30 @@ fn snapshots_carry_their_own_vehicle() {
     assert!(r.run_until(Time::from_ms(100)).is_none());
     let mut copy = r.snapshot();
     copy.vehicles[0].vehicle.state.velocity = [0.0, 0.0, 1.0];
-    assert!(copy.run_until(Time::from_ms(300)).is_none());
-    // The depth sensor input is shared, so the copy's run left its own pressure there; the original's next run
-    // starts by putting its own back
-    let port = [0.3, 0.0, 0.1];
-    assert_eq!(r.inputs[1].get("depth.pressure_pa"), copy.vehicles[0].vehicle.pressure_at(port));
-    assert!(r.run_until(r.now).is_none());
-    assert_eq!(r.inputs[1].get("depth.pressure_pa"), r.vehicles[0].vehicle.pressure_at(port));
-    assert!(r.run_until(Time::from_ms(300)).is_none());
+    // The two take turns 10 ms at a time, each writing its own vehicle's pressure to its own depth sensor input
+    while r.now < Time::from_ms(300) {
+        let t = r.now + Time::from_ms(10);
+        assert!(copy.run_until(t).is_none() && r.run_until(t).is_none());
+    }
     // The copy dived 20 cm; the original, trimmed 2 N positive, barely moved
     let (a, b) = (r.vehicles[0].vehicle.state.position[2], copy.vehicles[0].vehicle.state.position[2]);
     assert!(b - a > 0.1, "{a} {b}");
+    let port = [0.3, 0.0, 0.1];
+    for robot in [&mut r, &mut copy] {
+        let want = robot.vehicles[0].vehicle.pressure_at(port);
+        assert_eq!(robot.inputs[1].get("depth.pressure_pa"), want);
+        // ... which is what that robot's MS5837 model reads
+        let now = robot.now;
+        let sensor = robot.boards[1]
+            .machine
+            .sys
+            .i2c_devices
+            .iter()
+            .find_map(|a| a.dev.as_any().downcast_ref::<sim_devices::ms5837::Ms5837>())
+            .unwrap();
+        assert_eq!(sensor.pressure_pa.at(now), want);
+    }
+    assert!(copy.inputs[1].get("depth.pressure_pa") > r.inputs[1].get("depth.pressure_pa") + 1000.0);
     // Each one's transducer follows its own vehicle
     for robot in [&mut r, &mut copy] {
         let want = robot.vehicles[0].vehicle.point(MOUNT);

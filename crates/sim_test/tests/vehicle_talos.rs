@@ -83,3 +83,75 @@ fn talos_dives_and_turns_on_esc_board_rpm_commands() {
     let truth = v.point(port)[2] - zero;
     assert!(last > 0.3 && (last - truth).abs() < 0.03, "reported {last} vs {truth}");
 }
+
+/// Snapshots of a robot whose vehicle drives a sensor input each get their own input, so a sweep runs its points
+/// side by side: three copies of Talos, each held at another depth, and each camera cage reports its own.
+#[test]
+fn a_parallel_sweep_over_vehicle_depths() {
+    if sim_test::titan_rs("camera_cage_bb").is_none() {
+        return;
+    }
+    let mut base = RobotBench::load("talos.toml", &[("internal", 4)], |spec| {
+        spec.board.retain(|b| b.name == "camera_cage");
+        spec.vehicle[0].thrusters.clear();
+    })
+    .unwrap();
+    // Trimmed neutral, so it stays where it is put
+    let v = &mut base.robot.vehicle("talos").unwrap().vehicle;
+    v.params.volume_m3 = v.params.mass_kg / v.water.density_kg_m3;
+    base.run_until(Time::from_ms(3000));
+    let depths = |b: &RobotBench| -> Vec<(Time, f64)> {
+        b.picked("internal", |m| match m {
+            DeviceToHost::CameraCage(titan_link::camera_cage::DeviceToHost::Depth(d)) => Some(-*d as f64),
+            _ => None,
+        })
+    };
+    assert!(depths(&base).last().is_some_and(|d| d.1.abs() < 0.01), "zeroed at the surface");
+    let points = [0.5, 1.0, 2.0];
+    // The points go in lockstep, 10 ms at a time, so they really run side by side (one at a time, they would
+    // never all get to the same step)
+    let lockstep = Lockstep::new(points.len());
+    let reported = sim_test::sweep(&base, &points, points.len(), |mut b, dive| {
+        let v = &mut b.robot.vehicle("talos").unwrap().vehicle;
+        v.state.position[2] += dive;
+        v.state.velocity = [0.0; 3];
+        for _ in 0..100 {
+            b.run_for(Time::from_ms(10));
+            lockstep.wait(std::time::Duration::from_secs(60));
+        }
+        let truth = b.robot.vehicle("talos").unwrap().vehicle.state.position[2];
+        (depths(&b).last().unwrap().1, truth)
+    });
+    let start = base.robot.vehicle("talos").unwrap().vehicle.state.position[2];
+    for (dive, (got, truth)) in points.iter().zip(reported) {
+        assert!((truth - start - dive).abs() < 0.02, "{dive}: the vehicle is at {truth}");
+        assert!((got - dive).abs() < 0.03, "{dive} m down, the camera cage reports {got}");
+    }
+}
+
+/// A barrier that gives up: `n` threads meet at each step, or the one waiting panics after `timeout`.
+struct Lockstep {
+    n: usize,
+    /// Step number and how many have arrived at it.
+    state: std::sync::Mutex<(u64, usize)>,
+    cv: std::sync::Condvar,
+}
+
+impl Lockstep {
+    fn new(n: usize) -> Self {
+        Lockstep { n, state: std::sync::Mutex::new((0, 0)), cv: std::sync::Condvar::new() }
+    }
+
+    fn wait(&self, timeout: std::time::Duration) {
+        let mut s = self.state.lock().unwrap();
+        let step = s.0;
+        s.1 += 1;
+        if s.1 == self.n {
+            *s = (step + 1, 0);
+            self.cv.notify_all();
+            return;
+        }
+        let (s, t) = self.cv.wait_timeout_while(s, timeout, |s| s.0 == step).unwrap();
+        assert!(!t.timed_out() || s.0 != step, "the sweep's points do not run side by side");
+    }
+}

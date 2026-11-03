@@ -406,10 +406,10 @@ impl Bench {
         self.session.machine.power_cycle();
     }
 
-    /// A copy that runs on independently from here (machine, devices, bus, logs and bridge state). Physical inputs
-    /// stay shared with the original: set them after taking the copy.
+    /// A copy that runs on independently from here (machine, devices, bus, logs, bridge state, and physical inputs
+    /// of its own: setting one on the copy leaves the original alone).
     pub fn snapshot(&self) -> Bench {
-        let mut session = self.session.snapshot();
+        let (mut session, inputs) = self.session.snapshot_with_inputs(&self.inputs);
         let bridge = self.bridge.as_ref().map(MockBridge::fork);
         if let Some(b) = &bridge {
             session.can_endpoints.push(Box::new(b.clone()));
@@ -418,14 +418,7 @@ impl Bench {
         if let Some(p) = &puddles {
             session.eth_endpoints.push(Box::new(p.clone()));
         }
-        Bench {
-            session,
-            inputs: self.inputs.clone(),
-            bridge,
-            puddles,
-            image: self.image.clone(),
-            schedule: self.schedule.clone(),
-        }
+        Bench { session, inputs, bridge, puddles, image: self.image.clone(), schedule: self.schedule.clone() }
     }
 }
 
@@ -538,15 +531,14 @@ impl RobotBench {
 }
 
 /// Runs `scenario` once per point, each from its own snapshot of `base`, on up to `threads` threads at a time.
-/// Results come back in the order of `points`. A robot with a vehicle driving sensor inputs runs one point at a
-/// time, since its snapshots share those inputs (see [`Robot::snapshot`]).
+/// Results come back in the order of `points`. Each snapshot has its own physical inputs (see
+/// [`Robot::snapshot`]), so a scenario may set them, and the points with vehicles run side by side too.
 pub fn sweep<P: Sync, R: Send>(
     base: &RobotBench,
     points: &[P],
     threads: usize,
     scenario: impl Fn(RobotBench, &P) -> R + Sync,
 ) -> Vec<R> {
-    let threads = if base.robot.vehicles.iter().any(|v| v.has_sensors()) { 1 } else { threads };
     let mut results: Vec<Option<R>> = (0..points.len()).map(|_| None).collect();
     for (chunk_points, chunk_results) in points.chunks(threads.max(1)).zip(results.chunks_mut(threads.max(1))) {
         let benches: Vec<RobotBench> = chunk_points.iter().map(|_| base.snapshot()).collect();

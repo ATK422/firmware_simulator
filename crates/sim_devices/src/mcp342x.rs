@@ -171,6 +171,12 @@ impl I2cDevice for Mcp342x {
     fn as_any(&self) -> &dyn std::any::Any {
         self
     }
+
+    fn relink_inputs(&mut self, map: &sim_core::analog::Relink) {
+        for s in &mut self.inputs {
+            s.relink(map);
+        }
+    }
 }
 
 #[cfg(test)]
