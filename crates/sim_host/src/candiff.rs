@@ -322,7 +322,7 @@ impl Period {
 #[derive(Clone, Debug, Default)]
 pub struct StreamDiff {
     pub name: String,
-    /// Events of each log in the compared window.
+    /// Events of each log that were compared: paired ones plus the missing (A) or extra (B) ones.
     pub a_count: usize,
     pub b_count: usize,
     pub matched: usize,
@@ -549,12 +549,9 @@ pub fn diff(a: &Decoded, b: &Decoded, opts: &DiffOptions) -> Report {
         let (pairs, only_a, only_b) = pair(&ta_all, &tb_own, tol);
         // Unpaired events near the edges of the window may have their partner just outside it
         let inside = |t: i64| opts.full || (t >= window.0 + tol && t <= window.1 - tol);
-        let in_window = |t: i64| opts.full || (t >= window.0 && t <= window.1);
         let compare_payload = !opts.ignore_payload.iter().any(|s| name.contains(s.as_str()));
         let mut d = StreamDiff {
             name: name.to_string(),
-            a_count: ta_all.iter().filter(|t| in_window(**t)).count(),
-            b_count: tb_own.iter().filter(|t| in_window(**t)).count(),
             matched: pairs.len(),
             payload_compared: compare_payload,
             offset_ns: own,
@@ -588,6 +585,8 @@ pub fn diff(a: &Decoded, b: &Decoded, opts: &DiffOptions) -> Report {
         if !pairs.is_empty() {
             d.mean_skew_ns = skew_sum / pairs.len() as f64;
         }
+        d.a_count = d.matched + d.missing.len();
+        d.b_count = d.matched + d.extra.len();
         streams.push(d);
     }
     Report {
