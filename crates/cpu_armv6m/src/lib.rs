@@ -558,6 +558,8 @@ impl CortexM0Plus {
         match self.exception_entry(bus, exception::HARD_FAULT, pc) {
             Ok(c) => {
                 self.cycles += c as u64;
+                // As for an interrupt's entry (`step_inner`): SysTick on the core clock counts these cycles too
+                self.tick(c);
                 StepOutcome::Ran(c)
             }
             Err(_) => {

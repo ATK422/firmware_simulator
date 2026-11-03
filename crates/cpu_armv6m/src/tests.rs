@@ -1593,3 +1593,22 @@ fn branch_to_an_even_address_faults_at_the_target() {
         assert_eq!(rig.r(13), (STACK_TOP - 32) & !7, "frame pushed below the popped SP");
     }
 }
+
+#[test]
+fn systick_counts_the_cycles_of_a_hardfault_entry() {
+    // SysTick on the core clock counts every cycle, the 15 of a fault's exception entry as those of an interrupt's
+    for blocks in [None, Some(false), Some(true)] {
+        let mut rig = Rig::new(&[0xDE00, NOP]);
+        rig.handler(exception::HARD_FAULT, HANDLER, &[NOP; 4]);
+        rig.cpu.systick.rvr = 1000;
+        rig.cpu.systick.cvr = 100;
+        rig.cpu.systick.csr = 0b101;
+        let cycles = match blocks {
+            None => rig.run(1) as u64,
+            Some(b) => batch_on(&mut rig, b, 1, 1000).cycles,
+        };
+        assert_eq!(rig.cpu.ipsr(), exception::HARD_FAULT);
+        assert_eq!(cycles, 15);
+        assert_eq!(rig.cpu.systick.cvr, 85, "{blocks:?}");
+    }
+}
