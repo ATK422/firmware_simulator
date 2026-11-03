@@ -604,30 +604,49 @@ impl Machine {
     /// Runs up to `max_steps` steps of core `c` as one batch (see [`CortexM0Plus::run_batch`]), ending once its
     /// time reaches `limit`, and handles the batch's last step as [`Machine::step_core`] would. Instructions in
     /// the middle of a batch touched nothing but memory, so they needed no handling of their own.
-    fn run_batch(&mut self, c: usize, max_steps: u32, limit: Time) -> cpu_armv6m::Batch {
-        let budget = self.clocks[c].cycles_until(&self.clk_sys, limit);
+    ///
+    /// `budget` carries the cycles left until `limit` between batches of one quantum: it is used if set, and set
+    /// again afterwards unless something other than the batch's own cycles may have moved the core's clock.
+    fn run_batch(&mut self, c: usize, max_steps: u32, limit: Time, budget: &mut Option<u64>) -> cpu_armv6m::Batch {
+        let cycles = match budget.take() {
+            Some(b) => b,
+            None => self.clocks[c].cycles_until(&self.clk_sys, limit),
+        };
         // Trapped ROM functions are entered by the single step path
         let trap_below = if self.hle_enabled { ROM_SIZE as u32 } else { 0 };
-        let mut bus = BatchBus::new(&mut self.sys, &mut *self.trace, c as u8, self.clocks[c], self.clk_sys);
-        let b = self.cores[c].run_batch(&mut bus, max_steps, budget, trap_below);
+        let lines = self.cores[c].irq_lines();
+        let mut bus = BatchBus::new(&mut self.sys, &mut *self.trace, c as u8, self.clocks[c], self.clk_sys, lines);
+        let b = self.cores[c].run_batch(&mut bus, max_steps, cycles, trap_below);
+        if let Some(lines) = bus.take_lines() {
+            for (core, l) in self.cores.iter_mut().zip(lines) {
+                core.set_irq_lines(l);
+            }
+        }
         if b.steps == 0 {
+            *budget = Some(cycles);
             return b;
         }
         self.clocks[c].advance(&self.clk_sys, b.cycles);
         match b.stop {
             None => {
+                let mut undisturbed = true;
                 if self.sys.clk_sys_changed
                     || self.sys.reset_request.is_some()
                     || self.sys.psm_forced_off != 0
                     || self.sys.psm_released != 0
                 {
                     self.after_system_change();
+                    undisturbed = false;
                 }
                 if self.cores[c].take_sev() {
                     self.cores[1 - c].signal_event();
                 }
                 if self.cores[c].take_reset_request() {
                     self.core_reset(c);
+                    undisturbed = false;
+                }
+                if undisturbed {
+                    *budget = Some(cycles.saturating_sub(b.cycles));
                 }
             }
             Some(StepOutcome::Breakpoint(_)) if self.bkpt_policy == BkptPolicy::HardFault => {
@@ -724,9 +743,11 @@ impl Machine {
             self.last_ran = c;
             let limit = next_event.min(end);
             let mut left = self.quantum;
+            // Cycles until core c reaches `limit`, carried from one batch to the next while nothing else moved it
+            let mut budget = None;
             while left > 0 {
                 if self.can_batch(c) {
-                    let b = self.run_batch(c, left, limit);
+                    let b = self.run_batch(c, left, limit, &mut budget);
                     if b.steps > 0 {
                         left -= b.steps;
                         match b.stop {
@@ -747,6 +768,7 @@ impl Machine {
                     }
                 }
                 left -= 1;
+                budget = None;
                 let pc = self.cores[c].pc();
                 if !self.breakpoints.is_empty() && self.breakpoints.contains(&pc) && !self.cores[c].is_sleeping() {
                     if self.skip_breakpoint[c] {

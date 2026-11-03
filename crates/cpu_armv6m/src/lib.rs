@@ -285,6 +285,11 @@ impl CortexM0Plus {
         self.irq_lines = lines;
     }
 
+    /// The interrupt lines last set with [`CortexM0Plus::set_irq_lines`].
+    pub fn irq_lines(&self) -> u32 {
+        self.irq_lines
+    }
+
     /// Sets the event register (an `SEV` from another core, or an external event), waking a `WFE`.
     pub fn signal_event(&mut self) {
         self.event_reg = true;

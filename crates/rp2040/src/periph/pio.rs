@@ -89,8 +89,13 @@ impl Sm {
         (int << 8) | ((self.clkdiv >> 8) & 0xFF) as u64
     }
 
+    #[inline]
     fn tick_cycle(&self, k: u64) -> u64 {
-        self.anchor + ((k as u128 * self.div() as u128) >> 8) as u64
+        let div = self.div();
+        match k.checked_mul(div) {
+            Some(p) => self.anchor + (p >> 8),
+            None => self.anchor + ((k as u128 * div as u128) >> 8) as u64,
+        }
     }
 
     /// Smallest tick index falling after `cycle`.
@@ -315,12 +320,13 @@ impl Pio {
         if s.stalled && s.stall_epoch == self.epoch {
             return u64::MAX;
         }
-        if s.stalled {
-            // Something changed: retry at the next tick after now
-            let k = s.first_tick_after(self.cycle).max(s.next_k);
-            return s.tick_cycle(k);
+        let next = s.tick_cycle(s.next_k);
+        if s.stalled && next <= self.cycle {
+            // Something changed: retry at the next tick after now (`first_tick_after(cycle).max(next_k)`, which is
+            // `next_k` itself when that tick is still ahead)
+            return s.tick_cycle(s.first_tick_after(self.cycle).max(s.next_k));
         }
-        s.tick_cycle(s.next_k)
+        next
     }
 
     /// Runs the block until `until` (a `clk_sys` cycle) with the GPIOs reading `inputs`. Returns early when the
@@ -342,7 +348,11 @@ impl Pio {
                 if wake == next {
                     let k = {
                         let s = &self.sm[i];
-                        if s.stalled { s.first_tick_after(next - 1).max(s.next_k) } else { s.next_k }
+                        if s.stalled && s.tick_cycle(s.next_k) < next {
+                            s.first_tick_after(next - 1).max(s.next_k)
+                        } else {
+                            s.next_k
+                        }
                     };
                     self.tick(i, k, inputs);
                 }
@@ -740,7 +750,8 @@ impl Pio {
 
     /// Interrupt line `n` (0 or 1) of the block.
     pub fn irq_line(&self, n: usize) -> bool {
-        (self.intr() | self.intf[n]) & self.inte[n] & 0xFFF != 0
+        // Most blocks enable no interrupts: skip collecting the raw status
+        self.inte[n] & 0xFFF != 0 && (self.intr() | self.intf[n]) & self.inte[n] & 0xFFF != 0
     }
 
     /// Executes an instruction written to SMx_INSTR: immediately (at the current cycle), whether or not the state

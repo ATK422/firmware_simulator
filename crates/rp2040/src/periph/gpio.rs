@@ -40,6 +40,8 @@ pub struct Drive {
 
 #[derive(Clone, Debug)]
 pub struct Gpio {
+    /// IO_BANK0 GPIOx_CTRL and PADS_BANK0 GPIOx. Change them through [`Gpio::write_io`] and [`Gpio::write_pads`],
+    /// which keep the input levels ([`Gpio::inputs`]) up to date.
     pub ctrl: [u32; NUM_GPIOS],
     pub pads: [u32; NUM_GPIOS],
     pub pads_voltage: u32,
@@ -60,6 +62,10 @@ pub struct Gpio {
     /// Output and enable from the selected peripheral, before overrides.
     out_from_peri: u32,
     oe_from_peri: u32,
+    /// [`Gpio::inputs`] and the levels the interrupt logic sees, kept up to date whenever the levels, pads or CTRL
+    /// change (they are read on every SIO and PIO access and every pin update, and computing them visits every pin).
+    input_levels: u32,
+    irq_levels: u32,
 }
 
 impl Default for Gpio {
@@ -79,6 +85,9 @@ impl Default for Gpio {
             oe_to_pad: 0,
             out_from_peri: 0,
             oe_from_peri: 0,
+            // Level 0 everywhere and INOVER/IRQOVER normal
+            input_levels: 0,
+            irq_levels: 0,
         }
     }
 }
@@ -104,6 +113,7 @@ impl Gpio {
             fresh.pads_swd = self.pads_swd;
         }
         *self = fresh;
+        self.update_inputs();
     }
 
     pub fn funcsel(&self, pin: usize) -> u32 {
@@ -117,8 +127,20 @@ impl Gpio {
     }
 
     /// SIO `GPIO_IN`.
+    #[inline]
     pub fn inputs(&self) -> u32 {
-        (0..NUM_GPIOS).filter(|&p| self.input(p)).fold(0, |acc, p| acc | 1 << p)
+        self.input_levels
+    }
+
+    fn update_inputs(&mut self) {
+        self.input_levels = (0..NUM_GPIOS).filter(|&p| self.input(p)).fold(0, |acc, p| acc | 1 << p);
+        self.irq_levels = (0..NUM_GPIOS).filter(|&p| self.irq_level(p)).fold(0, |acc, p| acc | 1 << p);
+    }
+
+    /// PADS_BANK0 back to its reset values (the block was reset).
+    pub fn reset_pads(&mut self) {
+        self.pads = Gpio::default().pads;
+        self.update_inputs();
     }
 
     /// Level the interrupt logic sees on `pin` (pad input then IRQOVER).
@@ -131,7 +153,8 @@ impl Gpio {
     /// level changed.
     pub fn evaluate(&mut self, mut drive: impl FnMut(u32, usize) -> Drive) -> u32 {
         let old_level = self.level;
-        let old_irq: [bool; NUM_GPIOS] = std::array::from_fn(|p| self.irq_level(p));
+        let old_irq = self.irq_levels;
+        let (mut inputs, mut irq) = (0, 0);
         let mut level = 0;
         let (mut ofp, mut oefp, mut otp, mut oetp) = (0, 0, 0, 0);
         for pin in 0..NUM_GPIOS {
@@ -149,6 +172,14 @@ impl Gpio {
             if l.is_high() {
                 level |= bit;
             }
+            // `input` and `irq_level` for the new level
+            let pad_in = pad & PAD_IE != 0 && l.is_high();
+            if over(pad_in, ctrl >> 16) {
+                inputs |= bit;
+            }
+            if over(pad_in, ctrl >> 28) {
+                irq |= bit;
+            }
             if d.out {
                 ofp |= bit;
             }
@@ -163,17 +194,19 @@ impl Gpio {
             }
         }
         self.level = level;
+        self.input_levels = inputs;
+        self.irq_levels = irq;
         self.out_from_peri = ofp;
         self.oe_from_peri = oefp;
         self.out_to_pad = otp;
         self.oe_to_pad = oetp;
         // Latch edges
-        for (pin, &was) in old_irq.iter().enumerate() {
-            let now = self.irq_level(pin);
-            if now != was {
-                let shift = 4 * (pin % 8);
-                self.edges[pin / 8] |= if now { 0b1000 } else { 0b0100 } << shift;
-            }
+        let mut changed = old_irq ^ irq;
+        while changed != 0 {
+            let pin = changed.trailing_zeros() as usize;
+            changed &= changed - 1;
+            let shift = 4 * (pin % 8);
+            self.edges[pin / 8] |= if irq & (1 << pin) != 0 { 0b1000 } else { 0b0100 } << shift;
         }
         old_level ^ level
     }
@@ -186,7 +219,7 @@ impl Gpio {
             if pin >= NUM_GPIOS {
                 break;
             }
-            v |= if self.irq_level(pin) { 0b0010 } else { 0b0001 } << (4 * k);
+            v |= if self.irq_levels & (1 << pin) != 0 { 0b0010 } else { 0b0001 } << (4 * k);
         }
         v
     }
@@ -252,6 +285,7 @@ impl Gpio {
                 let pin = (offset / 8) as usize;
                 if offset % 8 == 4 {
                     mode.update(&mut self.ctrl[pin], value, 0x3033_331F);
+                    self.update_inputs();
                     return Some(true);
                 }
             }
@@ -292,7 +326,10 @@ impl Gpio {
     pub fn write_pads(&mut self, offset: u32, value: u32, mode: WriteMode) -> Option<bool> {
         match offset {
             0x00 => mode.update(&mut self.pads_voltage, value, 1),
-            0x04..=0x78 => mode.update(&mut self.pads[((offset - 4) / 4) as usize], value, 0xFF),
+            0x04..=0x78 => {
+                mode.update(&mut self.pads[((offset - 4) / 4) as usize], value, 0xFF);
+                self.update_inputs();
+            }
             0x7C => mode.update(&mut self.pads_swclk, value, 0xFF),
             0x80 => mode.update(&mut self.pads_swd, value, 0xFF),
             _ => return None,
@@ -312,6 +349,43 @@ mod tests {
             } else {
                 Drive::default()
             }
+        }
+    }
+
+    #[test]
+    fn input_and_interrupt_levels_follow_every_change() {
+        let mut g = Gpio::default();
+        let mut x = 0x2545_F491_4F6C_DD1Du64;
+        let fresh = |g: &Gpio| (0..NUM_GPIOS).filter(|&p| g.input(p)).fold(0u32, |a, p| a | 1 << p);
+        for _ in 0..5000 {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            let pin = (x >> 8) as usize % NUM_GPIOS;
+            match x % 6 {
+                0 => {
+                    g.write_io(pin as u32 * 8 + 4, (x >> 16) as u32 & 0x3033_331F, WriteMode::Normal);
+                }
+                1 => {
+                    g.write_pads(4 + 4 * pin as u32, (x >> 20) as u32 & 0xFF, WriteMode::Xor);
+                }
+                2 => {
+                    g.external[pin] = match (x >> 30) % 3 {
+                        0 => External::Floating,
+                        1 => External::Driven(Level::from_bool(x & (1 << 40) != 0)),
+                        _ => External::Pull(Level::from_bool(x & (1 << 41) != 0)),
+                    };
+                    g.evaluate(sio((x >> 32) as u32, (x >> 2) as u32));
+                }
+                3 => g.reset_io(x & 1 << 50 != 0),
+                4 => g.reset_pads(),
+                _ => {
+                    g.evaluate(sio((x >> 32) as u32, (x >> 2) as u32));
+                }
+            }
+            assert_eq!(g.inputs(), fresh(&g));
+            let irq = (0..NUM_GPIOS).filter(|&p| g.irq_level(p)).fold(0u32, |a, p| a | 1 << p);
+            assert_eq!(g.irq_levels, irq);
         }
     }
 

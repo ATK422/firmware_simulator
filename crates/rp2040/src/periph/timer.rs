@@ -16,6 +16,19 @@ pub struct TickGen {
     ref_period: ClockPeriod,
     base_time: Time,
     base_ticks: u64,
+    /// The last count computed and a span of time known to give the same count (firmware polls the timer far
+    /// more often than it ticks, and each count costs two divisions).
+    cache: std::cell::Cell<TickCache>,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+struct TickCache {
+    /// The configuration the count was computed under: ENABLE, CYCLES, `clk_ref` and the base.
+    config: (bool, u32, u64, Time, u64),
+    /// Every time in `from..=to` gives `ticks`; empty (`from > to`) when nothing is cached.
+    from: Time,
+    to: Time,
+    ticks: u64,
 }
 
 impl TickGen {
@@ -27,6 +40,7 @@ impl TickGen {
             ref_period: ClockPeriod::from_hz(clk_ref_hz),
             base_time: Time::ZERO,
             base_ticks: 0,
+            cache: std::cell::Cell::new(TickCache { from: Time::MAX, ..Default::default() }),
         }
     }
 
@@ -35,7 +49,40 @@ impl TickGen {
     }
 
     /// Ticks generated since power-on.
+    #[inline]
     pub fn ticks(&self, now: Time) -> u64 {
+        let c = self.cache.get();
+        if c.from <= now && now <= c.to && c.config == self.config() {
+            return c.ticks;
+        }
+        self.ticks_uncached(now)
+    }
+
+    fn config(&self) -> (bool, u32, u64, Time, u64) {
+        (self.enabled, self.cycles, self.ref_period.hz(), self.base_time, self.base_ticks)
+    }
+
+    #[inline(never)]
+    fn ticks_uncached(&self, now: Time) -> u64 {
+        let ticks = self.ticks_at(now);
+        // The count never decreases with time, so every time between two that give the same count gives it too.
+        // `time_of_tick` is at most a picosecond late, so the next tick is certainly not reached 2 ps before it.
+        let mut to = match self.time_of_tick(ticks + 1) {
+            Some(t) if t.0 >= 2 && Time(t.0 - 2) > now => Time(t.0 - 2),
+            _ => now,
+        };
+        let mut from = now;
+        let config = self.config();
+        let c = self.cache.get();
+        if c.config == config && c.ticks == ticks && c.from <= c.to {
+            from = from.min(c.from);
+            to = to.max(c.to);
+        }
+        self.cache.set(TickCache { config, from, to, ticks });
+        ticks
+    }
+
+    fn ticks_at(&self, now: Time) -> u64 {
         if !self.running() || now <= self.base_time {
             return self.base_ticks;
         }
@@ -419,6 +466,32 @@ mod tests {
         assert_eq!(stopped.ticks(Time::from_ms(5)), 0, "CYCLES = 0 after reset: no ticks");
         assert!(stopped.time_of_tick(1).is_none());
         assert_eq!(t.tick_reg(Time::ZERO) & 0x7FF, 1 << 10 | 1 << 9 | 12, "RUNNING, ENABLE, CYCLES");
+    }
+
+    #[test]
+    fn cached_ticks_match_computed_ones() {
+        // Clocks whose periods are not whole picoseconds, ticks of several cycles, times around tick edges, out of
+        // order, and configuration changes in between
+        for (hz, cycles) in [(12_000_000, 12), (12_000_000, 1), (48_000_000, 48), (6_500_000, 7), (125_000_000, 125)] {
+            let mut t = TickGen::new(hz);
+            t.write_tick_reg(Time::ZERO, 1 << 9 | cycles);
+            let mut x = 0x9E37_79B9_7F4A_7C15u64;
+            let mut now = Time::ZERO;
+            for i in 0..20_000 {
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                now = match x % 8 {
+                    0 => Time(now.0.saturating_sub(x >> 40)),
+                    1 => t.time_of_tick(t.ticks_at(now) + 1).unwrap() - Time(x % 3),
+                    _ => now + Time((x >> 32) % 400_000),
+                };
+                assert_eq!(t.ticks(now), t.ticks_at(now), "{hz} Hz / {cycles} at {now:?}");
+                if i % 5000 == 4999 {
+                    t.write_tick_reg(now, 1 << 9 | (cycles + 1));
+                }
+            }
+        }
     }
 
     #[test]

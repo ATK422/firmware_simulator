@@ -484,7 +484,7 @@ impl System {
                 bit::IO_BANK0 => {
                     self.gpio.reset_io(true);
                 }
-                bit::PADS_BANK0 => self.gpio.pads = Gpio::default().pads,
+                bit::PADS_BANK0 => self.gpio.reset_pads(),
                 bit::PLL_SYS => self.clocks.pll_sys = Pll::default(),
                 bit::PLL_USB => self.clocks.pll_usb = Pll::default(),
                 bit::PWM => {
@@ -1834,8 +1834,17 @@ impl Bus for CoreBus<'_> {
 ///
 /// SRAM, ROM and flash (while XIP works) are read and written directly. Everything else goes through
 /// [`System::read`]/[`System::write`] at the exact time of the accessing instruction (the batch's start time plus
-/// the cycles the batch took before it) and raises [`Bus::take_attention`], which ends the batch after that
-/// instruction so the machine can pick up interrupt, clock and reset changes as it does after every single step.
+/// the cycles the batch took before it). The run loop handles a few things after every instruction; the batch
+/// does what they amount to after each such access and ends ([`Bus::take_attention`]) only when the machine has
+/// to act:
+///
+/// * interrupt lines (`irq_dirty`): recomputed here; the batch goes on if the running core's lines are unchanged,
+///   and the machine hands the other core its lines when the batch ends (that core does not run meanwhile);
+/// * a new `clk_sys`, a reset request or a PSM change: the batch ends and the machine handles them as after a
+///   single step;
+/// * the XIP state: re-checked, as the access may have reconfigured the SSI.
+///
+/// Events the access scheduled need nothing: the run loop's time limit is fixed for the whole quantum.
 pub struct BatchBus<'a> {
     pub sys: &'a mut System,
     pub trace: &'a mut dyn TraceSink,
@@ -1846,8 +1855,16 @@ pub struct BatchBus<'a> {
     /// Cycles the batch has taken before the current instruction.
     elapsed: u64,
     attention: bool,
-    /// Flash reads need no further checks for the whole batch.
+    /// Flash reads need no further checks (until the next peripheral access).
     xip_ok: bool,
+    /// The flash size is a power of two: offsets are `addr & flash_mask` (else they go through `flash_offset`).
+    flash_mask: Option<usize>,
+    /// The running core's interrupt lines as its NVIC sees them.
+    core_lines: u32,
+    /// Interrupt lines computed during the batch, for the machine to hand to both cores.
+    lines: Option<[u32; 2]>,
+    /// An access left `irq_dirty` set: recompute the lines after the instruction.
+    check_irqs: bool,
 }
 
 impl<'a> BatchBus<'a> {
@@ -1857,11 +1874,32 @@ impl<'a> BatchBus<'a> {
         core: u8,
         clock: CycleClock,
         period: ClockPeriod,
+        core_lines: u32,
     ) -> Self {
-        // Time only moves forward within the batch, so if XIP works at its start it works throughout (until a
-        // peripheral access, which ends the batch)
+        // Time only moves forward within the batch, so if XIP works at its start it works until something changes
+        // the SSI or flash (a peripheral access)
         let xip_ok = sys.xip_ready_from(clock.now);
-        BatchBus { sys, trace, core, clock, period, elapsed: 0, attention: false, xip_ok }
+        let len = sys.flash.len();
+        let flash_mask = len.is_power_of_two().then(|| len - 1);
+        BatchBus {
+            flash_mask,
+            sys,
+            trace,
+            core,
+            clock,
+            period,
+            elapsed: 0,
+            attention: false,
+            xip_ok,
+            core_lines,
+            lines: None,
+            check_irqs: false,
+        }
+    }
+
+    /// Interrupt lines recomputed during the batch, for cores 0 and 1.
+    pub fn take_lines(&mut self) -> Option<[u32; 2]> {
+        self.lines.take()
     }
 
     /// The start time of the current instruction.
@@ -1878,7 +1916,10 @@ impl<'a> BatchBus<'a> {
         } else {
             self.xip_check(addr)?;
         }
-        Ok(self.sys.flash_offset(addr))
+        Ok(match self.flash_mask {
+            Some(mask) => addr as usize & mask,
+            None => self.sys.flash_offset(addr),
+        })
     }
 
     // The slow paths are kept out of line so that the fast ones stay small enough to inline into the interpreter
@@ -1890,20 +1931,49 @@ impl<'a> BatchBus<'a> {
         self.sys.xip_check(now, addr)
     }
 
-    #[cold]
     #[inline(never)]
     fn slow_read(&mut self, addr: u32, size: Size) -> Result<u32, BusFault> {
-        self.attention = true;
         let now = self.now();
-        self.sys.read(self.trace, self.core, now, addr, size)
+        let r = self.sys.read(self.trace, self.core, now, addr, size);
+        self.after_access(now);
+        r
     }
 
-    #[cold]
     #[inline(never)]
     fn slow_write(&mut self, addr: u32, size: Size, value: u32) -> Result<(), BusFault> {
-        self.attention = true;
         let now = self.now();
-        self.sys.write(self.trace, self.core, now, addr, size, value)
+        let r = self.sys.write(self.trace, self.core, now, addr, size, value);
+        self.after_access(now);
+        r
+    }
+
+    /// What the run loop would do after the instruction, as far as this access is concerned (see the type's docs).
+    fn after_access(&mut self, now: Time) {
+        let s = &mut *self.sys;
+        self.xip_ok = s.xip_ready_from(now);
+        if s.clk_sys_changed || s.reset_request.is_some() || s.psm_forced_off != 0 || s.psm_released != 0 {
+            // The machine handles these, then refreshes the interrupt lines
+            self.attention = true;
+            return;
+        }
+        // The lines are recomputed once the whole instruction is done, as the run loop would
+        self.check_irqs |= s.irq_dirty;
+    }
+
+    #[inline(never)]
+    fn refresh_irqs(&mut self) -> bool {
+        self.check_irqs = false;
+        let s = &mut *self.sys;
+        if s.irq_dirty {
+            s.irq_dirty = false;
+            let lines = [s.irq_lines(0), s.irq_lines(1)];
+            self.lines = Some(lines);
+            if lines[self.core as usize] != self.core_lines {
+                self.core_lines = lines[self.core as usize];
+                return true;
+            }
+        }
+        false
     }
 }
 
@@ -1934,18 +2004,28 @@ impl Bus for BatchBus<'_> {
         self.slow_write(addr, size, value)
     }
 
-    #[inline]
+    #[inline(always)]
     fn fetch16(&mut self, addr: u32) -> Result<u16, BusFault> {
+        // Halfword aligned (the PC always is), so the second byte is in range whenever the first is
+        fn half(buf: &[u8], off: usize) -> Option<u16> {
+            buf.get(off..off + 2).map(|b| u16::from_le_bytes([b[0], b[1]]))
+        }
         if addr >> 26 == XIP_BASE >> 26 {
             let off = self.flash(addr)?;
-            return Ok(u16::from_le_bytes([self.sys.flash[off], self.sys.flash[off + 1]]));
+            if let Some(v) = half(&self.sys.flash, off) {
+                return Ok(v);
+            }
         }
         let sram = addr.wrapping_sub(SRAM_BASE) as usize;
-        if sram < SRAM_SIZE {
-            return Ok(u16::from_le_bytes([self.sys.sram[sram], self.sys.sram[sram + 1]]));
+        if sram < SRAM_SIZE
+            && let Some(v) = half(&self.sys.sram, sram)
+        {
+            return Ok(v);
         }
-        if (addr as usize) < ROM_SIZE {
-            return Ok(u16::from_le_bytes([self.sys.rom[addr as usize], self.sys.rom[addr as usize + 1]]));
+        if (addr as usize) < ROM_SIZE
+            && let Some(v) = half(&self.sys.rom, addr as usize)
+        {
+            return Ok(v);
         }
         self.slow_read(addr, Size::Half).map(|v| v as u16)
     }
@@ -1957,7 +2037,13 @@ impl Bus for BatchBus<'_> {
 
     #[inline]
     fn take_attention(&mut self) -> bool {
-        std::mem::take(&mut self.attention)
+        if self.attention {
+            // The machine takes over, and refreshes the interrupt lines itself afterwards
+            self.attention = false;
+            self.check_irqs = false;
+            return true;
+        }
+        self.check_irqs && self.refresh_irqs()
     }
 
     fn peek(&mut self, addr: u32, size: Size) -> Option<u32> {
