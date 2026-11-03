@@ -2,10 +2,12 @@
 //! robot files for a fixed virtual time and reports how fast the emulator ran them.
 //!
 //! ```text
-//! cargo run --release -p sim_test --example bench -- [--time 2s] [--repeat 3] [--only esc_board,talos]
+//! cargo run --release -p sim_test --example bench -- [--time 2s] [--repeat 3] [--only esc_board,talos] [--threads N]
 //! ```
 //!
-//! `talos_mt` is Talos with its boards on four threads (`--threads 4`); its fingerprint matches `talos`'s.
+//! `talos_mt` is Talos with its boards on up to four threads (`robot --threads 4`), or as many as `--threads N` says
+//! (0: one per core); `talos_t2`, `talos_t3` and `talos_t6` on up to two, three and six. Their fingerprints match
+//! `talos`'s. `--threads` also prints how the boards were spread over the threads.
 //!
 //! For each case: the virtual time run, the best wall time over the repeats, virtual/wall (above 1 keeps up with
 //! `--realtime`), the CPU time of that run (less disturbed than the wall clock by a busy machine), instructions
@@ -44,6 +46,9 @@ const CASES: &[Case] = &[
     Case { name: "ivc_board2", kind: Kind::Board { elf: "ivc_board2", board: "talos/ivc_board", client: 8 } },
     Case { name: "talos", kind: Kind::Robot { file: "talos.toml", bridges: &[("internal", 1)], threads: 1 } },
     Case { name: "talos_mt", kind: Kind::Robot { file: "talos.toml", bridges: &[("internal", 1)], threads: 4 } },
+    Case { name: "talos_t2", kind: Kind::Robot { file: "talos.toml", bridges: &[("internal", 1)], threads: 2 } },
+    Case { name: "talos_t3", kind: Kind::Robot { file: "talos.toml", bridges: &[("internal", 1)], threads: 3 } },
+    Case { name: "talos_t6", kind: Kind::Robot { file: "talos.toml", bridges: &[("internal", 1)], threads: 6 } },
     Case {
         name: "ivc2_pool",
         kind: Kind::Robot { file: "ivc2_pool.toml", bridges: &[("talos", 8), ("surface", 8)], threads: 1 },
@@ -80,6 +85,13 @@ fn hash_session(h: &mut Fnv, s: &Session) {
     m.sys.sram.hash(h);
 }
 
+fn threads_of(case: &Case) -> usize {
+    match case.kind {
+        Kind::Robot { threads, .. } => threads,
+        Kind::Board { .. } => 1,
+    }
+}
+
 fn skipped(s: &Session) -> u64 {
     s.machine.spin_skipped
 }
@@ -88,7 +100,8 @@ fn instructions(s: &Session) -> u64 {
     s.machine.cores.iter().map(|c| c.instructions()).sum()
 }
 
-fn run(case: &Case, time: Time) -> Result<Outcome, String> {
+/// `override_threads`: replaces `talos_mt`'s thread count, and prints where the boards ran.
+fn run(case: &Case, time: Time, override_threads: Option<usize>) -> Result<Outcome, String> {
     let mut h = Fnv::default();
     match case.kind {
         Kind::Board { elf, board, client } => {
@@ -110,12 +123,20 @@ fn run(case: &Case, time: Time) -> Result<Outcome, String> {
                 fingerprint: h.finish(),
             })
         }
-        Kind::Robot { file, bridges, threads } => {
+        Kind::Robot { file, bridges, .. } => {
             let mut r = RobotBench::load(file, bridges, |_| {})?;
-            r.robot.threads = threads;
+            r.robot.threads = match override_threads {
+                Some(n) if case.name == "talos_mt" => n,
+                _ => threads_of(case),
+            };
             let (wall, cpu) = (Instant::now(), cpu_time());
             r.run_until(time);
             let (wall, cpu) = (wall.elapsed(), cpu_time().zip(cpu).map(|(b, a)| b - a));
+            if override_threads.is_some() && r.robot.threads != 1 {
+                let on: Vec<String> =
+                    r.robot.names.iter().zip(r.robot.thread_of_boards()).map(|(n, t)| format!("{n}:{t}")).collect();
+                println!("{:<11} threads (0: the calling one): {}", case.name, on.join(" "));
+            }
             for s in &r.robot.boards {
                 hash_session(&mut h, s);
             }
@@ -161,6 +182,7 @@ fn main() {
     let mut time = Time::from_secs(2);
     let mut repeat = 3;
     let mut only: Option<Vec<String>> = None;
+    let mut threads = None;
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
         let mut value = || args.next().unwrap_or_else(|| panic!("{a} needs a value"));
@@ -168,8 +190,9 @@ fn main() {
             "--time" => time = parse_time(&value()),
             "--repeat" => repeat = value().parse().expect("--repeat N"),
             "--only" => only = Some(value().split(',').map(str::to_string).collect()),
+            "--threads" => threads = Some(value().parse().expect("--threads N")),
             "--bench" => {} // passed by `cargo bench`-style runners
-            other => panic!("unknown argument {other} (--time T, --repeat N, --only a,b)"),
+            other => panic!("unknown argument {other} (--time T, --repeat N, --only a,b, --threads N)"),
         }
     }
     println!(
@@ -182,7 +205,7 @@ fn main() {
         }
         let mut best: Option<Outcome> = None;
         for _ in 0..repeat.max(1) {
-            let o = match run(case, time) {
+            let o = match run(case, time, threads) {
                 Ok(o) => o,
                 Err(e) => {
                     println!("{:<11} skipped: {e}", case.name);

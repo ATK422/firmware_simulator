@@ -84,9 +84,10 @@ struct RobotArgs {
     /// Pace virtual time to the wall clock.
     #[arg(long)]
     realtime: bool,
-    /// Run the boards on this many threads (0: one per core). Results are the same; robots in an acoustic
-    /// environment always run their boards in turn.
-    #[arg(long, default_value_t = 1)]
+    /// Run the boards on up to this many threads (0, the default: up to one per core; 1: in turn on one). Results
+    /// are the same with any number; the boards are spread by what they cost, and only as many threads are used as
+    /// make the slices shorter. Robots in an acoustic environment always run their boards in turn.
+    #[arg(long, default_value_t = 0)]
     threads: usize,
     /// Replace the ambient noise every hydrophone hears with white noise at this level, dB re 1 µPa²/Hz.
     #[arg(long)]

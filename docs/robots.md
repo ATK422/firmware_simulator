@@ -89,7 +89,7 @@ as `[t] NAME uart0: ...`); the run ends with the stop time, the wall time and ea
 | `--noise-db L` | | Replaces every hydrophone's ambient noise with white noise at `L` dB re 1 µPa²/Hz |
 | `--vehicle-csv FILE` | | Writes each vehicle's state every 10 ms (`NAME` in the file name for several vehicles) |
 | `--realtime` | off | Paces virtual time to the wall clock |
-| `--threads N` | 1 | Runs the boards on `N` threads within each slice (0: one per core) |
+| `--threads N` | 0 | Runs the boards on up to `N` threads (0: up to one per core; 1: in turn on one) ([below](#how-a-robot-runs)) |
 | `--trace KINDS`, `--trace-board NAMES`, `--trace-file FILE` | | Traces the boards ([below](#traces-profiles-waveforms-and-the-dashboard)) |
 | `--profile-dir DIR`, `--profile-interval T` | `10us` | Profiles every board's firmware |
 | `--vcd FILE`, `--vcd-pins SPEC`, `--vcd-events` | all pins | A VCD waveform with a scope per board (and per bus) |
@@ -136,18 +136,22 @@ its boards and host endpoints sent, the boards' devices update their pins, vehic
 progress is reported to the acoustic medium. The slice bounds how late a frame can reach another board, and keeps
 runs deterministic: the same robot file and inputs give the same run, frame for frame.
 
-**Threads.** Within a slice the boards do not see each other, so `--threads N` (`Robot::threads` in code) runs
-them side by side on a pool of worker threads, and each slice ends exactly as if they had taken turns (a test
-checks Talos frame by frame). Robots in an acoustic environment always take turns, since a hydrophone can hear
-another board within the slice. Handing a board to a worker costs about 15-20 µs of CPU per board and slice, so
-it only pays off with a few heavy boards on an otherwise idle multi-core machine; on the 4-core shared machine it
-was measured on, Talos was not faster with 4 threads. The default is 1. Emulator log lines from different boards
-can interleave differently with threads; what the boards do does not change.
+**Threads.** Within a slice the boards do not see each other, so they can run side by side, and each slice ends
+exactly as if they had taken turns (tests check Talos frame by frame on any number of threads). `--threads N`
+(`Robot::threads` in code) allows up to `N` threads; the default, 0, allows one per core. Each board stays on one
+thread for many slices, grouped by what it was measured to cost: on Talos the two ESC boards each get a thread and
+the other seven share a third. Only as many threads are used as make the slices shorter, so a robot of light
+boards stays on one, and if the cores are busy with other programs (the slices are not shorter on threads) the
+boards go back to taking turns for a while. Robots in an acoustic environment always take turns, since a
+hydrophone can hear another board within the slice. Emulator log lines from different boards can interleave
+differently with threads; what the boards do does not change. `Robot::threads` defaults to 1 in code (tests).
 
-**Speed.** Talos (nine boards) runs at about 0.4x real time on one core of the shared machine it was measured
-on, so `--realtime` with all of Talos is not expected to keep up; the template runs about 60x faster than real
-time, IVCBoard2 about 3.4x and the ESC board about 1.1x. `cargo run --release -p sim_test --example bench` measures it
-([internals.md](internals.md#performance)).
+**Speed.** On one core of the 4-core machine it was measured on, Talos (nine boards) runs at about 0.43x real
+time, and at about 0.72x on three or four threads (1.7x faster; 0.63x on two). That is as far as threads go: the
+slowest board sets the pace of every slice, and the two ESC boards each need about 0.95 s of host time per
+virtual second, in bursts that do not line up between them, so `--realtime` with all of Talos does not keep up.
+The template runs about 60x faster than real time, IVCBoard2 about 3.4x and the ESC board about 1.1x on its own.
+`cargo run --release -p sim_test --example bench` measures it ([internals.md](internals.md#performance)).
 
 ## Mock bridges
 
