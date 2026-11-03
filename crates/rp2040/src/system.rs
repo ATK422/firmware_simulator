@@ -126,6 +126,9 @@ pub struct System {
     /// Time base of the PIO cycle count: `clk_sys` cycle `.1` was at time `.0`.
     pio_base: (Time, u64),
     in_pio: bool,
+    /// Reads of PIO registers that change nothing skip the second advance (on by default; off to check that it
+    /// changes nothing).
+    pub pio_fast_reads: bool,
     /// PIO IRQ lines after the last advance.
     pio_lines: u8,
     /// Pin drives and wake-ups devices scheduled for later.
@@ -218,6 +221,7 @@ impl System {
             pio: [Pio::new(0), Pio::new(1)],
             pio_base: (Time::ZERO, 0),
             in_pio: false,
+            pio_fast_reads: true,
             pio_lines: 0,
             wire: WireQueue::default(),
             pin_devices: Vec::new(),
@@ -662,8 +666,11 @@ impl System {
         let level = self.gpio.level;
         let mut immediate = false;
         for dev in &mut self.pin_devices {
-            for pin in 0..NUM_GPIOS as u8 {
-                if changed & (1 << pin) != 0 && dev.watches(pin) {
+            let mut pins = changed & ((1 << NUM_GPIOS) - 1);
+            while pins != 0 {
+                let pin = pins.trailing_zeros() as u8;
+                pins &= pins - 1;
+                if dev.watches(pin) {
                     let mut ctx =
                         DevPins { now, gpio: &mut self.gpio, freqs: &self.freqs, changed: false, wire: &mut self.wire };
                     dev.pin_changed(&mut ctx, pin, level & (1 << pin) != 0);
@@ -1316,8 +1323,12 @@ impl System {
             PIO0_BASE | PIO1_BASE => {
                 self.pio_advance(trace, now);
                 let v = self.pio[(base == PIO1_BASE) as usize].read(off);
-                self.irq_dirty = true;
-                self.pio_advance(trace, now);
+                // A read that changed nothing needs nothing more (another advance at the same time would only find
+                // the same interrupt lines and schedule the same next advance)
+                if !(self.pio_fast_reads && Pio::read_is_pure(off)) {
+                    self.irq_dirty = true;
+                    self.pio_advance(trace, now);
+                }
                 v
             }
             I2C0_BASE | I2C1_BASE => {
@@ -2013,7 +2024,7 @@ pub struct BatchBus<'a> {
     ticked: bool,
     /// An access since the last [`Bus::take_slow_access`] went through the general path.
     slow: bool,
-    /// An access in the batch went through the general path.
+    /// An access in the batch went through the general path or read the timer.
     touched: bool,
     /// End the batch after an access that goes through the general path (a fused batch, see
     /// `Machine::run_until`: such an access may schedule an event or wake the other core, which the machine must
@@ -2067,8 +2078,8 @@ impl<'a> BatchBus<'a> {
         }
     }
 
-    /// Whether an access in the batch went through the general path (reached a peripheral other than by reading
-    /// the timer, or found XIP not set up).
+    /// Whether an access in the batch went through the general path (reached a peripheral or found XIP not set
+    /// up) or read the timer.
     pub fn touched(&self) -> bool {
         self.touched
     }
@@ -2131,6 +2142,12 @@ impl<'a> BatchBus<'a> {
         let now = self.now();
         match self.sys.timer.read(&self.sys.watchdog.tick, now, addr & 0xFFC) {
             Some(v) => {
+                // A fused batch ends here too: polling the timer is what busy-waits do, and the machine only finds
+                // those at quantum boundaries
+                self.touched = true;
+                if self.end_on_slow {
+                    self.after |= Self::ATTENTION;
+                }
                 let ticks = self.sys.watchdog.tick.ticks(now);
                 if self.timer_ticks.is_some_and(|t| t != ticks) {
                     self.ticked = true;
@@ -2629,5 +2646,48 @@ mod tests {
             sys.update_pins(&mut NullSink, Time::from_us(10 * i + 10));
         }
         assert_eq!(r(&mut sys, Time::from_us(60), PWM_BASE + 8), 5);
+    }
+
+    /// PIO reads that change nothing skip the second advance (`System::pio_fast_reads`): the interrupt lines the run
+    /// loop sees, the next PIO advance and what is read must be as with it. A state machine fills its RX FIFO and
+    /// stalls; the CPU polls FSTAT and pops the FIFO (unstalling the machine and dropping RX-not-empty), with and
+    /// without time passing in between.
+    #[test]
+    fn pio_fast_reads_change_nothing() {
+        let run = |fast: bool| {
+            let mut sys = quiet();
+            sys.pio_fast_reads = fast;
+            let mut log = Vec::new();
+            w(&mut sys, Time::ZERO, RESETS_BASE + 0x3000, 1 << 10); // PIO0 out of reset
+            w(&mut sys, Time::ZERO, PIO0_BASE + pio::INSTR_MEM0, 0x8020); // push block (then jmp 0 from empty memory)
+            w(&mut sys, Time::ZERO, PIO0_BASE + 0x12C, 1); // IRQ0_INTE: SM0 RX not empty
+            w(&mut sys, Time::ZERO, PIO0_BASE + pio::CTRL, 1);
+            // The run loop's view of the interrupt lines
+            let mut seen = sys.irq_lines_both();
+            sys.irq_dirty = false;
+            let mut t = Time::from_us(5);
+            for i in 0..40u64 {
+                let off = match i % 5 {
+                    0 | 2 => pio::FSTAT,
+                    1 => pio::FLEVEL,
+                    _ => pio::RXF0,
+                };
+                let v = r(&mut sys, t, PIO0_BASE + off);
+                if sys.irq_dirty {
+                    sys.irq_dirty = false;
+                    seen = sys.irq_lines_both();
+                }
+                assert_eq!(seen, sys.irq_lines_both(), "read {i}: the lines changed without irq_dirty");
+                log.push((t, off, v, seen, sys.sched.next_time()));
+                if i % 7 == 6 {
+                    t += Time::from_ns(40);
+                }
+            }
+            log
+        };
+        let fast = run(true);
+        assert!(fast.iter().any(|e| e.1 == pio::RXF0 && e.3[0] & 1 << irq::PIO0_IRQ_0 == 0), "{fast:?}");
+        assert!(fast.iter().any(|e| e.3[0] & 1 << irq::PIO0_IRQ_0 != 0), "{fast:?}");
+        assert_eq!(fast, run(false));
     }
 }

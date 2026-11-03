@@ -130,14 +130,15 @@ pub struct Machine {
     pub fuse_quanta: bool,
     /// Quantum boundaries crossed inside fused batches (statistics).
     pub quanta_fused: u64,
-    /// The last quantum reached a peripheral (other than reading the timer): its core is likely to again, so the
-    /// next quantum is not fused.
-    last_touched: bool,
+    /// The last quantum wrote memory and reached no peripheral (other than SRAM): its core is computing, so the next
+    /// quantum may be fused. After a quiet one (a busy-wait, maybe) the next is left to the busy-wait check, and
+    /// after one that reached a peripheral the next is likely to again.
+    fuse_next: bool,
 }
 
 /// Quanta one fused batch may run through at most (bounds how long busy-wait detection waits, see
 /// [`Machine::run_until`]).
-const FUSE_QUANTA: u32 = 16;
+const FUSE_QUANTA: u32 = 64;
 
 /// A snapshot of a machine: everything except the trace sink.
 #[derive(Clone)]
@@ -189,7 +190,7 @@ impl Machine {
             spin_skipped: 0,
             fuse_quanta: true,
             quanta_fused: 0,
-            last_touched: true,
+            fuse_next: false,
         };
         m.clk_sys = m.sys.clk_sys;
         m.sys.clk_sys_changed = false;
@@ -943,11 +944,12 @@ impl Machine {
             let spin_start = (self.spin_watch == Some(c)).then(|| self.cores[c].spin_state());
             let mut spin = Some((Quiet::Memory, 0u32, 0u64));
             // Quantum fusing: the first batch may run on through further quanta when the boundaries between them
-            // would change nothing. The other core cannot run and nothing that could wake it happens inside a
-            // batch that touches only memory and the timer (the batch ends after any other access); no SysTick
-            // counts (fed at boundaries); events are not due before `limit`, which ends the batch. Only the
-            // busy-wait check looks at quantum boundaries, so a quantum checked for a loop is not fused, and
-            // skipping a loop is the same as running it.
+            // would change nothing. The other core cannot run, and nothing that could wake it happens inside a
+            // batch that touches only memory (the batch ends after any other access, which may also schedule an
+            // event); no SysTick counts (fed at boundaries); events are not due before `limit`, which ends the
+            // batch. Only the busy-wait check looks at quantum boundaries, and skipping a loop is the same as
+            // running it; so that loops are still found, only quanta that follow one that wrote memory and touched
+            // nothing else are fused, and a timer read (busy-waits poll the timer) ends a fused batch too.
             let counts = |m: &Machine, k: usize| {
                 m.cores[k].systick.counts_core_clock()
                     || m.cores[k].systick.counts_reference_clock()
@@ -957,7 +959,7 @@ impl Machine {
             let mut fuse = self.fuse_quanta
                 && self.bkpt_policy == BkptPolicy::HardFault
                 && spin_start.is_none()
-                && !self.last_touched
+                && self.fuse_next
                 && runnable == 1
                 && !counts(self, c)
                 && !counts(self, 1 - c);
@@ -1041,7 +1043,7 @@ impl Machine {
                 Some(b) => Some((c, limit, self.clocks[c], self.clk_sys.hz(), b)),
                 None => None,
             };
-            self.last_touched = touched;
+            self.fuse_next = !touched && spin.is_none();
             // A whole quantum that only read memory and the timer: watch the next one, and if this one came back
             // to where it started, skip the ones that would repeat it
             let spin = spin.filter(|&(_, n, _)| n == self.quantum);
@@ -1129,7 +1131,7 @@ impl Machine {
             spin_skipped: self.spin_skipped,
             fuse_quanta: self.fuse_quanta,
             quanta_fused: self.quanta_fused,
-            last_touched: true,
+            fuse_next: false,
         }
     }
 

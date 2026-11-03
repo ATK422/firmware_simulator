@@ -72,7 +72,7 @@ fn embassy_firmware_fused_as_unfused() {
     // Timer alarms, interrupts, WFE sleeps and GPIO toggles; slices both on and off quantum boundaries
     for slice in [Time::from_us(100), Time::from_us(37)] {
         let fused = same("embassy_blinky.elf", Time::from_ms(600), slice, false);
-        assert!(fused > 1000, "{fused} quanta fused");
+        assert!(fused > 100, "{fused} quanta fused");
     }
 }
 

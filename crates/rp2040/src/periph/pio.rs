@@ -942,10 +942,15 @@ impl Pio {
         }
     }
 
+    /// Whether reading register `offset` leaves the block exactly as it was: FIFO levels, flags, IRQs and pins
+    /// (pure loops change none of them). The others show a state machine's position, which needs loops brought up
+    /// to date, or pop an RX FIFO.
+    pub fn read_is_pure(offset: u32) -> bool {
+        matches!(offset, CTRL | FSTAT | FDEBUG | FLEVEL | 0x010..=0x01C | IRQ..=0x0C4 | INTR..=0x140)
+    }
+
     pub fn read(&mut self, offset: u32) -> Option<u32> {
-        // Registers that show a state machine's position (or change what it reads: an RX FIFO pop) need the loops
-        // brought up to date; FIFO levels, flags, IRQs and pins are what they are (pure loops change none)
-        if !matches!(offset, CTRL | FSTAT | FDEBUG | FLEVEL | 0x010..=0x01C | IRQ..=0x0C4 | INTR..=0x140) {
+        if !Self::read_is_pure(offset) {
             self.materialize();
         }
         Some(match offset {
