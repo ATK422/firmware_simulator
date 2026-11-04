@@ -773,7 +773,12 @@ impl CortexM0Plus {
         leave: &mut bool,
     ) -> Result<u32, Fault> {
         let code = leave;
-        let pc = lo.wrapping_add(op.off as u32);
+        // (Fields are extracted in the arms that use them, so that the dispatch does not compute them all)
+        macro_rules! pc {
+            () => {
+                lo.wrapping_add(op.off as u32)
+            };
+        }
         // Accesses happen at the instruction's start time
         macro_rules! timed {
             () => {
@@ -781,9 +786,21 @@ impl CortexM0Plus {
             };
         }
         // Register numbers are below 16 (the masks spare the bounds checks)
-        let a = (op.a & 15) as usize;
-        let b = (op.b & 15) as usize;
-        let m = (op.imm & 15) as usize;
+        macro_rules! a {
+            () => {
+                (op.a & 15) as usize
+            };
+        }
+        macro_rules! b {
+            () => {
+                (op.b & 15) as usize
+            };
+        }
+        macro_rules! m {
+            () => {
+                (op.imm & 15) as usize
+            };
+        }
         let imm = op.imm;
         macro_rules! arith {
             ($x:expr, $y:expr, $c:expr) => {{
@@ -798,49 +815,49 @@ impl CortexM0Plus {
             ($r:expr) => {{
                 let r = $r;
                 self.set_nz(r);
-                self.r[a] = r;
+                self.r[a!()] = r;
             }};
         }
         match op.kind {
             K::LslI => {
-                let v = self.r[b];
+                let v = self.r[b!()];
                 self.c = (v >> (32 - imm)) & 1 != 0;
                 logic!(v << imm);
             }
             K::LsrI => {
-                let v = self.r[b];
+                let v = self.r[b!()];
                 self.c = (v >> (imm - 1)) & 1 != 0;
                 logic!(v >> imm);
             }
             K::AsrI => {
-                let v = self.r[b];
+                let v = self.r[b!()];
                 self.c = (v >> (imm - 1)) & 1 != 0;
                 logic!(((v as i32) >> imm) as u32);
             }
-            K::Movs => logic!(self.r[b]),
+            K::Movs => logic!(self.r[b!()]),
             K::Lsr32 => {
-                self.c = self.r[b] >> 31 != 0;
+                self.c = self.r[b!()] >> 31 != 0;
                 logic!(0);
             }
             K::Asr32 => {
-                let v = self.r[b];
+                let v = self.r[b!()];
                 self.c = v >> 31 != 0;
                 logic!(((v as i32) >> 31) as u32);
             }
-            K::AddR => self.r[a] = arith!(self.r[b], self.r[m], false),
-            K::SubR => self.r[a] = arith!(self.r[b], !self.r[m], true),
-            K::AddI3 => self.r[a] = arith!(self.r[b], imm, false),
-            K::SubI3 => self.r[a] = arith!(self.r[b], !imm, true),
+            K::AddR => self.r[a!()] = arith!(self.r[b!()], self.r[m!()], false),
+            K::SubR => self.r[a!()] = arith!(self.r[b!()], !self.r[m!()], true),
+            K::AddI3 => self.r[a!()] = arith!(self.r[b!()], imm, false),
+            K::SubI3 => self.r[a!()] = arith!(self.r[b!()], !imm, true),
             K::MovI => logic!(imm),
             K::CmpI => {
-                arith!(self.r[a], !imm, true);
+                arith!(self.r[a!()], !imm, true);
             }
-            K::AddI8 => self.r[a] = arith!(self.r[a], imm, false),
-            K::SubI8 => self.r[a] = arith!(self.r[a], !imm, true),
-            K::And => logic!(self.r[a] & self.r[b]),
-            K::Eor => logic!(self.r[a] ^ self.r[b]),
+            K::AddI8 => self.r[a!()] = arith!(self.r[a!()], imm, false),
+            K::SubI8 => self.r[a!()] = arith!(self.r[a!()], !imm, true),
+            K::And => logic!(self.r[a!()] & self.r[b!()]),
+            K::Eor => logic!(self.r[a!()] ^ self.r[b!()]),
             K::LslR => {
-                let (dn, s) = (self.r[a], self.r[b] & 0xFF);
+                let (dn, s) = (self.r[a!()], self.r[b!()] & 0xFF);
                 let r = match s {
                     0 => dn,
                     1..=31 => {
@@ -859,7 +876,7 @@ impl CortexM0Plus {
                 logic!(r);
             }
             K::LsrR => {
-                let (dn, s) = (self.r[a], self.r[b] & 0xFF);
+                let (dn, s) = (self.r[a!()], self.r[b!()] & 0xFF);
                 let r = match s {
                     0 => dn,
                     1..=31 => {
@@ -878,7 +895,7 @@ impl CortexM0Plus {
                 logic!(r);
             }
             K::AsrR => {
-                let (dn, s) = (self.r[a], self.r[b] & 0xFF);
+                let (dn, s) = (self.r[a!()], self.r[b!()] & 0xFF);
                 let r = match s {
                     0 => dn,
                     1..=31 => {
@@ -892,10 +909,10 @@ impl CortexM0Plus {
                 };
                 logic!(r);
             }
-            K::Adc => self.r[a] = arith!(self.r[a], self.r[b], self.c),
-            K::Sbc => self.r[a] = arith!(self.r[a], !self.r[b], self.c),
+            K::Adc => self.r[a!()] = arith!(self.r[a!()], self.r[b!()], self.c),
+            K::Sbc => self.r[a!()] = arith!(self.r[a!()], !self.r[b!()], self.c),
             K::Ror => {
-                let (dn, s) = (self.r[a], self.r[b] & 0xFF);
+                let (dn, s) = (self.r[a!()], self.r[b!()] & 0xFF);
                 let r = if s == 0 {
                     dn
                 } else {
@@ -905,146 +922,146 @@ impl CortexM0Plus {
                 };
                 logic!(r);
             }
-            K::Tst => self.set_nz(self.r[a] & self.r[b]),
-            K::Rsb => self.r[a] = arith!(!self.r[b], 0, true),
+            K::Tst => self.set_nz(self.r[a!()] & self.r[b!()]),
+            K::Rsb => self.r[a!()] = arith!(!self.r[b!()], 0, true),
             K::CmpR => {
-                arith!(self.r[a], !self.r[b], true);
+                arith!(self.r[a!()], !self.r[b!()], true);
             }
             K::Cmn => {
-                arith!(self.r[a], self.r[b], false);
+                arith!(self.r[a!()], self.r[b!()], false);
             }
-            K::Orr => logic!(self.r[a] | self.r[b]),
-            K::Mul => logic!(self.r[a].wrapping_mul(self.r[b])),
-            K::Bic => logic!(self.r[a] & !self.r[b]),
-            K::Mvn => logic!(!self.r[b]),
+            K::Orr => logic!(self.r[a!()] | self.r[b!()]),
+            K::Mul => logic!(self.r[a!()].wrapping_mul(self.r[b!()])),
+            K::Bic => logic!(self.r[a!()] & !self.r[b!()]),
+            K::Mvn => logic!(!self.r[b!()]),
             K::AddHi => {
-                let r = self.r[a].wrapping_add(self.r[b]);
-                self.r[a] = if a == 13 { r & !3 } else { r };
+                let r = self.r[a!()].wrapping_add(self.r[b!()]);
+                self.r[a!()] = if a!() == 13 { r & !3 } else { r };
             }
             K::CmpHi => {
-                arith!(self.r[a], !self.r[b], true);
+                arith!(self.r[a!()], !self.r[b!()], true);
             }
             K::MovHi => {
-                let r = self.r[b];
-                self.r[a] = if a == 13 { r & !3 } else { r };
+                let r = self.r[b!()];
+                self.r[a!()] = if a!() == 13 { r & !3 } else { r };
             }
-            K::Set => self.r[a] = imm,
-            K::AddSp => self.r[a] = self.r[13].wrapping_add(imm),
+            K::Set => self.r[a!()] = imm,
+            K::AddSp => self.r[a!()] = self.r[13].wrapping_add(imm),
             K::SpAdd => self.r[13] = self.r[13].wrapping_add(imm),
-            K::Sxth => self.r[a] = sext(self.r[b] & 0xFFFF, 16),
-            K::Sxtb => self.r[a] = sext(self.r[b] & 0xFF, 8),
-            K::Uxth => self.r[a] = self.r[b] & 0xFFFF,
-            K::Uxtb => self.r[a] = self.r[b] & 0xFF,
-            K::Rev => self.r[a] = self.r[b].swap_bytes(),
+            K::Sxth => self.r[a!()] = sext(self.r[b!()] & 0xFFFF, 16),
+            K::Sxtb => self.r[a!()] = sext(self.r[b!()] & 0xFF, 8),
+            K::Uxth => self.r[a!()] = self.r[b!()] & 0xFFFF,
+            K::Uxtb => self.r[a!()] = self.r[b!()] & 0xFF,
+            K::Rev => self.r[a!()] = self.r[b!()].swap_bytes(),
             K::Rev16 => {
-                let m = self.r[b];
-                self.r[a] = ((m & 0x00FF_00FF) << 8) | ((m & 0xFF00_FF00) >> 8);
+                let m = self.r[b!()];
+                self.r[a!()] = ((m & 0x00FF_00FF) << 8) | ((m & 0xFF00_FF00) >> 8);
             }
             K::Revsh => {
-                let m = self.r[b];
-                self.r[a] = sext(((m & 0xFF) << 8) | ((m >> 8) & 0xFF), 16);
+                let m = self.r[b!()];
+                self.r[a!()] = sext(((m & 0xFF) << 8) | ((m >> 8) & 0xFF), 16);
             }
             K::Nop => {}
             K::Ldr => {
                 timed!();
-                self.r[a] = self.load(bus, imm, Size::Word)?;
+                self.r[a!()] = self.load(bus, imm, Size::Word)?;
                 return Ok(2);
             }
             K::StrR => {
                 timed!();
-                let addr = self.r[b].wrapping_add(self.r[m]);
-                self.store(bus, addr, (Size::Word, self.r[a]), (lo, len), code)?;
+                let addr = self.r[b!()].wrapping_add(self.r[m!()]);
+                self.store(bus, addr, (Size::Word, self.r[a!()]), (lo, len), code)?;
                 return Ok(2);
             }
             K::StrhR => {
                 timed!();
-                let addr = self.r[b].wrapping_add(self.r[m]);
-                self.store(bus, addr, (Size::Half, self.r[a]), (lo, len), code)?;
+                let addr = self.r[b!()].wrapping_add(self.r[m!()]);
+                self.store(bus, addr, (Size::Half, self.r[a!()]), (lo, len), code)?;
                 return Ok(2);
             }
             K::StrbR => {
                 timed!();
-                let addr = self.r[b].wrapping_add(self.r[m]);
-                self.store(bus, addr, (Size::Byte, self.r[a]), (lo, len), code)?;
+                let addr = self.r[b!()].wrapping_add(self.r[m!()]);
+                self.store(bus, addr, (Size::Byte, self.r[a!()]), (lo, len), code)?;
                 return Ok(2);
             }
             K::LdrsbR => {
                 timed!();
-                let addr = self.r[b].wrapping_add(self.r[m]);
-                self.r[a] = sext(self.load(bus, addr, Size::Byte)?, 8);
+                let addr = self.r[b!()].wrapping_add(self.r[m!()]);
+                self.r[a!()] = sext(self.load(bus, addr, Size::Byte)?, 8);
                 return Ok(2);
             }
             K::LdrR => {
                 timed!();
-                let addr = self.r[b].wrapping_add(self.r[m]);
-                self.r[a] = self.load(bus, addr, Size::Word)?;
+                let addr = self.r[b!()].wrapping_add(self.r[m!()]);
+                self.r[a!()] = self.load(bus, addr, Size::Word)?;
                 return Ok(2);
             }
             K::LdrhR => {
                 timed!();
-                let addr = self.r[b].wrapping_add(self.r[m]);
-                self.r[a] = self.load(bus, addr, Size::Half)?;
+                let addr = self.r[b!()].wrapping_add(self.r[m!()]);
+                self.r[a!()] = self.load(bus, addr, Size::Half)?;
                 return Ok(2);
             }
             K::LdrbR => {
                 timed!();
-                let addr = self.r[b].wrapping_add(self.r[m]);
-                self.r[a] = self.load(bus, addr, Size::Byte)?;
+                let addr = self.r[b!()].wrapping_add(self.r[m!()]);
+                self.r[a!()] = self.load(bus, addr, Size::Byte)?;
                 return Ok(2);
             }
             K::LdrshR => {
                 timed!();
-                let addr = self.r[b].wrapping_add(self.r[m]);
-                self.r[a] = sext(self.load(bus, addr, Size::Half)?, 16);
+                let addr = self.r[b!()].wrapping_add(self.r[m!()]);
+                self.r[a!()] = sext(self.load(bus, addr, Size::Half)?, 16);
                 return Ok(2);
             }
             K::StrI => {
                 timed!();
-                let addr = self.r[b].wrapping_add(imm);
-                self.store(bus, addr, (Size::Word, self.r[a]), (lo, len), code)?;
+                let addr = self.r[b!()].wrapping_add(imm);
+                self.store(bus, addr, (Size::Word, self.r[a!()]), (lo, len), code)?;
                 return Ok(2);
             }
             K::LdrI => {
                 timed!();
-                let addr = self.r[b].wrapping_add(imm);
-                self.r[a] = self.load(bus, addr, Size::Word)?;
+                let addr = self.r[b!()].wrapping_add(imm);
+                self.r[a!()] = self.load(bus, addr, Size::Word)?;
                 return Ok(2);
             }
             K::StrbI => {
                 timed!();
-                let addr = self.r[b].wrapping_add(imm);
-                self.store(bus, addr, (Size::Byte, self.r[a]), (lo, len), code)?;
+                let addr = self.r[b!()].wrapping_add(imm);
+                self.store(bus, addr, (Size::Byte, self.r[a!()]), (lo, len), code)?;
                 return Ok(2);
             }
             K::LdrbI => {
                 timed!();
-                let addr = self.r[b].wrapping_add(imm);
-                self.r[a] = self.load(bus, addr, Size::Byte)?;
+                let addr = self.r[b!()].wrapping_add(imm);
+                self.r[a!()] = self.load(bus, addr, Size::Byte)?;
                 return Ok(2);
             }
             K::StrhI => {
                 timed!();
-                let addr = self.r[b].wrapping_add(imm);
-                self.store(bus, addr, (Size::Half, self.r[a]), (lo, len), code)?;
+                let addr = self.r[b!()].wrapping_add(imm);
+                self.store(bus, addr, (Size::Half, self.r[a!()]), (lo, len), code)?;
                 return Ok(2);
             }
             K::LdrhI => {
                 timed!();
-                let addr = self.r[b].wrapping_add(imm);
-                self.r[a] = self.load(bus, addr, Size::Half)?;
+                let addr = self.r[b!()].wrapping_add(imm);
+                self.r[a!()] = self.load(bus, addr, Size::Half)?;
                 return Ok(2);
             }
             K::Stm => {
                 timed!();
-                let base = self.r[a];
-                let r = self.op_stm(bus, a as u32, imm);
+                let base = self.r[a!()];
+                let r = self.op_stm(bus, a!() as u32, imm);
                 // Conservatively: any part of the block within the stored words
                 *code |= base.wrapping_sub(lo.wrapping_sub(64)) < len + 64;
                 return r;
             }
             K::Ldm => {
                 timed!();
-                return self.op_ldm(bus, a as u32, imm);
+                return self.op_ldm(bus, a!() as u32, imm);
             }
             K::Push => {
                 timed!();
@@ -1061,23 +1078,23 @@ impl CortexM0Plus {
                 return Ok(2);
             }
             K::BCond => {
-                if self.condition_passed(a as u32) {
+                if self.condition_passed(a!() as u32) {
                     self.r[15] = imm;
                     *code = true;
                     return Ok(2);
                 }
-                self.r[15] = pc.wrapping_add(2);
+                self.r[15] = pc!().wrapping_add(2);
             }
             K::Bl => {
-                self.r[14] = pc.wrapping_add(4) | 1;
+                self.r[14] = pc!().wrapping_add(4) | 1;
                 self.r[15] = imm;
                 return Ok(3);
             }
             K::Bx | K::Blx => {
                 timed!();
-                let target = self.r[a];
+                let target = self.r[a!()];
                 if op.kind == K::Blx {
-                    self.r[14] = pc.wrapping_add(2) | 1;
+                    self.r[14] = pc!().wrapping_add(2) | 1;
                 }
                 return self.op_bx(bus, target);
             }
@@ -1087,7 +1104,7 @@ impl CortexM0Plus {
             }
             K::Step => {
                 timed!();
-                return self.op_step(bus, pc);
+                return self.op_step(bus, pc!());
             }
         }
         Ok(1)
