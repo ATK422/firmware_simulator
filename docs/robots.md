@@ -206,6 +206,13 @@ to know when it sends (mock bridges, recordings), so with `--can`, `--cannelloni
 `--profile-dir`, a pty or `--usbip` the boards stay in step slice by slice, as with `--no-run-ahead`.
 `Robot::run_ahead` switches it in code.
 
+A board alone on a bus with nothing to acknowledge its frames (Talos's smart battery on the external bus when no
+bridge is there for client 21) retries each frame without end, as a CAN controller does (the firmware does since
+titan_firmware_rs c59474f; before, its transmit queue gave up after three attempts and fell silent). Each retry is a
+frame on the bus, every 284 µs, and each ends a window, so running ahead gains nothing: Talos on four threads took
+16 s of wall time for 2 s instead of 1.8 s. Give such a bus a bridge (`--mock-bridge external:21`, as the bench and
+the run-ahead tests do), which is also what the robot has: the Orin's CAN interface acknowledges every frame.
+
 **Speed.** On one core of the 4-core machine it was measured on, Talos (nine boards) runs at about 0.54x real
 time, and at about 1.2-1.25x on three or four threads (2.2-2.3x faster), so `--realtime` with all of Talos keeps
 up when three cores are free for it. Two threads give about 0.8x (the ESC boards then share a thread with the

@@ -70,6 +70,12 @@ fn talos(how: &How) -> Option<(Run, sim_host::runahead::Stats)> {
     let bridge = MockBridge::new(1, true, Time::ZERO);
     bridge.set_kill(Some(false));
     r.bus("internal").unwrap().endpoints.push(Box::new(bridge.clone()));
+    // The smart battery is alone on the external bus: without the Orin's interface there to acknowledge its frames,
+    // it retries each one without end (as CAN does, since titan_firmware_rs c59474f), a frame on the bus every
+    // 284 us, and every one of them ends a window
+    let battery = MockBridge::new(21, false, Time::ZERO);
+    battery.set_kill(Some(false));
+    r.bus("external").unwrap().endpoints.push(Box::new(battery));
     let hooks = Arc::new(Mutex::new(Vec::new()));
     for (i, s) in r.boards.iter_mut().enumerate() {
         let h = hooks.clone();

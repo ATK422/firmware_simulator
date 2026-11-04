@@ -42,17 +42,22 @@ enum Kind {
     Robot { file: &'static str, bridges: &'static [(&'static str, u8)], threads: isize },
 }
 
+/// Talos's mock bridges: the PoAC board's on the internal bus, and the smart battery's on the external bus, where it
+/// is the only board. Without something there to acknowledge its frames it retries each one without end (as CAN
+/// does, since titan_firmware_rs c59474f): a frame on the bus every 284 us, each of which ends a run-ahead window.
+const TALOS_BRIDGES: &[(&str, u8)] = &[("internal", 1), ("external", 21)];
+
 const CASES: &[Case] = &[
     Case { name: "template", kind: Kind::Board { elf: "template", board: "mk2/power_board", client: 1 } },
     Case { name: "esc_board", kind: Kind::Board { elf: "esc_board", board: "mk2/esc_board", client: 2 } },
     Case { name: "ivc_board2", kind: Kind::Board { elf: "ivc_board2", board: "talos/ivc_board", client: 8 } },
-    Case { name: "talos", kind: Kind::Robot { file: "talos.toml", bridges: &[("internal", 1)], threads: 1 } },
-    Case { name: "talos_mt", kind: Kind::Robot { file: "talos.toml", bridges: &[("internal", 1)], threads: 4 } },
-    Case { name: "talos_t2", kind: Kind::Robot { file: "talos.toml", bridges: &[("internal", 1)], threads: 2 } },
-    Case { name: "talos_t3", kind: Kind::Robot { file: "talos.toml", bridges: &[("internal", 1)], threads: 3 } },
-    Case { name: "talos_t6", kind: Kind::Robot { file: "talos.toml", bridges: &[("internal", 1)], threads: 6 } },
+    Case { name: "talos", kind: Kind::Robot { file: "talos.toml", bridges: TALOS_BRIDGES, threads: 1 } },
+    Case { name: "talos_mt", kind: Kind::Robot { file: "talos.toml", bridges: TALOS_BRIDGES, threads: 4 } },
+    Case { name: "talos_t2", kind: Kind::Robot { file: "talos.toml", bridges: TALOS_BRIDGES, threads: 2 } },
+    Case { name: "talos_t3", kind: Kind::Robot { file: "talos.toml", bridges: TALOS_BRIDGES, threads: 3 } },
+    Case { name: "talos_t6", kind: Kind::Robot { file: "talos.toml", bridges: TALOS_BRIDGES, threads: 6 } },
     // On three threads in step slice by slice (`Robot::run_ahead` off), for comparison
-    Case { name: "talos_t3_ls", kind: Kind::Robot { file: "talos.toml", bridges: &[("internal", 1)], threads: -3 } },
+    Case { name: "talos_t3_ls", kind: Kind::Robot { file: "talos.toml", bridges: TALOS_BRIDGES, threads: -3 } },
     Case {
         name: "ivc2_pool",
         kind: Kind::Robot { file: "ivc2_pool.toml", bridges: &[("talos", 8), ("surface", 8)], threads: 1 },
