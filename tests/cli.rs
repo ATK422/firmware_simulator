@@ -208,9 +208,7 @@ fn robot_usb_cdc_ports_from_the_command_line() {
 /// bridge prints it as it arrives across the pool.
 #[test]
 fn robot_ivc_send_reaches_the_other_vehicle() {
-    let fw = sim_host::titan_rs_release_dir(&repo()).join("ivc_board2");
-    if !fw.exists() {
-        eprintln!("skipping: {} not built", fw.display());
+    if sim_host::titan_rs_image(&repo(), "ivc_board2").is_none() {
         return;
     }
     let robot = repo().join("robots/ivc2_pool.toml");
@@ -247,8 +245,7 @@ fn robot_ivc_send_reaches_the_other_vehicle() {
 /// two USB ports; the command line moves the ptys away from the file's fixed paths.
 #[test]
 fn ivc2_interop_robot_takes_the_c_image_from_titan_firmware_dir() {
-    if !sim_host::titan_rs_release_dir(&repo()).join("ivc_board2").exists() {
-        eprintln!("skipping: ivc_board2 not built");
+    if sim_host::titan_rs_image(&repo(), "ivc_board2").is_none() {
         return;
     }
     let tf = temp("titan_firmware");
@@ -384,4 +381,56 @@ fn a_lockup_lasts_until_the_watchdog_resets_the_board() {
     assert!(!ok && err.contains("lk stopped: Lockup"), "{err}");
     let (ok, err) = sim_status(&["robot", path(&robot), "--time", "100ms", "--stop-on-lockup"]);
     assert!(!ok && err.contains("lk stopped: Lockup") && err.contains("stopped at 0.000000s;"), "{err}");
+}
+
+/// `robot --gdb BOARD=ADDR` waits for GDB on that board before running; after GDB detaches the run goes on to
+/// `--time`.
+#[test]
+fn robot_gdb_debugs_one_board() {
+    use std::io::{Read, Write};
+    let robot = temp("gdb.toml");
+    std::fs::write(
+        &robot,
+        format!(
+            "[[board]]\nname = \"a\"\nboard = {b:?}\nelf = {e:?}\n\n[[board]]\nname = \"b\"\nboard = {b:?}\nelf = {e:?}\n",
+            b = path(&repo().join("boards/mk2/power_board.toml")),
+            e = path(&repo().join("test_programs/blink.elf"))
+        ),
+    )
+    .unwrap();
+    let port = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
+    let child = Command::new(env!("CARGO_BIN_EXE_firmware_simulator"))
+        .args(["robot", path(&robot), "--time", "20ms", "--gdb", &format!("b=127.0.0.1:{port}")])
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut s = (0..100)
+        .find_map(|_| {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            std::net::TcpStream::connect(("127.0.0.1", port)).ok()
+        })
+        .expect("the robot listens for GDB");
+    s.set_read_timeout(Some(std::time::Duration::from_secs(30))).unwrap();
+    let reply = |s: &mut std::net::TcpStream, pkt: &[u8]| {
+        s.write_all(pkt).unwrap();
+        let mut got = Vec::new();
+        let mut b = [0u8; 1];
+        while !got.ends_with(b"#") {
+            s.read_exact(&mut b).unwrap();
+            got.push(b[0]);
+        }
+        s.read_exact(&mut [0u8; 2]).unwrap();
+        String::from_utf8_lossy(&got).trim_start_matches('+').to_string()
+    };
+    assert_eq!(reply(&mut s, b"$?#3f"), "$T05thread:1;#");
+    assert_eq!(reply(&mut s, b"$D#44"), "$OK#");
+    let out = child.wait_with_output().unwrap();
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "{err}");
+    assert!(err.contains("waiting for GDB") && err.contains("(board b)") && err.contains("GDB detached"), "{err}");
+    assert!(err.contains("stopped at 0.020000s"), "{err}");
+    for (arg, want) in [("nope=127.0.0.1:0", "--gdb: no board \"nope\""), ("127.0.0.1:0", "expected BOARD=ADDR")] {
+        let (ok, err) = sim_status(&["robot", path(&robot), "--time", "1ms", "--gdb", arg]);
+        assert!(!ok && err.contains(want), "{arg}: {err}");
+    }
 }

@@ -2,8 +2,14 @@
 //!
 //! Each RP2040 core is a GDB thread (thread 1 = core 0, thread 2 = core 1). Supported: registers (`g`/`G`/`p`/`P`,
 //! with an M-profile target description), memory (`m`/`M`/`X`; writes reach flash, so `load` works), software and
-//! hardware breakpoints (`Z0`/`Z1`), `c`/`s`/`vCont`, Ctrl-C, `qRcmd` monitor commands (`reset`, `time`), no-ack
-//! mode and detach/kill. While running, the session keeps polling RTT so logs keep flowing.
+//! hardware breakpoints (`Z0`/`Z1`), `c`/`s`/`vCont`, Ctrl-C, `qRcmd` monitor commands (`reset`, `reset halt`,
+//! `halt`, `time`: what Cortex-Debug and OpenOCD-style launch scripts send), no-ack mode, `target extended-remote`,
+//! and detach/kill (`k`, `vKill`). While running, the session keeps polling RTT so logs keep flowing.
+//!
+//! The stub debugs a [`Target`]: one board on its own (a [`Session`]), or one board of a robot ([`RobotBoard`]),
+//! where running it runs every board and bus of the robot. A connection that closes before sending a packet (a
+//! port check) is not a debugger: the stub waits for the next one. GDB going away while the target runs ends the
+//! session, as does the run being asked to stop (SIGINT, SIGTERM), which GDB hears as the program exiting.
 
 use std::io::{self, Read, Write};
 use std::net::{TcpListener, TcpStream};
@@ -14,7 +20,58 @@ use rp2040::machine::BkptPolicy;
 use sim_core::bus::Size;
 use sim_core::cpu::Cpu;
 
+use crate::robot::Robot;
 use crate::session::Session;
+
+/// What GDB debugs: a board ([`Target::session`]: the registers, memory and breakpoints GDB sees) and how it runs.
+pub trait Target {
+    /// The board being debugged.
+    fn session(&mut self) -> &mut Session;
+    /// Runs for `d` of virtual time. Returns why it stopped: [`StopReason::TimeLimit`] when it ran the whole
+    /// piece, [`StopReason::Requested`] when the run was asked to stop.
+    fn run_for(&mut self, d: sim_core::Time) -> StopReason;
+}
+
+impl Target for Session {
+    fn session(&mut self) -> &mut Session {
+        self
+    }
+
+    fn run_for(&mut self, d: sim_core::Time) -> StopReason {
+        Session::run_for(self, d)
+    }
+}
+
+/// Board `board` of a robot. Running it runs the whole robot (every board, bus, the water and the vehicles), so the
+/// other boards keep pace with it, and it stops when the debugged board stops (a breakpoint, `BKPT`, a final
+/// lockup). Another board that stops (a final lockup) ends the run, as it does without GDB. The boards run in turn
+/// on the calling thread while GDB is attached.
+pub struct RobotBoard<'a> {
+    pub robot: &'a mut Robot,
+    pub board: usize,
+}
+
+impl Target for RobotBoard<'_> {
+    fn session(&mut self) -> &mut Session {
+        &mut self.robot.boards[self.board]
+    }
+
+    fn run_for(&mut self, d: sim_core::Time) -> StopReason {
+        let (threads, end) = (self.robot.threads, self.robot.now + d);
+        self.robot.threads = 1;
+        let stopped = self.robot.run_until(end);
+        self.robot.threads = threads;
+        match stopped {
+            Some((i, reason)) if i == self.board => reason,
+            Some((i, reason)) => {
+                log::warn!("[{}] {} stopped: {reason:?}; ending the run", self.robot.now, self.robot.names[i]);
+                StopReason::Requested
+            }
+            None if self.robot.now < end => StopReason::Requested,
+            None => StopReason::TimeLimit,
+        }
+    }
+}
 
 const TARGET_XML: &str = r#"<?xml version="1.0"?>
 <!DOCTYPE target SYSTEM "gdb-target.dtd">
@@ -204,6 +261,8 @@ pub enum Ended {
     Detached,
     /// GDB killed the target or closed the connection.
     Killed,
+    /// The run was asked to stop while GDB was attached (SIGINT, SIGTERM; for a robot, another board stopped).
+    Stopped,
 }
 
 /// The protocol state for one connected debugger.
@@ -251,15 +310,22 @@ impl GdbStub {
     }
 
     fn monitor(&mut self, session: &mut Session, cmd: &str) -> String {
-        let out = match cmd.trim() {
-            "reset" => {
+        let words: Vec<&str> = cmd.split_whitespace().collect();
+        let out = match words[..] {
+            // OpenOCD's spellings, which Cortex-Debug and many launch scripts send: the target is halted whenever
+            // GDB can send a command, so they all reset and stay halted until GDB resumes
+            ["reset"] | ["reset", "halt" | "init" | "run"] => {
                 let m = &mut session.machine;
                 m.watchdog_reset(rp2040::periph::timer::WatchdogReset::Force);
-                "machine reset\n".to_string()
+                self.current = 0;
+                "machine reset (watchdog), halted at the reset vector until GDB resumes; \
+                 `maintenance flush register-cache` shows the new registers\n"
+                    .to_string()
             }
-            "time" => format!("virtual time {}\n", session.machine.now),
-            "help" => "monitor commands: reset, time\n".to_string(),
-            other => format!("unknown monitor command {other:?}\n"),
+            ["halt"] => "halted\n".to_string(),
+            ["time"] => format!("virtual time {}\n", session.machine.now),
+            ["help"] | [] => "monitor commands: reset [halt|init|run], halt, time, help\n".to_string(),
+            _ => format!("unknown monitor command {:?} (monitor help lists them)\n", cmd.trim()),
         };
         hex(out.as_bytes())
     }
@@ -288,6 +354,9 @@ impl GdbStub {
             }
         } else if pkt == "qAttached" {
             "1".into()
+        } else if pkt == "!" || pkt == "qSymbol::" {
+            // Extended mode (`target extended-remote`) changes nothing here; no symbols are needed
+            "OK".into()
         } else if pkt == "qC" {
             format!("QC{}", self.thread_of(self.current))
         } else if pkt == "qfThreadInfo" {
@@ -390,9 +459,14 @@ impl GdbStub {
         Some(reply)
     }
 
-    /// Runs a resume packet (`c`, `s`, `vCont`) and returns the stop reply. `poll` is asked between slices whether
-    /// GDB sent an interrupt.
-    pub fn resume(&mut self, session: &mut Session, pkt: &str, mut interrupted: impl FnMut() -> bool) -> String {
+    /// Runs a resume packet (`c`, `s`, `vCont`) on `target`. `poll` is asked between slices whether GDB sent an
+    /// interrupt or went away.
+    pub fn resume(
+        &mut self,
+        target: &mut dyn Target,
+        pkt: &str,
+        mut poll: impl FnMut() -> io::Result<Option<Incoming>>,
+    ) -> Resumed {
         let step = pkt == "s" || pkt.starts_with("vCont;s") || pkt.starts_with("vCont;S") || pkt.starts_with('S');
         if step {
             // vCont;s:N selects the thread
@@ -402,21 +476,26 @@ impl GdbStub {
                 self.current = t as usize - 1;
             }
             let core = self.current;
+            let session = target.session();
             session.machine.single_step(core);
             session.poll_rtt();
-            return format!("T05thread:{};", self.thread_of(core));
+            return Resumed::Stopped(format!("T05thread:{};", self.thread_of(core)));
         }
         loop {
-            let reason = session.run_for(session.slice.max(sim_core::Time::from_us(500)));
-            match reason {
-                StopReason::TimeLimit | StopReason::Requested => {
-                    if interrupted() {
-                        return format!("T02thread:{};", self.thread_of(self.current));
+            let piece = target.session().slice.max(sim_core::Time::from_us(500));
+            match target.run_for(piece) {
+                StopReason::TimeLimit => match poll() {
+                    Ok(Some(Incoming::Interrupt)) => {
+                        return Resumed::Stopped(format!("T02thread:{};", self.thread_of(self.current)));
                     }
-                }
+                    Ok(Some(Incoming::Closed)) | Err(_) => return Resumed::Closed,
+                    // Nothing, or a packet GDB should not send while the target runs
+                    Ok(_) => {}
+                },
+                StopReason::Requested => return Resumed::Ended,
                 StopReason::Deadlock => {
                     // Nothing will ever happen again; report a stop so the user can look around
-                    return format!("T05thread:{};", self.thread_of(self.current));
+                    return Resumed::Stopped(format!("T05thread:{};", self.thread_of(self.current)));
                 }
                 other => {
                     if let StopReason::Breakpoint { core, .. }
@@ -425,28 +504,71 @@ impl GdbStub {
                     {
                         self.current = core as usize;
                     }
-                    return self.stop_reply(session, Some(other));
+                    return Resumed::Stopped(self.stop_reply(target.session(), Some(other)));
                 }
             }
         }
     }
 }
 
+/// How running the target for GDB ended.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Resumed {
+    /// It stopped (a breakpoint, a step, an interrupt): the stop reply for GDB.
+    Stopped(String),
+    /// GDB closed the connection while it ran.
+    Closed,
+    /// The run was asked to stop (SIGINT, SIGTERM, another board of a robot stopped).
+    Ended,
+}
+
 /// Serves one GDB connection on `listener`, driving `session` until GDB detaches or disconnects.
 pub fn serve(listener: &TcpListener, session: &mut Session) -> io::Result<Ended> {
-    let (stream, peer) = listener.accept()?;
-    stream.set_nodelay(true)?;
-    log::info!("GDB connected from {peer}");
-    let old_policy = session.machine.bkpt_policy;
-    session.machine.bkpt_policy = BkptPolicy::Stop;
-    let mut conn = Connection::new(stream);
+    serve_target(listener, session)
+}
+
+/// Waits for a debugger on `listener`: a connection that closes before sending anything (a port check) is let go.
+/// Returns the connection and its first message.
+fn accept_debugger(listener: &TcpListener) -> io::Result<(Connection<TcpStream>, Incoming)> {
+    loop {
+        let (stream, peer) = listener.accept()?;
+        stream.set_nodelay(true)?;
+        let mut conn = Connection::new(stream);
+        match conn.recv() {
+            Ok(Incoming::Closed) | Err(_) => {
+                log::info!("{peer} closed the connection without a packet (a port check?); still waiting for GDB");
+            }
+            Ok(first) => {
+                log::info!("GDB connected from {peer}");
+                return Ok((conn, first));
+            }
+        }
+    }
+}
+
+/// Serves one GDB connection on `listener`, driving `target` until GDB detaches or disconnects, or the run is
+/// asked to stop.
+pub fn serve_target(listener: &TcpListener, target: &mut dyn Target) -> io::Result<Ended> {
+    let (mut conn, first) = accept_debugger(listener)?;
+    let old_policy = target.session().machine.bkpt_policy;
+    target.session().machine.bkpt_policy = BkptPolicy::Stop;
     let mut stub = GdbStub::new();
+    let mut next = Some(first);
     let result = loop {
-        match conn.recv()? {
+        let msg = match next.take() {
+            Some(m) => m,
+            None => conn.recv()?,
+        };
+        match msg {
             Incoming::Closed => break Ended::Killed,
             Incoming::Interrupt => conn.send(&format!("T02thread:{};", stub.thread_of(stub.current)))?,
             Incoming::Packet(pkt) => {
                 if pkt == "k" {
+                    break Ended::Killed;
+                }
+                if pkt.starts_with("vKill") {
+                    // extended-remote's kill
+                    conn.send("OK")?;
                     break Ended::Killed;
                 }
                 if pkt.starts_with('D') {
@@ -454,7 +576,7 @@ pub fn serve(listener: &TcpListener, session: &mut Session) -> io::Result<Ended>
                     break Ended::Detached;
                 }
                 let mut ack = conn.ack;
-                match stub.handle(session, &mut ack, &pkt) {
+                match stub.handle(target.session(), &mut ack, &pkt) {
                     Some(reply) => {
                         // A NUL separates several packets (monitor output, then the final reply)
                         for part in reply.split('\u{0}') {
@@ -463,19 +585,35 @@ pub fn serve(listener: &TcpListener, session: &mut Session) -> io::Result<Ended>
                         conn.ack = ack;
                     }
                     None => {
-                        let reply = {
+                        let resumed = {
                             let conn_ref = &mut conn;
-                            stub.resume(session, &pkt, || matches!(conn_ref.poll(), Ok(Some(Incoming::Interrupt))))
+                            stub.resume(target, &pkt, || conn_ref.poll())
                         };
-                        conn.send(&reply)?;
+                        match resumed {
+                            Resumed::Stopped(reply) => conn.send(&reply)?,
+                            Resumed::Closed => break Ended::Killed,
+                            Resumed::Ended => {
+                                // GDB hears that the program exited; it may already be gone
+                                let _ = conn.send("W00");
+                                break Ended::Stopped;
+                            }
+                        }
                     }
                 }
             }
         }
     };
-    session.machine.bkpt_policy = old_policy;
-    session.machine.breakpoints.clear();
-    log::info!("GDB {}", if result == Ended::Detached { "detached" } else { "disconnected" });
+    let m = &mut target.session().machine;
+    m.bkpt_policy = old_policy;
+    m.breakpoints.clear();
+    log::info!(
+        "GDB {}",
+        match result {
+            Ended::Detached => "detached",
+            Ended::Killed => "disconnected",
+            Ended::Stopped => "told the program exited: the run was asked to stop",
+        }
+    );
     Ok(result)
 }
 

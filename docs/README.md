@@ -7,7 +7,7 @@ their sensors, actuators, the water around them and the robot computer's side of
 | Page | For |
 |---|---|
 | [Quick start](#quick-start) | Build the firmware, run a board, read its logs, run a test |
-| [running.md](running.md) | The `run` command: images, boot modes, logs, traces, GDB, flash files, USB, Puddles Ethernet |
+| [running.md](running.md) | The `run` command: images, boot modes, logs, traces, GDB and VS Code, flash files, USB, Puddles Ethernet |
 | [boards.md](boards.md) | Board files: every device table and its fields, overlays, the generator, inputs |
 | [robots.md](robots.md) | Robot files and the `robot` command, mock bridges, CAN logs, replay and `can-diff`, cannelloni, `bridges`, robot in a box |
 | [acoustics.md](acoustics.md) | Acoustic environments, transducers, the shared medium, IVC link tests and sweeps |

@@ -19,6 +19,7 @@ firmware_simulator run $FW/power_board --board boards/mk2/power_board.toml --moc
 - [Traces](#traces)
 - [Profiles, waveforms, dashboard and JSON logs](#profiles-waveforms-dashboard-and-json-logs)
 - [Debugging with GDB](#debugging-with-gdb)
+- [Debugging in VS Code](#debugging-in-vs-code)
 - [USB: BOOTSEL, PICOBOOT, UF2 and CDC](#usb-bootsel-picoboot-uf2-and-cdc)
 - [Several micro-ROS boards at once](#several-micro-ros-boards-at-once)
 - [Puddles: Ethernet](#puddles-ethernet)
@@ -249,9 +250,18 @@ shift how their instructions interleave, as a different `--quantum` would. They 
 ## Debugging with GDB
 
 `--gdb 127.0.0.1:3333` waits for GDB before running. Each core is a thread (thread 1 is core 0); registers,
-memory (writes reach flash, so `load` works), software and hardware breakpoints, stepping, Ctrl-C and the monitor
-commands `monitor reset` and `monitor time` work. Virtual time stops while GDB has the target halted; RTT logs keep
-flowing while it runs.
+memory (writes reach flash, so `load` works), software and hardware breakpoints, stepping, Ctrl-C, `target remote`
+and `target extended-remote`, and these monitor commands work:
+
+| Command | |
+|---|---|
+| `monitor reset` | Resets the chip from the watchdog (as `watchdog_reboot` does) and stays halted at the reset vector until GDB resumes. `reset halt`, `reset init` and `reset run` (OpenOCD's spellings, which Cortex-Debug and many launch scripts send) do the same. GDB caches registers, so run `maintenance flush register-cache` afterwards to see the new ones |
+| `monitor halt` | Nothing: the target is halted whenever GDB can send a command |
+| `monitor time` | Prints the virtual time |
+| `monitor help` | Lists them |
+
+Virtual time stops while GDB has the target halted; RTT logs keep flowing while it runs. Peripheral registers read
+without side effects (no FIFO pops or spinlock claims), so GDB and an SVD view can read whole register blocks.
 
 ```bash
 firmware_simulator run $FW/template --board boards/mk2/power_board.toml --gdb 127.0.0.1:3333 --time 60s &
@@ -264,7 +274,48 @@ gdb-multiarch -ex "target remote :3333" -ex "break main" -ex continue $FW/templa
 #   virtual time 0.003147s
 ```
 
-Killing the session from GDB ends the run.
+A connection that closes without sending anything (a port check) is not taken for GDB; the emulator keeps waiting.
+Killing the session from GDB, or GDB going away while the target runs, ends the run. Detaching lets it run on to
+`--time`, which counts from power-on: with `--time 0s` the run lasts exactly as long as GDB drives it. SIGINT or
+SIGTERM while GDB runs the target ends the run too, and GDB hears that the program exited.
+
+A board of a robot is debugged the same way with `robot --gdb BOARD=ADDR`. Continuing runs the whole robot, with
+its boards in turn on one thread, and the board's breakpoints stop all of it. `--fault`s that fall due while GDB
+is attached are applied once it detaches:
+
+```bash
+firmware_simulator robot robots/talos.toml --mock-bridge internal:2 --gdb esc0=127.0.0.1:3333 --time 0s &
+gdb-multiarch -ex "target extended-remote :3333" -ex "break main" -ex continue $FW/esc_board
+```
+
+## Debugging in VS Code
+
+The repository's [`.vscode/launch.json`](../.vscode/launch.json) and [`.vscode/tasks.json`](../.vscode/tasks.json)
+let you step through firmware in VS Code with the [Cortex-Debug](https://github.com/Marus/cortex-debug) extension
+(`marus25.cortex-debug`, recommended in `.vscode/extensions.json`). You also need `gdb-multiarch` (Debian, Ubuntu)
+or `arm-none-eabi-gdb`, and the images (see [Images](#images)). Pick a configuration in the Run and Debug view:
+
+| Configuration | Asks for | Runs |
+|---|---|---|
+| Emulator: titan_firmware_rs image | An image (the [smoke test](../crates/sim_test/tests/smoke.rs)'s list) | The image on its board file, with a mock `titan_bridge` for its client |
+| Emulator: Talos robot board | A board of `robots/talos.toml` | The whole robot, with GDB on that board and a mock bridge for it |
+| Emulator: C pico-sdk ELF | An ELF path (default `build/c/basic_template/template_project.elf`) | The ELF on its own |
+
+Each configuration's pre-launch task runs [`scripts/vscode_gdb.sh`](../scripts/vscode_gdb.sh). The script builds
+the emulator (`cargo run --release`), links the chosen ELF to `target/vscode/debug.elf` (every configuration's
+`executable`, so you are asked only once) and starts the emulator with `--gdb 127.0.0.1:3333 --time 0s`. Cortex-Debug
+connects as soon as the emulator logs "waiting for GDB", runs to `main`, and from there you can step, set
+breakpoints, watch variables, see both cores in the call stack, and read peripheral registers in the Cortex
+Peripherals view (from the SVD, [`crates/rp2040/svd/rp2040.svd`](../crates/rp2040/svd/rp2040.svd)). Pause, Restart
+(`monitor reset halt`) and Stop work. The emulator ends with the debug session.
+
+Launch does not reset the chip: the emulator already waits at the reset vector, and a reset would be a watchdog
+reset, which titan firmware counts. If your GDB is not `gdb-multiarch`, change `gdbPath` or set
+`cortex-debug.gdbPath` in your user settings. To debug another robot, or with other options, copy a task and change
+its arguments; arguments after the pick in a task's `args` go to the emulator, e.g. `--realtime`.
+
+The configurations are checked by driving `gdb-multiarch` over GDB/MI with the commands Cortex-Debug sends
+(`crates/sim_host/tests/gdb.rs` has the packet-level tests). VS Code itself is not run in CI.
 
 ## USB: BOOTSEL, PICOBOOT, UF2 and CDC
 

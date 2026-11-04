@@ -178,6 +178,16 @@ struct RobotArgs {
     /// until its watchdog resets it.
     #[arg(long)]
     stop_on_lockup: bool,
+    /// Debug one board with GDB: `BOARD=ADDR`, e.g. `power=127.0.0.1:3333`. Waits for GDB before running; while it
+    /// is attached, continuing runs the whole robot (its boards in turn) and the board's breakpoints stop it all.
+    /// `--fault`s due meanwhile are applied once GDB detaches.
+    #[arg(long, value_parser = parse_board_addr)]
+    gdb: Option<(String, String)>,
+}
+
+fn parse_board_addr(s: &str) -> Result<(String, String), String> {
+    let (board, addr) = s.split_once('=').ok_or("expected BOARD=ADDR")?;
+    Ok((board.to_string(), addr.to_string()))
 }
 
 fn parse_board_udp(s: &str) -> Result<(String, String, String), String> {
@@ -447,6 +457,16 @@ fn robot(args: RobotArgs) -> Result<()> {
     let mut faults = faults.into_iter().peekable();
     let mut pending: Option<(Time, usize, sim_host::fault::Fault)> = None;
     r.stop_flag = Some(&sim_host::signal::STOP);
+    if let Some((board, addr)) = &args.gdb {
+        let i = r.index(board).with_context(|| format!("--gdb: no board {board:?}"))?;
+        let listener = std::net::TcpListener::bind(addr).with_context(|| format!("binding {addr}"))?;
+        log::info!("waiting for GDB on {addr} (board {board})");
+        let mut target = sim_host::gdb::RobotBoard { robot: &mut r, board: i };
+        if sim_host::gdb::serve_target(&listener, &mut target)? == sim_host::gdb::Ended::Killed {
+            eprintln!("GDB ended the session at {}", r.now);
+            return Ok(());
+        }
+    }
     let stopped = loop {
         if pending.is_none() {
             pending = faults.next_if(|f| f.0 <= args.time);
@@ -1046,6 +1066,7 @@ fn run(args: RunArgs) -> Result<()> {
     if let Some(addr) = &args.gdb {
         let listener = std::net::TcpListener::bind(addr).with_context(|| format!("binding {addr}"))?;
         log::info!("waiting for GDB on {addr}");
+        // Stopped (SIGINT, SIGTERM while GDB was attached): the run below ends at once, with the usual summary
         if sim_host::gdb::serve(&listener, &mut session)? == sim_host::gdb::Ended::Killed {
             eprintln!("GDB ended the session at {}", session.machine.now);
             return Ok(());
