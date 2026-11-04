@@ -14,8 +14,14 @@ fn temp(name: &str) -> PathBuf {
     dir.join(name)
 }
 
+/// Runs the CLI. Scenario files written to a temporary directory find the titan_firmware_rs images by name through
+/// `TITAN_RS_RELEASE_DIR`, which is set to the release directory the tests use (this checkout's, or the one set).
 fn sim(args: &[&str]) -> Output {
-    Command::new(env!("CARGO_BIN_EXE_firmware_simulator")).args(args).output().unwrap()
+    Command::new(env!("CARGO_BIN_EXE_firmware_simulator"))
+        .args(args)
+        .env("TITAN_RS_RELEASE_DIR", sim_host::titan_rs_release_dir(&repo()))
+        .output()
+        .unwrap()
 }
 
 fn text(o: &Output) -> String {
@@ -83,8 +89,13 @@ steps:
     let o = sim(&["scenario", path(&p), "--junit", path(&junit), "--json", path(&json), "-j", "2"]);
     let t = text(&o);
     assert_eq!(o.status.code(), Some(1), "{t}");
-    assert!(t.contains("✓      0.200400s  expect log \"ROS connected\" within 500ms"), "{t}");
-    assert!(t.contains("✗      0.400400s  expect log \"nothing like this\" within 200ms"), "{t}");
+    // When the board connects depends on the firmware build; the failure is reported at the end of its window
+    let j: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&json).unwrap()).unwrap();
+    let connected = j["scenarios"][0]["steps"][0]["time"].as_f64().unwrap();
+    assert!((0.1..0.5).contains(&connected), "{connected}");
+    assert!(t.contains(&format!("✓{connected:>14.6}s  expect log \"ROS connected\" within 500ms")), "{t}");
+    let failed = connected + 0.2;
+    assert!(t.contains(&format!("✗{failed:>14.6}s  expect log \"nothing like this\" within 200ms")), "{t}");
     assert!(t.contains("2 scenario(s): 1 passed, 1 failed, 0 skipped (one passes, one fails)"), "{t}");
     let xml = std::fs::read_to_string(&junit).unwrap();
     assert!(xml.contains("tests=\"2\" failures=\"1\""), "{xml}");
@@ -92,9 +103,7 @@ steps:
         xml.contains("<failure message=\"step 2: expect log &quot;nothing like this&quot; within 200ms\"/>"),
         "{xml}"
     );
-    let j: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&json).unwrap()).unwrap();
     assert_eq!((j["passed"].as_u64(), j["failed"].as_u64()), (Some(1), Some(1)));
-    assert_eq!(j["scenarios"][0]["steps"][0]["time"], 0.2004);
     // JSON on stdout instead of the text; --quiet leaves out what passed
     let o = sim(&["scenario", path(&p), "--json", "-"]);
     let j: serde_json::Value = serde_json::from_slice(&o.stdout).unwrap();
