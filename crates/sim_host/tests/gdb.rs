@@ -537,3 +537,50 @@ fn writes_in_the_past_change_the_run_from_there() {
     assert_eq!(c.reply(), "OK");
     assert_eq!(ended(&rx).0, Ended::Detached);
 }
+
+/// The real GDB: `reverse-stepi`, the MI command VS Code's Native Debug sends for Step Back
+/// (`-exec-step-instruction --reverse`), and `reverse-continue`. Skipped without `gdb-multiarch`.
+#[test]
+fn gdb_multiarch_steps_and_continues_backwards() {
+    if std::process::Command::new("gdb-multiarch").arg("--version").output().is_err() {
+        eprintln!("skipping: gdb-multiarch not installed");
+        return;
+    }
+    let (image, session) = blinky();
+    let main = image.symbol("main").unwrap().addr & !1;
+    let reset = image.symbol("Reset").unwrap().addr & !1;
+    let (port, rx) = serve_travel(session);
+    let elf = common::repo().join("test_programs/embassy_blinky.elf");
+    let mut cmd = std::process::Command::new("gdb-multiarch");
+    cmd.args(["-nx", "-batch", "-ex", "set pagination off", "-ex", "set confirm off"]);
+    for c in [
+        format!("target extended-remote :{port}"),
+        "break main".into(),
+        "continue".into(),
+        "printf \"at main %x\\n\", $pc".into(),
+        "stepi".into(),
+        "stepi".into(),
+        "stepi".into(),
+        "printf \"stepped %x\\n\", $pc".into(),
+        "reverse-stepi".into(),
+        "interpreter-exec mi \"-exec-step-instruction --reverse\"".into(),
+        "reverse-stepi".into(),
+        "printf \"back %x\\n\", $pc".into(),
+        "reverse-continue".into(),
+        "printf \"start %x\\n\", $pc".into(),
+        "detach".into(),
+    ] {
+        cmd.args(["-ex", &c]);
+    }
+    let out = cmd.arg(&elf).output().unwrap();
+    let text = String::from_utf8_lossy(&out.stdout).into_owned() + &String::from_utf8_lossy(&out.stderr);
+    // (GDB breaks after main's prologue)
+    let at_main = text.split("at main ").nth(1).and_then(|t| t.split_whitespace().next()).expect(&text).to_string();
+    let pc = u32::from_str_radix(&at_main, 16).unwrap();
+    assert!((main..main + 16).contains(&pc), "{text}");
+    assert!(!text.contains(&format!("stepped {at_main}")), "{text}");
+    assert!(text.contains(&format!("back {at_main}")), "three steps back is main again: {text}");
+    assert!(text.contains("No more reverse-execution history"), "{text}");
+    assert!(text.contains(&format!("start {reset:x}")), "the start of the history: {text}");
+    assert_eq!(ended(&rx).0, Ended::Detached);
+}
