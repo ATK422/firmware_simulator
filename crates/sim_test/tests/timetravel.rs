@@ -132,7 +132,9 @@ fn robot_goes_back_whole(threads: usize) {
     if sim_test::titan_rs("esc_board").is_none() {
         return;
     }
-    let load = || RobotBench::load("talos.toml", &[("internal", 1)], |_| {}).unwrap();
+    // The smart battery's bridge too: alone on the external bus with nothing to acknowledge its frames, it would
+    // retry each without end (titan_firmware_rs c59474f on), and every retry ends a run-ahead window
+    let load = || RobotBench::load("talos.toml", &[("internal", 1), ("external", 21)], |_| {}).unwrap();
     let mut rb = load();
     rb.robot.threads = threads;
     let inputs = rb.robot.inputs.clone();

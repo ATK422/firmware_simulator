@@ -98,17 +98,18 @@ fn panic_leaves_a_crash_record_across_watchdog_resets() {
     assert!(!st.is_empty(), "the bridge connected");
     assert!(st.iter().all(|(_, f)| f.faults & 1 == 1), "{st:?}");
 
-    // A panic while ROS is connected: the handler's delay (12.5M iterations of a 3-cycle loop, 300 ms at
-    // 125 MHz) outlasts the 250 ms active watchdog timeout, so the chip resets on the timeout first and the boot
-    // reports a watchdog timeout, not a panic. That is the firmware's behaviour on hardware too (see the PR).
+    // A panic while ROS is connected (250 ms active watchdog timeout) is recorded as a panic too: the handler
+    // reloads the watchdog before its 100 ms log drain and then forces the reset. (Before titan_firmware_rs
+    // b2afb53 it busy-waited 300 ms, the timeout fired first and the boot reported a watchdog timeout.)
     s.logs.clear();
     force_panic(&mut s, &image);
     s.run_until(Time::from_ms(6000));
     assert!(s.logged("PANIC: panicked at"), "{:?}", s.logs);
     assert_eq!(s.machine.resets, resets + 2);
-    assert_eq!(s.machine.sys.watchdog.read(s.machine.now, 0x08), Some(1), "REASON = TIMER");
-    assert!(s.logged("Watchdog timeout after"), "{:?}", s.logs);
-    assert!(s.logged(&counts(1, 1)), "{:?}", s.logs);
+    assert_eq!(s.machine.sys.watchdog.read(s.machine.now, 0x08), Some(2), "REASON = FORCE");
+    assert!(s.logged("Reset by panic after"), "{:?}", s.logs);
+    assert!(!s.logged("Watchdog timeout after"), "{:?}", s.logs);
+    assert!(s.logged(&counts(0, 2)), "{:?}", s.logs);
 
     // A power cycle clears the record (the scratch registers lose power) and REASON
     s.logs.clear();

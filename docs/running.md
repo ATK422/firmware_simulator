@@ -49,12 +49,12 @@ script does not build them; the C programs the tests run are the template, the b
 [INFO  firmware_simulator] direct boot: VTOR 0x10000100, entry 0x100001c0
 [INFO  firmware_simulator] RTT control block at 0x20000008, decoding defmt
 [INFO  firmware_simulator] mock bridge for client 1 attached
-[0.132000s] 0.000025 INFO  mk2/power_board v1.0 (release type 2, git 342ee0d)
-[0.132000s] 0.000123 INFO  Crash counts since power on: CrashCounts { watchdog_timeouts: 0, panics: 0 }
-[0.135200s] 0.003300 INFO  CAN controller online as client 1
-[0.200400s] 0.068450 INFO  ROS connected
-stopped at 2.000000s (TimeLimit); core0 234375135 cycles, pc 0x1000039c <..._11power_board18___cortex_m_rt_main0EB1f_+0x94>; 200.71ms wall
-core1 249575205 cycles, pc 0x00000176, Some(Wfe)
+[0.132000s] 0.000024 INFO  mk2/power_board v1.0 (release type 2, git 94a107e)
+[0.132000s] 0.000089 INFO  Crash counts since power on: CrashCounts { watchdog_timeouts: 0, panics: 0 }
+[0.135100s] 0.003181 INFO  CAN controller online as client 1
+[0.200301s] 0.068408 INFO  ROS connected
+stopped at 2.000000s (TimeLimit); core0 234373475 cycles, pc 0x1000039c <..._11power_board18___cortex_m_rt_main0EB1f_+0x94>; 200.71ms wall
+core1 249573727 cycles, pc 0x00000176, Some(Wfe)
 ```
 
 * `[INFO  crate]` lines on stderr are the emulator's own log (`RUST_LOG` filters it, e.g.

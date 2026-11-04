@@ -47,16 +47,21 @@ steps:
     assert!(!o.passed());
     let st = |n: usize| o.steps.iter().find(|s| s.number == n).unwrap();
     assert_eq!(st(1).status, Status::Pass);
+    // When the board connected depends on the firmware build (to the 100 us slice); the rest follows from it
+    let connected = st(1).time.unwrap();
+    assert!(connected > sim_test::Time::from_ms(100) && connected < sim_test::Time::from_ms(500), "{connected}");
+    let window_end = connected + sim_test::Time::from_ms(500);
     // No such line: the window, then the board's last lines
     assert_eq!(st(2).status, Status::Fail);
-    assert!(st(2).evidence[0].contains("no matching line from 0.200400s to 0.700400s"), "{:?}", st(2).evidence);
+    let window = format!("no matching line from {connected} to {window_end}");
+    assert!(st(2).evidence[0].contains(&window), "{window}: {:?}", st(2).evidence);
     assert!(st(2).evidence.iter().any(|e| e.contains("ROS connected")), "{:?}", st(2).evidence);
     // The fault goes in at the cursor (the end of step 2's window, on the 100 us slice grid)
-    assert_eq!((st(3).status, st(3).time), (Status::Pass, Some(sim_test::Time::from_us(700_400))));
+    assert_eq!((st(3).status, st(3).time), (Status::Pass, Some(window_end)));
     // Unplugged before its first status went out: a second later the bridge has none to look at
     assert_eq!(st(4).status, Status::Fail);
     assert!(st(4).evidence[0].contains("no FirmwareStatus at can:1"), "{:?}", st(4).evidence);
-    // The link never comes back within the run (the stalled transmit queue): the run ends first
+    // The link never comes back within the run (the cable stays out): the run ends first
     assert_eq!(st(5).status, Status::Fail);
     assert!(st(5).evidence[0].contains("the run ended at 3.000000s before the window closed"), "{:?}", st(5).evidence);
     assert_eq!(st(6).status, Status::NotReached);
@@ -64,7 +69,11 @@ steps:
     assert_eq!(st(7).status, Status::Fail);
     assert!(st(7).evidence[0].contains("Lost connection to ROS"));
     assert_eq!(st(8).status, Status::Fail);
-    assert!(st(8).evidence[0].contains("down at 0.9"), "{:?}", st(8).evidence);
+    // Down a few hundred ms after the unplug, when the bridge's link timeout runs out
+    let down = st(8).evidence[0].split("down at ").nth(1).and_then(|r| r.split('s').next()).map(str::parse::<f64>);
+    let down = down.and_then(Result::ok).unwrap_or_else(|| panic!("{:?}", st(8).evidence));
+    let unplugged = window_end.as_secs_f64();
+    assert!(down > unplugged + 0.1 && down < unplugged + 0.4, "{unplugged} {:?}", st(8).evidence);
     assert_eq!(st(9).status, Status::NotReached);
     let text = scenario::human(o);
     assert!(text.contains("✗") && text.contains("·") && text.contains("FAIL (7 of 9 steps)"), "{text}");

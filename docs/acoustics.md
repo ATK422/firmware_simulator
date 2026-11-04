@@ -206,10 +206,10 @@ snapshot and move a board to its range).
 
 | Test | What it shows |
 |---|---|
-| `crates/sim_host/tests/ivc_link.rs` | IVCBoard to IVCBoard and IVCBoard2 to IVCBoard2 exchange bytes across `pool.toml`; the C IVCBoard2 modem and the Rust one exchange bytes both ways ([below](#c-and-rust-ivcboard2-interop)); the first-generation modem's reverberation finding and the C IVCBoard2's overwritten packet |
+| `crates/sim_host/tests/ivc_link.rs` | IVCBoard to IVCBoard (every byte delivered and ACKed within its retransmissions, once the link is established) and IVCBoard2 to IVCBoard2 exchange bytes across `pool.toml`; the C IVCBoard2 modem and the Rust one exchange bytes both ways ([below](#c-and-rust-ivcboard2-interop)); the first-generation modem's reverberation finding (statistics over six packets) and lost-answer finding, and the C IVCBoard2's overwritten packet |
 | `crates/sim_host/tests/acoustics.rs` | IVCBoard2's pinger amplitude against distance |
 | `crates/sim_host/tests/vehicle.rs` (`ivc_boards_talk_from_a_drifting_vehicle`) | First-generation IVC boards still link with one of them on a drifting vehicle |
-| `crates/sim_test/tests/ivc_sweep.rs` | Delivery against range and noise for both generations, in open water: boot once, snapshot, run every point in parallel from the snapshot; asserts that delivery degrades monotonically |
+| `crates/sim_test/tests/ivc_sweep.rs` | Delivery against range and noise for both generations, in open water: boot once (the first-generation boards until their link is established), snapshot, run every point in parallel from the snapshot; asserts that the easiest point delivers everything once (ACKed, for IVCBoard) and that delivery degrades monotonically within one byte |
 
 The sweeps print their tables with `--nocapture`:
 
@@ -222,10 +222,39 @@ cargo test --release -p sim_test --test ivc_sweep -- --nocapture
 
 They are the slowest tests in the suite (minutes). See [testing.md](testing.md#sweeps) for writing one.
 
-In `robots/ivc_pool.toml` the first-generation boards lose a byte when one moves at 0.5 m/s, and also at some
-fixed ranges. That is the modem, not Doppler or the moving-path model: its fixed threshold on the "other" band is
+The first-generation sweep with titan_firmware_rs 94a107e (4 bytes from Talos in 9 s; delivered / sent, and the
+ACKs the sender saw, the heartbeat included), from images built by the pinned rustc 1.99.0 and, for comparison, by
+1.97.0:
+
+| Point | 1.99.0 (pinned) | 1.97.0 |
+|---|---|---|
+| 25 m, 60 dB | 4/4, 5 ACKs | 4/4, 5 |
+| 25 m, 74 dB | 4/4, 5 | 4/4, 5 |
+| 25 m, 76 dB | 1/4, 1 | 4/4, 4 |
+| 25 m, 77 dB | 0/4, 0 | 2/4, 2 |
+| 25 m, 78 dB | 1/4, 1 | 0/4, 2 |
+| 25 m, 85 dB | 0/4, 1 | 0/4, 2 |
+| 25 m, 70 dB | 4/4, 5 | 4/4, 5 |
+| 50 m, 70 dB | 4/4, 5 | 4/4, 5 |
+| 80 m, 70 dB | 4/4, 5 | 4/4, 5 |
+| 86 m, 70 dB | 4/4, 5 | 4/4, 5 |
+| 92 m, 70 dB | 2/4, 2 | 3/4, 3 |
+| 150 m, 70 dB | 0/4, 0 | 0/4, 0 |
+
+ACKs now come back at every range the data reaches (the firmware before 4d86d47 sampled the ACK once and saw none
+beyond about 25 m, so it never retransmitted). Near each cliff (76-78 dB, about 90 m) single points flip with the
+build, since a different compiler moves when the detector's captures fall; the ACKs seen at 78-85 dB with nothing
+delivered are noise taken for an ACK (titan_firmware_rs PR #1 describes the trade-off). The IVCBoard2 table is the
+same with both builds except at 95 dB, its cliff (delivered with 1.99.0, lost with 1.97.0).
+
+In `robots/ivc_pool.toml` the first-generation boards lose bytes at some fixed ranges, and when one moves through
+such spots. That is the modem, not Doppler or the moving-path model: its fixed threshold on the "other" band is
 reached by the previous symbol's reverberation at the assumed 40 dB receive gain
 (`firmware_finding_ivc_symbols_lost_to_pool_reverberation` in `ivc_link.rs`, [faults.md](faults.md#firmware-findings-so-far)).
+In the pool many packets lose a symbol at most positions, so the link there lives on retransmission, and which
+attempt gets through changes with the firmware build; the pool's pinger adds a phantom packet every 2 s (a ping
+taken for a start symbol keeps a receiver busy for 825 ms). The surface vehicle's answer is lost outright when Talos
+has a second packet queued (finding 11 in faults.md).
 The hydrophone unit tests check the moving paths against exact recomputation at every sample and the Doppler
 shift of a walking-speed source.
 
