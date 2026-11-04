@@ -80,6 +80,51 @@ pub fn clipping_notes(m: &mut rp2040::Machine) -> Vec<String> {
         .collect()
 }
 
+/// Starts keeping every ADC sample of a machine's hydrophones; returns how many there are.
+pub fn record_hydrophones(m: &mut rp2040::Machine) -> usize {
+    let mut n = 0;
+    for h in hydrophones(m) {
+        h.recording.get_or_insert_with(Vec::new);
+        n += 1;
+    }
+    n
+}
+
+/// Writes what a machine's hydrophones recorded ([`record_hydrophones`]) as WAV files: the first to `path`, any
+/// further one to `path` with `_2`, `_3`, ... before its extension. -1..1 is the ADC input range (0 to 3.3 V), the
+/// samples quantised to the RP2040 ADC's 12 bits, `rate` the WAV's sample rate. Returns a line about each file.
+pub fn write_hydrophone_wavs(
+    m: &mut rp2040::Machine,
+    path: &std::path::Path,
+    rate: u32,
+) -> std::io::Result<Vec<String>> {
+    let mut out = Vec::new();
+    for (k, h) in hydrophones(m).enumerate() {
+        let p = if k == 0 {
+            path.to_path_buf()
+        } else {
+            let stem = path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
+            let ext = path.extension().map(|e| format!(".{}", e.to_string_lossy())).unwrap_or_default();
+            path.with_file_name(format!("{stem}_{}{ext}", k + 1))
+        };
+        let n = h.recording.as_ref().map_or(0, Vec::len);
+        let first = h.recording.as_ref().and_then(|r| r.first()).map(|f| f.0);
+        match h.recording_pin_wav(rate, [0.0, 3.3], 12) {
+            Some(w) => {
+                w.save(&p)?;
+                out.push(format!(
+                    "hydrophone: {n} ADC sample(s) in {} ({:.3} s at {rate} Hz from {}, -1..1 is 0..3.3 V at the pin)",
+                    p.display(),
+                    w.duration(),
+                    first.unwrap_or_default()
+                ));
+            }
+            None => out.push(format!("hydrophone: no ADC samples to write to {}", p.display())),
+        }
+    }
+    Ok(out)
+}
+
 /// Points a machine's hydrophones and projector pins that use medium `old` at `new` (a copy of it).
 pub fn relink(m: &mut rp2040::Machine, old: &SharedMedium, new: &SharedMedium) {
     for h in hydrophones(m) {
@@ -103,6 +148,30 @@ mod tests {
     use sim_acoustics::medium::Medium;
     use sim_acoustics::transducer::Transducer;
     use sim_acoustics::water::Water;
+
+    #[test]
+    fn hydrophone_recordings_are_written_as_wav() {
+        use sim_acoustics::chain::ChainSpec;
+        use sim_acoustics::transducer::Transducer;
+        let env = std::sync::Arc::new(sim_acoustics::Environment::open_water(Default::default()));
+        let chain = ChainSpec { bias_v: Some(2.475), ..Default::default() };
+        let h = Hydrophone::new(env, [0.0; 3], Transducer::hydrophone(-190.0), chain);
+        let mut m = rp2040::Machine::new(Default::default());
+        m.sys.attach_analog(1, Box::new(h));
+        assert_eq!(record_hydrophones(&mut m), 1);
+        for k in 0..100u64 {
+            m.sys.analog_inputs[1].as_mut().unwrap().voltage(sim_core::time::Time::from_us(2 * k), 0);
+        }
+        let dir = std::env::temp_dir().join(format!("hydro-wav-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let lines = write_hydrophone_wavs(&mut m, &dir.join("h.wav"), 500_000).unwrap();
+        assert!(lines[0].contains("100 ADC sample(s)"), "{lines:?}");
+        let w = sim_acoustics::wav::Wav::load(&dir.join("h.wav")).unwrap();
+        assert_eq!((w.rate, w.samples.len()), (500_000, 100));
+        // A quiet pin at 2.475 V is half way up the upper half of 0..3.3 V (to the nearest 12-bit step)
+        assert!(w.samples.iter().all(|s| (s - 0.5).abs() < 1e-3), "{:?}", w.samples);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn hydrophones_are_found_behind_a_fault_injector() {

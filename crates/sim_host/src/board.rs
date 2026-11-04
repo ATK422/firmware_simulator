@@ -106,6 +106,9 @@ pub struct EscEntry {
     /// How long after the last DShot frame the ESC stops the motor (250 ms by default, an assumption; see
     /// `sim_devices::dshot`); 0 keeps the last throttle forever.
     pub signal_loss_ms: Option<f64>,
+    /// Time constant of the motor's first-order response to a throttle change (60 ms by default, an assumption;
+    /// `firmware_simulator calibrate thrusters` fits it from test-stand data).
+    pub tau_ms: Option<f64>,
 }
 
 /// Steady-state throttle step for a speed, per direction: `c0 + c1 rpm + c2 rpm^2` ([`EscEntry::throttle_fit`]).
@@ -448,6 +451,12 @@ impl Board {
                 (None, None) => esc.curve,
             };
             esc.pole_pairs = e.pole_pairs.unwrap_or(esc.pole_pairs);
+            if let Some(ms) = e.tau_ms {
+                if !(ms > 0.0 && ms.is_finite()) {
+                    return Err(format!("[[dshot_esc]] {name}: tau_ms must be positive"));
+                }
+                esc.tau = sim_core::Time::from_secs_f64(ms / 1000.0);
+            }
             if let Some(ms) = e.signal_loss_ms {
                 esc.signal_loss_timeout = (ms > 0.0).then(|| sim_core::Time::from_secs_f64(ms / 1000.0));
             }
@@ -732,6 +741,24 @@ mux = { select_pins = [3, 4, 5], inputs = [{ volts = 1.0 }, { volts = 2.0 }] }
             let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| b.apply(&mut m).map(|_| ())));
             assert!(matches!(r, Ok(Err(_))), "{text}: {r:?}");
         }
+    }
+
+    #[test]
+    fn esc_motor_time_constant() {
+        let b =
+            Board::parse("name = \"x\"\n[[dshot_esc]]\nsignal_pin = 1\n[[dshot_esc]]\nsignal_pin = 2\ntau_ms = 35\n")
+                .unwrap();
+        let mut m = Machine::new(Default::default());
+        b.apply(&mut m).unwrap();
+        let t: Vec<_> = m
+            .sys
+            .pin_devices
+            .iter()
+            .map(|d| d.as_any().downcast_ref::<sim_devices::dshot::Esc>().unwrap().tau)
+            .collect();
+        assert_eq!(t, [sim_core::Time::from_ms(60), sim_core::Time::from_ms(35)]);
+        let bad = Board::parse("name = \"x\"\n[[dshot_esc]]\nsignal_pin = 1\ntau_ms = 0\n").unwrap();
+        assert!(bad.apply(&mut Machine::new(Default::default())).is_err());
     }
 
     #[test]

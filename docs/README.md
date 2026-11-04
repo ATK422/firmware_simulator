@@ -12,6 +12,7 @@ their sensors, actuators, the water around them and the robot computer's side of
 | [robots.md](robots.md) | Robot files and the `robot` command, mock bridges, CAN logs, replay and `can-diff`, cannelloni, `bridges`, robot in a box |
 | [acoustics.md](acoustics.md) | Acoustic environments, transducers, the shared medium, IVC link tests and sweeps |
 | [vehicles.md](vehicles.md) | Vehicle physics: vehicle files, thruster wiring, sensors following the hull, external vehicles, CSV logs |
+| [calibration.md](calibration.md) | Fitting the acoustic, thruster and vehicle models to recordings from the robot (`calibrate`), the data to collect, and replaying a pool test's CAN logs into the emulated boards (`replay-pool-test`) |
 | [nereus.md](nereus.md) | The firmware in nereus: the riptide stack's thruster commands through the emulated ESC boards move nereus's vehicle |
 | [testing.md](testing.md) | Writing firmware tests with `sim_test`, the test suites, CI |
 | [scenarios.md](scenarios.md) | Firmware tests in YAML without Rust (`scenario`: faults, inputs, checks on logs, statuses, frames and states; JUnit for CI), and firmware A/B comparisons (`compare`) |

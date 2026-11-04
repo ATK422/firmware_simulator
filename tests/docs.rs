@@ -89,8 +89,9 @@ fn script_options() -> BTreeSet<String> {
         assert!(o.status.success(), "{s} --help");
         out.extend(options(&String::from_utf8_lossy(&o.stdout)));
     }
-    for py in ["firmware_bridge.py", "make_packs.py"] {
-        let path = repo().join("integrations/nereus").join(py);
+    for py in ["integrations/nereus/firmware_bridge.py", "integrations/nereus/make_packs.py", "scripts/bag_to_calib.py"]
+    {
+        let path = repo().join(py);
         let o = match Command::new("python3").args(["-I", "-B"]).arg(path).arg("--help").output() {
             Ok(o) if o.status.success() => o,
             _ => panic!("{py} --help"),
@@ -110,8 +111,21 @@ fn commands(text: &str) -> Vec<(String, String)> {
             let rest = &line[at + "firmware_simulator ".len()..];
             let sub = rest.split_whitespace().next().unwrap_or("");
             let sub = sub.trim_matches(|c: char| !c.is_ascii_alphanumeric() && c != '-');
-            if !["run", "robot", "can-diff", "bridges", "can-tunnel", "picoboot", "mcp", "scenario", "compare", "fuzz"]
-                .contains(&sub)
+            if ![
+                "run",
+                "robot",
+                "can-diff",
+                "bridges",
+                "can-tunnel",
+                "picoboot",
+                "mcp",
+                "scenario",
+                "compare",
+                "calibrate",
+                "replay-pool-test",
+                "fuzz",
+            ]
+            .contains(&sub)
             {
                 continue;
             }
@@ -136,6 +150,10 @@ fn commands_use_options_their_subcommand_has() {
     let run = help_options(&["run"]);
     let mut picoboot = help_options(&["picoboot", "load"]);
     picoboot.extend(run.iter().cloned());
+    let mut calibrate = BTreeSet::new();
+    for sub in ["acoustics", "thrusters", "vehicle"] {
+        calibrate.extend(help_options(&["calibrate", sub]));
+    }
     let by_sub = [
         ("run", run),
         ("robot", help_options(&["robot"])),
@@ -146,6 +164,8 @@ fn commands_use_options_their_subcommand_has() {
         ("mcp", help_options(&["mcp"])),
         ("scenario", help_options(&["scenario"])),
         ("compare", help_options(&["compare"])),
+        ("calibrate", calibrate),
+        ("replay-pool-test", help_options(&["replay-pool-test"])),
         ("fuzz", help_options(&["fuzz"])),
     ];
     let mut checked = 0;
@@ -178,6 +198,10 @@ fn every_option_mentioned_exists() {
         &["mcp"],
         &["scenario"],
         &["compare"],
+        &["calibrate", "acoustics"],
+        &["calibrate", "thrusters"],
+        &["calibrate", "vehicle"],
+        &["replay-pool-test"],
         &["fuzz"],
     ] {
         known.extend(help_options(sub));

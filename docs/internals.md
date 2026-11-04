@@ -26,10 +26,11 @@ For contributors. The design and its reasons are in [PLAN.md](../PLAN.md); this 
 | [`sim_physics`](../crates/sim_physics) | The 6-DOF vehicle model. No board knowledge |
 | [`sim_host`](../crates/sim_host) | Everything that connects a machine to the world: `Session` (a board plus RTT/defmt, UARTs, CAN, Ethernet, USB host side), `Robot`, board and robot files, mock bridges and the protocol-neutral mock agents (`host_protocol`, the nano-ROS agent in `nanoros`: [nanoros.md](nanoros.md)), SocketCAN, Ethernet/UDP, GDB, ptys, USB tools and USB/IP, CAN logs, `can-diff`, cannelloni, `bridges`, the bootloader upload, fault application, vehicles |
 | [`sim_test`](../crates/sim_test) | The test harness: `Bench`, `RobotBench`, `sweep` ([testing.md](testing.md)) |
-| `firmware_simulator` (root) | The command line (`src/main.rs`, `src/host_tools.rs`) |
+| [`sim_calib`](../crates/sim_calib) | Calibration: fitting the acoustic, thruster and vehicle models to recordings, replaying pool tests ([calibration.md](calibration.md)) |
+| `firmware_simulator` (root) | The command line (`src/main.rs`, `src/host_tools.rs`, `src/calib_cli.rs`) |
 
 The dependency direction is `sim_core` ← `cpu_armv6m`, `sim_devices`, `sim_acoustics`, `sim_physics` ← `rp2040`
-← `sim_host` ← `sim_test`, CLI. The CPU and the SoC are separate crates so that another machine (an Orin SPE, an
+← `sim_host` ← `sim_test`, `sim_calib`, CLI. The CPU and the SoC are separate crates so that another machine (an Orin SPE, an
 RP2350) can bring its own CPU and peripherals and reuse the rest; keep SoC knowledge out of `sim_core` and board
 knowledge out of `sim_acoustics` and `sim_physics`.
 
