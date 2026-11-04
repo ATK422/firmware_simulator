@@ -18,6 +18,7 @@ pub mod sched;
 pub mod snapshot;
 pub mod time;
 pub mod trace;
+pub mod versioned;
 pub mod wire;
 
 pub use bus::{Bus, BusFault, Peripheral, Size, WriteMode};

@@ -49,12 +49,17 @@ use std::sync::{Arc, Mutex};
 use serde::Deserialize;
 use sim_acoustics::medium::{LivePath, Trajectory};
 use sim_core::time::Time;
-use sim_devices::dshot::Esc;
+use sim_devices::dshot::{Esc, Motor};
 use sim_physics::log::StateLog;
 use sim_physics::{Quat, State, Vec3, Vehicle, VehicleFile, Water};
 
 use crate::Session;
 use crate::board::Inputs;
+
+/// The motor of the ESC that is pin device `k` of board `b`.
+fn live_motor<B: Borrow<Session>>(boards: &[B], b: usize, k: usize) -> Option<Motor> {
+    boards[b].borrow().machine.sys.pin_devices[k].as_any().downcast_ref::<Esc>().map(Esc::motor)
+}
 
 /// A `[[vehicle]]` of a robot file.
 #[derive(Debug, Clone, Deserialize)]
@@ -147,6 +152,8 @@ pub struct VehicleSim {
     thrusters: Vec<Option<(usize, usize)>>,
     /// Pressure inputs and where they are on the hull.
     sensors: Vec<(Arc<Mutex<f64>>, Vec3)>,
+    /// The board of each pressure input.
+    sensor_boards: Vec<usize>,
     /// Transducers: board index, mount, and the path its hydrophone and projector follow.
     paths: Vec<(usize, Vec3, LivePath)>,
 }
@@ -187,6 +194,7 @@ impl VehicleSim {
             poses_set: 0,
             thrusters: Vec::new(),
             sensors: Vec::new(),
+            sensor_boards: Vec::new(),
             paths: Vec::new(),
         };
         sim.record();
@@ -240,6 +248,7 @@ impl VehicleSim {
                 .get(&s.input)
                 .ok_or_else(|| ctx(format!("board {} has no input {:?}", s.board, s.input)))?;
             self.sensors.push((h.clone(), s.mount_m));
+            self.sensor_boards.push(b);
         }
         for t in &spec.transducer {
             if !self.paths.iter().any(|p| names[p.0] == t.board) {
@@ -260,13 +269,17 @@ impl VehicleSim {
 
     /// Each thruster's propeller speed (signed mechanical RPM) at `now`; 0 for one that isn't wired.
     pub fn rpms<B: Borrow<Session>>(&self, boards: &[B], now: Time) -> Vec<f64> {
-        self.thrusters
-            .iter()
-            .map(|w| {
-                w.and_then(|(b, k)| boards[b].borrow().machine.sys.pin_devices[k].as_any().downcast_ref::<Esc>())
-                    .map_or(0.0, |e| e.rpm_at(now))
-            })
-            .collect()
+        self.rpms_with(&|b, k| live_motor(boards, b, k), now)
+    }
+
+    /// [`VehicleSim::rpms`] with each ESC's motor given by `motor(board, pin device)`.
+    fn rpms_with(&self, motor: &dyn Fn(usize, usize) -> Option<Motor>, now: Time) -> Vec<f64> {
+        self.thrusters.iter().map(|w| w.and_then(|(b, k)| motor(b, k)).map_or(0.0, |m| m.rpm_at(now))).collect()
+    }
+
+    /// The boards whose inputs the vehicle writes (those of its pressure sensors): they must see it move.
+    pub fn sensor_boards(&self) -> &[usize] {
+        &self.sensor_boards
     }
 
     /// Each thruster's ESC: the board's index in the robot and the ESC's index among the board's pin devices
@@ -293,9 +306,15 @@ impl VehicleSim {
     /// Steps the vehicle up to `t` with the ESCs' current speeds, then updates its sensors and transducers. An
     /// external vehicle stays where it was put and only works out its thrust.
     pub fn advance<B: Borrow<Session>>(&mut self, t: Time, boards: &[B]) {
+        self.advance_with(t, &|b, k| live_motor(boards, b, k));
+    }
+
+    /// [`VehicleSim::advance`] with the motor of the ESC that is pin device `k` of board `b` given by `motor(b, k)`
+    /// (as it was when the boards reached `t`).
+    pub fn advance_with(&mut self, t: Time, motor: &dyn Fn(usize, usize) -> Option<Motor>) {
         let end = t.as_secs_f64();
         if self.external {
-            let rpm = self.rpms(boards, t);
+            let rpm = self.rpms_with(motor, t);
             let before = self.vehicle.time;
             self.vehicle.hold_to(end, &rpm);
             if self.vehicle.time > before {
@@ -308,7 +327,7 @@ impl VehicleSim {
             return;
         }
         while self.vehicle.time + self.vehicle.dt <= end + 1e-9 {
-            let rpm = self.rpms(boards, Time::from_secs_f64(self.vehicle.time));
+            let rpm = self.rpms_with(motor, Time::from_secs_f64(self.vehicle.time));
             self.vehicle.step(&rpm);
             for (_, mount, path) in &self.paths {
                 path.push(self.vehicle.time, self.vehicle.point(*mount));

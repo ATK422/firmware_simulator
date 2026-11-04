@@ -4,6 +4,7 @@
 use rp2040::{Machine, StopReason};
 use sim_core::image::Image;
 use sim_core::time::Time;
+use sim_core::versioned::Versioned;
 use sim_devices::can::{BusRecord, CanBus, CanEndpoint};
 
 use crate::defmt::{DefmtDecoder, LogLine};
@@ -73,6 +74,26 @@ pub struct Session {
     /// Lockups the board went through without stopping (`stop_on_lockup` off).
     pub lockups: u64,
     /// The current lockup was returned as final (it is returned once; running on, the board stays locked up).
+    final_lockup_reported: bool,
+}
+
+/// What [`Session::collect`] took out of a board's machine at the end of a slice.
+#[derive(Default)]
+pub(crate) struct Collected {
+    now: Time,
+    /// The UARTs' output, taken twice (as the end of a slice polls them twice).
+    uarts: [[Vec<(Time, u8)>; 2]; 2],
+    usb_cdc: Vec<u8>,
+    rtt: Vec<(usize, Vec<u8>)>,
+}
+
+/// A board as it was at one moment ([`Session::checkpoint`]).
+pub(crate) struct Checkpoint {
+    /// The machine, without its flash (kept apart, and only when it changed).
+    snapshot: rp2040::machine::Snapshot,
+    carry: rp2040::RunCarry,
+    flash_version: u64,
+    lockups: u64,
     final_lockup_reported: bool,
 }
 
@@ -210,18 +231,23 @@ impl Session {
                 let bytes: Vec<u8> = out.iter().map(|(_, b)| *b).collect();
                 pty.write(&bytes);
             }
-            for (t, b) in out {
-                let c = b as char;
-                self.uart_text[n].push(c);
-                match b {
-                    b'\n' => {
-                        let line = std::mem::take(&mut self.uart_line[n]);
-                        if let Some(hook) = &mut self.on_uart_line {
-                            hook(t, n, line.trim_end_matches('\r'));
-                        }
+            self.uart_bytes(n, out);
+        }
+    }
+
+    /// Takes in what UART `n` transmitted: its text, and complete lines to the hook.
+    fn uart_bytes(&mut self, n: usize, out: Vec<(Time, u8)>) {
+        for (t, b) in out {
+            let c = b as char;
+            self.uart_text[n].push(c);
+            match b {
+                b'\n' => {
+                    let line = std::mem::take(&mut self.uart_line[n]);
+                    if let Some(hook) = &mut self.on_uart_line {
+                        hook(t, n, line.trim_end_matches('\r'));
                     }
-                    _ => self.uart_line[n].push(c),
                 }
+                _ => self.uart_line[n].push(c),
             }
         }
     }
@@ -256,6 +282,11 @@ impl Session {
         if let Some(pty) = &self.usb_cdc_pty {
             pty.write(&rx);
         }
+        self.usb_cdc_bytes(now, rx);
+    }
+
+    /// Takes in what the device sent on its USB CDC port by `now`: its text, and complete lines to the hook.
+    fn usb_cdc_bytes(&mut self, now: Time, rx: Vec<u8>) {
         for b in rx {
             let c = b as char;
             self.usb_cdc_text.push(c);
@@ -290,7 +321,13 @@ impl Session {
         self.poll_usb_cdc();
         let Some(rtt) = &self.rtt else { return };
         let now = self.machine.now;
-        for (ch, bytes) in rtt.poll(&mut self.machine) {
+        let polled = rtt.poll(&mut self.machine);
+        self.rtt_bytes(now, polled);
+    }
+
+    /// Takes in what the RTT up channels held at `now`: defmt lines (to the hook and `logs`) and raw text.
+    fn rtt_bytes(&mut self, now: Time, polled: Vec<(usize, Vec<u8>)>) {
+        for (ch, bytes) in polled {
             match (&mut self.defmt, ch) {
                 (Some(d), 0) => {
                     for line in d.feed(&bytes) {
@@ -305,6 +342,82 @@ impl Session {
                 _ => self.rtt_text.push((ch, bytes)),
             }
         }
+    }
+
+    /// Whether a robot may run this board ahead of the others ([`crate::runahead`]): nothing outside the
+    /// simulation feeds it or watches it as it runs (no pseudo terminal, USB/IP server, Ethernet cable, profiler or
+    /// trace sink), so its host side can take in what it produced later, and a copy rolled back reruns the same.
+    pub(crate) fn can_run_ahead(&self) -> bool {
+        use sim_core::trace::Category::*;
+        self.profiler.is_none()
+            && self.uart_pty.iter().all(Option::is_none)
+            && self.usb_cdc_pty.is_none()
+            && self.usb_cdc2_pty.is_none()
+            && self.usbip.is_none()
+            && self.machine.sys.ethernet.is_none()
+            && ![Instruction, Exception, Gpio, Peripheral, Unmodelled, Device]
+                .iter()
+                .any(|&c| self.machine.trace.wants(c))
+    }
+
+    /// The machine side of a robot's end of a slice for this board ([`Session::poll_rtt`] then
+    /// [`Session::poll_uarts`], for a board that [`Session::can_run_ahead`]): takes what the UARTs, the USB CDC port
+    /// and RTT hold out of the machine, for [`Session::deliver`] to take in later.
+    pub(crate) fn collect(&mut self) -> Collected {
+        fn uarts(m: &mut Machine) -> [Vec<(Time, u8)>; 2] {
+            [std::mem::take(&mut m.sys.uart[0].output), std::mem::take(&mut m.sys.uart[1].output)]
+        }
+        let now = self.machine.now;
+        let first = uarts(&mut self.machine);
+        let usb_cdc = self.machine.sys.usb_host_mut().map(|h| h.cdc_take_rx(0)).unwrap_or_default();
+        let rtt = self.rtt.as_ref().map(|r| r.poll(&mut self.machine)).unwrap_or_default();
+        let again = uarts(&mut self.machine);
+        Collected { now, uarts: [first, again], usb_cdc, rtt }
+    }
+
+    /// The host side of [`Session::collect`]: text, logs and hooks, as [`Session::poll_rtt`] and
+    /// [`Session::poll_uarts`] would have taken them in.
+    pub(crate) fn deliver(&mut self, c: Collected) {
+        let [[a0, a1], again] = c.uarts;
+        self.uart_bytes(0, a0);
+        self.uart_bytes(1, a1);
+        self.usb_cdc_bytes(c.now, c.usb_cdc);
+        self.rtt_bytes(c.now, c.rtt);
+        let [b0, b1] = again;
+        self.uart_bytes(0, b0);
+        self.uart_bytes(1, b1);
+    }
+
+    /// The state a robot running its boards ahead keeps to roll this board back to ([`Session::rollback`]): the
+    /// machine and what running it changes in the session. `flash` keeps the flash as it is now: it is copied only
+    /// if it changed since it was last kept there.
+    pub(crate) fn checkpoint(&mut self, flash: &mut Versioned) -> Checkpoint {
+        let live = std::mem::take(&mut self.machine.sys.flash);
+        let snapshot = self.machine.snapshot();
+        self.machine.sys.flash = live;
+        if flash.version() != self.machine.sys.flash.version() {
+            flash.copy_from(&self.machine.sys.flash);
+        }
+        Checkpoint {
+            snapshot,
+            carry: self.machine.run_carry(),
+            flash_version: self.machine.sys.flash.version(),
+            lockups: self.lockups,
+            final_lockup_reported: self.final_lockup_reported,
+        }
+    }
+
+    /// Puts the board back where [`Session::checkpoint`] was taken; `flash` is what that call kept.
+    pub(crate) fn rollback(&mut self, c: &Checkpoint, flash: &Versioned) {
+        let mut live = std::mem::take(&mut self.machine.sys.flash);
+        self.machine.restore(&c.snapshot);
+        if live.version() != c.flash_version {
+            live.copy_from(flash);
+        }
+        self.machine.sys.flash = live;
+        self.machine.set_run_carry(&c.carry);
+        self.lockups = c.lockups;
+        self.final_lockup_reported = c.final_lockup_reported;
     }
 
     /// Runs the CAN bus up to the machine's current time and lets the devices react to what arrived.

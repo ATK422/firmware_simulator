@@ -108,6 +108,13 @@ pub struct BitRates {
     pub data: Option<u64>,
 }
 
+impl BitRates {
+    /// The time `frame` takes on a bus running at these rates.
+    pub fn frame_time(&self, frame: &CanFrame) -> Time {
+        frame.duration(self.nominal, self.data.unwrap_or(self.nominal))
+    }
+}
+
 /// A frame a node wants to send.
 #[derive(Clone, Debug)]
 pub struct TxRequest {
@@ -159,6 +166,12 @@ pub trait CanNode {
     fn error_passive(&self) -> bool {
         false
     }
+    /// Whether [`CanNode::recessive_sequences`] would change nothing in this node now (it counts no dominant run and
+    /// is not recovering from bus-off): a bus step that carries no frame then leaves the node as it is. `false`
+    /// (the default) when the node cannot tell.
+    fn idle_changes_nothing(&self) -> bool {
+        false
+    }
 }
 
 /// A host-side participant: a SocketCAN bridge, a scripted mock, a recorder. Endpoints always acknowledge.
@@ -171,6 +184,13 @@ pub trait CanEndpoint {
     /// writes with `ENOBUFS` while the bus cannot take frames (stuck, flooded, or no one acknowledging), and
     /// drops them unless it retries. `None` (the default): it waits for room, nothing is lost.
     fn tx_queue_limit(&self) -> Option<usize> {
+        None
+    }
+    /// A time before which [`CanEndpoint::take_tx`] hands in no frame (`take_tx(until)` returns nothing for any
+    /// `until` before it), as long as nothing but the bus calls the endpoint meanwhile and it receives nothing:
+    /// `Some(Time::MAX)` if it will send nothing at all. `None` (the default): it may send at any time (a bridge
+    /// to real host tools). A robot runs its boards ahead of each other only while every endpoint can tell.
+    fn idle_until(&self) -> Option<Time> {
         None
     }
 }
@@ -464,6 +484,51 @@ impl CanBus {
         }
     }
 
+    /// The shortest time any frame can take on this bus: a frame becoming ready at `t` finishes at `t` plus at
+    /// least this.
+    pub fn shortest_frame(&self) -> Time {
+        let data = self.rates.data.unwrap_or(self.rates.nominal);
+        let mut fd_slow = CanFrame::fd(0, false, &[]);
+        fd_slow.brs = false;
+        let mut rtr = CanFrame::classic(0, false, &[]);
+        rtr.rtr = true;
+        [CanFrame::fd(0, false, &[]), fd_slow, CanFrame::classic(0, false, &[]), rtr]
+            .iter()
+            .map(|f| f.duration(self.rates.nominal, data))
+            .min()
+            .unwrap()
+    }
+
+    /// The earliest time at which a frame already handed in by an endpoint could finish (`Time::MAX` if none is
+    /// waiting), or `None` if the bus cannot tell: a fault is injected (bit errors cut frames short, a stuck bus or
+    /// an unplugged node changes what the nodes see without a frame, a flood sends by itself). Together with what
+    /// the nodes and endpoints want to send, this bounds the next step that can change a node.
+    pub fn earliest_queued_end(&self) -> Option<Time> {
+        let f = &self.faults;
+        if f.error_rate > 0.0
+            || f.corrupt_next > 0
+            || f.stuck_dominant.is_some()
+            || !f.unplugged.is_empty()
+            || !f.floods.is_empty()
+        {
+            return None;
+        }
+        let data = self.rates.data.unwrap_or(self.rates.nominal);
+        Some(
+            self.endpoint_queue
+                .iter()
+                .filter_map(|q| q.front())
+                .map(|(t, fr)| *t + fr.duration(self.rates.nominal, data))
+                .min()
+                .unwrap_or(Time::MAX),
+        )
+    }
+
+    /// When a frame a node made ready at `ready_at` could finish at the earliest.
+    pub fn earliest_end(&self, ready_at: Time, frame: &CanFrame) -> Time {
+        ready_at + self.rates.frame_time(frame)
+    }
+
     /// Runs the bus up to `until`: arbitrates, transmits and delivers every frame that finishes by then.
     pub fn step(&mut self, nodes: &mut [&mut dyn CanNode], endpoints: &mut [&mut dyn CanEndpoint], until: Time) {
         if self.endpoint_queue.len() < endpoints.len() {
@@ -679,6 +744,9 @@ impl CanEndpoint for Monitor {
     fn tx_queue_limit(&self) -> Option<usize> {
         self.limit
     }
+    fn idle_until(&self) -> Option<Time> {
+        Some(self.outbox.iter().map(|(t, _)| *t).min().unwrap_or(Time::MAX))
+    }
 }
 
 /// `candump`-style text for a frame: `123#DEADBEEF` or `12345678##1DEADBEEF` for FD.
@@ -745,6 +813,92 @@ mod tests {
     }
 
     const FD: BitRates = BitRates { nominal: 1_000_000, data: Some(5_000_000) };
+
+    /// No frame, on any bus, is shorter than the bus's shortest frame.
+    #[test]
+    fn no_frame_is_shorter_than_the_shortest() {
+        for rates in
+            [FD, BitRates { nominal: 250_000, data: None }, BitRates { nominal: 500_000, data: Some(2_000_000) }]
+        {
+            let bus = CanBus::new("b", rates);
+            let short = bus.shortest_frame();
+            assert!(short > Time::ZERO);
+            let mut rng = Rng::new(9);
+            for _ in 0..2000 {
+                let len = (rng.next_u64() % 65) as usize;
+                let ext = rng.chance(0.5);
+                let mut f = if rng.chance(0.5) {
+                    CanFrame::fd(0x7FF, ext, &vec![0xA5; len])
+                } else {
+                    CanFrame::classic(0x123, ext, &vec![0; len.min(8)])
+                };
+                f.brs &= rng.chance(0.5);
+                f.rtr = !f.fd && rng.chance(0.3);
+                assert!(rates.frame_time(&f) >= short, "{f:?}");
+                assert_eq!(bus.earliest_end(Time::from_us(7), &f), Time::from_us(7) + rates.frame_time(&f));
+            }
+        }
+    }
+
+    /// Stepped before the earliest end of everything ready (nodes' requests plus their time on the wire, frames
+    /// endpoints handed in), a bus changes no node: it only reports the idle bus.
+    #[test]
+    fn nothing_finishes_before_the_earliest_end() {
+        let mut rng = Rng::new(4);
+        for _ in 0..300 {
+            let mut bus = CanBus::new("can0", FD);
+            let mut nodes: Vec<Node> = (0..3)
+                .map(|_| {
+                    let us = 10 + rng.next_u64() % 400;
+                    let len = (rng.next_u64() % 9) as usize;
+                    node(&[(us, CanFrame::fd(0x100 + rng.next_u64() as u32 % 0x100, false, &vec![1; len]))])
+                })
+                .collect();
+            let mut ep = Monitor::default();
+            let at = Time::from_us(rng.next_u64() % 400);
+            ep.outbox.push((at, CanFrame::classic(0x50, false, &[1])));
+            let mut bound = Time(at.as_ps() + bus.shortest_frame().as_ps());
+            for n in nodes.iter_mut() {
+                let r = n.tx_request().unwrap();
+                bound = bound.min(bus.earliest_end(r.ready_at, &r.frame));
+            }
+            assert_eq!(ep.idle_until(), Some(at));
+            let mut until = Time::ZERO;
+            // Stepped in pieces up to just before the bound
+            while until + Time(1) < bound {
+                until = (until + Time::from_us(1 + rng.next_u64() % 60)).min(bound - Time(1));
+                let mut ns: Vec<&mut dyn CanNode> = nodes.iter_mut().map(|n| n as &mut dyn CanNode).collect();
+                bus.step(&mut ns, &mut [&mut ep], until);
+                assert!(bus.earliest_queued_end().unwrap() >= bound);
+            }
+            for n in &nodes {
+                assert!(n.done.is_empty() && n.rx.is_empty() && n.tx_errors.is_empty() && n.rx_errors == 0);
+            }
+            assert!(ep.received.is_empty());
+            // ...and everything goes out later
+            let mut ns: Vec<&mut dyn CanNode> = nodes.iter_mut().map(|n| n as &mut dyn CanNode).collect();
+            bus.step(&mut ns, &mut [&mut ep], Time::from_ms(5));
+            assert!(nodes.iter().all(|n| n.done.len() == 1) && ep.received.len() == 3);
+        }
+    }
+
+    /// A bus with a fault injected cannot tell when it will next change a node.
+    #[test]
+    fn faults_make_the_next_change_unknown() {
+        let mut bus = CanBus::new("can0", FD);
+        assert_eq!(bus.earliest_queued_end(), Some(Time::MAX));
+        bus.faults.error_rate = 0.1;
+        assert_eq!(bus.earliest_queued_end(), None);
+        bus.faults.error_rate = 0.0;
+        bus.set_stuck_dominant(true, Time::ZERO);
+        assert_eq!(bus.earliest_queued_end(), None);
+        bus.set_stuck_dominant(false, Time::ZERO);
+        bus.set_unplugged(1, true, Time::ZERO);
+        assert_eq!(bus.earliest_queued_end(), None);
+        bus.set_unplugged(1, false, Time::ZERO);
+        assert_eq!(bus.earliest_queued_end(), Some(Time::MAX), "plugged back in");
+        assert_eq!(Monitor::default().idle_until(), Some(Time::MAX));
+    }
 
     fn node(frames: &[(u64, CanFrame)]) -> Node {
         Node {
