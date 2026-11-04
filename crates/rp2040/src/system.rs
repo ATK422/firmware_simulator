@@ -10,6 +10,7 @@ use sim_core::bus::{Bus, BusFault, Size, WriteMode, mem};
 use sim_core::sched::Scheduler;
 use sim_core::time::{ClockPeriod, CycleClock, Time};
 use sim_core::trace::{Category, TraceEvent, TraceSink};
+use sim_core::versioned::Versioned;
 use sim_core::wire::External;
 use sim_devices::DeviceCtx;
 use sim_devices::i2c::I2cDevice;
@@ -82,7 +83,8 @@ pub const DEFAULT_CRYSTAL_HZ: u64 = 12_000_000;
 pub struct System {
     pub rom: Vec<u8>,
     pub sram: Vec<u8>,
-    pub flash: Vec<u8>,
+    /// Versioned: large and rarely written, so whoever keeps a copy can tell cheaply whether it is still the same.
+    pub flash: Versioned,
     pub xip_sram: Vec<u8>,
     pub clocks: Clocks,
     /// Clock frequencies after the last clock tree change.
@@ -194,7 +196,7 @@ impl System {
         System {
             rom,
             sram: vec![0; SRAM_SIZE],
-            flash: vec![0xFF; flash_size.max(4096)],
+            flash: Versioned::from(vec![0xFF; flash_size.max(4096)]),
             xip_sram: vec![0; XIP_SRAM_SIZE],
             clk_sys: ClockPeriod::from_hz(freqs.clk_sys),
             freqs,
@@ -2409,11 +2411,11 @@ impl Bus for BatchBus<'_> {
             let mask = self.flash_mask.filter(|_| self.xip_ok)?;
             // What xip_check does when XIP works
             self.sys.xip_failed = false;
-            (&self.sys.flash, addr as usize & mask)
+            (&self.sys.flash[..], addr as usize & mask)
         } else if addr.wrapping_sub(SRAM_BASE) < SRAM_SIZE as u32 {
-            (&self.sys.sram, addr.wrapping_sub(SRAM_BASE) as usize)
+            (&self.sys.sram[..], addr.wrapping_sub(SRAM_BASE) as usize)
         } else if (addr as usize) < ROM_SIZE {
-            (&self.sys.rom, addr as usize)
+            (&self.sys.rom[..], addr as usize)
         } else {
             return None;
         };
