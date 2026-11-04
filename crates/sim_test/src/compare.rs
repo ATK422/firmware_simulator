@@ -1011,6 +1011,7 @@ mod tests {
             wall: Default::default(),
             images: Vec::new(),
             record: Some(record),
+            coverage: None,
         }
     }
 

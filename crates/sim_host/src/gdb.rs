@@ -2,9 +2,17 @@
 //!
 //! Each RP2040 core is a GDB thread (thread 1 = core 0, thread 2 = core 1). Supported: registers (`g`/`G`/`p`/`P`,
 //! with an M-profile target description), memory (`m`/`M`/`X`; writes reach flash, so `load` works), software and
-//! hardware breakpoints (`Z0`/`Z1`), `c`/`s`/`vCont`, Ctrl-C, `qRcmd` monitor commands (`reset`, `reset halt`,
-//! `halt`, `time`: what Cortex-Debug and OpenOCD-style launch scripts send), no-ack mode, `target extended-remote`,
-//! and detach/kill (`k`, `vKill`). While running, the session keeps polling RTT so logs keep flowing.
+//! hardware breakpoints (`Z0`/`Z1`), watchpoints (`Z2` write, `Z3` read, `Z4` access, any number of any length),
+//! `c`/`s`/`vCont`, Ctrl-C, `qRcmd` monitor commands (`reset`, `reset halt`, `halt`, `time`: what Cortex-Debug and
+//! OpenOCD-style launch scripts send), no-ack mode, `target extended-remote`, and detach/kill (`k`, `vKill`). While
+//! running, the session keeps polling RTT so logs keep flowing.
+//!
+//! With time travel ([`Travel`]: a target recorded by a [`TimeTravel`]), the stub also runs backwards:
+//! `reverse-continue` (`bc`) goes back to the most recent breakpoint or watchpoint hit, `reverse-stepi` (`bs`) one
+//! step of the current core (GDB builds `reverse-step`, `reverse-next` and `reverse-finish` on these), and `monitor
+//! rewind TIME` goes to a virtual time; `ReverseStep+` and `ReverseContinue+` are advertised. Going forward again
+//! re-executes the recorded history (stopping at breakpoints on the way) up to where the run had got, then runs on
+//! live. Stepping steps the current core while the other one runs as scheduled, and stops never change the run.
 //!
 //! The stub debugs a [`Target`]: one board on its own (a [`Session`]), or one board of a robot ([`RobotBoard`]),
 //! where running it runs every board and bus of the robot. A connection that closes before sending a packet (a
@@ -13,15 +21,17 @@
 
 use std::io::{self, Read, Write};
 use std::net::{TcpListener, TcpStream};
+use std::sync::Arc;
 
 use cpu_armv6m::reg;
 use rp2040::StopReason;
-use rp2040::machine::BkptPolicy;
+use rp2040::machine::{BkptPolicy, WatchKind, Watchpoint};
 use sim_core::bus::Size;
 use sim_core::cpu::Cpu;
 
 use crate::robot::Robot;
 use crate::session::Session;
+use crate::timetravel::{Change, Pos, Ran, Rewindable, TimeTravel, Travelled};
 
 /// What GDB debugs: a board ([`Target::session`]: the registers, memory and breakpoints GDB sees) and how it runs.
 pub trait Target {
@@ -30,6 +40,106 @@ pub trait Target {
     /// Runs for `d` of virtual time. Returns why it stopped: [`StopReason::TimeLimit`] when it ran the whole
     /// piece, [`StopReason::Requested`] when the run was asked to stop.
     fn run_for(&mut self, d: sim_core::Time) -> StopReason;
+    /// The recorder, the recorded target and the debugged board's index in it, when the target can run backwards.
+    fn travel(&mut self) -> Option<(&mut TimeTravel, &mut dyn Rewindable, usize)> {
+        None
+    }
+}
+
+/// A board (`target` a [`Session`], `board` 0) or a robot's board recorded by `tt`: GDB can run it backwards.
+pub struct Travel<'a> {
+    pub tt: &'a mut TimeTravel,
+    pub target: &'a mut dyn Rewindable,
+    pub board: usize,
+}
+
+impl Target for Travel<'_> {
+    fn session(&mut self) -> &mut Session {
+        self.target.session(self.board)
+    }
+
+    fn run_for(&mut self, d: sim_core::Time) -> StopReason {
+        let end = self.target.now() + d;
+        match self.tt.run_until(self.target, end) {
+            Ran::Reached => StopReason::TimeLimit,
+            Ran::Interrupted => StopReason::Requested,
+            Ran::Stopped { reason, .. } => reason,
+        }
+    }
+
+    fn travel(&mut self) -> Option<(&mut TimeTravel, &mut dyn Rewindable, usize)> {
+        Some((self.tt, self.target, self.board))
+    }
+}
+
+/// Live runs under time travel go in pieces of this much virtual time, ending on multiples of it (slice
+/// boundaries), so the run is the same wherever GDB stopped or interrupted it.
+pub const PIECE: sim_core::Time = sim_core::Time::from_us(500);
+
+/// The next multiple of [`PIECE`] after `now`.
+fn piece_end(now: sim_core::Time) -> sim_core::Time {
+    let p = PIECE.as_ps();
+    sim_core::Time((now.as_ps() / p + 1) * p)
+}
+
+/// Applies a packet that changes the target (`G`, `P`, `M`, `X`) to `m` as seen from `core`. `None` for other
+/// packets; else whether it worked.
+pub fn apply_write(m: &mut rp2040::Machine, core: usize, pkt: &str) -> Option<bool> {
+    if let Some(data) = pkt.strip_prefix('G') {
+        let bytes = unhex(data)?;
+        for (n, chunk) in bytes.chunks(4).enumerate().take(G_REGS) {
+            if chunk.len() == 4 {
+                m.cores[core].write_reg(n, u32::from_le_bytes(chunk.try_into().unwrap()));
+            }
+        }
+        Some(true)
+    } else if let Some(rest) = pkt.strip_prefix('P') {
+        let (n, v) = rest.split_once('=')?;
+        let n = parse_hex(n)? as usize;
+        let v = unhex(v)?;
+        if n < reg::COUNT && v.len() == 4 {
+            m.cores[core].write_reg(n, u32::from_le_bytes(v.try_into().unwrap()));
+            Some(true)
+        } else {
+            Some(false)
+        }
+    } else if let Some(rest) = pkt.strip_prefix('M') {
+        let (head, data) = rest.split_once(':')?;
+        let (addr, _) = head.split_once(',')?;
+        let addr = parse_hex(addr)?;
+        let bytes = unhex(data)?;
+        Some(bytes.iter().enumerate().all(|(i, &b)| m.sys.poke(addr + i as u32, Size::Byte, b as u32)))
+    } else if let Some(rest) = pkt.strip_prefix('X') {
+        let (head, data) = rest.split_once(':')?;
+        let (addr, _) = head.split_once(',')?;
+        let addr = parse_hex(addr)?;
+        Some(data.chars().enumerate().all(|(i, c)| m.sys.poke(addr + i as u32, Size::Byte, c as u32)))
+    } else {
+        None
+    }
+}
+
+/// Whether a packet changes the target's state (registers, memory).
+fn is_write(pkt: &str) -> bool {
+    matches!(pkt.as_bytes().first(), Some(b'G' | b'P' | b'M' | b'X'))
+}
+
+/// Parses a time for `monitor rewind`: seconds, or with a unit (`1.5s`, `200ms`, `350us`, `100ns`).
+pub fn parse_time(s: &str) -> Option<sim_core::Time> {
+    let s = s.trim();
+    let (num, scale) = if let Some(n) = s.strip_suffix("ms") {
+        (n, 1e-3)
+    } else if let Some(n) = s.strip_suffix("us") {
+        (n, 1e-6)
+    } else if let Some(n) = s.strip_suffix("ns") {
+        (n, 1e-9)
+    } else if let Some(n) = s.strip_suffix('s') {
+        (n, 1.0)
+    } else {
+        (s, 1.0)
+    };
+    let v: f64 = num.trim().parse().ok()?;
+    (v >= 0.0 && v.is_finite()).then(|| sim_core::Time::from_secs_f64(v * scale))
 }
 
 impl Target for Session {
@@ -127,9 +237,41 @@ fn parse_hex(s: &str) -> Option<u32> {
     u32::from_str_radix(s, 16).ok()
 }
 
-/// Whether a packet resumes execution (continue or step).
+/// Whether a packet resumes execution (continue or step, either way).
 fn is_resume(pkt: &str) -> bool {
-    pkt == "c" || pkt == "s" || pkt.starts_with("vCont;") || pkt.starts_with('C') || pkt.starts_with('S')
+    pkt == "c"
+        || pkt == "s"
+        || pkt == "bc"
+        || pkt == "bs"
+        || pkt.starts_with("vCont;")
+        || pkt.starts_with('C')
+        || pkt.starts_with('S')
+}
+
+/// `Z2`/`Z3`/`Z4` (insert) and `z2`/`z3`/`z4` (remove): whether it inserts, the kind and `addr,len`.
+fn watch_packet(pkt: &str) -> Option<(bool, WatchKind, &str)> {
+    let insert = match pkt.as_bytes().first()? {
+        b'Z' => true,
+        b'z' => false,
+        _ => return None,
+    };
+    let kind = match pkt.get(1..3)? {
+        "2," => WatchKind::Write,
+        "3," => WatchKind::Read,
+        "4," => WatchKind::Access,
+        _ => return None,
+    };
+    Some((insert, kind, &pkt[3..]))
+}
+
+/// The stop reply field for a watchpoint hit.
+fn watch_field(kind: WatchKind, addr: u32) -> String {
+    let name = match kind {
+        WatchKind::Write => "watch",
+        WatchKind::Read => "rwatch",
+        WatchKind::Access => "awatch",
+    };
+    format!("{name}:{addr:x};")
 }
 
 /// Packet framing over a byte stream.
@@ -269,6 +411,8 @@ pub enum Ended {
 pub struct GdbStub {
     /// Thread (core) selected for register access and stepping (0-based core index).
     current: usize,
+    /// The target can run backwards (advertised in `qSupported`).
+    reverse: bool,
 }
 
 impl Default for GdbStub {
@@ -279,7 +423,7 @@ impl Default for GdbStub {
 
 impl GdbStub {
     pub fn new() -> Self {
-        GdbStub { current: 0 }
+        GdbStub { current: 0, reverse: false }
     }
 
     fn thread_of(&self, core: usize) -> String {
@@ -288,10 +432,11 @@ impl GdbStub {
 
     fn stop_reply(&self, session: &Session, reason: Option<StopReason>) -> String {
         let (core, extra) = match reason {
-            Some(StopReason::Breakpoint { core, .. }) => (core as usize, "swbreak:;"),
-            Some(StopReason::BkptInstruction { core, .. }) => (core as usize, "swbreak:;"),
-            Some(StopReason::Lockup { core, .. }) => (core as usize, ""),
-            _ => (self.current, ""),
+            Some(StopReason::Breakpoint { core, .. }) => (core as usize, "swbreak:;".to_string()),
+            Some(StopReason::BkptInstruction { core, .. }) => (core as usize, "swbreak:;".to_string()),
+            Some(StopReason::Watchpoint { core, addr, kind, .. }) => (core as usize, watch_field(kind, addr)),
+            Some(StopReason::Lockup { core, .. } | StopReason::Reached { core, .. }) => (core as usize, String::new()),
+            _ => (self.current, String::new()),
         };
         let _ = session;
         format!("T05thread:{};{extra}", self.thread_of(core))
@@ -324,7 +469,10 @@ impl GdbStub {
             }
             ["halt"] => "halted\n".to_string(),
             ["time"] => format!("virtual time {}\n", session.machine.now),
-            ["help"] | [] => "monitor commands: reset [halt|init|run], halt, time, help\n".to_string(),
+            ["help"] | [] => {
+                let travel = if self.reverse { ", rewind TIME, checkpoints" } else { "" };
+                format!("monitor commands: reset [halt|init|run], halt, time{travel}, help\n")
+            }
             _ => format!("unknown monitor command {:?} (monitor help lists them)\n", cmd.trim()),
         };
         hex(out.as_bytes())
@@ -336,7 +484,8 @@ impl GdbStub {
         let reply = if pkt == "?" {
             self.stop_reply(session, None)
         } else if pkt.starts_with("qSupported") {
-            "PacketSize=4000;qXfer:features:read+;vContSupported+;swbreak+;hwbreak+;QStartNoAckMode+".into()
+            let reverse = if self.reverse { ";ReverseStep+;ReverseContinue+" } else { "" };
+            format!("PacketSize=4000;qXfer:features:read+;vContSupported+;swbreak+;hwbreak+;QStartNoAckMode+{reverse}")
         } else if pkt == "QStartNoAckMode" {
             *conn_ack = false;
             "OK".into()
@@ -388,28 +537,15 @@ impl GdbStub {
             "OK".into()
         } else if pkt == "g" {
             (0..G_REGS).map(|n| hex_u32_le(self.read_reg(session, n).unwrap_or(0))).collect()
-        } else if let Some(data) = pkt.strip_prefix('G') {
-            let bytes = unhex(data)?;
-            for (n, chunk) in bytes.chunks(4).enumerate().take(G_REGS) {
-                if chunk.len() == 4 {
-                    m.cores[self.current].write_reg(n, u32::from_le_bytes(chunk.try_into().unwrap()));
-                }
+        } else if is_write(pkt) {
+            match apply_write(m, self.current, pkt)? {
+                true => "OK".into(),
+                false => "E01".into(),
             }
-            "OK".into()
         } else if let Some(n) = pkt.strip_prefix('p') {
             match self.read_reg(session, parse_hex(n)? as usize) {
                 Some(v) => hex_u32_le(v),
                 None => "E01".into(),
-            }
-        } else if let Some(rest) = pkt.strip_prefix('P') {
-            let (n, v) = rest.split_once('=')?;
-            let n = parse_hex(n)? as usize;
-            let v = unhex(v)?;
-            if n < reg::COUNT && v.len() == 4 {
-                m.cores[self.current].write_reg(n, u32::from_le_bytes(v.try_into().unwrap()));
-                "OK".into()
-            } else {
-                "E01".into()
             }
         } else if let Some(rest) = pkt.strip_prefix('m') {
             let (addr, len) = rest.split_once(',')?;
@@ -423,19 +559,6 @@ impl GdbStub {
                 }
             }
             if out.is_empty() && len > 0 { "E01".into() } else { hex(&out) }
-        } else if let Some(rest) = pkt.strip_prefix('M') {
-            let (head, data) = rest.split_once(':')?;
-            let (addr, _) = head.split_once(',')?;
-            let addr = parse_hex(addr)?;
-            let bytes = unhex(data)?;
-            let ok = bytes.iter().enumerate().all(|(i, &b)| m.sys.poke(addr + i as u32, Size::Byte, b as u32));
-            if ok { "OK".into() } else { "E01".into() }
-        } else if let Some(rest) = pkt.strip_prefix('X') {
-            let (head, data) = rest.split_once(':')?;
-            let (addr, _) = head.split_once(',')?;
-            let addr = parse_hex(addr)?;
-            let ok = data.chars().enumerate().all(|(i, c)| m.sys.poke(addr + i as u32, Size::Byte, c as u32));
-            if ok { "OK".into() } else { "E01".into() }
         } else if let Some(rest) = pkt.strip_prefix("Z0,").or_else(|| pkt.strip_prefix("Z1,")) {
             let addr = parse_hex(rest.split(',').next()?)?;
             m.breakpoints.insert(addr & !1);
@@ -443,6 +566,17 @@ impl GdbStub {
         } else if let Some(rest) = pkt.strip_prefix("z0,").or_else(|| pkt.strip_prefix("z1,")) {
             let addr = parse_hex(rest.split(',').next()?)?;
             m.breakpoints.remove(&(addr & !1));
+            "OK".into()
+        } else if let Some((insert, kind, rest)) = watch_packet(pkt) {
+            let mut it = rest.split(',');
+            let addr = parse_hex(it.next()?)?;
+            let len = parse_hex(it.next()?)?;
+            let w = Watchpoint { addr, len, kind };
+            if insert {
+                m.watchpoints.push(w);
+            } else if let Some(i) = m.watchpoints.iter().position(|&x| x == w) {
+                m.watchpoints.remove(i);
+            }
             "OK".into()
         } else if pkt == "vCont?" {
             "vCont;c;C;s;S".into()
@@ -457,6 +591,151 @@ impl GdbStub {
             String::new()
         };
         Some(reply)
+    }
+
+    /// The reply for a stop on the debugged board.
+    fn travel_stop(&mut self, session: &Session, reason: StopReason) -> String {
+        if let StopReason::Breakpoint { core, .. }
+        | StopReason::BkptInstruction { core, .. }
+        | StopReason::Watchpoint { core, .. }
+        | StopReason::Reached { core, .. }
+        | StopReason::Lockup { core, .. } = reason
+        {
+            self.current = core as usize;
+        }
+        self.stop_reply(session, Some(reason))
+    }
+
+    /// [`GdbStub::resume`] with time travel: either direction, in the recorded history or live.
+    fn resume_travel(
+        &mut self,
+        target: &mut dyn Target,
+        pkt: &str,
+        step: bool,
+        mut poll: impl FnMut() -> io::Result<Option<Incoming>>,
+    ) -> Resumed {
+        let Some((tt, rw, board)) = target.travel() else { unreachable!("checked by the caller") };
+        let core = self.current;
+        let begin = |me: &Self| format!("T05replaylog:begin;thread:{};", me.thread_of(core));
+        if pkt == "bc" || pkt == "bs" {
+            let r = if pkt == "bc" { tt.reverse_continue(rw) } else { tt.reverse_step(rw, board, core) };
+            return match r {
+                Travelled::Hit(h) => Resumed::Stopped(self.travel_stop(rw.session(board), h.reason)),
+                Travelled::Beginning => Resumed::Stopped(begin(self)),
+                Travelled::Interrupted => Resumed::Ended,
+                Travelled::Arrived | Travelled::Frontier => {
+                    Resumed::Stopped(format!("T05thread:{};", self.thread_of(core)))
+                }
+            };
+        }
+        let goal =
+            step.then(|| Pos::At { board, core, time: rw.session(board).machine.core_time(core) + sim_core::Time(1) });
+        let resumed = loop {
+            if !tt.at_frontier() {
+                let until = piece_end(rw.now());
+                match tt.forward(rw, goal, until) {
+                    Travelled::Arrived if goal.is_some() => {
+                        break Resumed::Stopped(format!("T05thread:{};", self.thread_of(core)));
+                    }
+                    Travelled::Hit(h) => break Resumed::Stopped(self.travel_stop(rw.session(board), h.reason)),
+                    Travelled::Interrupted => break Resumed::Ended,
+                    Travelled::Frontier => continue,
+                    Travelled::Arrived | Travelled::Beginning => {}
+                }
+            } else {
+                if let Some(Pos::At { time, .. }) = goal {
+                    rw.session(board).machine.stop_at[core] = Some(time);
+                }
+                let end = piece_end(rw.now());
+                match tt.run_until(rw, end) {
+                    Ran::Reached => {}
+                    Ran::Interrupted => break Resumed::Ended,
+                    Ran::Stopped { reason: StopReason::Deadlock, .. } => {
+                        break Resumed::Stopped(format!("T05thread:{};", self.thread_of(core)));
+                    }
+                    Ran::Stopped { reason, .. } => break Resumed::Stopped(self.travel_stop(rw.session(board), reason)),
+                }
+            }
+            match poll() {
+                Ok(Some(Incoming::Interrupt)) => {
+                    break Resumed::Stopped(format!("T02thread:{};", self.thread_of(self.current)));
+                }
+                Ok(Some(Incoming::Closed)) | Err(_) => break Resumed::Closed,
+                Ok(_) => {}
+            }
+        };
+        rw.session(board).machine.stop_at = [None; 2];
+        resumed
+    }
+
+    /// Monitor commands and changes to the target, with time travel: changes are logged (replays make them again)
+    /// and drop the recorded future when made in the past. `None` for packets [`GdbStub::handle`] answers.
+    fn travel_packet(&mut self, target: &mut dyn Target, pkt: &str) -> Option<String> {
+        let core = self.current;
+        let (tt, rw, board) = target.travel()?;
+        if is_write(pkt) {
+            let ok = apply_write(&mut rw.session(board).machine.fork(), core, pkt)?;
+            if ok {
+                let p = pkt.to_string();
+                let change: Change = Arc::new(move |m| {
+                    apply_write(m, core, &p);
+                });
+                tt.apply(rw, board, change);
+            }
+            return Some(if ok { "OK" } else { "E01" }.into());
+        }
+        let cmd = String::from_utf8(unhex(pkt.strip_prefix("qRcmd,")?)?).ok()?;
+        let words: Vec<&str> = cmd.split_whitespace().collect();
+        let out = match words[..] {
+            ["reset"] | ["reset", "halt" | "init" | "run"] => {
+                let change: Change = Arc::new(|m| m.watchdog_reset(rp2040::periph::timer::WatchdogReset::Force));
+                tt.apply(rw, board, change);
+                self.current = 0;
+                "machine reset (watchdog), halted at the reset vector until GDB resumes; \
+                 `maintenance flush register-cache` shows the new registers\n"
+                    .to_string()
+            }
+            ["rewind", t] => match parse_time(t) {
+                Some(t) => {
+                    let r = tt.rewind_to(rw, t);
+                    let now = rw.now();
+                    let note = match r {
+                        Travelled::Beginning => " (the start of the recorded history)",
+                        Travelled::Frontier => " (as far as the run has got)",
+                        _ => "",
+                    };
+                    format!(
+                        "at {now}{note}; `maintenance flush register-cache` (or `flushregs`) shows the registers there\n"
+                    )
+                }
+                None => format!("not a time: {t:?} (1.5s, 200ms, 350us)\n"),
+            },
+            ["checkpoints"] => {
+                let st = tt.stats();
+                format!(
+                    "{} checkpoints, {:.1} MB, history from {} to {}; {} taken ({:.2} ms each), {} restores, {} replayed in {:.2} s\n",
+                    st.checkpoints,
+                    st.bytes as f64 / (1 << 20) as f64,
+                    st.oldest,
+                    st.frontier,
+                    st.taken,
+                    st.taking_ns as f64 / 1e6 / st.taken.max(1) as f64,
+                    st.restores,
+                    st.replayed,
+                    st.replay_ns as f64 / 1e9
+                )
+            }
+            ["time"] => {
+                let pos = match tt.here() {
+                    Pos::Boundary(t) => format!("slice boundary {t}"),
+                    Pos::At { core, time, .. } => format!("core{core} at {time}"),
+                };
+                let front = if tt.at_frontier() { "live" } else { "in the recorded history" };
+                format!("virtual time {}; {pos}; {front}\n", rw.now())
+            }
+            _ => return None,
+        };
+        Some(format!("O{}\u{0}OK", hex(out.as_bytes())))
     }
 
     /// Runs a resume packet (`c`, `s`, `vCont`) on `target`. `poll` is asked between slices whether GDB sent an
@@ -475,6 +754,11 @@ impl GdbStub {
             {
                 self.current = t as usize - 1;
             }
+        }
+        if target.travel().is_some() {
+            return self.resume_travel(target, pkt, step, poll);
+        }
+        if step {
             let core = self.current;
             let session = target.session();
             session.machine.single_step(core);
@@ -553,6 +837,7 @@ pub fn serve_target(listener: &TcpListener, target: &mut dyn Target) -> io::Resu
     let old_policy = target.session().machine.bkpt_policy;
     target.session().machine.bkpt_policy = BkptPolicy::Stop;
     let mut stub = GdbStub::new();
+    stub.reverse = target.travel().is_some();
     let mut next = Some(first);
     let result = loop {
         let msg = match next.take() {
@@ -574,6 +859,12 @@ pub fn serve_target(listener: &TcpListener, target: &mut dyn Target) -> io::Resu
                 if pkt.starts_with('D') {
                     conn.send("OK")?;
                     break Ended::Detached;
+                }
+                if let Some(reply) = stub.travel_packet(target, &pkt) {
+                    for part in reply.split('\u{0}') {
+                        conn.send(part)?;
+                    }
+                    continue;
                 }
                 let mut ack = conn.ack;
                 match stub.handle(target.session(), &mut ack, &pkt) {
@@ -606,6 +897,8 @@ pub fn serve_target(listener: &TcpListener, target: &mut dyn Target) -> io::Resu
     let m = &mut target.session().machine;
     m.bkpt_policy = old_policy;
     m.breakpoints.clear();
+    m.watchpoints.clear();
+    m.stop_at = [None; 2];
     log::info!(
         "GDB {}",
         match result {

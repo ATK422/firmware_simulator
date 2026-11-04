@@ -107,6 +107,17 @@ scheduled. Counters (timer, PWM, watchdog) are computed lazily from virtual time
    that changes nothing (FSTAT, FLEVEL, IRQ, INTR...) advances the blocks once rather than twice
    (`System::pio_fast_reads`).
 
+7. **Debugger stops** (`StopReason::is_debug_stop`: a breakpoint, `BKPT`, a watchpoint, a position reached with
+   `Machine::stop_at`) return in the middle of a quantum with what is left of it noted (`Resume`: the core, the
+   instructions left, the quantum's time limit); the next `run_until` goes on with that quantum before anything
+   else, so a run that stopped is the same as one that did not (`crates/rp2040/tests/debug_stops.rs`, on both
+   cores). `Session::run_until` likewise finishes the slice a stop interrupted before doing the slice's end. A
+   **position** is a core and the time on its clock when one of its steps (an instruction or an exception entry)
+   starts; `stop_at[core]` stops before the first step at or after a time, with that core's batches cut there and
+   its busy-wait skipping and fusing off. Watchpoints (`Machine::watchpoints`) run the cores one instruction at a
+   time through a bus that checks every data access, and stop the core before its next step. Code coverage
+   (`Machine::coverage`) does too, marking each executed instruction.
+
 `Machine::skip_spins`, `Machine::skip_timer_waits`, `Machine::fuse_quanta`, `Pio::skip_loops`,
 `Pio::skip_counted`, `Pio::loop_inputs` and `Pio::fast_run` switch the skips and the fusing off;
 `crates/rp2040/tests/batching.rs`, `busy_wait.rs`, `timer_waits.rs`, `fused_quanta.rs`,
@@ -160,10 +171,10 @@ in windows: each runs on alone on its thread, doing the machine side of its end 
 out what RTT and the UARTs hold, `Session::collect`) and noting what its controllers show the bus and its ESCs'
 motors, up to the first boundary where any board's frame could finish (an atomic minimum it lowers as soon as it
 has a frame ready), an endpoint's next frame, or 64 slices. A board that went past the window's end before it was
-told is rolled back to a checkpoint (`Session::checkpoint`: the machine without its flash, which is versioned so
-that it is copied only when it changed, plus what the run loop carries, `Machine::run_carry`; one at the window's
-first boundary and one after every 1.5 ms of host time) and run again; runs are deterministic, so it gets there
-exactly as it would have. Meanwhile the calling thread commits every boundary all boards have gone past: each bus
+told is rolled back to a rollback point (`Session::rollback_point`: the board's machine state, see
+[Checkpoints](#checkpoints-one-machine-state-for-both-kinds), with the debugger's positions and the code coverage;
+one at the window's first boundary and one after every 1.5 ms of host time) and run again; runs are deterministic,
+so it gets there exactly as it would have. Meanwhile the calling thread commits every boundary all boards have gone past: each bus
 steps against stand-ins that answer as the controllers did there (one that the step would change panics: it would
 mean the bounds are wrong), the vehicles step with the noted motors, and boards whose inputs a vehicle drives (the
 camera cage) run there slice by slice rather than ahead; a frame of theirs cuts the window and rolls the others
@@ -298,6 +309,65 @@ and a `Relink` map from old to new, and `sim_host::board::relink_inputs` walks e
 (`relink_inputs` on each device trait) to point it at them. `Bench`, `RobotBench` and `Robot` snapshots do this
 (`Session::snapshot_with_inputs`); a plain `Session::snapshot` keeps sharing. A robot snapshot also re-links the
 copy's hydrophones and projectors to the copy's acoustic medium and its vehicles' paths.
+
+**Checkpoints for time travel** (`sim_host::timetravel`) restore in place instead, so that whoever holds the live
+session, robot, inputs and bridges keeps holding them: `Session::checkpoint` and `Session::rewind_to` (the machine
+via `Machine::snapshot` and `restore`, the host side's RTT position, a defmt frame in progress, the CAN bus, the
+Ethernet cable; the logs and text collected are cut back, and given back from a kept copy when going forward), a
+robot's buses, vehicles (with their transducers' paths) and the medium's contents, and the inputs' values. The
+flash is shared between checkpoints while unchanged (see below), the ROM, the SRAM (in 4 KB pieces) and the code
+coverage map with the checkpoint before where they are equal. `TimeTravel` keeps them in a thinned ring within a memory budget, with a log of
+everything from outside (runs asked for and where they stopped, debugger writes, inputs, and per call what each host
+endpoint and pty gave, through `TappedCan`, `TappedEth` and the ptys' taps), and replays from the nearest one: the
+taps give the recorded frames again, hooks, trace sinks and the profiler are put aside. Host changes it does not
+log (faults, poses) are marked with `TimeTravel::changed`, a checkpoint replays never go through.
+
+### Checkpoints: one machine state for both kinds
+
+A robot running ahead and time travel both keep a board's machine as it was (`MachineState` in
+`sim_host::session`): `Machine::snapshot` without the flash, what the run loop carries (`Machine::run_carry`, so
+that the machine goes on exactly as it did, its statistics included), the lockup count, and the flash apart. The
+flash is a `sim_core::versioned::Versioned` array: every mutable borrow of it (an SSI or IO_QSPI access, a trapped
+flash function, `poke`, a host writing it) gives it a new, globally unique version, so the session keeps one copy
+(`Session::keep_flash`) that every checkpoint of either kind shares while the version is the same (or, taking that
+copy's version, while the contents are), and a restore copies it back only when the live flash's version differs.
+The two kinds differ in what else they keep and how long they live:
+
+| | Rollback point (`Session::rollback_point`, `roll_back`) | Time-travel checkpoint (`Session::checkpoint`, `rewind_to`) |
+|---|---|---|
+| Taken | in the hot loop of a window, every 1.5 ms of host time per board, dropped at the window's end | every `--checkpoint-every` of virtual time, kept in a thinned ring within a budget |
+| SRAM | in the snapshot (one 264 KB copy: cheapest to take and to put back) | apart, in 4 KB pieces shared with the checkpoint before |
+| Host side | nothing: the host side takes in what was collected only once the window is committed | RTT position, defmt frame in progress, text collected, CAN bus, Ethernet cable |
+| Debugger positions (`stop_at`) | kept: a rolled-back board stops where it would have | not kept: replays arm their own |
+| Code coverage | kept: what was rolled back counts as not run | kept (shared while unchanged): coverage follows the timeline, as the logs do |
+
+**Time travel and running ahead together.** The committed run is the reference: everything is as taking turns
+would have done it, whatever ran ahead and was rolled back. So:
+* *Checkpoints are taken at committed boundaries.* `TimeTravel` cuts live runs into pieces that end where a
+  checkpoint is due (`Rewindable::run_until_after`); a robot running ahead goes on to the end of the window that
+  is running then (`Robot::run_until_after`: where the boards meet anyway, at most 64 slices on), so recording
+  does not cut windows short, and checkpoints come every `--checkpoint-every` or up to a window later. When it
+  returns every board is committed and every host side has taken in what it collected. A recorded robot runs
+  ahead with the same results as recording slice by slice (`crates/sim_host/tests/runahead.rs`,
+  `recording_for_time_travel_runs_ahead_the_same`).
+* *External inputs are recorded per bus step.* The taps (`TappedCan`) record what an endpoint gave on each call;
+  only the commit steps the buses, once per boundary in order as taking turns does, and rolled-back boards never
+  call an endpoint, so the calls and what they gave are the same either way. A tapped endpoint can tell when it
+  will next send (`CanEndpoint::idle_until`) if the endpoint itself can: live, the endpoint's own answer; in a
+  replay, the time its next recorded frames were asked for (or, once the replay reaches the frontier, the
+  endpoint's own answer, whichever is first). So replays run ahead too.
+* *Debugger stops run in turns.* While GDB is attached to one of its boards (it stops at a `BKPT`), or a
+  breakpoint, watchpoint or position is armed on any board, a recorded robot runs its boards in turns on the
+  calling thread, as GDB without time travel always did, so stops are reported exactly as before (on threads the
+  other boards would run on to the end of the slice, and a replay taking turns to the same stop would not have them
+  there). The rest of the time it runs ahead. A history recorded running ahead is the same history, so
+  reverse-continue and reverse steps on it give the states fresh robots taking turns have
+  (`crates/sim_test/tests/timetravel.rs`, `a_robot_that_ran_ahead_goes_back_whole`).
+* *Coverage counts the committed run.* Rollback points keep the coverage map and a rollback puts it back, so the
+  coverage of a robot running ahead equals that of taking turns, rollbacks forced or not
+  (`coverage_is_the_same_running_ahead`; `runahead::tests::rolled_back_execution_is_not_covered`). Time travel puts
+  the map back with the rest of the board, so after going back it is that of a fresh run to there, and going forward
+  again gives the rest back (`crates/sim_host/tests/coverage.rs`, `coverage_goes_back_with_time_travel`).
 
 ## Performance
 

@@ -1,7 +1,7 @@
 # Rebuilds the hand-written test programs. The ELFs are committed so the tests do not need an ARM toolchain.
 AS = arm-none-eabi-as
 LD = arm-none-eabi-ld
-PROGRAMS = blink watchdog sysreset lockup profile embassy_blinky
+PROGRAMS = blink watchdog sysreset lockup profile coverage embassy_blinky
 
 all: $(PROGRAMS:=.elf)
 
@@ -9,6 +9,12 @@ all: $(PROGRAMS:=.elf)
 	$(AS) -mcpu=cortex-m0plus -o $*.o $<
 	$(LD) -T link.ld -o $@ $*.o
 	rm -f $*.o
+
+# With a line table (the coverage tests map instructions to its lines)
+coverage.elf: coverage.S link.ld
+	$(AS) -g -mcpu=cortex-m0plus -o coverage.o $<
+	$(LD) -T link.ld -o $@ coverage.o
+	rm -f coverage.o
 
 clean:
 	rm -f *.elf *.o

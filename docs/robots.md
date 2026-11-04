@@ -204,7 +204,10 @@ camera cage's depth sensor) run slice by slice on the calling thread, after the 
 ESC boards, whose heavy slices do not line up, stop waiting for each other every slice. It needs every bus endpoint
 to know when it sends (mock bridges, recordings), so with `--can`, `--cannelloni`, a `--vcd` waveform, `--trace`,
 `--profile-dir`, a pty or `--usbip` the boards stay in step slice by slice, as with `--no-run-ahead`.
-`Robot::run_ahead` switches it in code.
+`Robot::run_ahead` switches it in code. A run recorded for time travel (`--checkpoint-every`, `--dashboard`) runs
+ahead too, live and when it replays (checkpoints are taken where every board is committed, and the recorded bridges
+tell when they send from the recording); with `--gdb` the boards take turns, so stops are as without threads.
+`--coverage` counts only what the committed run executed: what a board ran before it was rolled back does not count.
 
 **Speed.** On one core of the 4-core machine it was measured on, Talos (nine boards) runs at about 0.54x real
 time, and at about 1.2-1.25x on three or four threads (2.2-2.3x faster), so `--realtime` with all of Talos keeps

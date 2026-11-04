@@ -19,6 +19,7 @@ firmware_simulator run $FW/power_board --board boards/mk2/power_board.toml --moc
 - [Traces](#traces)
 - [Profiles, waveforms, dashboard and JSON logs](#profiles-waveforms-dashboard-and-json-logs)
 - [Debugging with GDB](#debugging-with-gdb)
+- [Reverse debugging and rewinding](#reverse-debugging-and-rewinding)
 - [Debugging in VS Code](#debugging-in-vs-code)
 - [USB: BOOTSEL, PICOBOOT, UF2 and CDC](#usb-bootsel-picoboot-uf2-and-cdc)
 - [Several micro-ROS boards at once](#several-micro-ros-boards-at-once)
@@ -106,6 +107,9 @@ differ by roughly the boot time.
 | `--stop-on-bkpt` | off | A `BKPT` stops the run instead of escalating to HardFault |
 | `--stop-on-lockup` | off | A lockup stops the run, instead of the board running on (locked up) until the watchdog resets it ([faults.md](faults.md#what-the-models-do)) |
 | `--gdb ADDR` | | Waits for GDB on this address before running ([below](#debugging-with-gdb)) |
+| `--checkpoint-every T` | `10ms` with `--gdb` or `--dashboard`, else off | Records the run for time travel (reverse debugging, rewinding) with a checkpoint every `T` of virtual time; `0` turns it off ([below](#reverse-debugging-and-rewinding)) |
+| `--checkpoint-memory MB` | 512 | Memory the checkpoints may take; older ones are thinned out beyond it |
+| `--coverage FILE` | | Collects firmware code coverage and writes it as an lcov file at the end, with a table per crate ([tools.md](tools.md#code-coverage)) |
 
 `firmware_simulator run --help` has the same list.
 
@@ -241,6 +245,16 @@ firmware_simulator run $FW/power_board --board boards/mk2/power_board.toml --moc
 Coding agents get the same through `firmware_simulator mcp`, an MCP server whose tools start runs, read their
 state, logs and CAN frames, and inject faults ([tools.md](tools.md#mcp-server)).
 
+**Code coverage.** `--coverage FILE` writes which source lines and functions of the firmware ran as an lcov
+tracefile (for `genhtml` or VS Code's Coverage Gutters) and prints functions and lines hit per crate
+([tools.md](tools.md#code-coverage)):
+
+```bash
+firmware_simulator run $FW/power_board --board boards/mk2/power_board.toml --mock-bridge 1 --time 2s \
+    --coverage power.info
+genhtml power.info -o power-coverage
+```
+
 `--log-json`, `--trace-file` and `--candump-log` are flushed every 100 ms of wall time and stdout line by line, so
 `tail -f` (or a script waiting for a line) can follow a run while it goes on. None of them changes what a
 single-core program does; with both cores running, the profiler's extra cuts can
@@ -251,16 +265,24 @@ shift how their instructions interleave, as a different `--quantum` would. They 
 
 `--gdb 127.0.0.1:3333` waits for GDB before running. Each core is a thread (thread 1 is core 0); registers,
 memory (writes reach flash, so `load` works), software and hardware breakpoints, stepping, Ctrl-C, `target remote`
-and `target extended-remote`, and these monitor commands work:
+and `target extended-remote`, data watchpoints (`watch`, `rwatch`, `awatch`: any number, any length; a watchpoint stops
+after the access, before the core's next instruction), running backwards ([below](#reverse-debugging-and-rewinding)),
+and these monitor commands work:
 
 | Command | |
 |---|---|
 | `monitor reset` | Resets the chip from the watchdog (as `watchdog_reboot` does) and stays halted at the reset vector until GDB resumes. `reset halt`, `reset init` and `reset run` (OpenOCD's spellings, which Cortex-Debug and many launch scripts send) do the same. GDB caches registers, so run `maintenance flush register-cache` afterwards to see the new ones |
 | `monitor halt` | Nothing: the target is halted whenever GDB can send a command |
-| `monitor time` | Prints the virtual time |
+| `monitor time` | Prints the virtual time, the position (the stopped core and the time on its clock) and whether the run is live or in its recorded history |
+| `monitor rewind T` | Goes to virtual time `T` (`1.5s`, `200ms`, `350us`; the last 100 µs slice boundary at or before it), back or forward within what has run; `maintenance flush register-cache` shows the registers there |
+| `monitor checkpoints` | The time-travel checkpoints: how many, their memory, the history they cover, what taking and replaying cost |
 | `monitor help` | Lists them |
 
-Virtual time stops while GDB has the target halted; RTT logs keep flowing while it runs. Peripheral registers read
+Virtual time stops while GDB has the target halted; RTT logs keep flowing while it runs. Stopping never changes the
+run: a stop in the middle of a quantum or a slice (a breakpoint, a watchpoint, a step) goes on from exactly there,
+and with time travel on (the default with `--gdb`) the run goes on in pieces of 500 µs ending on multiples of
+500 µs, so a run with any number of stops, steps and interrupts is the same as one without. Stepping (`stepi`)
+runs the selected core one step (an instruction, or an exception entry) while the other core runs as scheduled. Peripheral registers read
 without side effects (no FIFO pops or spinlock claims), so GDB and an SVD view can read whole register blocks.
 
 ```bash
@@ -279,14 +301,72 @@ Killing the session from GDB, or GDB going away while the target runs, ends the 
 `--time`, which counts from power-on: with `--time 0s` the run lasts exactly as long as GDB drives it. SIGINT or
 SIGTERM while GDB runs the target ends the run too, and GDB hears that the program exited.
 
-A board of a robot is debugged the same way with `robot --gdb BOARD=ADDR`. Continuing runs the whole robot, with
-its boards in turn on one thread, and the board's breakpoints stop all of it. `--fault`s that fall due while GDB
+A board of a robot is debugged the same way with `robot --gdb BOARD=ADDR` (going backwards takes the whole robot
+back: every board, bus, the vehicles and the water). Continuing runs the whole robot, with
+its boards in turn on one thread (with or without `--threads`; a recorded history made with the boards running
+ahead of each other is the same history), and the board's breakpoints stop all of it. `--fault`s that fall due while GDB
 is attached are applied once it detaches:
 
 ```bash
 firmware_simulator robot robots/talos.toml --mock-bridge internal:2 --gdb esc0=127.0.0.1:3333 --time 0s &
 gdb-multiarch -ex "target extended-remote :3333" -ex "break main" -ex continue $FW/esc_board
 ```
+
+## Reverse debugging and rewinding
+
+Runs are deterministic, so the past can be made again. With `--gdb` (or `--dashboard`) the run is recorded: a
+checkpoint (a copy of the whole board or robot: cores, memories, peripherals, devices, buses, vehicles, the water)
+every `--checkpoint-every` of virtual time, and a log of what came from outside since (the runs GDB asked for and
+where they stopped, what GDB wrote, inputs set, what bridges, SocketCAN, cannelloni, UDP relays and ptys sent in).
+Going back restores the checkpoint before the moment and replays the log up to it; bridges are not asked again,
+what they sent is given again.
+
+```text
+(gdb) break ros_task          # anything; or watch a variable
+(gdb) continue                # ... the firmware panics, the board reboots ...
+(gdb) reverse-continue        # back to the most recent hit before here
+(gdb) reverse-stepi           # one instruction (or exception entry) back
+(gdb) reverse-next            # GDB builds reverse-step, -next, -finish on these
+(gdb) watch crash_counts.panics
+(gdb) reverse-continue        # who wrote it: stops before the writing instruction
+(gdb) monitor rewind 1.5s     # to a time
+(gdb) continue                # forward again: the recorded history, then live
+```
+
+| Command | Packet | What it does |
+|---|---|---|
+| `reverse-continue` | `bc` | Back to the most recent breakpoint or watchpoint hit before the current position, on either core; for a watchpoint, to just before the instruction that made the access (as GDB expects backwards). With none, to the start of the history (`No more reverse-execution history`) |
+| `reverse-stepi` | `bs` | Back one step of the selected core: to just before its previous instruction or exception entry (stepping back out of an interrupt handler's first instruction lands before the exception entry) |
+| `reverse-step`, `reverse-next`, `reverse-finish` | `bs`, `bc` | GDB's, on top of the two |
+| `monitor rewind T` | | To a virtual time |
+| `continue`, `stepi` in the past | | Re-execute the recorded history, stopping at breakpoints and watchpoints on the way, then go on live from where the run had got |
+
+**Positions.** A position is a slice boundary, or a step of one core: the core and the time on its clock when
+the step starts (each step takes at least a cycle, so the time names it). Going to a position gives the state a
+run that never stopped had there, both cores, every peripheral and device, the buses and, for a robot, every board,
+the vehicle and the water (`crates/sim_host/tests/timetravel.rs` and `crates/sim_test/tests/timetravel.rs` check
+this against fresh runs, on a board and across Talos).
+
+**Changing the past.** Writing a register or memory, `monitor reset`, setting an input or injecting a fault while
+in the past drops the recorded future: the run goes on live from there (bridges carry on from where they were at
+the end). Writes are logged, so going back before one and forward again makes it again. Faults applied by
+`--fault` or the dashboard take a checkpoint right after them, which replays never go through.
+
+**What it costs.** Checkpoints share the flash, the ROM and unchanged 4 KB pieces of SRAM with the one before, so
+one is about 30-140 µs and a few tens of KB for a board, under 1 ms for all of Talos (the bench's
+`--checkpoint-every 10ms`, CPU time of 2 s of virtual time: template +0.01 s, ESC board +2 %, IVCBoard2 +1 %,
+Talos +4 %, the IVC2 pool +15 %, its acoustic medium being the expensive part; the fingerprints do not change;
+Talos on three threads, its boards running ahead of each other, +3 % CPU and about +10 % on the wall clock, the
+checkpoints being taken while the boards wait).
+`--checkpoint-memory` bounds them (512 MB by default: about 80 s of a single board, 7 s of Talos, before older
+checkpoints are thinned out, their spacing growing with age; the first is always kept, so going back to any time
+stays possible, it only replays more). Going back costs a restore (a few hundred µs) and a replay of up to
+`--checkpoint-every` of virtual time, at the emulator's speed, single stepped where breakpoints or watchpoints are
+set: a reverse step is a few ms, a reverse-continue a replay per checkpoint interval searched. Plain `run` and
+`robot` record nothing unless given `--checkpoint-every`; then their runs cost only the checkpoints.
+
+Not recorded: USB/IP traffic (a warning says so) and the profiler, which is off with time travel unless
+`--checkpoint-every` is given (it cuts runs at its sample times, which replays do not).
 
 ## Debugging in VS Code
 
@@ -300,6 +380,7 @@ or `arm-none-eabi-gdb`, and the images (see [Images](#images)). Pick a configura
 | Emulator: titan_firmware_rs image | An image (the [smoke test](../crates/sim_test/tests/smoke.rs)'s list) | The image on its board file, with a mock `titan_bridge` for its client |
 | Emulator: Talos robot board | A board of `robots/talos.toml` | The whole robot, with GDB on that board and a mock bridge for it |
 | Emulator: C pico-sdk ELF | An ELF path (default `build/c/basic_template/template_project.elf`) | The ELF on its own |
+| Emulator: titan_firmware_rs image, reverse debugging (Native Debug) | An image | As the first, debugged with [Native Debug](https://github.com/WebFreak001/code-debug) (`webfreak.debug`), which has Step Back and Reverse Continue buttons |
 
 Each configuration's pre-launch task runs [`scripts/vscode_gdb.sh`](../scripts/vscode_gdb.sh). The script builds
 the emulator (`cargo run --release`), links the chosen ELF to `target/vscode/debug.elf` (every configuration's
@@ -313,6 +394,13 @@ Launch does not reset the chip: the emulator already waits at the reset vector, 
 reset, which titan firmware counts. If your GDB is not `gdb-multiarch`, change `gdbPath` or set
 `cortex-debug.gdbPath` in your user settings. To debug another robot, or with other options, copy a task and change
 its arguments; arguments after the pick in a task's `args` go to the emulator, e.g. `--realtime`.
+
+**Reverse debugging in VS Code.** The emulator advertises `ReverseStep` and `ReverseContinue`, but Cortex-Debug
+has no Step Back or Reverse Continue buttons (it does not offer them to VS Code, whatever the server supports): in
+its Debug Console, type `-exec reverse-continue`, `-exec reverse-stepi`, `-exec reverse-next` or
+`-exec monitor rewind 1.5s`. The Native Debug configuration shows both buttons; they send
+`-exec-continue --reverse` and `-exec-step --reverse`, which `crates/sim_host/tests/gdb.rs` drives through
+`gdb-multiarch`.
 
 The configurations are checked by driving `gdb-multiarch` over GDB/MI with the commands Cortex-Debug sends
 (`crates/sim_host/tests/gdb.rs` has the packet-level tests). VS Code itself is not run in CI.
