@@ -100,6 +100,10 @@ struct RobotArgs {
     /// make the slices shorter. Robots in an acoustic environment always run their boards in turn.
     #[arg(long, default_value_t = 0)]
     threads: usize,
+    /// On threads, keep the boards in step slice by slice instead of letting them run ahead of each other between
+    /// the slices where they can see each other (the results are the same; this only checks that they are).
+    #[arg(long)]
+    no_run_ahead: bool,
     /// Replace the ambient noise every hydrophone hears with white noise at this level, dB re 1 µPa²/Hz.
     #[arg(long)]
     noise_db: Option<f64>,
@@ -454,6 +458,7 @@ fn robot(args: RobotArgs) -> Result<()> {
     }
     r.realtime = args.realtime;
     r.threads = args.threads;
+    r.run_ahead = !args.no_run_ahead;
     if !args.trace.is_empty() {
         for b in &args.trace_board {
             anyhow::ensure!(r.index(b).is_some(), "--trace-board: no board {b:?}");

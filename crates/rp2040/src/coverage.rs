@@ -40,6 +40,11 @@ impl CoverageMap {
         }
     }
 
+    /// About how many bytes the map takes.
+    pub fn bytes(&self) -> usize {
+        8 * (self.rom.len() + self.flash.len() + self.sram.len())
+    }
+
     /// Notes that the instruction at `addr` ran.
     #[inline]
     pub fn mark(&mut self, addr: u32) {

@@ -303,7 +303,8 @@ SIGTERM while GDB runs the target ends the run too, and GDB hears that the progr
 
 A board of a robot is debugged the same way with `robot --gdb BOARD=ADDR` (going backwards takes the whole robot
 back: every board, bus, the vehicles and the water). Continuing runs the whole robot, with
-its boards in turn on one thread, and the board's breakpoints stop all of it. `--fault`s that fall due while GDB
+its boards in turn on one thread (with or without `--threads`; a recorded history made with the boards running
+ahead of each other is the same history), and the board's breakpoints stop all of it. `--fault`s that fall due while GDB
 is attached are applied once it detaches:
 
 ```bash
@@ -354,7 +355,9 @@ the end). Writes are logged, so going back before one and forward again makes it
 **What it costs.** Checkpoints share the flash, the ROM and unchanged 4 KB pieces of SRAM with the one before, so
 one is about 30-140 µs and a few tens of KB for a board, under 1 ms for all of Talos (the bench's
 `--checkpoint-every 10ms`, CPU time of 2 s of virtual time: template +0.01 s, ESC board +2 %, IVCBoard2 +1 %,
-Talos +4 %, the IVC2 pool +15 %, its acoustic medium being the expensive part; the fingerprints do not change).
+Talos +4 %, the IVC2 pool +15 %, its acoustic medium being the expensive part; the fingerprints do not change;
+Talos on three threads, its boards running ahead of each other, +3 % CPU and about +10 % on the wall clock, the
+checkpoints being taken while the boards wait).
 `--checkpoint-memory` bounds them (512 MB by default: about 80 s of a single board, 7 s of Talos, before older
 checkpoints are thinned out, their spacing growing with age; the first is always kept, so going back to any time
 stays possible, it only replays more). Going back costs a restore (a few hundred µs) and a replay of up to

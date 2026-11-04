@@ -91,6 +91,15 @@ impl<T: Clone + Default + IsEmpty> TapLog<T> {
         self.recorded = self.calls;
         out
     }
+
+    /// While replaying, the next output recorded that was not empty (`None` if none comes before the frontier).
+    pub fn next_recorded(&self) -> Option<&T> {
+        if !self.replaying() {
+            return None;
+        }
+        let i = self.items.partition_point(|(c, _)| *c < self.calls);
+        self.items.get(i).map(|(_, t)| t)
+    }
 }
 
 /// Whether a tap's output is empty (and need not be recorded).
@@ -101,6 +110,19 @@ pub trait IsEmpty {
 impl<T> IsEmpty for Vec<T> {
     fn is_empty(&self) -> bool {
         Vec::is_empty(self)
+    }
+}
+
+/// What a CAN endpoint handed in on one call: the frames, and the time the bus asked up to.
+#[derive(Clone, Debug, Default)]
+pub struct CanCall {
+    pub until: Time,
+    pub frames: Vec<(Time, CanFrame)>,
+}
+
+impl IsEmpty for CanCall {
+    fn is_empty(&self) -> bool {
+        self.frames.is_empty()
     }
 }
 
@@ -134,13 +156,13 @@ impl<T: Send> TapControl for SharedTap<T> {
 /// to it is dropped: it saw that then).
 pub struct TappedCan {
     inner: Box<dyn CanEndpoint + Send>,
-    log: SharedTap<Vec<(Time, CanFrame)>>,
+    log: SharedTap<CanCall>,
 }
 
 impl CanEndpoint for TappedCan {
     fn take_tx(&mut self, until: Time) -> Vec<(Time, CanFrame)> {
         let inner = &mut self.inner;
-        self.log.lock().unwrap().call(|| inner.take_tx(until))
+        self.log.lock().unwrap().call(|| CanCall { until, frames: inner.take_tx(until) }).frames
     }
     fn receive(&mut self, frame: &CanFrame, at: Time) {
         // The bus delivers after asking every endpoint for frames: this slice's call was the last one
@@ -150,6 +172,14 @@ impl CanEndpoint for TappedCan {
     }
     fn tx_queue_limit(&self) -> Option<usize> {
         self.inner.tx_queue_limit()
+    }
+    /// Live, the endpoint's own. Replaying, the time its next recorded frames were asked for, or (once the replay
+    /// gets to the frontier) the endpoint's own, whichever is first: so a robot recorded for time travel runs its
+    /// boards ahead of each other ([`crate::runahead`]) live and in replays alike, if the endpoint itself can tell.
+    fn idle_until(&self) -> Option<Time> {
+        let live = self.inner.idle_until()?;
+        let log = self.log.lock().unwrap();
+        Some(log.next_recorded().map_or(live, |c| c.until.min(live)))
     }
 }
 
@@ -259,19 +289,26 @@ pub trait Rewindable {
     /// Whether the target is between slices (no debugger stop interrupted one).
     fn at_boundary(&self) -> bool;
     fn run_until(&mut self, end: Time) -> Ran;
-    /// A copy of everything; `flash` holds each board's flash from the last checkpoint, to share when unchanged
-    /// (and is updated). Returns it with about how many bytes it holds.
-    fn checkpoint(&mut self, flash: &mut Vec<Option<crate::session::SharedMemory>>) -> (Box<dyn Any + Send>, usize);
+    /// Runs to `soft` or a little past it where the target's parts meet anyway (a robot running its boards ahead of
+    /// each other: where a window ends), at most to `end`. By default exactly to `soft`.
+    fn run_until_after(&mut self, soft: Time, end: Time) -> Ran {
+        let _ = end;
+        self.run_until(soft)
+    }
+    /// A copy of everything; `memory` holds each board's SRAM and ROM from the last checkpoint, to share where
+    /// unchanged (and is updated; the flash is shared through its version, see [`Session::checkpoint`]). Returns it
+    /// with about how many bytes it holds.
+    fn checkpoint(&mut self, memory: &mut Vec<Option<crate::session::SharedMemory>>) -> (Box<dyn Any + Send>, usize);
     /// Puts everything back as in checkpoint `c`; what the boards collected (logs, text) by then comes from
     /// `collected` (kept up to date here) where the boards have less now.
     fn restore(
         &mut self,
         c: &(dyn Any + Send),
-        collected: &mut Vec<crate::session::Collected>,
-        flash: &mut Vec<Option<crate::session::SharedMemory>>,
+        collected: &mut Vec<crate::session::CollectedText>,
+        memory: &mut Vec<Option<crate::session::SharedMemory>>,
     );
     /// Cuts `collected` to what the boards have now (the future changed).
-    fn cut_collected(&mut self, collected: &mut Vec<crate::session::Collected>) {
+    fn cut_collected(&mut self, collected: &mut Vec<crate::session::CollectedText>) {
         collected.resize_with(self.boards(), Default::default);
         for (b, c) in collected.iter_mut().enumerate() {
             Session::cut_collected(self.session(b), c);
@@ -349,9 +386,9 @@ fn session_tap(s: &mut Session, board: usize, taps: &mut Taps) {
     tap_pty(&mut s.usb_cdc2_pty, &mut taps.list);
 }
 
-fn session_checkpoint(s: &mut Session, flash: &mut Option<crate::session::SharedMemory>) -> SessionCheckpoint {
-    let c = s.checkpoint(flash.as_ref());
-    *flash = Some(c.memory().clone());
+fn session_checkpoint(s: &mut Session, memory: &mut Option<crate::session::SharedMemory>) -> SessionCheckpoint {
+    let c = s.checkpoint(memory.as_ref());
+    *memory = Some(c.memory().clone());
     c
 }
 
@@ -374,23 +411,23 @@ impl Rewindable for Session {
     fn run_until(&mut self, end: Time) -> Ran {
         session_ran(Session::run_until(self, end))
     }
-    fn checkpoint(&mut self, flash: &mut Vec<Option<crate::session::SharedMemory>>) -> (Box<dyn Any + Send>, usize) {
-        flash.resize(1, None);
-        let c = session_checkpoint(self, &mut flash[0]);
+    fn checkpoint(&mut self, memory: &mut Vec<Option<crate::session::SharedMemory>>) -> (Box<dyn Any + Send>, usize) {
+        memory.resize(1, None);
+        let c = session_checkpoint(self, &mut memory[0]);
         let bytes = c.bytes();
         (Box::new(c), bytes)
     }
     fn restore(
         &mut self,
         c: &(dyn Any + Send),
-        collected: &mut Vec<crate::session::Collected>,
-        flash: &mut Vec<Option<crate::session::SharedMemory>>,
+        collected: &mut Vec<crate::session::CollectedText>,
+        memory: &mut Vec<Option<crate::session::SharedMemory>>,
     ) {
         let c = c.downcast_ref::<SessionCheckpoint>().expect("a session checkpoint");
         collected.resize_with(1, Default::default);
         self.keep_collected(&mut collected[0]);
         self.rewind_to_with(c, &collected[0]);
-        *flash = vec![Some(c.memory().clone())];
+        *memory = vec![Some(c.memory().clone())];
     }
     fn boards(&self) -> usize {
         1
@@ -421,6 +458,29 @@ struct RobotCheckpoint {
     power_on: Vec<(Time, bool)>,
 }
 
+/// Whether a debugger could stop `robot`: then it runs its boards in turn on the calling thread, board by board, as
+/// with GDB attached without time travel (on threads, the other boards would run to the end of the slice, and a
+/// replay taking turns to that stop would not have them there). While a stop is armed, or GDB is attached (it stops
+/// at a `BKPT`).
+fn debugging(robot: &Robot) -> bool {
+    robot.boards.iter().any(|b| {
+        let m = &b.machine;
+        m.stop_at.iter().any(Option::is_some)
+            || !m.breakpoints.is_empty()
+            || !m.watchpoints.is_empty()
+            || m.bkpt_policy == rp2040::machine::BkptPolicy::Stop
+    })
+}
+
+/// How a robot's run to `end` ended, now at `now`.
+fn robot_ran(r: Option<(usize, StopReason)>, now: Time, end: Time) -> Ran {
+    match r {
+        Some((board, reason)) => Ran::Stopped { board, reason },
+        None if now < end => Ran::Interrupted,
+        None => Ran::Reached,
+    }
+}
+
 impl Rewindable for Robot {
     fn now(&self) -> Time {
         self.now
@@ -439,27 +499,26 @@ impl Rewindable for Robot {
         self.boards.iter().all(|b| b.at_boundary())
     }
     fn run_until(&mut self, end: Time) -> Ran {
-        // Stops for a debugger are taken on the calling thread, board by board (as with GDB attached)
-        let debugging = self.boards.iter().any(|b| {
-            let m = &b.machine;
-            m.stop_at.iter().any(Option::is_some) || !m.breakpoints.is_empty() || !m.watchpoints.is_empty()
-        });
+        let debugging = debugging(self);
         let threads = self.threads;
         if debugging {
             self.threads = 1;
         }
         let r = Robot::run_until(self, end);
         self.threads = threads;
-        match r {
-            Some((board, reason)) => Ran::Stopped { board, reason },
-            None if self.now < end => Ran::Interrupted,
-            None => Ran::Reached,
-        }
+        robot_ran(r, self.now, end)
     }
-    fn checkpoint(&mut self, flash: &mut Vec<Option<crate::session::SharedMemory>>) -> (Box<dyn Any + Send>, usize) {
-        flash.resize(self.boards.len(), None);
+    fn run_until_after(&mut self, soft: Time, end: Time) -> Ran {
+        if debugging(self) {
+            return Rewindable::run_until(self, soft);
+        }
+        let r = Robot::run_until_after(self, soft, end);
+        robot_ran(r, self.now, soft.min(end))
+    }
+    fn checkpoint(&mut self, memory: &mut Vec<Option<crate::session::SharedMemory>>) -> (Box<dyn Any + Send>, usize) {
+        memory.resize(self.boards.len(), None);
         let boards: Vec<SessionCheckpoint> =
-            self.boards.iter_mut().zip(flash.iter_mut()).map(|(b, f)| session_checkpoint(b, f)).collect();
+            self.boards.iter_mut().zip(memory.iter_mut()).map(|(b, m)| session_checkpoint(b, m)).collect();
         let mut bytes = boards.iter().map(|b| b.bytes()).sum::<usize>();
         let buses = self
             .buses
@@ -482,8 +541,8 @@ impl Rewindable for Robot {
     fn restore(
         &mut self,
         c: &(dyn Any + Send),
-        collected: &mut Vec<crate::session::Collected>,
-        flash: &mut Vec<Option<crate::session::SharedMemory>>,
+        collected: &mut Vec<crate::session::CollectedText>,
+        memory: &mut Vec<Option<crate::session::SharedMemory>>,
     ) {
         let c = c.downcast_ref::<RobotCheckpoint>().expect("a robot checkpoint");
         collected.resize_with(self.boards.len(), Default::default);
@@ -491,7 +550,7 @@ impl Rewindable for Robot {
             b.keep_collected(k);
             b.rewind_to_with(s, k);
         }
-        *flash = c.boards.iter().map(|b| Some(b.memory().clone())).collect();
+        *memory = c.boards.iter().map(|b| Some(b.memory().clone())).collect();
         for (rb, (copy, len)) in self.buses.iter_mut().zip(&c.buses) {
             let mut record = rb.bus.record.take();
             if let (Some(r), Some(len)) = (&mut record, len) {
@@ -667,7 +726,8 @@ enum Probe<'a> {
 
 /// Recorded history of a run, with checkpoints (see the module documentation).
 pub struct TimeTravel {
-    /// Virtual time between checkpoints.
+    /// Virtual time between checkpoints (for a robot running its boards ahead of each other, up to a window more:
+    /// see [`Robot::run_until_after`]).
     pub every: Time,
     /// Memory the checkpoints may take; older ones are thinned out beyond it (spacing grows with age).
     pub budget: usize,
@@ -678,9 +738,9 @@ pub struct TimeTravel {
     cursor: Cursor,
     /// The current position.
     here: Pos,
-    flash: Vec<Option<crate::session::SharedMemory>>,
+    memory: Vec<Option<crate::session::SharedMemory>>,
     taps: Taps,
-    collected: Vec<crate::session::Collected>,
+    collected: Vec<crate::session::CollectedText>,
     inputs: Vec<Inputs>,
     last_inputs: Vec<Vec<f64>>,
     last_checkpoint: Time,
@@ -716,7 +776,7 @@ impl TimeTravel {
             base: 0,
             cursor: Cursor { entry: 0, inside: false },
             here: Pos::Boundary(target.now()),
-            flash: Vec::new(),
+            memory: Vec::new(),
             taps: Taps::default(),
             collected: Vec::new(),
             last_inputs: values(&inputs),
@@ -772,7 +832,7 @@ impl TimeTravel {
 
     fn take_checkpoint(&mut self, target: &mut dyn Rewindable, barrier: bool, name: Option<String>) {
         let start = std::time::Instant::now();
-        let (state, bytes) = target.checkpoint(&mut self.flash);
+        let (state, bytes) = target.checkpoint(&mut self.memory);
         let c = Checkpoint {
             state,
             bytes,
@@ -824,7 +884,7 @@ impl TimeTravel {
 
     fn restore(&mut self, target: &mut dyn Rewindable, i: usize) {
         let c = &self.checkpoints[i];
-        restore_from(target, c, &mut self.taps.list, &self.inputs, &mut self.collected, &mut self.flash);
+        restore_from(target, c, &mut self.taps.list, &self.inputs, &mut self.collected, &mut self.memory);
         self.cursor = c.cursor;
         self.here = Pos::Boundary(c.time);
         self.last_inputs = c.inputs.clone();
@@ -902,7 +962,7 @@ impl TimeTravel {
             return Ok(());
         }
         let start = std::time::Instant::now();
-        let (state, bytes) = target.checkpoint(&mut self.flash);
+        let (state, bytes) = target.checkpoint(&mut self.memory);
         let c = Checkpoint {
             state,
             bytes,
@@ -985,9 +1045,10 @@ impl TimeTravel {
             if target.at_boundary() && target.now() >= self.last_checkpoint + self.every && target.now() < end {
                 self.take_checkpoint(target, false, None);
             }
+            // (A robot running ahead goes on to where its boards meet anyway: the checkpoint is taken there)
             let split = self.split(target, end);
-            match target.run_until(split) {
-                Ran::Reached if split >= end => break Ran::Reached,
+            match target.run_until_after(split, end) {
+                Ran::Reached if split >= end || target.now() >= end => break Ran::Reached,
                 Ran::Reached => continue,
                 Ran::Stopped { board, reason } => {
                     let ended = if reason.is_debug_stop() {
@@ -1216,7 +1277,7 @@ impl TimeTravel {
                                     {
                                         steps.push(time);
                                         if std::mem::take(ephemeral) {
-                                            let (state, bytes) = target.checkpoint(&mut self.flash);
+                                            let (state, bytes) = target.checkpoint(&mut self.memory);
                                             let cp = Checkpoint {
                                                 state,
                                                 bytes,
@@ -1333,7 +1394,7 @@ impl TimeTravel {
     fn goto_cached(&mut self, target: &mut dyn Rewindable, prev: Time) -> Travelled {
         let Some(c) = &self.steps_cache else { return Travelled::Beginning };
         let (board, core, at) = (c.board, c.core, c.cp.time);
-        restore_from(target, &c.cp, &mut self.taps.list, &self.inputs, &mut self.collected, &mut self.flash);
+        restore_from(target, &c.cp, &mut self.taps.list, &self.inputs, &mut self.collected, &mut self.memory);
         self.cursor = c.cp.cursor;
         self.last_inputs = c.cp.inputs.clone();
         self.here = Pos::At { board, core, time: at };
@@ -1534,10 +1595,10 @@ fn restore_from(
     c: &Checkpoint,
     taps: &mut [Box<dyn TapControl>],
     inputs: &[Inputs],
-    collected: &mut Vec<crate::session::Collected>,
-    flash: &mut Vec<Option<crate::session::SharedMemory>>,
+    collected: &mut Vec<crate::session::CollectedText>,
+    memory: &mut Vec<Option<crate::session::SharedMemory>>,
 ) {
-    target.restore(&*c.state, collected, flash);
+    target.restore(&*c.state, collected, memory);
     for (t, &calls) in taps.iter_mut().zip(&c.taps) {
         t.seek(calls);
     }
@@ -1557,5 +1618,66 @@ fn set_values(inputs: &[Inputs], v: &[Vec<f64>]) {
         for (h, &x) in i.0.values().zip(vals) {
             *h.lock().unwrap() = x;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Hands in its frames once the bus asks up to their times.
+    struct Script(Vec<(Time, CanFrame)>);
+
+    impl CanEndpoint for Script {
+        fn take_tx(&mut self, until: Time) -> Vec<(Time, CanFrame)> {
+            let (now, later) = std::mem::take(&mut self.0).into_iter().partition(|(t, _)| *t <= until);
+            self.0 = later;
+            now
+        }
+        fn receive(&mut self, _: &CanFrame, _: Time) {}
+        fn idle_until(&self) -> Option<Time> {
+            Some(self.0.iter().map(|(t, _)| *t).min().unwrap_or(Time::MAX))
+        }
+    }
+
+    /// Live, a tapped endpoint tells when it sends as the endpoint does; replaying, from the recording: the time the
+    /// next frames it gave were asked for; past the recording, the endpoint's own answer again.
+    #[test]
+    fn a_tapped_endpoint_tells_when_it_sends_live_and_in_replays() {
+        let us = Time::from_us;
+        let frames = [3, 7, 20].map(|t| (us(t), CanFrame::fd(0x10, false, &[1])));
+        let log = TapLog::new();
+        let mut e = TappedCan { inner: Box::new(Script(frames.to_vec())), log: log.clone() };
+        assert_eq!(e.idle_until(), Some(us(3)));
+        let sent: Vec<usize> = (1..=5).map(|k| e.take_tx(us(5 * k)).len()).collect();
+        assert_eq!(sent, [1, 1, 0, 1, 0]);
+        assert_eq!(e.idle_until(), Some(Time::MAX), "it has nothing more to send");
+        // Back to the start: replayed
+        TapControl::seek(&mut log.clone(), 0);
+        assert_eq!(e.idle_until(), Some(us(5)), "the first call that gave frames asked up to 5 µs");
+        assert_eq!(e.take_tx(us(5)).len(), 1);
+        assert_eq!(e.idle_until(), Some(us(10)));
+        assert_eq!(e.take_tx(us(10)).len(), 1);
+        assert_eq!(e.idle_until(), Some(us(20)), "the call at 15 µs gave nothing");
+        e.take_tx(us(15));
+        e.take_tx(us(20));
+        assert_eq!(e.idle_until(), Some(Time::MAX), "nothing more recorded, and the endpoint has nothing either");
+        // The endpoint's own answer bounds the replay's: once past the recording, it is what it sends
+        let mut f = TappedCan { inner: Box::new(Script(vec![(us(12), frames[0].1.clone())])), log: TapLog::new() };
+        f.take_tx(us(5));
+        f.take_tx(us(30));
+        TapControl::seek(&mut f.log.clone(), 0);
+        f.inner = Box::new(Script(vec![(us(8), frames[0].1.clone())]));
+        assert_eq!(f.idle_until(), Some(us(8)));
+        // One that cannot tell cannot when tapped either
+        struct Unknown;
+        impl CanEndpoint for Unknown {
+            fn take_tx(&mut self, _: Time) -> Vec<(Time, CanFrame)> {
+                Vec::new()
+            }
+            fn receive(&mut self, _: &CanFrame, _: Time) {}
+        }
+        let g = TappedCan { inner: Box::new(Unknown), log: TapLog::new() };
+        assert_eq!(g.idle_until(), None);
     }
 }

@@ -58,24 +58,18 @@ pub fn leave_as_rom(sys: &mut System, f: RomFn, now: Time) {
     match f {
         RomFn::ConnectInternalFlash => sys.io_qspi.connect_internal_flash(),
         RomFn::FlashExitXip => {
-            sys.flash_writes += 1;
             sys.ssi.enter_command_mode(now, &mut sys.flash);
             sys.io_qspi.set_cs_override(CsOverride::Normal);
         }
         RomFn::FlashRangeErase | RomFn::FlashRangeProgram => {
-            sys.flash_writes += 1;
             sys.ssi.enter_command_mode(now, &mut sys.flash);
             sys.io_qspi.set_cs_override(CsOverride::High);
         }
         RomFn::FlashFlushCache => sys.io_qspi.set_cs_override(CsOverride::Normal),
-        RomFn::FlashEnterCmdXip => {
-            sys.flash_writes += 1;
-            sys.ssi.enter_cmd_xip(now, &mut sys.flash)
-        }
+        RomFn::FlashEnterCmdXip => sys.ssi.enter_cmd_xip(now, &mut sys.flash),
         RomFn::ResetToUsbBoot => return,
     }
     let o = sys.io_qspi.cs_override();
-    sys.flash_writes += 1;
     sys.ssi.set_cs_override(o, now, &mut sys.flash);
     sys.refresh_xip();
 }

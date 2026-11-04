@@ -117,15 +117,34 @@ fn robot_state(r: &mut sim_host::robot::Robot) -> Vec<String> {
 
 #[test]
 fn a_robot_goes_back_whole() {
+    robot_goes_back_whole(1);
+}
+
+/// The same with the robot on threads, its boards run ahead of each other while it was recorded (and while going
+/// forward again): stops for the debugger are taken in turns, from a history made running ahead, and every state
+/// is the one fresh robots taking turns have.
+#[test]
+fn a_robot_that_ran_ahead_goes_back_whole() {
+    robot_goes_back_whole(3);
+}
+
+fn robot_goes_back_whole(threads: usize) {
     if sim_test::titan_rs("esc_board").is_none() {
         return;
     }
     let load = || RobotBench::load("talos.toml", &[("internal", 1)], |_| {}).unwrap();
     let mut rb = load();
+    rb.robot.threads = threads;
     let inputs = rb.robot.inputs.clone();
     let mut tt = TimeTravel::new(&mut rb.robot, inputs);
     tt.every = Time::from_ms(50);
     assert_eq!(tt.run_until(&mut rb.robot, Time::from_ms(400)), Ran::Reached);
+    let stats = rb.robot.run_ahead_stats;
+    if threads > 1 {
+        assert!(stats.slices >= 3900 && stats.windows < stats.slices / 6, "{stats:?}");
+    } else {
+        assert_eq!(stats, Default::default());
+    }
     let end = robot_state(&mut rb.robot);
 
     // Back to a time, as a fresh robot has it there

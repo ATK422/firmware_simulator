@@ -613,7 +613,6 @@ impl Machine {
             Ok(data) => {
                 let n = data.len().min(self.sys.flash.len());
                 self.sys.flash[..n].copy_from_slice(&data[..n]);
-                self.sys.flash_writes += 1;
                 Ok(true)
             }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
@@ -705,7 +704,6 @@ impl Machine {
         let (r0, r1, r2) = (cpu.reg(0), cpu.reg(1), cpu.reg(2));
         let lr = cpu.reg(14);
         let now = self.clocks[c].now;
-        self.sys.flash_writes += 1;
         let duration = match f {
             RomFn::FlashRangeErase => {
                 log::debug!("[{now}] core{c} flash_range_erase({r0:#x}, {r1:#x}, {r2:#x})");
@@ -1670,5 +1668,51 @@ impl Machine {
         let image = self.image.as_ref()?;
         let (sym, off) = image.symbolize(addr)?;
         Some(if off == 0 { sym.name.clone() } else { format!("{}+{off:#x}", sym.name) })
+    }
+}
+
+/// What the run loop carries from one [`Machine::run_until`] to the next besides the state a [`Snapshot`] holds:
+/// a busy-wait watch and the fusing hint (which only decide how fast the next run goes, and what the statistics
+/// count), the cycle budget cache, a breakpoint being resumed from, `External` events not yet collected, and the
+/// statistics. A copy of the machine restored from a snapshot and given this back runs on exactly as the machine
+/// did, statistics included (a robot that runs its boards ahead of each other rolls a board back this way, and time
+/// travel restores its checkpoints this way).
+#[derive(Clone)]
+pub struct RunCarry {
+    budget_carry: Option<(usize, Time, CycleClock, u64, u64)>,
+    spin_watch: Option<usize>,
+    fuse_next: bool,
+    skip_breakpoint: [bool; 2],
+    external_fired: Vec<(Time, u32)>,
+    spin_skipped: u64,
+    timer_waits_skipped: u64,
+    quanta_fused: u64,
+}
+
+impl Machine {
+    /// What the next run carries over from the last one (see [`RunCarry`]).
+    pub fn run_carry(&self) -> RunCarry {
+        RunCarry {
+            budget_carry: self.budget_carry,
+            spin_watch: self.spin_watch,
+            fuse_next: self.fuse_next,
+            skip_breakpoint: self.skip_breakpoint,
+            external_fired: self.external_fired.clone(),
+            spin_skipped: self.spin_skipped,
+            timer_waits_skipped: self.timer_waits_skipped,
+            quanta_fused: self.quanta_fused,
+        }
+    }
+
+    /// Puts back what [`Machine::run_carry`] took, after a [`Machine::restore`] of a snapshot taken with it.
+    pub fn set_run_carry(&mut self, c: &RunCarry) {
+        self.budget_carry = c.budget_carry;
+        self.spin_watch = c.spin_watch;
+        self.fuse_next = c.fuse_next;
+        self.skip_breakpoint = c.skip_breakpoint;
+        self.external_fired.clone_from(&c.external_fired);
+        self.spin_skipped = c.spin_skipped;
+        self.timer_waits_skipped = c.timer_waits_skipped;
+        self.quanta_fused = c.quanta_fused;
     }
 }

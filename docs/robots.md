@@ -107,6 +107,7 @@ as `[t] NAME uart0: ...`); the run ends with the stop time, the wall time and ea
 | `--external-vehicle NAME` | | Lets another simulator move the vehicle through the dashboard (`external = true`; needs `--dashboard`; [vehicles.md](vehicles.md#external-vehicles)) |
 | `--realtime` | off | Paces virtual time to the wall clock; warns when the robot falls behind it ([running.md](running.md#options)) |
 | `--threads N` | 0 | Runs the boards on up to `N` threads (0: up to one per core; 1: in turn on one) ([below](#how-a-robot-runs)) |
+| `--no-run-ahead` | off | On threads, keeps the boards in step slice by slice rather than letting them run ahead of each other (same results; [below](#how-a-robot-runs)) |
 | `--trace KINDS`, `--trace-board NAMES`, `--trace-file FILE` | | Traces the boards ([below](#traces-profiles-waveforms-and-the-dashboard)) |
 | `--profile-dir DIR`, `--profile-interval T` | `10us` | Profiles every board's firmware |
 | `--vcd FILE`, `--vcd-pins SPEC`, `--vcd-events` | all pins | A VCD waveform with a scope per board (and per bus) |
@@ -192,12 +193,29 @@ boards go back to taking turns for a while. Robots in an acoustic environment al
 hydrophone can hear another board within the slice. Emulator log lines from different boards can interleave
 differently with threads; what the boards do does not change. `Robot::threads` defaults to 1 in code (tests).
 
+**Running ahead.** On threads, the boards also run ahead of each other between the slices where they can see each
+other: a CAN frame can reach another board no sooner than it finishes on the wire, and a mock bridge knows when it
+will next send, so each board runs on alone through the slices where no frame can finish (up to 64 at a time),
+and stops where its own next frame could; the others stop there too. A board that went past such a point before it
+knew is rolled back and run again, and the calling thread replays every bus, vehicle and host hook in slice order
+as it goes, so the run is exactly the one taking turns gives (tests check Talos frame by frame, log line by log line
+and state by state, also with boards rolled back thousands of times). Boards whose inputs a vehicle drives (the
+camera cage's depth sensor) run slice by slice on the calling thread, after the vehicle. This is what lets the two
+ESC boards, whose heavy slices do not line up, stop waiting for each other every slice. It needs every bus endpoint
+to know when it sends (mock bridges, recordings), so with `--can`, `--cannelloni`, a `--vcd` waveform, `--trace`,
+`--profile-dir`, a pty or `--usbip` the boards stay in step slice by slice, as with `--no-run-ahead`.
+`Robot::run_ahead` switches it in code. A run recorded for time travel (`--checkpoint-every`, `--dashboard`) runs
+ahead too, live and when it replays (checkpoints are taken where every board is committed, and the recorded bridges
+tell when they send from the recording); with `--gdb` the boards take turns, so stops are as without threads.
+`--coverage` counts only what the committed run executed: what a board ran before it was rolled back does not count.
+
 **Speed.** On one core of the 4-core machine it was measured on, Talos (nine boards) runs at about 0.54x real
-time, and at about 0.8x on three threads (1.5x faster; 0.7x on two). That is as far as threads go: the slowest
-board sets the pace of every slice, and the two ESC boards each need about 0.7 s of host time per virtual second,
-in bursts (their DShot frames) that do not line up between them, so `--realtime` with all of Talos does not keep
-up. The template runs about 75x faster than real time, IVCBoard2 about 3.6x and the ESC board about 1.5x on its
-own. `cargo run --release -p sim_test --example bench` measures it ([internals.md](internals.md#performance)). Without
+time, and at about 1.2-1.25x on three or four threads (2.2-2.3x faster), so `--realtime` with all of Talos keeps
+up when three cores are free for it. Two threads give about 0.8x (the ESC boards then share a thread with the
+others). More threads than three or four add nothing: each ESC board needs about 0.7 s of host time per virtual
+second on its own, and with running ahead the costlier of them sets the pace (slice by slice, without running
+ahead, it was about 0.8x on three threads: their bursts, the DShot frames, do not line up). The template runs
+about 75x faster than real time, IVCBoard2 about 3.6x and the ESC board about 1.5x on its own. `cargo run --release -p sim_test --example bench` measures it ([internals.md](internals.md#performance)). Without
 `--realtime` a robot runs as fast as it can, so a host tool next to it (titan_bridge, a micro-ROS agent) needs
 timeouts with room for a robot slower than real time; with `--realtime` the robot warns
 (`real-time mode: emulation is 1.23s behind the wall clock`, at most every 5 s) when it cannot keep up.

@@ -89,6 +89,16 @@ pub struct Robot {
     /// Threads the boards may run on (1, the default: the calling thread only; 0: one per core). Boards in an
     /// acoustic medium always take turns on one (see [`crate::parallel`]).
     pub threads: usize,
+    /// On threads, let the boards run ahead of each other between the slices where they can see each other (on
+    /// by default; off to check that it changes nothing): see [`crate::runahead`].
+    pub run_ahead: bool,
+    /// What running ahead did so far.
+    pub run_ahead_stats: crate::runahead::Stats,
+    /// Tests: makes running ahead roll boards back as often as it can (each board ignores where the window ends
+    /// until it is rolled back, and every window is cut at a random boundary drawn from this seed). The run must
+    /// stay the same.
+    #[doc(hidden)]
+    pub run_ahead_stress: Option<u64>,
     pub now: Time,
     /// Pace virtual time to the wall clock.
     pub realtime: bool,
@@ -121,6 +131,9 @@ impl Default for Robot {
             medium: None,
             slice: Time::from_us(100),
             threads: 1,
+            run_ahead: true,
+            run_ahead_stats: Default::default(),
+            run_ahead_stress: None,
             now: Time::ZERO,
             realtime: false,
             power_on: Vec::new(),
@@ -184,6 +197,9 @@ impl Robot {
             v.update_outputs();
         }
         if crate::parallel::worth_it(self, end) {
+            if crate::runahead::possible(self) {
+                return crate::runahead::run_until(self, end, None);
+            }
             return crate::parallel::run_until(self, end);
         }
         while self.now < end && !crate::signal::is_set(self.stop_flag) {
@@ -208,6 +224,21 @@ impl Robot {
             }
         }
         None
+    }
+
+    /// Runs every board until `soft` or a little past it, at most until `end`: running its boards ahead of each other
+    /// ([`crate::runahead`]), it returns where the first window that ends at or after `soft` ends (where the boards
+    /// meet anyway); otherwise at `soft`. Time travel takes its checkpoints this way, so that recording does not cut
+    /// the windows short. Stops and [`Robot::stop_flag`] as [`Robot::run_until`].
+    pub fn run_until_after(&mut self, soft: Time, end: Time) -> Option<(usize, StopReason)> {
+        let soft = soft.min(end);
+        if soft < end && crate::parallel::worth_it(self, end) && crate::runahead::possible(self) {
+            for v in &self.vehicles {
+                v.update_outputs();
+            }
+            return crate::runahead::run_until(self, end, Some(soft));
+        }
+        self.run_until(soft)
     }
 
     /// Plugs board `i`'s USB port into a host controller model (once; the host enumerates whatever the firmware
@@ -370,6 +401,9 @@ impl Robot {
             medium,
             slice: self.slice,
             threads: self.threads,
+            run_ahead: self.run_ahead,
+            run_ahead_stats: self.run_ahead_stats,
+            run_ahead_stress: self.run_ahead_stress,
             now: self.now,
             realtime: self.realtime,
             power_on: self.power_on.clone(),
@@ -564,19 +598,7 @@ pub(crate) fn end_slice(
                 nodes.extend(b.machine.can_nodes());
             }
         }
-        let mut eps: Vec<&mut dyn CanEndpoint> =
-            rb.endpoints.iter_mut().map(|e| &mut **e as &mut dyn CanEndpoint).collect();
-        let before = rb.bus.record.as_ref().map_or(0, |r| r.len());
-        rb.bus.step(&mut nodes, &mut eps, t);
-        if let (Some(rec), Some(hook)) = (&mut rb.bus.record, &mut rb.on_can) {
-            for r in &rec[before..] {
-                hook(r);
-            }
-            // The callback has seen the history; keep memory bounded on long runs (`--candump-log`)
-            if rec.len() > 100_000 {
-                rec.drain(..50_000);
-            }
-        }
+        step_bus(rb, &mut nodes, t);
     }
     for b in boards.iter_mut() {
         b.step_ethernet();
@@ -586,6 +608,24 @@ pub(crate) fn end_slice(
     }
     for v in vehicles {
         v.advance(t, boards);
+    }
+}
+
+/// Steps bus `rb` with its nodes `nodes` (its boards' CAN controllers, in board order) up to `t`, and passes what
+/// went over it to its callback.
+pub(crate) fn step_bus(rb: &mut RobotBus, nodes: &mut [&mut dyn CanNode], t: Time) {
+    let mut eps: Vec<&mut dyn CanEndpoint> =
+        rb.endpoints.iter_mut().map(|e| &mut **e as &mut dyn CanEndpoint).collect();
+    let before = rb.bus.record.as_ref().map_or(0, |r| r.len());
+    rb.bus.step(nodes, &mut eps, t);
+    if let (Some(rec), Some(hook)) = (&mut rb.bus.record, &mut rb.on_can) {
+        for r in &rec[before..] {
+            hook(r);
+        }
+        // The callback has seen the history; keep memory bounded on long runs (`--candump-log`)
+        if rec.len() > 100_000 {
+            rec.drain(..50_000);
+        }
     }
 }
 

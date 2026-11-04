@@ -172,6 +172,12 @@ bench's fingerprints do not change with `--coverage` (`cargo run --release -p si
 --coverage`), and `crates/sim_host/tests/coverage.rs` compares a two-core run with and without it. It costs about 3x
 to 5x the CPU time (ESC board 4.5 s for 2 s of virtual time against 1.4 s; Talos 12.8 s against 3.8 s).
 
+Coverage counts what the run executed to get where it is, as the logs do. A robot on threads whose boards run ahead
+of each other rolls a board back when it ran past a frame it had not seen yet; what it ran then does not count (the
+rollback puts the bitmap back), so the coverage is the same as taking turns. Going back in time (`--gdb`, the
+dashboard's rewind) puts the bitmap back as it was then, and going forward again gives the rest back
+([internals.md](internals.md#checkpoints-one-machine-state-for-both-kinds)).
+
 **From bits to lines.** `sim_host::coverage` reads the ELF's DWARF line table (`.debug_line`, with `gimli`): each
 row's address range belongs to a file and line, a line is instrumented when it has a range and covered when an
 instruction in one ran. A function is a `FUNC` symbol with a size, covered when any instruction in it ran, named

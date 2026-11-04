@@ -158,6 +158,36 @@ the calling thread for 8 regroupings, twice as many each time in a row, up to 51
 calls. A board stopping for another reason than the slice's end is reported after the slice, lowest index first,
 with the others run to the end of the slice; a panic on a worker goes on on the calling thread.
 
+**Running ahead** (`sim_host::runahead`, on by default with threads; `Robot::run_ahead`, `robot --no-run-ahead`).
+Slice by slice, every slice waits for its slowest board, and the two ESC boards' heavy slices (their DShot frames)
+fall in different slices, so on threads Talos was bound by the sum of the slowest board of each slice. But boards
+see each other only through the end of a slice, and through it only in three ways: a bus step that carries a frame
+(a step that carries none changes no controller that counts no dominant bits and is not bus-off,
+`CanNode::idle_changes_nothing`), a vehicle (it reads the ESCs' motors and writes the pressure inputs of the boards
+it carries sensors for), and the order in which host hooks see lines. A frame finishes no earlier than when it
+became ready plus its time on the wire (`CanBus::earliest_end`), and endpoints say when they will next hand one in
+(`CanEndpoint::idle_until`: the mock bridge and `Monitor` can, SocketCAN and cannelloni cannot). So the boards run
+in windows: each runs on alone on its thread, doing the machine side of its end of each slice (devices, and taking
+out what RTT and the UARTs hold, `Session::collect`) and noting what its controllers show the bus and its ESCs'
+motors, up to the first boundary where any board's frame could finish (an atomic minimum it lowers as soon as it
+has a frame ready), an endpoint's next frame, or 64 slices. A board that went past the window's end before it was
+told is rolled back to a rollback point (`Session::rollback_point`: the board's machine state, see
+[Checkpoints](#checkpoints-one-machine-state-for-both-kinds), with the debugger's positions and the code coverage;
+one at the window's first boundary and one after every 1.5 ms of host time) and run again; runs are deterministic,
+so it gets there exactly as it would have. Meanwhile the calling thread commits every boundary all boards have gone past: each bus
+steps against stand-ins that answer as the controllers did there (one that the step would change panics: it would
+mean the bounds are wrong), the vehicles step with the noted motors, and boards whose inputs a vehicle drives (the
+camera cage) run there slice by slice rather than ahead; a frame of theirs cuts the window and rolls the others
+back. At the window's end the host sides take in what was collected, boundary by boundary in board order, and the
+end of the slice is done as usual. A board that stops ends the window at the end of that slice, as on threads.
+Boards with a pty, USB/IP, an Ethernet cable, a profiler or a trace sink (VCD, `--trace`), endpoints that cannot
+tell when they send, and acoustic media keep the slice-by-slice threads. `crates/sim_host/tests/runahead.rs`
+compares Talos frame by frame, line by line (the hooks' order across boards included) and state by state against
+taking turns: on 2, 3 and any threads, in uneven pieces, with a vehicle that moves the camera cage's input, with
+stops, and with a stress mode (`Robot::run_ahead_stress`) that makes every board ignore where its window ends
+until rolled back and cuts every window at a random boundary (thousands of rollbacks);
+`crates/sim_test/tests/run_ahead_thrusters.rs` does it with the thrusters spinning and the vehicle moving.
+
 Both run their machines through `Session::run_machine`, which goes through the session's sampling profiler when
 it has one (the profiler cuts the run at its sample times; a robot's worker thread takes the board's profiler with
 its machine). The waveform writer, the dashboard and the JSON log only observe: trace events (shared through
@@ -257,8 +287,11 @@ benchmark fingerprints rely on it.
 * Iterate in a defined order (`BTreeMap`, vectors), not over `HashMap`s, wherever the order can reach the
   machine.
 * Events at the same time fire in scheduling order; keep it that way when changing the scheduler.
-* Threads must not change results: robot boards only run in parallel within a slice where they cannot see each
-  other, and sweeps run independent snapshots.
+* Threads must not change results: robot boards only run in parallel where they cannot see each other (within a
+  slice, or ahead of each other up to where a frame could reach them, rolled back if they went too far), and
+  sweeps run independent snapshots. A `CanEndpoint::idle_until` or `CanNode::idle_changes_nothing` that promises
+  too much breaks this; the commit of a window panics when a bus step would change a node it was told would not
+  change.
 * Observers must not steer the machine: a trace sink only receives events, and only instruction and exception
   tracing turn batched execution off (GPIO and device traces, and so waveforms, leave it on). Cutting a run at
   any time, as the profiler does, must give the same single-core run (`crates/rp2040/tests/busy_wait.rs`).
@@ -282,12 +315,59 @@ session, robot, inputs and bridges keeps holding them: `Session::checkpoint` and
 via `Machine::snapshot` and `restore`, the host side's RTT position, a defmt frame in progress, the CAN bus, the
 Ethernet cable; the logs and text collected are cut back, and given back from a kept copy when going forward), a
 robot's buses, vehicles (with their transducers' paths) and the medium's contents, and the inputs' values. The
-flash and ROM are shared between checkpoints while unchanged (`System::flash_writes` counts what could change the
-flash), the SRAM in 4 KB pieces. `TimeTravel` keeps them in a thinned ring within a memory budget, with a log of
+flash is shared between checkpoints while unchanged (see below), the ROM, the SRAM (in 4 KB pieces) and the code
+coverage map with the checkpoint before where they are equal. `TimeTravel` keeps them in a thinned ring within a memory budget, with a log of
 everything from outside (runs asked for and where they stopped, debugger writes, inputs, and per call what each host
 endpoint and pty gave, through `TappedCan`, `TappedEth` and the ptys' taps), and replays from the nearest one: the
 taps give the recorded frames again, hooks, trace sinks and the profiler are put aside. Host changes it does not
 log (faults, poses) are marked with `TimeTravel::changed`, a checkpoint replays never go through.
+
+### Checkpoints: one machine state for both kinds
+
+A robot running ahead and time travel both keep a board's machine as it was (`MachineState` in
+`sim_host::session`): `Machine::snapshot` without the flash, what the run loop carries (`Machine::run_carry`, so
+that the machine goes on exactly as it did, its statistics included), the lockup count, and the flash apart. The
+flash is a `sim_core::versioned::Versioned` array: every mutable borrow of it (an SSI or IO_QSPI access, a trapped
+flash function, `poke`, a host writing it) gives it a new, globally unique version, so the session keeps one copy
+(`Session::keep_flash`) that every checkpoint of either kind shares while the version is the same (or, taking that
+copy's version, while the contents are), and a restore copies it back only when the live flash's version differs.
+The two kinds differ in what else they keep and how long they live:
+
+| | Rollback point (`Session::rollback_point`, `roll_back`) | Time-travel checkpoint (`Session::checkpoint`, `rewind_to`) |
+|---|---|---|
+| Taken | in the hot loop of a window, every 1.5 ms of host time per board, dropped at the window's end | every `--checkpoint-every` of virtual time, kept in a thinned ring within a budget |
+| SRAM | in the snapshot (one 264 KB copy: cheapest to take and to put back) | apart, in 4 KB pieces shared with the checkpoint before |
+| Host side | nothing: the host side takes in what was collected only once the window is committed | RTT position, defmt frame in progress, text collected, CAN bus, Ethernet cable |
+| Debugger positions (`stop_at`) | kept: a rolled-back board stops where it would have | not kept: replays arm their own |
+| Code coverage | kept: what was rolled back counts as not run | kept (shared while unchanged): coverage follows the timeline, as the logs do |
+
+**Time travel and running ahead together.** The committed run is the reference: everything is as taking turns
+would have done it, whatever ran ahead and was rolled back. So:
+* *Checkpoints are taken at committed boundaries.* `TimeTravel` cuts live runs into pieces that end where a
+  checkpoint is due (`Rewindable::run_until_after`); a robot running ahead goes on to the end of the window that
+  is running then (`Robot::run_until_after`: where the boards meet anyway, at most 64 slices on), so recording
+  does not cut windows short, and checkpoints come every `--checkpoint-every` or up to a window later. When it
+  returns every board is committed and every host side has taken in what it collected. A recorded robot runs
+  ahead with the same results as recording slice by slice (`crates/sim_host/tests/runahead.rs`,
+  `recording_for_time_travel_runs_ahead_the_same`).
+* *External inputs are recorded per bus step.* The taps (`TappedCan`) record what an endpoint gave on each call;
+  only the commit steps the buses, once per boundary in order as taking turns does, and rolled-back boards never
+  call an endpoint, so the calls and what they gave are the same either way. A tapped endpoint can tell when it
+  will next send (`CanEndpoint::idle_until`) if the endpoint itself can: live, the endpoint's own answer; in a
+  replay, the time its next recorded frames were asked for (or, once the replay reaches the frontier, the
+  endpoint's own answer, whichever is first). So replays run ahead too.
+* *Debugger stops run in turns.* While GDB is attached to one of its boards (it stops at a `BKPT`), or a
+  breakpoint, watchpoint or position is armed on any board, a recorded robot runs its boards in turns on the
+  calling thread, as GDB without time travel always did, so stops are reported exactly as before (on threads the
+  other boards would run on to the end of the slice, and a replay taking turns to the same stop would not have them
+  there). The rest of the time it runs ahead. A history recorded running ahead is the same history, so
+  reverse-continue and reverse steps on it give the states fresh robots taking turns have
+  (`crates/sim_test/tests/timetravel.rs`, `a_robot_that_ran_ahead_goes_back_whole`).
+* *Coverage counts the committed run.* Rollback points keep the coverage map and a rollback puts it back, so the
+  coverage of a robot running ahead equals that of taking turns, rollbacks forced or not
+  (`coverage_is_the_same_running_ahead`; `runahead::tests::rolled_back_execution_is_not_covered`). Time travel puts
+  the map back with the rest of the board, so after going back it is that of a fresh run to there, and going forward
+  again gives the rest back (`crates/sim_host/tests/coverage.rs`, `coverage_goes_back_with_time_travel`).
 
 ## Performance
 
@@ -296,7 +376,8 @@ cargo run --release -p sim_test --example bench -- --time 2s --repeat 3 --only e
 ```
 
 runs the template, ESC and IVCBoard2 images on their boards and the Talos (also on up to two, three, four and six
-threads: `talos_t2`, `talos_t3`, `talos_mt`, `talos_t6`; `--threads N` sets `talos_mt`'s and prints the grouping)
+threads: `talos_t2`, `talos_t3`, `talos_mt`, `talos_t6`, and on three slice by slice without running ahead:
+`talos_t3_ls`; `--threads N` sets `talos_mt`'s and prints the grouping)
 and IVC2 pool robots for 2 s of virtual time, and prints the best wall time, virtual/wall (above 1 keeps up with
 `--realtime`), CPU time, instructions executed, the share skipped in busy-waits, emulated MIPS, and a fingerprint
 of everything the run produced (log lines and their times, bridge messages, UART/RTT text, CPU registers, cycle
@@ -305,12 +386,17 @@ machine: compare the best of several repeats, or the instruction counts under `v
 `--repeat 1`.
 
 Measured on a shared 4-core machine (CPU time for 2 s of virtual time): template 0.03 s, ESC board 1.35 s,
-IVCBoard2 0.55 s, Talos 3.7 s, IVC2 pool 2.15 s. Talos on threads (wall time): 2.84 s on two, 2.47 s on three.
+IVCBoard2 0.55 s, Talos 3.7 s, IVC2 pool 2.15 s. Talos on threads (wall time): 1.6-1.7 s on three or four
+(1.2-1.25x real time), 2.4 s on two (both ESC boards share a thread with others there); slice by slice on three it
+was 2.5 s.
 The ESC board waits out each 400 µs DShot frame time on the timer (skipped across ticks up to its deadline, see
 the run loop), so what is left of its time is the frame itself: the control loop polling FSTAT while the PIO
 sends the frame and receives the replies. Per 100 µs slice an ESC board takes about 70 µs on average but its frames
-fall in different slices from the other ESC board's, so the slowest board of each slice adds up to about 2.4 s
-however many threads there are (2.5 s with three): about 0.8x real time is as far as threads take Talos. Under
+fall in different slices from the other ESC board's, so slice by slice the slowest board of each slice adds up to
+about 2.4 s however many threads there are: about 0.8x real time. Running ahead takes that floor away: Talos is
+then bound by its costliest board, an ESC board at about 1.4 s, plus about 0.2-0.3 s for the windows (430 per 2 s:
+the one that is ahead waits for the other at each window's end; reruns after 100-150 rollbacks per ESC board; about
+36 µs per checkpoint). Under
 callgrind (400 ms, `--repeat 1`) the ESC board executes 2,510 M host instructions, against 3,692 M before these
 skips: about 45 % in the interpreter and the run loop's per-quantum work, 20 % in advancing the PIO (half of it
 ticking the receivers between their counted loops) and 5 % resolving pins. IVCBoard2 is all interpretation

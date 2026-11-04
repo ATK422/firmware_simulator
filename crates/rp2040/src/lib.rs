@@ -17,7 +17,7 @@ pub mod svd;
 pub mod system;
 pub mod unmodelled;
 
-pub use machine::{Machine, MachineConfig, StopReason};
+pub use machine::{Machine, MachineConfig, RunCarry, StopReason};
 pub use system::System;
 
 /// The B1 bootrom image bundled with the emulator (see `bootrom/README.md`).

@@ -1,9 +1,12 @@
 //! A running board: the machine plus the host side of its debug channels (RTT/defmt), run in short slices of
 //! virtual time so the RTT buffer is drained as a probe would drain it.
 
+use std::sync::Arc;
+
 use rp2040::{Machine, StopReason};
 use sim_core::image::Image;
 use sim_core::time::Time;
+use sim_core::versioned::Versioned;
 use sim_devices::can::{BusRecord, CanBus, CanEndpoint};
 
 use crate::defmt::{DefmtDecoder, LogLine};
@@ -80,34 +83,65 @@ pub struct Session {
     /// Where the last slice [`Session::run_until`] ran ended (the time it ran to; the machine's own time may be a
     /// little past it, as its last instruction may end later).
     boundary: Time,
+    /// The flash as the last checkpoint of either kind kept it ([`Session::keep_flash`]): later ones share it while
+    /// the flash's version is the same.
+    kept_flash: Option<Arc<Versioned>>,
 }
 
-/// A checkpoint's flash, SRAM and ROM contents, shared with the checkpoint before where they are the same: the
-/// flash and ROM whole (the flash while [`rp2040::System::flash_writes`] says it may not have changed, or it
-/// compares equal), the SRAM in 4 KB pieces.
+/// A board's machine at one moment: what both kinds of checkpoint keep of it, a robot's rollback points for running
+/// ahead ([`RollbackPoint`], many, short-lived and taken in the hot loop) and time travel's checkpoints
+/// ([`SessionCheckpoint`], periodic and kept within a memory budget). The snapshot holds everything but the flash;
+/// the flash is kept apart and shared between checkpoints while it is the same ([`Session::keep_flash`]: the
+/// flash is a [`Versioned`] array, so that is a comparison of versions), and copied back on a restore only if the
+/// live flash's version differs.
+struct MachineState {
+    snapshot: rp2040::machine::Snapshot,
+    /// What the run loop carries from one run to the next: restored with the snapshot, the machine runs on exactly
+    /// as it did, statistics included.
+    carry: rp2040::RunCarry,
+    flash: Arc<Versioned>,
+    lockups: u64,
+    final_lockup_reported: bool,
+}
+
+/// A board as it was at one moment of a robot running its boards ahead ([`Session::rollback_point`]), to roll it
+/// back to ([`Session::roll_back`]) when it turns out to have run past where its window ended. Only what running
+/// the machine changes: the host side takes in what the board produced later ([`Session::deliver`]). It also keeps
+/// the debugger's positions ([`rp2040::Machine::stop_at`]) and the code coverage, so that what was rolled back
+/// leaves no trace (only the committed run counts as covered).
+pub(crate) struct RollbackPoint {
+    machine: MachineState,
+    stop_at: [Option<Time>; 2],
+    coverage: Option<Box<rp2040::coverage::CoverageMap>>,
+}
+
+/// A time-travel checkpoint's SRAM and ROM contents and code coverage, shared with the checkpoint before where they
+/// are the same (the SRAM in 4 KB pieces). (The flash is shared through its version: [`MachineState`].)
 #[derive(Clone, Debug)]
 pub struct SharedMemory {
-    flash: std::sync::Arc<Vec<u8>>,
-    flash_writes: u64,
-    sram: Vec<std::sync::Arc<[u8]>>,
-    rom: std::sync::Arc<Vec<u8>>,
+    sram: Vec<Arc<[u8]>>,
+    rom: Arc<Vec<u8>>,
+    coverage: Option<Arc<rp2040::coverage::CoverageMap>>,
 }
 
 const SRAM_PIECE: usize = 4096;
 
 impl SharedMemory {
-    /// The memories now, sharing what is unchanged with `prev`; and how many bytes were not shared.
-    fn keep(prev: Option<&SharedMemory>, flash: &[u8], sram: &[u8], rom: &[u8], writes: u64) -> (SharedMemory, usize) {
-        use std::sync::Arc;
+    /// The memories and coverage now, sharing what is unchanged with `prev`; and how many bytes were not shared.
+    fn keep(
+        prev: Option<&SharedMemory>,
+        sram: &[u8],
+        rom: &[u8],
+        coverage: Option<&rp2040::coverage::CoverageMap>,
+    ) -> (SharedMemory, usize) {
         let mut fresh = 0;
-        let flash = match prev {
-            Some(p) if p.flash_writes == writes && p.flash.len() == flash.len() => p.flash.clone(),
-            Some(p) if *p.flash == flash => p.flash.clone(),
+        let coverage = coverage.map(|now| match prev.and_then(|p| p.coverage.as_ref()) {
+            Some(old) if **old == *now => old.clone(),
             _ => {
-                fresh += flash.len();
-                Arc::new(flash.to_vec())
+                fresh += now.bytes();
+                Arc::new(now.clone())
             }
-        };
+        });
         let rom = match prev {
             Some(p) if *p.rom == rom => p.rom.clone(),
             _ => {
@@ -126,33 +160,36 @@ impl SharedMemory {
                 }
             })
             .collect();
-        (SharedMemory { flash, flash_writes: writes, sram, rom }, fresh)
+        (SharedMemory { sram, rom, coverage }, fresh)
     }
 
-    /// Copies the memories into `sys`.
-    fn restore(&self, sys: &mut rp2040::System) {
-        sys.flash.clone_from(&*self.flash);
+    /// Copies the memories and the coverage into `m`.
+    fn restore(&self, m: &mut Machine) {
+        let sys = &mut m.sys;
         sys.rom.clone_from(&*self.rom);
         sys.sram.clear();
         for piece in &self.sram {
             sys.sram.extend_from_slice(piece);
         }
-        sys.flash_writes = self.flash_writes;
+        if let (Some(live), Some(kept)) = (&mut m.coverage, &self.coverage) {
+            (**live).clone_from(kept);
+        }
     }
 }
 
-/// What a session collected (see [`Session::keep_collected`]).
+/// What a session collected as text (logs, RTT, UART and USB text), kept by time travel so that going forward
+/// again to a later checkpoint gives back what going back cut (see [`Session::keep_collected`]).
 #[derive(Clone, Default)]
-pub struct Collected {
+pub struct CollectedText {
     logs: Vec<(Time, LogLine)>,
     rtt_text: Vec<(usize, Vec<u8>)>,
     uart_text: [String; 2],
     usb_cdc_text: String,
 }
 
-/// A [`Session::checkpoint`].
+/// A time-travel checkpoint of a board ([`Session::checkpoint`]).
 pub struct SessionCheckpoint {
-    machine: rp2040::machine::Snapshot,
+    machine: MachineState,
     memory: SharedMemory,
     /// Bytes of memory contents this checkpoint did not share with the one before it.
     fresh: usize,
@@ -168,8 +205,6 @@ pub struct SessionCheckpoint {
     #[allow(clippy::type_complexity)]
     eth: Option<(std::collections::VecDeque<Vec<u8>>, Vec<(Time, Vec<u8>)>, bool, u64)>,
     eth_loss: Option<crate::fault::PacketLoss>,
-    lockups: u64,
-    final_lockup_reported: bool,
     slice_end: Option<Time>,
     boundary: Time,
 }
@@ -183,8 +218,18 @@ impl SessionCheckpoint {
     /// About how much memory the checkpoint adds: what of the memories it does not share with the one before, and
     /// the rest (devices, peripherals).
     pub fn bytes(&self) -> usize {
-        self.machine.bytes() + self.fresh + self.defmt_partial.len() + 4096
+        self.machine.snapshot.bytes() + self.fresh + self.defmt_partial.len() + 4096
     }
+}
+
+/// What [`Session::collect`] took out of a board's machine at the end of a slice, for [`Session::deliver`].
+#[derive(Default)]
+pub(crate) struct SliceOutput {
+    now: Time,
+    /// The UARTs' output, taken twice (as the end of a slice polls them twice).
+    uarts: [[Vec<(Time, u8)>; 2]; 2],
+    usb_cdc: Vec<u8>,
+    rtt: Vec<(usize, Vec<u8>)>,
 }
 
 /// Callback for complete lines of text: `(virtual time, line)`.
@@ -237,6 +282,7 @@ impl Session {
             final_lockup_reported: false,
             slice_end: None,
             boundary: Time::ZERO,
+            kept_flash: None,
         }
     }
 
@@ -293,6 +339,7 @@ impl Session {
             final_lockup_reported: self.final_lockup_reported,
             slice_end: self.slice_end,
             boundary: self.boundary,
+            kept_flash: self.kept_flash.clone(),
         }
     }
 
@@ -325,18 +372,23 @@ impl Session {
                 let bytes: Vec<u8> = out.iter().map(|(_, b)| *b).collect();
                 pty.write(&bytes);
             }
-            for (t, b) in out {
-                let c = b as char;
-                self.uart_text[n].push(c);
-                match b {
-                    b'\n' => {
-                        let line = std::mem::take(&mut self.uart_line[n]);
-                        if let Some(hook) = &mut self.on_uart_line {
-                            hook(t, n, line.trim_end_matches('\r'));
-                        }
+            self.uart_bytes(n, out);
+        }
+    }
+
+    /// Takes in what UART `n` transmitted: its text, and complete lines to the hook.
+    fn uart_bytes(&mut self, n: usize, out: Vec<(Time, u8)>) {
+        for (t, b) in out {
+            let c = b as char;
+            self.uart_text[n].push(c);
+            match b {
+                b'\n' => {
+                    let line = std::mem::take(&mut self.uart_line[n]);
+                    if let Some(hook) = &mut self.on_uart_line {
+                        hook(t, n, line.trim_end_matches('\r'));
                     }
-                    _ => self.uart_line[n].push(c),
                 }
+                _ => self.uart_line[n].push(c),
             }
         }
     }
@@ -371,6 +423,11 @@ impl Session {
         if let Some(pty) = &self.usb_cdc_pty {
             pty.write(&rx);
         }
+        self.usb_cdc_bytes(now, rx);
+    }
+
+    /// Takes in what the device sent on its USB CDC port by `now`: its text, and complete lines to the hook.
+    fn usb_cdc_bytes(&mut self, now: Time, rx: Vec<u8>) {
         for b in rx {
             let c = b as char;
             self.usb_cdc_text.push(c);
@@ -405,7 +462,13 @@ impl Session {
         self.poll_usb_cdc();
         let Some(rtt) = &self.rtt else { return };
         let now = self.machine.now;
-        for (ch, bytes) in rtt.poll(&mut self.machine) {
+        let polled = rtt.poll(&mut self.machine);
+        self.rtt_bytes(now, polled);
+    }
+
+    /// Takes in what the RTT up channels held at `now`: defmt lines (to the hook and `logs`) and raw text.
+    fn rtt_bytes(&mut self, now: Time, polled: Vec<(usize, Vec<u8>)>) {
+        for (ch, bytes) in polled {
             match (&mut self.defmt, ch) {
                 (Some(d), 0) => {
                     for line in d.feed(&bytes) {
@@ -419,6 +482,127 @@ impl Session {
                 }
                 _ => self.rtt_text.push((ch, bytes)),
             }
+        }
+    }
+
+    /// Whether a robot may run this board ahead of the others ([`crate::runahead`]): nothing outside the
+    /// simulation feeds it or watches it as it runs (no pseudo terminal, USB/IP server, Ethernet cable, profiler or
+    /// trace sink), so its host side can take in what it produced later, and a copy rolled back reruns the same.
+    pub(crate) fn can_run_ahead(&self) -> bool {
+        use sim_core::trace::Category::*;
+        self.profiler.is_none()
+            && self.uart_pty.iter().all(Option::is_none)
+            && self.usb_cdc_pty.is_none()
+            && self.usb_cdc2_pty.is_none()
+            && self.usbip.is_none()
+            && self.machine.sys.ethernet.is_none()
+            && ![Instruction, Exception, Gpio, Peripheral, Unmodelled, Device]
+                .iter()
+                .any(|&c| self.machine.trace.wants(c))
+    }
+
+    /// The machine side of a robot's end of a slice for this board ([`Session::poll_rtt`] then
+    /// [`Session::poll_uarts`], for a board that [`Session::can_run_ahead`]): takes what the UARTs, the USB CDC port
+    /// and RTT hold out of the machine, for [`Session::deliver`] to take in later.
+    pub(crate) fn collect(&mut self) -> SliceOutput {
+        fn uarts(m: &mut Machine) -> [Vec<(Time, u8)>; 2] {
+            [std::mem::take(&mut m.sys.uart[0].output), std::mem::take(&mut m.sys.uart[1].output)]
+        }
+        let now = self.machine.now;
+        let first = uarts(&mut self.machine);
+        let usb_cdc = self.machine.sys.usb_host_mut().map(|h| h.cdc_take_rx(0)).unwrap_or_default();
+        let rtt = self.rtt.as_ref().map(|r| r.poll(&mut self.machine)).unwrap_or_default();
+        let again = uarts(&mut self.machine);
+        SliceOutput { now, uarts: [first, again], usb_cdc, rtt }
+    }
+
+    /// The host side of [`Session::collect`]: text, logs and hooks, as [`Session::poll_rtt`] and
+    /// [`Session::poll_uarts`] would have taken them in.
+    pub(crate) fn deliver(&mut self, c: SliceOutput) {
+        let [[a0, a1], again] = c.uarts;
+        self.uart_bytes(0, a0);
+        self.uart_bytes(1, a1);
+        self.usb_cdc_bytes(c.now, c.usb_cdc);
+        self.rtt_bytes(c.now, c.rtt);
+        let [b0, b1] = again;
+        self.uart_bytes(0, b0);
+        self.uart_bytes(1, b1);
+    }
+
+    /// The flash as it is now, shared with the copy the last checkpoint kept while it is the same: while its
+    /// version is the same, or (taking that copy's version) while its contents are. Returns it, and whether it is
+    /// a new copy.
+    fn keep_flash(&mut self) -> (Arc<Versioned>, bool) {
+        let live = &mut self.machine.sys.flash;
+        if let Some(kept) = &self.kept_flash
+            && live.share_version(kept)
+        {
+            return (kept.clone(), false);
+        }
+        // The old copy's allocation is reused when no checkpoint holds it any more
+        let copy = match self.kept_flash.take().and_then(|k| Arc::try_unwrap(k).ok()) {
+            Some(mut v) => {
+                v.copy_from(live);
+                v
+            }
+            None => live.clone(),
+        };
+        let copy = Arc::new(copy);
+        self.kept_flash = Some(copy.clone());
+        (copy, true)
+    }
+
+    /// The machine's state now ([`MachineState`]); with `apart`, the SRAM and ROM are left out of the snapshot too
+    /// (the caller keeps them, shared). Returns it, and whether the flash was copied.
+    fn save_machine(&mut self, apart: bool) -> (MachineState, bool) {
+        let sys = &mut self.machine.sys;
+        let flash = std::mem::take(&mut sys.flash);
+        let memories = apart.then(|| (std::mem::take(&mut sys.sram), std::mem::take(&mut sys.rom)));
+        let snapshot = self.machine.snapshot();
+        let sys = &mut self.machine.sys;
+        sys.flash = flash;
+        if let Some((sram, rom)) = memories {
+            (sys.sram, sys.rom) = (sram, rom);
+        }
+        let (flash, copied) = self.keep_flash();
+        let state = MachineState {
+            snapshot,
+            carry: self.machine.run_carry(),
+            flash,
+            lockups: self.lockups,
+            final_lockup_reported: self.final_lockup_reported,
+        };
+        (state, copied)
+    }
+
+    /// Puts the machine back as in `s` (keeping its trace sink, breakpoints and watchpoints); the flash is copied
+    /// only if the live one's version differs. A snapshot taken `apart` leaves the SRAM and ROM to the caller.
+    fn restore_machine(&mut self, s: &MachineState) {
+        let mut live = std::mem::take(&mut self.machine.sys.flash);
+        self.machine.restore(&s.snapshot);
+        if live.version() != s.flash.version() {
+            live.copy_from(&s.flash);
+        }
+        self.machine.sys.flash = live;
+        self.kept_flash = Some(s.flash.clone());
+        self.machine.set_run_carry(&s.carry);
+        self.lockups = s.lockups;
+        self.final_lockup_reported = s.final_lockup_reported;
+    }
+
+    /// The state a robot running its boards ahead keeps to roll this board back to ([`Session::roll_back`]): the
+    /// machine and what running it changes in the session ([`RollbackPoint`]).
+    pub(crate) fn rollback_point(&mut self) -> RollbackPoint {
+        let (machine, _) = self.save_machine(false);
+        RollbackPoint { machine, stop_at: self.machine.stop_at, coverage: self.machine.coverage.clone() }
+    }
+
+    /// Puts the board back where [`Session::rollback_point`] was taken.
+    pub(crate) fn roll_back(&mut self, p: &RollbackPoint) {
+        self.restore_machine(&p.machine);
+        self.machine.stop_at = p.stop_at;
+        if let (Some(live), Some(kept)) = (&mut self.machine.coverage, &p.coverage) {
+            live.clone_from(kept);
         }
     }
 
@@ -533,15 +717,15 @@ impl Session {
     /// A checkpoint of the session for time travel (see [`crate::timetravel`]): the machine without its trace sink
     /// and debugger settings, and the host side's state (RTT position, a defmt frame in progress, how much log,
     /// RTT, UART and USB text there was, the CAN bus without its record, the Ethernet cable). The flash is shared
-    /// with `prev` when it has not changed since. Hooks, endpoints and ptys are not part of it.
+    /// with earlier checkpoints while it is the same (see [`MachineState`]), the SRAM, ROM and code coverage with
+    /// `prev` where they are. Hooks, endpoints and ptys are not part of it.
     pub fn checkpoint(&mut self, prev: Option<&SharedMemory>) -> SessionCheckpoint {
-        let sys = &mut self.machine.sys;
-        let (flash, sram, rom) =
-            (std::mem::take(&mut sys.flash), std::mem::take(&mut sys.sram), std::mem::take(&mut sys.rom));
-        let machine = self.machine.snapshot();
-        let (memory, fresh) = SharedMemory::keep(prev, &flash, &sram, &rom, self.machine.sys.flash_writes);
-        let sys = &mut self.machine.sys;
-        (sys.flash, sys.sram, sys.rom) = (flash, sram, rom);
+        let (machine, flash_copied) = self.save_machine(true);
+        let sys = &self.machine.sys;
+        let (memory, mut fresh) = SharedMemory::keep(prev, &sys.sram, &sys.rom, self.machine.coverage.as_deref());
+        if flash_copied {
+            fresh += sys.flash.len();
+        }
         let can_bus = self.can_bus.as_mut().map(|bus| {
             let record = bus.record.take();
             let len = record.as_ref().map(|r| r.len());
@@ -568,23 +752,22 @@ impl Session {
             can_bus,
             eth,
             eth_loss: self.eth_loss.clone(),
-            lockups: self.lockups,
-            final_lockup_reported: self.final_lockup_reported,
             slice_end: self.slice_end,
             boundary: self.boundary,
         }
     }
 
     /// Puts the session back where `c` was taken: the machine (keeping its trace sink, breakpoints and
-    /// watchpoints), the host side, and the collected logs and text cut back to what there was then. Inputs the
+    /// watchpoints), the host side, and the collected logs and text and the code coverage cut back to what there was
+    /// then (both follow the timeline: what the run did to get where it is). Inputs the
     /// devices read are not part of it (see [`crate::timetravel`]).
     pub fn rewind_to(&mut self, c: &SessionCheckpoint) {
-        self.rewind_to_with(c, &Collected::default());
+        self.rewind_to_with(c, &CollectedText::default());
     }
 
     /// Keeps in `c` what the session collected (logs, RTT, UART and USB text) if it has more than `c` has: going
     /// back cuts them, going forward again to a later checkpoint ([`Session::rewind_to_with`]) gives them back.
-    pub fn keep_collected(&self, c: &mut Collected) {
+    pub fn keep_collected(&self, c: &mut CollectedText) {
         if self.logs.len() > c.logs.len() {
             c.logs.clone_from(&self.logs);
         }
@@ -602,7 +785,7 @@ impl Session {
     }
 
     /// Cuts `c` to what the session has now (the future changed).
-    pub fn cut_collected(&self, c: &mut Collected) {
+    pub fn cut_collected(&self, c: &mut CollectedText) {
         c.logs.truncate(self.logs.len());
         c.rtt_text.truncate(self.rtt_text.len());
         for n in 0..2 {
@@ -617,7 +800,7 @@ impl Session {
 
     /// [`Session::rewind_to`], taking what was collected by then from `collected` when the session has less now
     /// (it was taken back before the checkpoint).
-    pub fn rewind_to_with(&mut self, c: &SessionCheckpoint, collected: &Collected) {
+    pub fn rewind_to_with(&mut self, c: &SessionCheckpoint, collected: &CollectedText) {
         fn cut<T: Clone>(v: &mut Vec<T>, len: usize, longer: &[T]) {
             if v.len() >= len {
                 v.truncate(len);
@@ -642,8 +825,8 @@ impl Session {
             cut_text(&mut self.uart_text[n], c.uart_text[n], &collected.uart_text[n]);
         }
         cut_text(&mut self.usb_cdc_text, c.usb_cdc_text, &collected.usb_cdc_text);
-        self.machine.restore(&c.machine);
-        c.memory.restore(&mut self.machine.sys);
+        self.restore_machine(&c.machine);
+        c.memory.restore(&mut self.machine);
         self.rtt = c.rtt.clone();
         if let Some(d) = &self.defmt {
             self.defmt = Some(d.with_partial(&c.defmt_partial));
@@ -666,8 +849,6 @@ impl Session {
             w.dropped = *dropped;
         }
         self.eth_loss = c.eth_loss.clone();
-        self.lockups = c.lockups;
-        self.final_lockup_reported = c.final_lockup_reported;
         self.slice_end = c.slice_end;
         self.boundary = c.boundary;
     }
@@ -826,5 +1007,50 @@ mod tests {
         assert!(t0.elapsed() >= Duration::from_millis(28), "{:?}", t0.elapsed());
         // A little behind is no reason for a warning
         assert_eq!(p.pace(Time::from_ms(30)), None);
+    }
+
+    fn template() -> Option<Session> {
+        let repo = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let image = Image::load(&crate::titan_rs_image(&repo, "template")?).unwrap();
+        let mut m =
+            Machine::new(rp2040::MachineConfig { bootrom: Some(rp2040::BOOTROM_B1.to_vec()), ..Default::default() });
+        m.sys.unmodelled.log_mode = rp2040::unmodelled::LogMode::Off;
+        m.load(&image).unwrap();
+        m.direct_boot().unwrap();
+        Some(Session::new(m, &image))
+    }
+
+    /// Both kinds of checkpoint keep the flash the same way: one copy shared while its version is the same (or its
+    /// contents are), a new one once it was written, and put back on a restore only if it differs.
+    #[test]
+    fn checkpoints_share_the_flash_while_it_is_the_same() {
+        let Some(mut s) = template() else { return };
+        s.run_until(Time::from_ms(2));
+        let a = s.rollback_point();
+        let b = s.checkpoint(None);
+        let c = s.rollback_point();
+        assert!(Arc::ptr_eq(&a.machine.flash, &b.machine.flash) && Arc::ptr_eq(&a.machine.flash, &c.machine.flash));
+        assert!(b.fresh >= s.machine.sys.sram.len(), "the first time-travel checkpoint copies the SRAM");
+        let b2 = s.checkpoint(Some(b.memory()));
+        assert_eq!(b2.fresh, 0, "nothing changed: everything shared");
+        // A write makes a new copy (compared with the last copy kept, which it differs from)
+        let old = s.machine.sys.flash[0x1000];
+        s.machine.sys.flash[0x1000] = !old;
+        let d = s.checkpoint(Some(b.memory()));
+        assert!(!Arc::ptr_eq(&a.machine.flash, &d.machine.flash));
+        assert_eq!(d.fresh, s.machine.sys.flash.len(), "the flash was copied");
+        s.machine.sys.flash[0x1000] = old;
+        let e = s.rollback_point();
+        assert!(!Arc::ptr_eq(&d.machine.flash, &e.machine.flash), "the last copy is compared, and it differs");
+        let f = s.checkpoint(None);
+        assert!(Arc::ptr_eq(&e.machine.flash, &f.machine.flash));
+        // Going back to before the write puts the old contents back, with their version
+        s.machine.sys.flash[0x1000] = !old;
+        s.rewind_to(&b);
+        assert_eq!((s.machine.sys.flash[0x1000], s.machine.sys.flash.version()), (old, a.machine.flash.version()));
+        s.rewind_to(&d);
+        assert_eq!(s.machine.sys.flash[0x1000], !old);
+        s.roll_back(&a);
+        assert_eq!(s.machine.sys.flash[0x1000], old);
     }
 }

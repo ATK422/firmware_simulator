@@ -92,3 +92,40 @@ fn a_titan_image_has_its_panic_handler_unrun_until_a_panic() {
     let p = run(true);
     assert!(p.function("__defmt_default_panic").unwrap().1.hit, "a panic runs the panic handler");
 }
+
+/// Coverage follows the timeline, as the logs do: going back to before a panic takes the panic handler's coverage
+/// back with it, going forward again (a replay) gives it back, and a run that went back has the coverage of a fresh
+/// run to there.
+#[test]
+fn coverage_goes_back_with_time_travel() {
+    use sim_host::timetravel::{Ran, TimeTravel, Travelled};
+    let Some(elf) = common::titan_elf("power_board") else { return };
+    let handler = |s: &sim_host::Session| {
+        let mut cov = Coverage::new();
+        cov.add_machine("power_board", &s.machine);
+        cov.report().function("__defmt_default_panic").unwrap().1.hit
+    };
+    let mut s = common::boot(&elf, None);
+    s.machine.enable_coverage();
+    let mut tt = TimeTravel::new(&mut s, vec![]);
+    tt.every = Time::from_ms(20);
+    assert_eq!(tt.run_until(&mut s, Time::from_ms(300)), Ran::Reached);
+    sim_host::fault::FaultTarget { session: &mut s, bus: None, bridge: None, power: None }
+        .apply(&sim_host::fault::Fault::Panic)
+        .unwrap();
+    tt.changed(&mut s);
+    assert_eq!(tt.run_until(&mut s, Time::from_ms(400)), Ran::Reached);
+    assert!(handler(&s), "the panic ran the panic handler");
+    let end = s.machine.coverage.clone();
+    assert_eq!(tt.rewind_to(&mut s, Time::from_ms(250)), Travelled::Arrived);
+    assert!(!handler(&s), "back before the panic");
+    let sim_host::timetravel::Pos::Boundary(at) = tt.here() else { panic!("{:?}", tt.here()) };
+    let mut fresh = common::boot(&elf, None);
+    fresh.machine.enable_coverage();
+    fresh.run_until(at);
+    assert_eq!(fresh.machine.now, s.machine.now);
+    assert!(fresh.machine.coverage == s.machine.coverage, "as a fresh run to there");
+    assert_eq!(tt.run_until(&mut s, Time::from_ms(400)), Ran::Reached);
+    assert!(tt.at_frontier());
+    assert!(s.machine.coverage == end, "forward again: the same as at the frontier");
+}
