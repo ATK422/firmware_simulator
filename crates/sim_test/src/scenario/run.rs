@@ -2191,6 +2191,13 @@ pub fn run(s: &Scenario, opts: &Options) -> Vec<Outcome> {
     };
     let images = match images_of(&spec, &dir, &opts.images) {
         Ok(x) => x,
+        // Images from a checkout that is not there (the C robots' `${TITAN_FIRMWARE_DIR}` unset): not built here
+        Err(e) if e.contains(" is not set") => {
+            let mut o = Outcome::empty(s);
+            o.skipped = Some(e);
+            o.wall = wall.elapsed();
+            return vec![o];
+        }
         Err(e) => return fail(e),
     };
     if let Some((b, p)) = images.iter().find(|(_, p)| !p.exists()) {

@@ -26,6 +26,8 @@ and replay, log comparison, UDP tunnels, and the real host tools.
 | `robots/ivc2_interop.toml` | The Rust `ivc_board2` and the C titan_firmware IVCBoard2 (your build, micro-ROS over USB) in the pool ([acoustics.md](acoustics.md#c-and-rust-ivcboard2-interop)) |
 | `robots/talos_c.toml` | Talos with titan_firmware's C board apps (your build, micro-ROS over CAN), as the robot runs them, in Talos's real thruster layout ([robot in a box](#robot-in-a-box-the-orins-side-on-vcan)) |
 | `robots/talos_c_nereus.toml`, `robots/talos_nereus.toml` | The boards in the loop (PoAC, two ESC boards, camera cage), C or Rust, in a vehicle nereus moves ([nereus.md](nereus.md)) |
+| `robots/mercury.toml` | Mercury, the vehicle UWRT's new Mercury stack (`mercury_release`) runs on: titan_firmware's C `mercury/PoHalfBoard` (client 1) and `mercury/ESCBoard` twice (clients 2 and 3), your build, micro-ROS over CAN on the internal bus; no vehicle ([below](#mercury-and-tempest)) |
+| `robots/tempest.toml` | Tempest, the AUV before Talos: its MK2 camera cage (client 4) and actuator (client 5) with today's Rust images, in `vehicles/tempest.toml` (riptide's description), thrusters unwired ([below](#mercury-and-tempest)) |
 
 ```toml
 [environment]                       # optional: the water the boards' transducers are in
@@ -77,6 +79,28 @@ are redirected to `$TITAN_RS_RELEASE_DIR` when it is set (a worktree, another ch
   `position_m`, a `trajectory` or a vehicle that carries it ([acoustics.md](acoustics.md)).
 * **Vehicles**: `[[vehicle]]`, `[[vehicle.sensor]]`, `[[vehicle.transducer]]` ([vehicles.md](vehicles.md)).
 * **USB**: see [below](#usb-on-robot-boards).
+
+### Mercury and Tempest
+
+**Mercury** is UWRT's new software stack (`osu-uwrt/mercury_release` and its `mercury_*` packages, most of them
+still empty skeletons) and the robot titan_firmware builds for it (`robots/mercury.h`: namespace `mercury`, CAN FD
+internal bus, classic external bus). Its boards are titan_firmware's "Triton" boards (`tools/DeviceList.jsonc`):
+`mercury/PoHalfBoard` (kill switch, aux switch, depth) and `mercury/ESCBoard` twice, a copy of `talos/ESCBoard` with
+the ESC pins moved, no inverted thrusters and `mercury_msgs`. Only these C apps exist (titan_firmware_rs has no
+Mercury boards: its `po_half_board` is Lilboat's), so `robots/mercury.toml` takes them from `TITAN_FIRMWARE_DIR`,
+and `scenarios/boot_mercury.yaml` (build tags on the UART, each client's CANmore heartbeat, no panic or reset) is
+skipped until it is set. There is no vehicle file: `mercury_descriptions` is empty and `mercury_simulator` loads
+riptide's `talos.yaml`. A firmware finding: `mercury/ESCBoard`'s raw CAN thruster command handler still reads each
+RPM's high byte twice (`(buf[idx] << 8) | buf[idx]`), fixed for `talos/ESCBoard` only (titan_firmware PR #26).
+
+**Tempest** is the AUV before Talos, not a new one: riptide's launch files default to `robot:=tempest` because they
+were carried over from the earlier stack, and `riptide_descriptions/config/tempest.yaml` has not changed since. Its
+boards are electric_boogaloo's `TempestBoards`: the MK1 coprocessor on the backplane breakout board (micro-ROS over
+CAN, PWM thrusters), MK1 power distribution, and the MK2 camera cage and actuator boards that Talos carries now.
+titan_firmware built `Copro/`, `Actuator/` and `CameraCageBB/` for `UWRT_ROBOT tempest` until February 2023
+(2f24ddb removed them); today only the MK2 boards have firmware, Talos's. `robots/tempest.toml` runs those two
+Rust images (they report themselves as Talos boards) in `vehicles/tempest.toml`, with the camera cage's depth
+sensor at tempest.yaml's depth pose and the thrusters unwired.
 
 ## The `robot` command
 

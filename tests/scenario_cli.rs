@@ -48,7 +48,7 @@ fn check_lists_every_shipped_scenario_without_running_it() {
     assert!(t.contains("Talos boots and every board connects"), "{t}");
     assert!(t.contains("case \"sensor unplugged\":"), "{t}");
     assert!(t.contains("expect camera_cage log \"Lost connection to ROS\" within 1s"), "{t}");
-    assert!(t.contains("scenario(s) in 8 file(s): OK"), "{t}");
+    assert!(t.contains("scenario(s) in 9 file(s): OK"), "{t}");
 }
 
 #[test]

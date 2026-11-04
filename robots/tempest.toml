@@ -1,0 +1,50 @@
+# Tempest: UWRT's AUV before Talos (not a new vehicle: riptide's launch files still default to `robot:=tempest`
+# because they were carried over from the earlier stack; the robot runs with `robot:=talos`). What is known of its
+# electronics, and which firmware exists for it today:
+#
+#   * The coprocessor ("Copro") on the MK1 backplane breakout board (boards/mk1/backplane_breakout_board, from
+#     titan_firmware's mk1 header): micro-ROS over CAN, depth sensor, cooling, actuator over I2C, and the eight
+#     thrusters as PWM ESCs (HW_USE_PWM). Its firmware (titan_firmware Copro/, UWRT_ROBOT tempest) was deleted in
+#     titan_firmware 2f24ddb "Remove old firmware and reoganize repo" (February 2023) and built against the old
+#     uwrt_boards layout; nothing builds for this board now, and this emulator has no PWM ESC model, so it is left
+#     out. The MK1 power distribution boards (electric_boogaloo TempestBoards/MK1: PD 1.5, PD 1.75) have no MCU.
+#   * The MK2 camera cage board (depth) and actuator board (electric_boogaloo TempestBoards/MK2), which titan_firmware
+#     built for Tempest until then (CameraCageBB/ and Actuator/, UWRT_ROBOT tempest, PICO_BOARD mk2_camera_cage_bb
+#     and mk2_actuator_board) and which Talos carries now. The firmware for them today is Talos's: this file runs the
+#     titan_firmware_rs camera_cage_bb and actuator_board images, which identify as talos boards (namespace talos)
+#     on the internal CAN FD bus. Mock bridges: client 4 (camera cage) and 5 (actuator).
+#
+#   firmware_simulator robot robots/tempest.toml --mock-bridge internal:4 --mock-bridge internal:5 --time 2s
+#
+# titan_firmware keeps a robot header (lib/titan_boards/include/robots/tempest.h: namespace "tempest", the robot
+# computer at 192.168.1.23 over Ethernet) that no project uses. The vehicle is riptide's Tempest description
+# (vehicles/tempest.toml); its thrusters are not wired, since the board that drove them has no firmware.
+
+[[bus]]
+name = "internal"
+rates = "internal"
+
+[[board]]
+name = "camera_cage"
+board = "../boards/mk2/camera_cage_bb.toml"
+elf = "../external/titan_firmware_rs/firmware/target/thumbv6m-none-eabi/release/camera_cage_bb"
+bus = "internal"
+
+[[board]]
+name = "actuator"
+board = "../boards/mk2/actuator_board.toml"
+elf = "../external/titan_firmware_rs/firmware/target/thumbv6m-none-eabi/release/actuator_board"
+bus = "internal"
+
+# Afloat (6.7 N positive); the camera cage's depth sensor at tempest.yaml's depth pose
+[[vehicle]]
+name = "tempest"
+file = "../vehicles/tempest.toml"
+position_m = [5.0, 6.0, 0.0]
+floating = true
+thrusters = []
+
+[[vehicle.sensor]]
+board = "camera_cage"
+input = "depth.pressure_pa"
+mount_m = [-0.109, 0.103, -0.0188]

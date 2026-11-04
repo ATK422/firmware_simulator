@@ -1,23 +1,31 @@
-# Four bidirectional DShot600 ESCs (ESC1-4 on GPIO 6, 4, 2, 0; UART telemetry on GPIO 7, 5, 3, 1), 7 pole pairs
+# Four bidirectional DShot600 ESCs (ESC1-4 on GPIO 6, 4, 2, 0; UART telemetry on GPIO 7, 5, 3, 1), 7 pole pairs.
+# They are APD 80F3s with titan_firmware's 3D-mode patch (talos/ESCBoard/esc_firmware_patching: 48-1047 ahead and
+# 1049-2047 astern on the same 0-1000 throttle scale) driving T200 thrusters. Their speed for a throttle is the bench
+# fit the firmware's feed-forward was made from (titan_firmware ThrusterController.c, esc_core::controller::
+# feed_forward; sim_devices::dshot::SpeedCurve::APD_T200): throttle step = c0 + c1 rpm + c2 rpm^2 at the steady state.
 [[dshot_esc]]
 name = "esc1"
 signal_pin = 6
 telemetry_pin = 7
+throttle_fit = { forward = [12.369874, 0.103410, 0.000042], reverse = [14.791378, 0.098938, 0.000042] }
 
 [[dshot_esc]]
 name = "esc2"
 signal_pin = 4
 telemetry_pin = 5
+throttle_fit = { forward = [12.369874, 0.103410, 0.000042], reverse = [14.791378, 0.098938, 0.000042] }
 
 [[dshot_esc]]
 name = "esc3"
 signal_pin = 2
 telemetry_pin = 3
+throttle_fit = { forward = [12.369874, 0.103410, 0.000042], reverse = [14.791378, 0.098938, 0.000042] }
 
 [[dshot_esc]]
 name = "esc4"
 signal_pin = 0
 telemetry_pin = 1
+throttle_fit = { forward = [12.369874, 0.103410, 0.000042], reverse = [14.791378, 0.098938, 0.000042] }
 
 # ESC rail sense on GPIO 28 (ADC 2) behind 10k/1k; the board counts the ESCs as powered above 9 V
 [[analog]]

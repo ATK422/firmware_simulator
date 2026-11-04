@@ -1,0 +1,27 @@
+# The board I2C bus (I2C0 on GPIO 24/25) "with temp sensor, adc, depth sensor" (boards/mercury/po_half.h): an
+# MS5837-02BA water depth sensor, an SHT41 and an MCP3426 rail monitor. The C firmware (mercury/PoHalfBoard) starts
+# only the depth sensor; its SHT41 and MCP3426 set-up is commented out, though it still publishes the MCP3426's
+# channels as state/electrical.
+[[i2c]]
+bus = 0
+device = "ms5837_02ba"
+name = "depth"
+depth_m = 0.0
+temperature_c = 18.0
+
+[[i2c]]
+bus = 0
+device = "sht41"
+temperature_c = 30.0
+humidity_rh = 35.0
+
+# Channels as the firmware converts them (ros.c calc_actual_voltage: 3.3 V behind 10k/10k, the others 10k/1k)
+[[i2c]]
+bus = 0
+device = "mcp3426"
+channels = [
+    { name = "rail_3v3", volts = 3.3, divider_ohms = [10_000, 10_000] },
+    { name = "rail_balanced", volts = 16.0, divider_ohms = [10_000, 1_000] },
+    { name = "rail_12v", volts = 12.0, divider_ohms = [10_000, 1_000] },
+    { name = "rail_5v", volts = 5.0, divider_ohms = [10_000, 1_000] },
+]

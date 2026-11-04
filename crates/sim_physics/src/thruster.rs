@@ -3,7 +3,8 @@
 //! A propeller's thrust grows with the square of its speed (`T = k rpm |rpm|`, the thrust coefficient of
 //! momentum theory at a fixed advance ratio), and is weaker in reverse, where the propeller and duct work against
 //! their design. The coefficients come from one point of a thrust curve in each direction, as datasheets give
-//! them: e.g. the Blue Robotics T200 at 16 V makes about 5.25 kgf forward and 4.1 kgf in reverse near 3800 RPM.
+//! them: e.g. the Blue Robotics T200 at 16 V makes 51.4 N forward at its top speed of 3533 RPM and 39.9 N in reverse
+//! at 3465 RPM (its published performance data).
 //!
 //! Thrusters with a counter-rotating propeller (fitted so that the torques of neighbouring thrusters cancel) are
 //! `inverted`: their motor turns backwards for the same push, and forwards gives their weaker reverse thrust. The

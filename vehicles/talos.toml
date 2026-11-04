@@ -30,8 +30,10 @@ quadratic_drag = [120.0, 190.0, 280.0, 3.0, 5.0, 5.0]
 # frame sheds the flow and feels much less of it
 munk_moment_scale = 0.25
 
-# T200 at 16 V (Blue Robotics' published curve): about 5.25 kgf forward, 4.1 kgf reverse near 3800 RPM
-thruster_model = { forward_n = 51.5, reverse_n = 40.2, at_rpm = 3800.0 }
+# T200 at 16 V, Blue Robotics' published data (T200-Public-Performance-Data-10-20V-September-2019.xlsx): a
+# k rpm|rpm| fit per direction to its 16 V sheet, 4.07e-6 N/RPM^2 ahead (51.4 N measured at its top speed, 3533
+# RPM) and 3.25e-6 astern (39.9 N at 3465 RPM); within 8% of the sheet from 5 N up
+thruster_model = { forward_n = 50.82, reverse_n = 40.53, at_rpm = 3533.0 }
 
 # ESC board 0 (thrusters 1-4): the horizontal thrusters at the corners, angled 45 degrees so that all four ahead
 # drive the vehicle forward. The starboard pair ahead and the port pair astern turn it to port; diagonally

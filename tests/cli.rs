@@ -492,3 +492,40 @@ fn c_talos_robot_files_and_external_vehicles() {
     let err = String::from_utf8_lossy(&out.stderr);
     assert!(!out.status.success() && err.contains("TITAN_FIRMWARE_DIR is not set"), "{err}");
 }
+
+/// `robots/mercury.toml` takes Mercury's C images from `$TITAN_FIRMWARE_DIR` (stand-ins at the C builds' paths), and
+/// its smoke scenario is skipped, passing, while `TITAN_FIRMWARE_DIR` is unset; with images that are not Mercury's
+/// it runs and fails.
+#[test]
+fn mercury_robot_file_and_its_smoke_scenario() {
+    let tf = temp("titan_firmware_mercury");
+    for (dir, name) in [("mercury/PoHalfBoard", "po_half"), ("mercury/ESCBoard", "esc_board")] {
+        let build = tf.join(dir).join("build");
+        std::fs::create_dir_all(&build).unwrap();
+        std::fs::copy(
+            repo().join("test_programs/c_dual_usb/c_dual_usb.elf"),
+            build.join(format!("{name}_with_bl.uf2")),
+        )
+        .unwrap();
+    }
+    let run = |args: &[&str], dir: Option<&Path>| {
+        let mut c = Command::new(env!("CARGO_BIN_EXE_firmware_simulator"));
+        c.args(args).current_dir(repo());
+        match dir {
+            Some(d) => c.env("TITAN_FIRMWARE_DIR", d),
+            None => c.env_remove("TITAN_FIRMWARE_DIR"),
+        };
+        let out = c.output().unwrap();
+        (
+            out.status.success(),
+            String::from_utf8_lossy(&out.stdout).into_owned() + &String::from_utf8_lossy(&out.stderr),
+        )
+    };
+    let (ok, text) = run(&["robot", "robots/mercury.toml", "--time", "50ms"], Some(&tf));
+    assert!(ok && text.contains("3 board(s) on 1 bus(es)"), "{text}");
+    let (ok, text) = run(&["scenario", "scenarios/boot_mercury.yaml"], None);
+    assert!(ok && text.contains("SKIPPED") && text.contains("TITAN_FIRMWARE_DIR is not set"), "{text}");
+    assert!(text.contains("0 passed, 0 failed, 1 skipped"), "{text}");
+    let (ok, text) = run(&["scenario", "scenarios/boot_mercury.yaml"], Some(&tf));
+    assert!(!ok && text.contains("0 passed, 1 failed"), "{text}");
+}

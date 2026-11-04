@@ -11,7 +11,10 @@
 //! 115200 baud.
 //!
 //! The motor follows the throttle with a first-order lag: throttle 48-1047 forward and 1049-2047 reverse (3D
-//! mode, as the UWRT ESCs are patched), `max_rpm` at full throttle; 0 and the special commands 1-47 stop it.
+//! mode, as the UWRT ESCs are patched), 0 and the special commands 1-47 stop it. How fast it turns for a throttle
+//! in the steady state is the ESC's [`SpeedCurve`]: by default proportional to the throttle (`max_rpm` at full
+//! throttle, either way), or a fit of bench data per direction. The UWRT ESC boards' APD 80F3 ESCs with T200
+//! thrusters use the fit their own firmware's feed-forward was made from ([`SpeedCurve::APD_T200`]).
 //!
 //! When the frames stop, the ESC stops the motor [`Esc::signal_loss_timeout`] after the last valid one (it coasts
 //! down with the same lag), as the ESC firmwares do: BLHeli_S and Bluejay cut the motor after about 250 ms without
@@ -76,8 +79,8 @@ pub struct Esc {
     pub name: String,
     pub signal_pin: u8,
     pub telemetry_pin: Option<u8>,
-    /// Mechanical RPM at full throttle, motor pole pairs, time constant of the motor's response.
-    pub max_rpm: f64,
+    /// Steady-state speed for a throttle; motor pole pairs, time constant of the motor's response.
+    pub curve: SpeedCurve,
     pub pole_pairs: u32,
     pub tau: Time,
     pub reply_delay: Time,
@@ -109,6 +112,57 @@ pub struct Esc {
     bit_start: Option<Time>,
     bits: Vec<(Time, Time)>,
     busy_until: Time,
+}
+
+/// How fast an ESC turns its motor for a DShot throttle, once the motor has settled (signed mechanical RPM).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum SpeedCurve {
+    /// Proportional to the throttle: `max_rpm` at full throttle (1047 ahead: 1000 steps above 47; 2047 astern: 999
+    /// steps above 1048).
+    Linear { max_rpm: f64 },
+    /// Measured, per direction: at the steady state the throttle step `u` (the DShot value minus 48 ahead, minus
+    /// 1048 astern: `esc_core`'s throttle units) is `c0 + c1 rpm + c2 rpm^2` for the speed's magnitude. The motor
+    /// stands still below `c0`.
+    Fit { forward: [f64; 3], reverse: [f64; 3] },
+}
+
+impl SpeedCurve {
+    /// titan_firmware's ESC board feed-forward (`Thruster_Controller/ThrusterController.c`, ported as
+    /// `esc_core::controller::feed_forward`): a quadratic fit of DShot throttle against RPM that `generateFF.m`
+    /// made from riptide's `calibrate_thruster.py` bench runs (throttle steps of +-20 to +-725, the RPM the ESC
+    /// reported, the force on a gauge) with the boards' APD 80F3 ESCs and T200 thrusters; the same runs gave
+    /// riptide's `force_to_rpm_coefficents`. Measured up to the boards' 725 hard limit (3068 RPM ahead, 3100
+    /// astern), extrapolated beyond (3770 / 3804 RPM at full throttle).
+    pub const APD_T200: SpeedCurve =
+        SpeedCurve::Fit { forward: [12.369874, 0.103410, 0.000042], reverse: [14.791378, 0.098938, 0.000042] };
+
+    /// Signed steady-state RPM for an 11-bit DShot throttle value.
+    pub fn rpm(&self, v: u16) -> f64 {
+        match *self {
+            SpeedCurve::Linear { max_rpm } => match v {
+                48..=1047 => (v - 47) as f64 / 1000.0 * max_rpm,
+                1049..=2047 => -((v - 1048) as f64 / 999.0 * max_rpm),
+                _ => 0.0,
+            },
+            SpeedCurve::Fit { forward, reverse } => match v {
+                48..=1047 => solve(forward, (v - 48) as f64),
+                1049..=2047 => -solve(reverse, (v - 1048) as f64),
+                _ => 0.0,
+            },
+        }
+    }
+}
+
+/// The speed at which `c0 + c1 rpm + c2 rpm^2` reaches throttle `u` (0 below `c0`).
+fn solve([c0, c1, c2]: [f64; 3], u: f64) -> f64 {
+    let u = u - c0;
+    if u <= 0.0 {
+        0.0
+    } else if c2 == 0.0 {
+        u / c1
+    } else {
+        2.0 * u / (c1 + (c1 * c1 + 4.0 * c2 * u).sqrt())
+    }
 }
 
 /// The lag of a motor with time constant `tau` towards `target` over `dt` seconds from `rpm`.
@@ -155,7 +209,7 @@ impl Esc {
             name: name.into(),
             signal_pin,
             telemetry_pin,
-            max_rpm: 4000.0,
+            curve: SpeedCurve::Linear { max_rpm: 4000.0 },
             pole_pairs: 7,
             tau: Time::from_ms(60),
             reply_delay: Time::from_us(30),
@@ -265,11 +319,7 @@ impl Esc {
     }
 
     fn apply_throttle(&mut self, v: u16) {
-        self.target_rpm = match v {
-            48..=1047 => (v - 47) as f64 / 1000.0 * self.max_rpm,
-            1049..=2047 => -((v - 1048) as f64 / 999.0 * self.max_rpm),
-            _ => 0.0,
-        };
+        self.target_rpm = self.curve.rpm(v);
     }
 
     fn finish_frame(&mut self, ctx: &mut dyn DeviceCtx) {
@@ -487,6 +537,85 @@ mod tests {
             assert!(back <= period && period - back < period / 256 + 1, "{period} -> {back}");
         }
         assert_eq!(checksum(0x123 << 1, false), (0x246 ^ 0x24 ^ 0x2) & 0xF);
+    }
+
+    /// `esc_core::controller::feed_forward` written out again (its integer arithmetic): the throttle the ESC board
+    /// firmware puts out for a target RPM before its P and I terms.
+    fn feed_forward(rpm: i64) -> i64 {
+        if rpm.abs() < 50 {
+            return 0;
+        }
+        let v = if rpm > 0 {
+            12_369_874 + 103_410 * rpm + 42 * rpm * rpm
+        } else {
+            -14_791_378 + 98_938 * rpm - 42 * rpm * rpm
+        };
+        v / 1_000_000
+    }
+
+    /// The DShot value `esc_core::dshot::throttle_command` sends for a throttle.
+    fn dshot_value(throttle: i64) -> u16 {
+        match throttle {
+            1..=999 => throttle as u16 + 48,
+            -999..=-1 => (-throttle) as u16 + 1048,
+            _ => 0,
+        }
+    }
+
+    #[test]
+    fn the_apd_t200_curve_turns_the_feed_forward_throttle_into_its_target() {
+        let c = SpeedCurve::APD_T200;
+        // Each way, the feed-forward throttle for a target spins the motor to that target, to within the RPM one
+        // throttle step is worth (the firmware truncates the polynomial); its P term (0.1 throttle per RPM) and I
+        // term take the rest out
+        for rpm in (100..=3700).step_by(50) {
+            for sign in [1i64, -1] {
+                let target = sign * rpm;
+                let got = c.rpm(dshot_value(feed_forward(target)));
+                let step = 1.0 / (0.1034 + 2.0 * 0.000042 * rpm as f64);
+                assert!(got.signum() == sign as f64, "{target}: {got}");
+                assert!(
+                    (got.abs() - rpm as f64).abs() <= step + 0.5 && got.abs() <= rpm as f64 + 0.5,
+                    "{target}: {got}"
+                );
+            }
+        }
+        // The boards' hard limit (725) and full throttle
+        assert!((c.rpm(725 + 48) - 3068.0).abs() < 1.0, "{}", c.rpm(773));
+        assert!((c.rpm(725 + 1048) + 3100.0).abs() < 1.0, "{}", c.rpm(1773));
+        assert!((c.rpm(1047) - 3770.0).abs() < 1.0 && (c.rpm(2047) + 3804.0).abs() < 1.0);
+        // Below the fit's offset (about 12 steps ahead, 15 astern) the motor stands; neutral and commands stop it
+        for v in [0, 1, 47, 48, 48 + 12, 1048, 1048 + 14] {
+            assert_eq!(c.rpm(v), 0.0, "{v}");
+        }
+        assert!(c.rpm(48 + 13) > 0.0 && c.rpm(1048 + 15) < 0.0);
+        // Rising all the way, each way
+        for v in 49..=1047u16 {
+            assert!(c.rpm(v) >= c.rpm(v - 1) && c.rpm(v + 1000) <= c.rpm(v + 999), "{v}");
+        }
+        // A straight-line fit, and the default linear curve as before
+        let lin = SpeedCurve::Fit { forward: [10.0, 0.25, 0.0], reverse: [0.0, 0.5, 0.0] };
+        assert_eq!((lin.rpm(48 + 110), lin.rpm(1048 + 100)), (400.0, -200.0));
+        let def = SpeedCurve::Linear { max_rpm: 4000.0 };
+        assert_eq!((def.rpm(547), def.rpm(1047), def.rpm(2047)), (2000.0, 4000.0, -4000.0));
+    }
+
+    /// The motor of an ESC with the measured curve settles where the curve says, the lag as before.
+    #[test]
+    fn a_fitted_esc_settles_on_its_curve() {
+        let mut ctx = TestCtx { now: Time::from_ms(1), ..Default::default() };
+        let mut e = Esc::new("esc", 6, None);
+        e.curve = SpeedCurve::APD_T200;
+        e.pin_changed(&mut ctx, 6, true);
+        for (v, want) in [(48 + 400, 2046.9), (1048 + 400, -2071.6)] {
+            assert!((e.curve.rpm(v) - want).abs() < 0.1, "{v}: {}", e.curve.rpm(v));
+            for _ in 0..1250 {
+                ctx.now += Time::from_us(400);
+                play(&mut e, &mut ctx, bidir_frame(v, false));
+            }
+            // 0.5 s is eight time constants
+            assert!((e.rpm - want).abs() < 2.0, "{v}: {}", e.rpm);
+        }
     }
 
     /// Plays a bidirectional DShot600 frame on the pin (idle high, asserted low).

@@ -34,6 +34,9 @@ each image connects as:
 | `po_half_board` | `lilboat/po_half` | 1 |
 | `puddles_backplane` | `mk2/puddles_backplane` (Ethernet, no CAN) | |
 
+titan_firmware's C apps for Mercury (no titan_firmware_rs image yet) go on `mercury/po_half` (client 1) and
+`mercury/esc_board` (ID strap GPIO 29: clients 2 and 3), as `robots/mercury.toml` puts them.
+
 ## Generated files and overlays
 
 The files are generated from titan_firmware's board headers (`lib/titan_boards/include/boards/**/*.h`) by
@@ -203,7 +206,8 @@ pulses outside the datasheet's windows are counted as timing errors.
 | `name` | `esc1`, `esc2`, ... | Name in traces and in a vehicle's thruster wiring |
 | `signal_pin` | | DShot signal pin |
 | `telemetry_pin` | | UART pin for KISS telemetry (10 bytes at 115 200 baud), if wired |
-| `max_rpm` | 4000 | Mechanical RPM at full throttle |
+| `max_rpm` | 4000 | Mechanical RPM at full throttle, the speed proportional to the throttle |
+| `throttle_fit` | | A measured speed curve instead: `{ forward = [c0, c1, c2], reverse = [c0, c1, c2] }`, the throttle step (DShot value minus 48 ahead, minus 1048 astern) at which the motor settles at `rpm`, `c0 + c1 rpm + c2 rpm²`; below `c0` it stands still. The mk2 and Mercury ESC boards give it the bench fit of their APD 80F3 ESCs and T200 thrusters ([below](#the-esc-boards-speed-curve)) |
 | `pole_pairs` | 7 | Motor pole pairs (for eRPM) |
 | `signal_loss_ms` | 250 | The motor stops this long after the last valid frame and coasts down (0: never). Assumed from BLHeli_S/Bluejay behaviour, not measured on the UWRT ESCs |
 
@@ -211,6 +215,31 @@ The model decodes DShot150-1200 frames (rate measured from the frame), answers b
 high) with its eRPM 30 µs after each frame, sends telemetry when asked, and turns a motor that follows the throttle
 with a 60 ms first-order lag (3D mode: 48-1047 forward, 1049-2047 reverse). After a signal loss it follows the
 next valid frame (there is no arming sequence). A vehicle reads each ESC's RPM ([vehicles.md](vehicles.md)).
+
+#### The ESC boards' speed curve
+
+The Talos (mk2) and Mercury ESC boards drive APD 80F3 ESCs, patched by titan_firmware for 3D DShot
+(`talos/ESCBoard/esc_firmware_patching`: 48-1047 ahead and 1049-2047 astern, both on the ESC's 0-1000 throttle
+scale), with Blue Robotics T200 thrusters. Their `throttle_fit` is the quadratic fit of throttle against RPM that
+the boards' own feed-forward uses (`ThrusterController.c`, `esc_core::controller::feed_forward`), which
+`generateFF.m` made from riptide's `calibrate_thruster.py` bench runs (throttle ±20 to ±725, the RPM the ESC
+reported and the force on a gauge; the same runs gave riptide's `force_to_rpm_coefficents`). So the firmware's
+feed-forward lands each motor next to its target, ahead and astern, and the controller's P and I terms take out the
+rest, as on the bench.
+
+| Throttle step | Ahead | Astern |
+|---|---|---|
+| 13 / 15 (the fit's offset) | starts turning | starts turning |
+| 400 | 2047 RPM | 2072 RPM |
+| 725 (the boards' hard limit) | 3068 RPM | 3100 RPM |
+| 999 (extrapolated) | 3770 RPM | 3804 RPM |
+
+The fit was measured up to the hard limit. It is indexed by the DShot direction, as the calibration ran in raw
+throttle; astern turns slightly faster and (by riptide's curve) pushes harder per RPM, which suggests the bench
+thruster had a counter-rotating propeller, so for the others the two directions may be swapped (a 1 % difference in
+speed). Not modelled: the ESCs' configured ramp of 25 % per 100 ms (`Talos_Config.cfg`; how the APD firmware
+applies it to DShot is not known), the patch's slow-down before a direction change (the lag passes through zero
+instead), and the current drawn (`current_per_krpm_a`, linear, in the telemetry).
 
 ### `[[dynamixel]]`
 
