@@ -430,7 +430,8 @@ the same commit with rustup agree. With the pinned titan_firmware_rs (94a107e, r
 | `template` | `cf8e88c45976e6e8` |
 | `esc_board` | `7092fc6b0d773de0` |
 | `ivc_board2` | `9316e6e8f76e2f2c` |
-| `talos`, `talos_mt`, `talos_t2`, `talos_t3`, `talos_t6`, `talos_t3_ls` | `a02da435f15bdb96` |
+| `talos`, `talos_mt`, `talos_t2`, `talos_t3`, `talos_t6`, `talos_t3_ls`, `talos_live_t3`, `talos_live_t3_ls` | `a02da435f15bdb96` |
+| `nereus`, `nereus_t3`, `nereus_t3_ls` | `081433a1925d555f` |
 | `ivc2_pool` | `d2a2e6a73362cf3e` |
 
 Before comparing a change against these, check the images are that build (the bench prints the same fingerprints
