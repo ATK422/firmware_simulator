@@ -11,7 +11,8 @@ their sensors, actuators, the water around them and the robot computer's side of
 | [boards.md](boards.md) | Board files: every device table and its fields, overlays, the generator, inputs |
 | [robots.md](robots.md) | Robot files and the `robot` command, mock bridges, CAN logs, replay and `can-diff`, cannelloni, `bridges`, robot in a box |
 | [acoustics.md](acoustics.md) | Acoustic environments, transducers, the shared medium, IVC link tests and sweeps |
-| [vehicles.md](vehicles.md) | Vehicle physics: vehicle files, thruster wiring, sensors following the hull, CSV logs |
+| [vehicles.md](vehicles.md) | Vehicle physics: vehicle files, thruster wiring, sensors following the hull, external vehicles, CSV logs |
+| [nereus.md](nereus.md) | The firmware in nereus: the riptide stack's thruster commands through the emulated ESC boards move nereus's vehicle |
 | [testing.md](testing.md) | Writing firmware tests with `sim_test`, the test suites, CI |
 | [tools.md](tools.md) | Developer tools: the firmware profiler, VCD waveforms, the live dashboard and its API, the MCP server for coding agents, JSON logs, robot traces |
 | [faults.md](faults.md) | Every fault, its CLI spelling and what it models; firmware findings so far |

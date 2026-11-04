@@ -182,7 +182,7 @@ piling up while the bus is unusable. `--candump` prints the traffic:
 (`(no ACK)` marks a frame nobody acknowledged, `(destroyed: ...)` one cut off by an injected bit error.)
 
 `--can vcan0 --realtime` bridges the bus to a SocketCAN interface instead, for `titan_bridge`, `canmore_cli` and
-`candump` on the host; see [robots.md](robots.md#robot-in-a-box-vcan-titan_bridge-docker) (needs the vcan module,
+`candump` on the host; see [robots.md](robots.md#robot-in-a-box-the-orins-side-on-vcan) (needs the vcan module,
 not available in the cloud environments this was written in).
 
 `--environment environments/pool.toml --position 2,6,1` puts a board with a `[transducer]` (IVCBoard2) in the

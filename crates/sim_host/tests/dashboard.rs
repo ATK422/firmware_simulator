@@ -513,3 +513,163 @@ fn a_fresh_state_is_built_on_request() {
     assert!(first < 0.0011, "not due again for an hour: {first}");
     assert!(fresh["time_s"].as_f64().unwrap() > first + 0.001, "{}", fresh["time_s"]);
 }
+
+/// `robots/talos_nereus.toml` with its boards running the small program: an external vehicle wired to two ESC boards
+/// and a depth sensor input on the camera cage.
+fn nereus_robot() -> sim_host::robot::Robot {
+    let path = common::repo().join("robots/talos_nereus.toml");
+    let mut spec: sim_host::robot::RobotSpec = toml::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+    for b in &mut spec.board {
+        b.elf = "../test_programs/embassy_blinky.elf".into();
+    }
+    sim_host::robot::Robot::from_spec(&spec, path.parent().unwrap()).unwrap()
+}
+
+/// What `integrations/nereus/firmware_bridge.py` does every tick: post the pose nereus has the vehicle at, read the
+/// thrust back; and `GET /api/thrusters` on its own. The pose moves the depth sensor at once; the thrust is each
+/// ESC's propeller speed through its thruster's curve, per ESC and per vehicle thruster.
+#[test]
+fn an_external_vehicle_is_posted_its_pose_and_reports_its_thrust() {
+    use sim_devices::dshot::Esc;
+    let mut r = nereus_robot();
+    let infos = (0..r.boards.len())
+        .map(|i| BoardInfo { name: r.names[i].clone(), inputs: r.inputs[i].clone(), ..Default::default() })
+        .collect();
+    let mut d = Dashboard::start("127.0.0.1:0", infos, r.bus_names.clone()).unwrap();
+    // ESC board 1's third ESC (VLS, thruster 6) at 2000 RPM, its fourth (VLP, inverted) at 2000 too
+    let esc1 = r.index("esc1").unwrap();
+    for e in r.boards[esc1].machine.sys.pin_devices.iter_mut().filter_map(|d| d.as_any_mut()?.downcast_mut::<Esc>()) {
+        if e.name == "esc3" || e.name == "esc4" {
+            e.rpm = 2000.0;
+        }
+    }
+    let addr = d.addr;
+    let h = std::thread::spawn(move || {
+        let read = request(addr, "GET", "/api/thrusters", "");
+        let posted = request(
+            addr,
+            "POST",
+            "/api/vehicle",
+            r#"{"vehicle": "talos", "position_m": [1.0, 2.0, 1.5], "rpy_deg": [0.0, 0.0, 90.0], "velocity_mps": [0.1, 0.0, 0.0]}"#,
+        );
+        let quat = request(
+            addr,
+            "POST",
+            "/api/vehicle",
+            r#"{"position_m": [1.0, 2.0, 1.5], "quat_wxyz": [2.0, 0.0, 0.0, 0.0]}"#,
+        );
+        let errors = [
+            request(
+                addr,
+                "POST",
+                "/api/vehicle",
+                r#"{"vehicle": "puddles", "position_m": [0, 0, 0], "rpy_deg": [0, 0, 0]}"#,
+            ),
+            request(addr, "POST", "/api/vehicle", r#"{"position_m": [0, 0], "rpy_deg": [0, 0, 0]}"#),
+            request(addr, "POST", "/api/vehicle", r#"{"position_m": [0, 0, 0]}"#),
+            request(
+                addr,
+                "POST",
+                "/api/vehicle",
+                r#"{"position_m": [0, 0, 0], "rpy_deg": [0, 0, 0], "quat_wxyz": [1, 0, 0, 0]}"#,
+            ),
+            request(addr, "POST", "/api/vehicle", "not json"),
+            request(addr, "PUT", "/api/thrusters", ""),
+        ];
+        (read, posted, quat, errors)
+    });
+    while !h.is_finished() {
+        d.service_robot(&mut r, &[]);
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+    let (read, posted, quat, errors) = h.join().unwrap();
+    assert_eq!(read.0, 200, "{}", read.1);
+    let read = json(&read.1);
+    assert_eq!(read["ok"], true);
+    assert_eq!(read["time_s"], 0.0);
+    // Every ESC of both boards, in board order, the two spinning ones with their thruster's thrust
+    let escs = read["escs"].as_array().unwrap();
+    assert_eq!(escs.len(), 8);
+    assert_eq!(
+        (escs[0]["board"].as_str(), escs[0]["esc"].as_str(), escs[0]["thruster"].as_str()),
+        (Some("esc0"), Some("esc1"), Some("VUS"))
+    );
+    let curve = |rpm: f64| 24.0 * (rpm / 3170.95).powi(2);
+    let (vls, vlp) = (&escs[6], &escs[7]);
+    assert_eq!((vls["thruster"].as_str(), vls["rpm"].as_f64()), (Some("VLS"), Some(2000.0)));
+    assert!((vls["thrust_n"].as_f64().unwrap() - curve(2000.0)).abs() < 1e-9, "{vls}");
+    // VLP is inverted: forward speed is its weak (reverse-curve) direction... which for this propeller is the strong one
+    assert!((vlp["thrust_n"].as_f64().unwrap() + 28.07 * (2000.0f64 / 3170.95).powi(2)).abs() < 1e-9, "{vlp}");
+    assert_eq!(escs[0]["thrust_n"], 0.0);
+    let v = &read["vehicles"][0];
+    assert_eq!((v["name"].as_str(), v["external"].as_bool()), (Some("talos"), Some(true)));
+    let thrusters = v["thrusters"].as_array().unwrap();
+    assert_eq!(thrusters.len(), 8);
+    assert_eq!(thrusters[6]["thrust_n"], vls["thrust_n"]);
+    assert_eq!((thrusters[6]["board"].as_str(), thrusters[6]["esc"].as_str()), (Some("esc1"), Some("esc3")));
+    // The posted pose: answered with the same view, the vehicle there, its depth sensor 13.5 cm above base_link
+    assert_eq!(posted.0, 200, "{}", posted.1);
+    let posted = json(&posted.1);
+    assert!(posted["message"].as_str().unwrap().contains("talos at [1.000, 2.000, 1.500]"), "{posted}");
+    assert_eq!(posted["escs"].as_array().unwrap().len(), 8);
+    assert_eq!(quat.0, 200, "{}", quat.1);
+    let veh = &r.vehicles[0];
+    assert_eq!(veh.poses_set, 2);
+    assert_eq!(veh.vehicle.state.position, [1.0, 2.0, 1.5]);
+    assert_eq!(veh.vehicle.state.attitude, sim_physics::Quat::IDENTITY, "the quaternion is normalised");
+    assert_eq!(veh.vehicle.state.velocity, [0.1, 0.0, 0.0], "kept from the first post");
+    let cage = r.index("camera_cage").unwrap();
+    let want = 101_325.0 + 997.0 * 9.80665 * (1.5 - 0.135);
+    assert!((r.inputs[cage].get("depth.pressure_pa") - want).abs() < 1e-6);
+    // Mistakes are answered with what was wrong
+    let codes: Vec<u16> = errors.iter().map(|e| e.0).collect();
+    assert_eq!(codes, [422, 400, 400, 400, 400, 405], "{errors:?}");
+    let e0 = json(&errors[0].1);
+    assert_eq!(e0["error"], "no vehicle \"puddles\"; there are: talos");
+    assert!(errors[1].1.contains("position_m: expected 3 numbers"), "{}", errors[1].1);
+    assert!(errors[2].1.contains("rpy_deg or quat_wxyz: missing"), "{}", errors[2].1);
+    assert!(errors[3].1.contains("not both"), "{}", errors[3].1);
+    assert!(errors[4].1.contains("bad JSON"), "{}", errors[4].1);
+}
+
+/// A single board's run lists its ESCs on `/api/thrusters` and has no vehicle to post a pose to.
+#[test]
+fn a_single_board_has_escs_but_no_vehicle() {
+    let mut s = common::boot(&common::repo().join("test_programs/embassy_blinky.elf"), None);
+    let board = sim_host::board::Board::load(&common::repo().join("boards/mk2/esc_board.toml")).unwrap();
+    board.apply(&mut s.machine).unwrap();
+    let mut d =
+        Dashboard::start("127.0.0.1:0", vec![BoardInfo { name: "esc".into(), ..Default::default() }], vec![]).unwrap();
+    let (read, post) = run_with_client(&mut s, &mut d, |addr| {
+        (
+            request(addr, "GET", "/api/thrusters", ""),
+            request(addr, "POST", "/api/vehicle", r#"{"position_m": [0, 0, 0], "rpy_deg": [0, 0, 0]}"#),
+        )
+    });
+    assert_eq!(read.0, 200, "{}", read.1);
+    let read = json(&read.1);
+    assert_eq!(read["escs"].as_array().unwrap().len(), 4);
+    assert_eq!(read["escs"][3]["esc"], "esc4");
+    assert_eq!(read["escs"][3]["thruster"], Value::Null);
+    assert_eq!(read["vehicles"], serde_json::json!([]));
+    assert_eq!(post.0, 422);
+    assert!(post.1.contains("no vehicle"), "{}", post.1);
+}
+
+#[test]
+fn poses_are_parsed() {
+    use sim_host::dashboard::parse_pose;
+    let (name, p) =
+        parse_pose(&serde_json::json!({"position_m": [1, 2, 3], "rpy_deg": [0, 90, 0], "rate_dps": [0, 0, 180]}))
+            .unwrap();
+    assert_eq!(name, "");
+    assert_eq!(p.position, [1.0, 2.0, 3.0]);
+    assert!((p.attitude.euler()[1] - std::f64::consts::FRAC_PI_2).abs() < 1e-6);
+    assert_eq!(p.velocity, None);
+    assert!((p.rate.unwrap()[2] - std::f64::consts::PI).abs() < 1e-12);
+    let bad = |v: Value| parse_pose(&v).unwrap_err();
+    assert!(bad(serde_json::json!({"position_m": [1, 2, "x"], "rpy_deg": [0, 0, 0]})).contains("position_m"));
+    assert!(bad(serde_json::json!({"position_m": [1, 2, 3], "quat_wxyz": [0, 0, 0, 0]})).contains("not a rotation"));
+    assert!(bad(serde_json::json!({"vehicle": 3, "position_m": [1, 2, 3], "rpy_deg": [0, 0, 0]})).contains("vehicle"));
+    assert!(bad(serde_json::json!({"rpy_deg": [0, 0, 0]})).contains("position_m: missing"));
+}

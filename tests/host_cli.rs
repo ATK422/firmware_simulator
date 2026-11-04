@@ -277,3 +277,132 @@ fn robot_replay_maps_interfaces() {
     assert!(err.contains("frames on can1 are not replayed"), "{err}");
     let _ = std::fs::remove_dir_all(&d);
 }
+
+/// The emulator <-> nereus bridge's Python: its logic and pack generation tests (no ROS needed), and the files that
+/// need ROS compile.
+#[test]
+fn nereus_bridge_python() {
+    let dir = repo().join("integrations/nereus");
+    let (code, out, err) = run(Command::new("python3")
+        .args(["-I", "-B", "-m", "unittest", "discover", "-s"])
+        .arg(&dir)
+        .args(["-p", "test_*.py"]));
+    assert_eq!(code, 0, "{out}{err}");
+    assert!(err.contains("OK"), "{err}");
+    for f in ["firmware_bridge.py", "nereus_firmware.launch.py", "make_packs.py"] {
+        let src = std::fs::read_to_string(dir.join(f)).unwrap();
+        let parse = "import ast, sys; ast.parse(open(sys.argv[1]).read())";
+        let (code, _, err) = run(Command::new("python3").args(["-I", "-B", "-c", parse]).arg(dir.join(f)));
+        assert_eq!(code, 0, "{f}: {err}");
+        assert!(src.starts_with("#!/usr/bin/env python3") || f.ends_with(".launch.py"), "{f}");
+    }
+}
+
+/// An `ip` stand-in for the scripts' interface checks: `STUB_DIR/links` lists `NAME KIND` per interface.
+fn stub_ip(dir: &Path) {
+    let ip = r#"#!/bin/bash
+echo "ip $*" >> "$STUB_DIR/log"
+[ "$1" = -details ] && shift
+if [ "$1 $2" = "link show" ]; then
+    kind=$(grep "^$3 " "$STUB_DIR/links" 2>/dev/null | cut -d' ' -f2) || exit 1
+    [ -n "$kind" ] || exit 1
+    echo "1: $3: <NOARP,UP> mtu 72"; echo "    link/can  $kind"
+fi
+"#;
+    let p = dir.join("ip");
+    std::fs::write(&p, ip).unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
+}
+
+fn script(stubs: &Path, name: &str, args: &[&str], env: &[(&str, &str)]) -> (i32, String, String) {
+    let path = format!("{}:{}", stubs.display(), std::env::var("PATH").unwrap());
+    let mut cmd = Command::new("bash");
+    cmd.arg(repo().join("scripts").join(name)).args(args).env("PATH", path).env("STUB_DIR", stubs);
+    cmd.env_remove("ROS_DISTRO").env("FIRMWARE_SIMULATOR", env!("CARGO_BIN_EXE_firmware_simulator"));
+    for (k, v) in env {
+        cmd.env(k, v);
+    }
+    run(&mut cmd)
+}
+
+/// `scripts/robot_in_a_box.sh` and `scripts/nereus_firmware_sim.sh` (which need vcan, ROS 2 and nereus to really run)
+/// in `--dry-run`: the commands they would run, and the checks that stop them.
+#[test]
+fn robot_in_a_box_and_nereus_scripts() {
+    for s in ["robot_in_a_box.sh", "nereus_firmware_sim.sh", "build_c_boards.sh"] {
+        check_bash(&repo().join("scripts").join(s));
+        if Command::new("shellcheck").arg("--version").output().is_ok() {
+            let (code, out, _) = run(Command::new("shellcheck").arg(repo().join("scripts").join(s)));
+            assert_eq!(code, 0, "shellcheck {s}:\n{out}");
+        }
+    }
+    let d = scratch("box");
+    stub_ip(&d);
+    let tf = d.join("tf");
+    let tf = tf.to_str().unwrap();
+    // C images: the emulator on can0 and can1, the Orin's micro-ROS agents (no ROS here, so printed)
+    let (code, out, err) = script(&d, "robot_in_a_box.sh", &["--dry-run"], &[("TITAN_FIRMWARE_DIR", tf)]);
+    assert_eq!(code, 0, "{err}");
+    assert!(out.contains("scripts/vcan_up.sh can0 can1"), "{out}");
+    assert!(
+        out.contains("robots/talos_c.toml --can internal=can0 --realtime") && out.contains("--can external=can1"),
+        "{out}"
+    );
+    assert!(out.contains("ros2 launch riptide_hardware2 copro_agent.launch.py robot:=talos"), "{out}");
+    assert!(out.contains("No sourced ROS 2 with the riptide workspace found"), "{out}");
+    // Rust images: titan_bridge per board, from the bridges command
+    let (code, out, err) = script(&d, "robot_in_a_box.sh", &["--dry-run", "--rust", "--no-vcan"], &[]);
+    assert_eq!(code, 0, "{err}");
+    assert!(!out.contains("vcan_up") && out.contains("robots/talos.toml --can internal=can0"), "{out}");
+    assert!(out.contains("bridges") && out.contains("--format launch"), "{out}");
+    // A real CAN adapter called can0 is never used
+    std::fs::write(d.join("links"), "can0 mttcan\n").unwrap();
+    let (code, _, err) = script(&d, "robot_in_a_box.sh", &["--dry-run"], &[("TITAN_FIRMWARE_DIR", tf)]);
+    assert_eq!(code, 1);
+    assert!(err.contains("can0 exists and is not a vcan interface"), "{err}");
+    std::fs::write(d.join("links"), "can0 vcan\ncan1 vcan\n").unwrap();
+    let (code, _, err) = script(&d, "robot_in_a_box.sh", &["--dry-run", "--no-vcan"], &[("TITAN_FIRMWARE_DIR", tf)]);
+    assert_eq!(code, 0, "{err}");
+    // A robot file without the external bus leaves can1 alone
+    let (code, out, err) =
+        script(&d, "robot_in_a_box.sh", &["--dry-run", "--no-vcan", "--robot", "robots/talos_c_nereus.toml"], &[]);
+    assert_eq!(code, 0, "{err}");
+    assert!(out.contains("--dashboard 127.0.0.1:8080") && !out.contains("external=can1"), "{out}");
+    let (code, _, err) = script(&d, "robot_in_a_box.sh", &["--stack", "maybe"], &[]);
+    assert_eq!(code, 2, "{err}");
+    let (code, _, err) = script(&d, "robot_in_a_box.sh", &[], &[]);
+    assert!(code == 1 && err.contains("TITAN_FIRMWARE_DIR is not set"), "{err}");
+
+    // nereus: a stand-in checkout with the launch file it includes
+    let nereus = d.join("nereus");
+    std::fs::create_dir_all(nereus.join("integrations/uwrt/launch")).unwrap();
+    std::fs::write(nereus.join("integrations/uwrt/launch/sim.launch.py"), "").unwrap();
+    let n = nereus.to_str().unwrap();
+    let (code, out, err) = script(
+        &d,
+        "nereus_firmware_sim.sh",
+        &["--dry-run", "--nereus", n, "--pool", "rpac"],
+        &[("TITAN_FIRMWARE_DIR", tf)],
+    );
+    assert_eq!(code, 0, "{err}");
+    // What's missing is listed, and the commands are printed anyway
+    assert!(err.contains("nereus: not built") && err.contains("ROS 2: not sourced"), "{err}");
+    assert!(out.contains("make_packs.py") && out.contains("--pool rpac"), "{out}");
+    assert!(out.contains("robots/talos_c_nereus.toml --can internal=can0 --realtime"), "{out}");
+    assert!(out.contains("--dashboard 127.0.0.1:8080"), "{out}");
+    assert!(out.contains("nereus_firmware.launch.py") && out.contains("scenarios/talos_firmware_rpac"), "{out}");
+    assert!(!out.contains("firmware:=rust"), "{out}");
+    let (code, out, err) =
+        script(&d, "nereus_firmware_sim.sh", &["--dry-run", "--nereus", n, "--rust", "--no-vcan"], &[]);
+    assert_eq!(code, 0, "{err}");
+    assert!(out.contains("robots/talos_nereus.toml") && out.contains("firmware:=rust"), "{out}");
+    assert!(out.contains("bridges_launch:="), "{out}");
+    // Without --dry-run the missing pieces stop it before anything starts
+    let (code, out, err) = script(&d, "nereus_firmware_sim.sh", &["--nereus", n], &[]);
+    assert_eq!(code, 1, "{out}");
+    assert!(err.contains("TITAN_FIRMWARE_DIR is not set") && !out.contains("+ "), "{err}{out}");
+    let (code, _, _) = script(&d, "nereus_firmware_sim.sh", &["--bogus"], &[]);
+    assert_eq!(code, 2);
+    let _ = std::fs::remove_dir_all(&d);
+}

@@ -434,3 +434,61 @@ fn robot_gdb_debugs_one_board() {
         assert!(!ok && err.contains(want), "{arg}: {err}");
     }
 }
+
+/// The C robot files take their images from `$TITAN_FIRMWARE_DIR` at each project's `build/NAME_with_bl.uf2` (a
+/// stand-in program here), and `robots/talos_c_nereus.toml`'s external vehicle needs the dashboard that moves it;
+/// `--external-vehicle` makes a robot file's vehicle external, and names the vehicles when it is wrong.
+#[test]
+fn c_talos_robot_files_and_external_vehicles() {
+    let tf = temp("titan_firmware_talos");
+    for (dir, name) in [
+        ("talos/PoacBoard", "poac_board"),
+        ("talos/ESCBoard", "esc_board"),
+        ("talos/CameraCageBB", "camera_cage_bb"),
+        ("talos/Actuator", "actuator_mk2"),
+        ("talos/LEDBoard", "led_board"),
+        ("SBCBoard", "sbc_board"),
+        ("talos/SmartBattery", "smart_battery"),
+    ] {
+        let build = tf.join(dir).join("build");
+        std::fs::create_dir_all(&build).unwrap();
+        std::fs::copy(
+            repo().join("test_programs/c_dual_usb/c_dual_usb.elf"),
+            build.join(format!("{name}_with_bl.uf2")),
+        )
+        .unwrap();
+    }
+    let robot = |file: &str, extra: &[&str]| {
+        let out = Command::new(env!("CARGO_BIN_EXE_firmware_simulator"))
+            .args(["robot", path(&repo().join("robots").join(file)), "--time", "50ms"])
+            .args(extra)
+            .env("TITAN_FIRMWARE_DIR", &tf)
+            .output()
+            .unwrap();
+        (
+            out.status.success(),
+            String::from_utf8_lossy(&out.stdout).into_owned() + &String::from_utf8_lossy(&out.stderr),
+        )
+    };
+    let (ok, text) = robot("talos_c.toml", &[]);
+    assert!(ok, "{text}");
+    assert!(text.contains("8 board(s) on 2 bus(es)") && text.contains("vehicle talos: at"), "{text}");
+    let (ok, text) = robot("talos_c_nereus.toml", &[]);
+    assert!(!ok && text.contains("vehicle talos is external") && text.contains("--dashboard"), "{text}");
+    let (ok, text) = robot("talos_c_nereus.toml", &["--dashboard", "127.0.0.1:0"]);
+    assert!(ok, "{text}");
+    assert!(text.contains("4 board(s) on 1 bus(es)") && text.contains("moved externally"), "{text}");
+    // Still at the surface, where it started: nothing posted a pose
+    assert!(text.contains("vehicle talos: at [0.00, 0.00, 0.00] m"), "{text}");
+    let (ok, text) = robot("talos_c.toml", &["--external-vehicle", "nope"]);
+    assert!(!ok && text.contains("--external-vehicle: no vehicle \"nope\" (the robot has: talos)"), "{text}");
+    let (ok, text) = robot("talos_c.toml", &["--external-vehicle", "talos", "--dashboard", "127.0.0.1:0"]);
+    assert!(ok && text.contains("vehicle talos is moved externally"), "{text}");
+    let out = Command::new(env!("CARGO_BIN_EXE_firmware_simulator"))
+        .args(["robot", path(&repo().join("robots/talos_c.toml")), "--time", "1ms"])
+        .env_remove("TITAN_FIRMWARE_DIR")
+        .output()
+        .unwrap();
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(!out.status.success() && err.contains("TITAN_FIRMWARE_DIR is not set"), "{err}");
+}
