@@ -21,7 +21,7 @@ Every run is repeatable: the same firmware and inputs give exactly the same resu
 **Full guide: [docs/](docs/README.md)** · Design and milestones: [PLAN.md](PLAN.md)
 
 - [Quick start](#quick-start)
-- [More ways to use it](#more-ways-to-use-it): coding agents (MCP), C firmware with micro-ROS, the robot computer on vcan, the firmware in nereus, IVC in the water
+- [More ways to use it](#more-ways-to-use-it): tests in YAML and firmware A/B comparisons, coding agents (MCP), C firmware with micro-ROS, the robot computer on vcan, the firmware in nereus, IVC in the water
 - [What it can do](#what-it-can-do)
 - [Boards, firmware and robots](#boards-firmware-and-robots)
 - [Architecture](#architecture)
@@ -131,6 +131,19 @@ Always test in release mode. Tests whose firmware is not built print `skipping: 
 [the walkthrough](docs/testing.md#a-first-test-step-by-step).
 
 ## More ways to use it
+
+**Write tests in YAML and compare firmware builds.** A scenario file names a robot (or one board), the faults and
+inputs to apply when, and what must happen: log lines, firmware status fields and faults, CAN frames and rates,
+the link, GPIO levels, ESC speeds, the vehicle's depth, resets, IVC bytes. `firmware_simulator scenario` runs them
+(in parallel, deterministically) with a ✓ or ✗ per step and its evidence, JUnit XML for CI and JSON; the ones in
+`scenarios/` run in `cargo test`. `firmware_simulator compare` runs them with two firmware builds and writes a
+Markdown report of what changed (checks, log lines, CAN traffic per message, boot and connect times, faults, resets,
+ESC speeds, CPU load) for a pull request ([scenarios.md](docs/scenarios.md)):
+
+```bash
+firmware_simulator scenario scenarios/ --junit results.xml
+firmware_simulator compare --a $FW --b ~/other-build/thumbv6m-none-eabi/release scenarios/ -o ab.md
+```
 
 **Let a coding agent drive it (MCP).** `firmware_simulator mcp` is an MCP server: an agent can run a board or a
 robot, read logs, board state and CAN frames as JSON, inject faults, set inputs, pause, and wait for a log line,

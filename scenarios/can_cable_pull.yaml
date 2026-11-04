@@ -1,0 +1,30 @@
+# The camera cage's CAN cable is pulled and plugged back in while the rest of the bus carries on. The board loses
+# ROS when the bridge's pings stop reaching it, hears them again as soon as it is plugged back in, and its own
+# traffic comes back afterwards; the other boards never notice.
+#
+# How long its traffic takes to come back depends on the firmware: with titan_firmware_rs at 342ee0d the CAN transmit
+# queue stalls once its retransmission attempts run out while unplugged (faults.md, finding 1), so nothing goes out
+# until the driver's offline reset about 10 s after the pull. Later firmware retries without limit and is back at
+# once. The 12 s window passes with both.
+name: Camera cage recovers after its CAN cable is pulled
+robot: {file: robots/talos.toml, boards: [poac, camera_cage, sbc]}
+bridges: all
+time: 17s
+steps:
+  - expect: {board: camera_cage, log: ROS connected, within: 1s}
+  - at: 2s
+    fault: camera_cage:can-unplug
+  - expect: {board: camera_cage, log: Lost connection to ROS, within: 1s}
+  - expect: {board: camera_cage, link: down, within: 1s}
+  - at: 4s
+    fault: camera_cage:can-plug
+  - expect: {board: camera_cage, log: ROS connected, within: 500ms}
+  - expect: {board: camera_cage, link: up, within: 12s}
+  # Its CANmore heartbeat (client 4: 0x12F) is back on the bus, twice a second
+  - expect: {bus: internal, frame: {id: 0x12F, extended: false}, count: {min: 2}, within: 1.5s}
+  - expect: {board: camera_cage, status: {board_name: mk2/camera_cage_bb, clear: [FAULT_CAN_INTERNAL_ERROR]}, within: 1.5s}
+  # The other boards stay connected throughout
+  - never: {board: poac, log: Lost connection to ROS}
+  - never: {board: sbc, log: Lost connection to ROS}
+  - always: {board: poac, link: up, at: 1s}
+  - never: {board: camera_cage, log: PANIC}

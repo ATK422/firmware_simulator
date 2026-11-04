@@ -1,0 +1,20 @@
+# Two vehicles in the pool, each with an IVCBoard2 on its own bus: a byte sent acoustically from one reaches the
+# other's titan_bridge, and back. IVCBoard2 hears nothing until its noise floor has settled (about 2.5 s after
+# power-on), and a packet takes about 9 s.
+name: An IVC byte crosses the pool both ways
+robot: robots/ivc2_pool.toml
+bridges: [talos:8, surface:8]
+time: 23s
+steps:
+  - expect: {board: talos_ivc, log: ROS connected, within: 1s}
+  - expect: {board: surface_ivc, log: ROS connected, at: 1s}
+  - at: 3.5s
+    ivc_send: talos_ivc:0x5a
+  - expect: {board: talos_ivc, log: Transmitting 0x5a, within: 200ms}
+  - expect: {board: surface_ivc, ivc: 0x5a, within: 10s}
+  - at: 13s
+    ivc_send: surface_ivc:0xc3
+  - expect: {board: talos_ivc, ivc: 0xc3, within: 10s}
+  # Nothing else arrives, and the sender does not hear itself
+  - expect: {board: surface_ivc, ivc: any, count: 1, at: 0s, until: 23s}
+  - never: {board: talos_ivc, ivc: 0x5a}

@@ -1,5 +1,5 @@
 # Builds the emulator and the titan_firmware_rs images, then runs every test: the emulator's own, a smoke test for
-# every board image, the robot, IVC link and sweep tests, and Puddles over UDP.
+# every board image, the robot, IVC link and sweep tests, Puddles over UDP, and the YAML scenarios in scenarios/.
 #
 # external/titan_firmware_rs is the private repository ATK422/titan_firmware_rs: give the workflow a token that can
 # read it as the repository secret TITAN_FIRMWARE_RS_TOKEN (a fine-grained token with "Contents: read" on that
@@ -60,6 +60,21 @@ jobs:
       - name: Smoke test and sweep tables
         if: always()
         run: grep -E "^(board|[a-z_0-9]+ +[0-9n]|IVC| +[0-9]+ m )" test.log || true
+
+      # The YAML scenarios (docs/scenarios.md) also ran in `cargo test`; here the command writes their JUnit XML
+      - name: Scenarios
+        if: always()
+        run: |
+          cargo build --release
+          target/release/firmware_simulator scenario scenarios/ --junit scenarios.xml --quiet
+
+      - name: Scenario results (JUnit)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: scenarios-junit
+          path: scenarios.xml
+          if-no-files-found: ignore
 
   macos:
     # The emulator also builds and runs natively on macOS (Apple silicon). SocketCAN (vcan, titan_bridge) is Linux
