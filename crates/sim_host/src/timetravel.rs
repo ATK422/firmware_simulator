@@ -260,10 +260,15 @@ pub trait Rewindable {
     fn run_until(&mut self, end: Time) -> Ran;
     /// A copy of everything; `flash` holds each board's flash from the last checkpoint, to share when unchanged
     /// (and is updated). Returns it with about how many bytes it holds.
-    fn checkpoint(&mut self, flash: &mut Vec<Option<Arc<Vec<u8>>>>) -> (Box<dyn Any + Send>, usize);
+    fn checkpoint(&mut self, flash: &mut Vec<Option<crate::session::SharedMemory>>) -> (Box<dyn Any + Send>, usize);
     /// Puts everything back as in checkpoint `c`; what the boards collected (logs, text) by then comes from
     /// `collected` (kept up to date here) where the boards have less now.
-    fn restore(&mut self, c: &(dyn Any + Send), collected: &mut Vec<crate::session::Collected>);
+    fn restore(
+        &mut self,
+        c: &(dyn Any + Send),
+        collected: &mut Vec<crate::session::Collected>,
+        flash: &mut Vec<Option<crate::session::SharedMemory>>,
+    );
     /// Cuts `collected` to what the boards have now (the future changed).
     fn cut_collected(&mut self, collected: &mut Vec<crate::session::Collected>) {
         collected.resize_with(self.boards(), Default::default);
@@ -343,9 +348,9 @@ fn session_tap(s: &mut Session, board: usize, taps: &mut Taps) {
     tap_pty(&mut s.usb_cdc2_pty, &mut taps.list);
 }
 
-fn session_checkpoint(s: &mut Session, flash: &mut Option<Arc<Vec<u8>>>) -> SessionCheckpoint {
+fn session_checkpoint(s: &mut Session, flash: &mut Option<crate::session::SharedMemory>) -> SessionCheckpoint {
     let c = s.checkpoint(flash.as_ref());
-    *flash = Some(c.flash().clone());
+    *flash = Some(c.memory().clone());
     c
 }
 
@@ -368,16 +373,23 @@ impl Rewindable for Session {
     fn run_until(&mut self, end: Time) -> Ran {
         session_ran(Session::run_until(self, end))
     }
-    fn checkpoint(&mut self, flash: &mut Vec<Option<Arc<Vec<u8>>>>) -> (Box<dyn Any + Send>, usize) {
+    fn checkpoint(&mut self, flash: &mut Vec<Option<crate::session::SharedMemory>>) -> (Box<dyn Any + Send>, usize) {
         flash.resize(1, None);
         let c = session_checkpoint(self, &mut flash[0]);
         let bytes = c.bytes();
         (Box::new(c), bytes)
     }
-    fn restore(&mut self, c: &(dyn Any + Send), collected: &mut Vec<crate::session::Collected>) {
+    fn restore(
+        &mut self,
+        c: &(dyn Any + Send),
+        collected: &mut Vec<crate::session::Collected>,
+        flash: &mut Vec<Option<crate::session::SharedMemory>>,
+    ) {
+        let c = c.downcast_ref::<SessionCheckpoint>().expect("a session checkpoint");
         collected.resize_with(1, Default::default);
         self.keep_collected(&mut collected[0]);
-        self.rewind_to_with(c.downcast_ref::<SessionCheckpoint>().expect("a session checkpoint"), &collected[0]);
+        self.rewind_to_with(c, &collected[0]);
+        *flash = vec![Some(c.memory().clone())];
     }
     fn boards(&self) -> usize {
         1
@@ -439,7 +451,7 @@ impl Rewindable for Robot {
             None => Ran::Reached,
         }
     }
-    fn checkpoint(&mut self, flash: &mut Vec<Option<Arc<Vec<u8>>>>) -> (Box<dyn Any + Send>, usize) {
+    fn checkpoint(&mut self, flash: &mut Vec<Option<crate::session::SharedMemory>>) -> (Box<dyn Any + Send>, usize) {
         flash.resize(self.boards.len(), None);
         let boards: Vec<SessionCheckpoint> =
             self.boards.iter_mut().zip(flash.iter_mut()).map(|(b, f)| session_checkpoint(b, f)).collect();
@@ -462,13 +474,19 @@ impl Rewindable for Robot {
         let c = RobotCheckpoint { boards, buses, vehicles, medium, now: self.now, power_on: self.power_on.clone() };
         (Box::new(c), bytes)
     }
-    fn restore(&mut self, c: &(dyn Any + Send), collected: &mut Vec<crate::session::Collected>) {
+    fn restore(
+        &mut self,
+        c: &(dyn Any + Send),
+        collected: &mut Vec<crate::session::Collected>,
+        flash: &mut Vec<Option<crate::session::SharedMemory>>,
+    ) {
         let c = c.downcast_ref::<RobotCheckpoint>().expect("a robot checkpoint");
         collected.resize_with(self.boards.len(), Default::default);
         for ((b, s), k) in self.boards.iter_mut().zip(&c.boards).zip(collected.iter_mut()) {
             b.keep_collected(k);
             b.rewind_to_with(s, k);
         }
+        *flash = c.boards.iter().map(|b| Some(b.memory().clone())).collect();
         for (rb, (copy, len)) in self.buses.iter_mut().zip(&c.buses) {
             let mut record = rb.bus.record.take();
             if let (Some(r), Some(len)) = (&mut record, len) {
@@ -655,7 +673,7 @@ pub struct TimeTravel {
     cursor: Cursor,
     /// The current position.
     here: Pos,
-    flash: Vec<Option<Arc<Vec<u8>>>>,
+    flash: Vec<Option<crate::session::SharedMemory>>,
     taps: Taps,
     collected: Vec<crate::session::Collected>,
     inputs: Vec<Inputs>,
@@ -801,7 +819,7 @@ impl TimeTravel {
 
     fn restore(&mut self, target: &mut dyn Rewindable, i: usize) {
         let c = &self.checkpoints[i];
-        restore_from(target, c, &mut self.taps.list, &self.inputs, &mut self.collected);
+        restore_from(target, c, &mut self.taps.list, &self.inputs, &mut self.collected, &mut self.flash);
         self.cursor = c.cursor;
         self.here = Pos::Boundary(c.time);
         self.last_inputs = c.inputs.clone();
@@ -1249,7 +1267,7 @@ impl TimeTravel {
     fn goto_cached(&mut self, target: &mut dyn Rewindable, prev: Time) -> Travelled {
         let Some(c) = &self.steps_cache else { return Travelled::Beginning };
         let (board, core, at) = (c.board, c.core, c.cp.time);
-        restore_from(target, &c.cp, &mut self.taps.list, &self.inputs, &mut self.collected);
+        restore_from(target, &c.cp, &mut self.taps.list, &self.inputs, &mut self.collected, &mut self.flash);
         self.cursor = c.cp.cursor;
         self.last_inputs = c.cp.inputs.clone();
         self.here = Pos::At { board, core, time: at };
@@ -1418,8 +1436,9 @@ fn restore_from(
     taps: &mut [Box<dyn TapControl>],
     inputs: &[Inputs],
     collected: &mut Vec<crate::session::Collected>,
+    flash: &mut Vec<Option<crate::session::SharedMemory>>,
 ) {
-    target.restore(&*c.state, collected);
+    target.restore(&*c.state, collected, flash);
     for (t, &calls) in taps.iter_mut().zip(&c.taps) {
         t.seek(calls);
     }

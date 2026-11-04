@@ -83,6 +83,10 @@ pub struct System {
     pub rom: Vec<u8>,
     pub sram: Vec<u8>,
     pub flash: Vec<u8>,
+    /// Counts what may have changed `flash`: SSI and IO_QSPI accesses (the flash chip's commands), `poke`, trapped
+    /// flash functions, loading a flash file. Time travel shares the flash between checkpoints while it does not
+    /// change; a host writing `flash` directly bumps it too.
+    pub flash_writes: u64,
     pub xip_sram: Vec<u8>,
     pub clocks: Clocks,
     /// Clock frequencies after the last clock tree change.
@@ -195,6 +199,7 @@ impl System {
             rom,
             sram: vec![0; SRAM_SIZE],
             flash: vec![0xFF; flash_size.max(4096)],
+            flash_writes: 0,
             xip_sram: vec![0; XIP_SRAM_SIZE],
             clk_sys: ClockPeriod::from_hz(freqs.clk_sys),
             freqs,
@@ -1374,6 +1379,7 @@ impl System {
             ROSC_BASE => self.clocks.rosc.read(off),
             VREG_AND_CHIP_RESET_BASE => self.vreg.read(off),
             XIP_SSI_BASE => {
+                self.flash_writes += 1;
                 let v = self.ssi.read(off, now, &mut self.flash);
                 self.refresh_xip();
                 v
@@ -1528,6 +1534,7 @@ impl System {
             }),
             VREG_AND_CHIP_RESET_BASE => self.vreg.write(off, value, mode).then_some(()),
             XIP_SSI_BASE => {
+                self.flash_writes += 1;
                 let ok = self.ssi.write(off, value, WriteMode::Normal, now, &mut self.flash);
                 self.refresh_xip();
                 ok.then_some(())
@@ -1535,6 +1542,7 @@ impl System {
             IO_QSPI_BASE => {
                 let ok = self.io_qspi.write(off, value, mode);
                 let o = self.io_qspi.cs_override();
+                self.flash_writes += 1;
                 self.ssi.set_cs_override(o, now, &mut self.flash);
                 self.refresh_xip();
                 ok.then_some(())
@@ -1750,6 +1758,7 @@ impl System {
             0x0 if (addr as usize) < ROM_SIZE => mem::write(&mut self.rom, addr as usize, size, value),
             0x1 if (0x10..=0x13).contains(&(addr >> 24)) => {
                 let off = self.flash_offset(addr);
+                self.flash_writes += 1;
                 mem::write(&mut self.flash, off, size, value)
             }
             0x1 if addr >> 24 == 0x15 && ((addr & 0x00FF_FFFF) as usize) < XIP_SRAM_SIZE => {

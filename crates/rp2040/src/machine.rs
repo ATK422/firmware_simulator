@@ -329,7 +329,7 @@ impl Snapshot {
             + self.sys.flash.len()
             + self.sys.rom.len()
             + self.sys.usb.dpram.len()
-            + 64 * 1024
+            + 16 * 1024
     }
 
     /// The time the snapshot was taken at (the machine's [`Machine::now`]).
@@ -597,6 +597,7 @@ impl Machine {
             Ok(data) => {
                 let n = data.len().min(self.sys.flash.len());
                 self.sys.flash[..n].copy_from_slice(&data[..n]);
+                self.sys.flash_writes += 1;
                 Ok(true)
             }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
@@ -688,6 +689,7 @@ impl Machine {
         let (r0, r1, r2) = (cpu.reg(0), cpu.reg(1), cpu.reg(2));
         let lr = cpu.reg(14);
         let now = self.clocks[c].now;
+        self.sys.flash_writes += 1;
         let duration = match f {
             RomFn::FlashRangeErase => {
                 log::debug!("[{now}] core{c} flash_range_erase({r0:#x}, {r1:#x}, {r2:#x})");

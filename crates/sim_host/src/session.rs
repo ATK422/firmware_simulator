@@ -82,6 +82,65 @@ pub struct Session {
     boundary: Time,
 }
 
+/// A checkpoint's flash, SRAM and ROM contents, shared with the checkpoint before where they are the same: the
+/// flash and ROM whole (the flash while [`rp2040::System::flash_writes`] says it may not have changed, or it
+/// compares equal), the SRAM in 4 KB pieces.
+#[derive(Clone, Debug)]
+pub struct SharedMemory {
+    flash: std::sync::Arc<Vec<u8>>,
+    flash_writes: u64,
+    sram: Vec<std::sync::Arc<[u8]>>,
+    rom: std::sync::Arc<Vec<u8>>,
+}
+
+const SRAM_PIECE: usize = 4096;
+
+impl SharedMemory {
+    /// The memories now, sharing what is unchanged with `prev`; and how many bytes were not shared.
+    fn keep(prev: Option<&SharedMemory>, flash: &[u8], sram: &[u8], rom: &[u8], writes: u64) -> (SharedMemory, usize) {
+        use std::sync::Arc;
+        let mut fresh = 0;
+        let flash = match prev {
+            Some(p) if p.flash_writes == writes && p.flash.len() == flash.len() => p.flash.clone(),
+            Some(p) if *p.flash == flash => p.flash.clone(),
+            _ => {
+                fresh += flash.len();
+                Arc::new(flash.to_vec())
+            }
+        };
+        let rom = match prev {
+            Some(p) if *p.rom == rom => p.rom.clone(),
+            _ => {
+                fresh += rom.len();
+                Arc::new(rom.to_vec())
+            }
+        };
+        let sram = sram
+            .chunks(SRAM_PIECE)
+            .enumerate()
+            .map(|(i, piece)| match prev.and_then(|p| p.sram.get(i)) {
+                Some(old) if **old == *piece => old.clone(),
+                _ => {
+                    fresh += piece.len();
+                    Arc::from(piece)
+                }
+            })
+            .collect();
+        (SharedMemory { flash, flash_writes: writes, sram, rom }, fresh)
+    }
+
+    /// Copies the memories into `sys`.
+    fn restore(&self, sys: &mut rp2040::System) {
+        sys.flash.clone_from(&*self.flash);
+        sys.rom.clone_from(&*self.rom);
+        sys.sram.clear();
+        for piece in &self.sram {
+            sys.sram.extend_from_slice(piece);
+        }
+        sys.flash_writes = self.flash_writes;
+    }
+}
+
 /// What a session collected (see [`Session::keep_collected`]).
 #[derive(Clone, Default)]
 pub struct Collected {
@@ -94,7 +153,9 @@ pub struct Collected {
 /// A [`Session::checkpoint`].
 pub struct SessionCheckpoint {
     machine: rp2040::machine::Snapshot,
-    flash: std::sync::Arc<Vec<u8>>,
+    memory: SharedMemory,
+    /// Bytes of memory contents this checkpoint did not share with the one before it.
+    fresh: usize,
     rtt: Option<RttReader>,
     defmt_partial: Vec<u8>,
     logs: usize,
@@ -114,14 +175,15 @@ pub struct SessionCheckpoint {
 }
 
 impl SessionCheckpoint {
-    /// The flash contents (shared between checkpoints while it does not change).
-    pub fn flash(&self) -> &std::sync::Arc<Vec<u8>> {
-        &self.flash
+    /// The memories (shared with the next checkpoint where they do not change).
+    pub fn memory(&self) -> &SharedMemory {
+        &self.memory
     }
 
-    /// About how much memory the checkpoint holds besides the flash: SRAM, the other memories, devices.
+    /// About how much memory the checkpoint adds: what of the memories it does not share with the one before, and
+    /// the rest (devices, peripherals).
     pub fn bytes(&self) -> usize {
-        self.machine.bytes() + self.defmt_partial.len() + 4096
+        self.machine.bytes() + self.fresh + self.defmt_partial.len() + 4096
     }
 }
 
@@ -472,14 +534,14 @@ impl Session {
     /// and debugger settings, and the host side's state (RTT position, a defmt frame in progress, how much log,
     /// RTT, UART and USB text there was, the CAN bus without its record, the Ethernet cable). The flash is shared
     /// with `prev` when it has not changed since. Hooks, endpoints and ptys are not part of it.
-    pub fn checkpoint(&mut self, prev: Option<&std::sync::Arc<Vec<u8>>>) -> SessionCheckpoint {
-        let flash = std::mem::take(&mut self.machine.sys.flash);
+    pub fn checkpoint(&mut self, prev: Option<&SharedMemory>) -> SessionCheckpoint {
+        let sys = &mut self.machine.sys;
+        let (flash, sram, rom) =
+            (std::mem::take(&mut sys.flash), std::mem::take(&mut sys.sram), std::mem::take(&mut sys.rom));
         let machine = self.machine.snapshot();
-        let shared = match prev {
-            Some(p) if **p == flash => p.clone(),
-            _ => std::sync::Arc::new(flash.clone()),
-        };
-        self.machine.sys.flash = flash;
+        let (memory, fresh) = SharedMemory::keep(prev, &flash, &sram, &rom, self.machine.sys.flash_writes);
+        let sys = &mut self.machine.sys;
+        (sys.flash, sys.sram, sys.rom) = (flash, sram, rom);
         let can_bus = self.can_bus.as_mut().map(|bus| {
             let record = bus.record.take();
             let len = record.as_ref().map(|r| r.len());
@@ -493,7 +555,8 @@ impl Session {
         });
         SessionCheckpoint {
             machine,
-            flash: shared,
+            memory,
+            fresh,
             rtt: self.rtt.clone(),
             defmt_partial: self.defmt.as_ref().map(|d| d.partial().to_vec()).unwrap_or_default(),
             logs: self.logs.len(),
@@ -580,7 +643,7 @@ impl Session {
         }
         cut_text(&mut self.usb_cdc_text, c.usb_cdc_text, &collected.usb_cdc_text);
         self.machine.restore(&c.machine);
-        self.machine.sys.flash.clone_from(&*c.flash);
+        c.memory.restore(&mut self.machine.sys);
         self.rtt = c.rtt.clone();
         if let Some(d) = &self.defmt {
             self.defmt = Some(d.with_partial(&c.defmt_partial));
