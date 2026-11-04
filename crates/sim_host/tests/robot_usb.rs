@@ -203,3 +203,68 @@ fn set_nonblocking(f: &std::fs::File) {
         libc::fcntl(f.as_raw_fd(), libc::F_SETFL, flags | libc::O_NONBLOCK);
     }
 }
+
+/// What a board with a terminal on its second CDC port did when sent a line through the terminal every 20 ms (put
+/// there between runs, so every way of running reads it at the same boundary): what came back on the terminal,
+/// port 0's lines, and the board's state.
+fn pty_exchange(threads: usize, stress: Option<u64>) -> (Vec<u8>, Vec<(Time, String)>, String, u64) {
+    use sim_core::cpu::Cpu;
+    let link = scratch(&format!("c_ivc-ros-{threads}-{stress:?}"));
+    let keys = format!("usb_cdc = \"stdout\"\nusb_cdc2 = \"pty:{}\"", link.display());
+    let mut r = dual_usb_robot(&format!("pty-{threads}-{stress:?}.toml"), &keys);
+    r.threads = threads;
+    r.run_ahead_stress = stress;
+    if threads > 1 {
+        r.fix_threads(vec![0, 1]);
+    }
+    r.open_usb_ptys().unwrap();
+    let lines = Arc::new(Mutex::new(Vec::new()));
+    let l = lines.clone();
+    r.boards[1].on_usb_cdc_line = Some(Box::new(move |t, line| l.lock().unwrap().push((t, line.to_string()))));
+    r.run_until(Time::from_ms(300));
+    let mut term = std::fs::OpenOptions::new().read(true).write(true).open(&link).unwrap();
+    set_nonblocking(&term);
+    let mut got = Vec::new();
+    let mut read = |term: &mut std::fs::File| {
+        let mut buf = [0u8; 256];
+        while let Ok(n) = term.read(&mut buf) {
+            if n == 0 {
+                break;
+            }
+            got.extend_from_slice(&buf[..n]);
+        }
+    };
+    for k in 0..30u64 {
+        if k % 10 == 0 {
+            term.write_all(format!("ros{k};").as_bytes()).unwrap();
+            term.flush().unwrap();
+            // The terminal passes it on to the emulator's side
+            std::thread::sleep(std::time::Duration::from_millis(30));
+        }
+        let t = r.now + Time::from_ms(2);
+        assert!(r.run_until(t).is_none());
+        read(&mut term);
+    }
+    std::thread::sleep(std::time::Duration::from_millis(30));
+    read(&mut term);
+    if threads > 1 {
+        assert!(r.run_ahead_stats.windows > 0, "{:?}", r.run_ahead_stats);
+    }
+    let m = &r.boards[1].machine;
+    let state = format!("{} {} {:?}", m.now, m.cores[0].instructions(), m.cores[0].cycles());
+    let lines = lines.lock().unwrap().clone();
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    std::hash::Hash::hash(&m.sys.sram, &mut h);
+    (got, lines, state, std::hash::Hasher::finish(&h))
+}
+
+/// A board fed from a terminal runs ahead of the others: what it reads is taken in at the boundary it was read at
+/// (and given back for the rerun if the board is rolled back), what it writes reaches the terminal once final. The
+/// run is the one taking turns gives.
+#[test]
+fn a_board_fed_from_a_terminal_runs_ahead_as_in_turns() {
+    let want = pty_exchange(1, None);
+    assert_eq!(want.0, b"ROS0;ROS10;ROS20;", "{:?}", String::from_utf8_lossy(&want.0));
+    assert_eq!(pty_exchange(2, None), want);
+    assert_eq!(pty_exchange(2, Some(5)), want);
+}

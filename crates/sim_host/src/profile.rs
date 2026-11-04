@@ -296,6 +296,26 @@ pub struct Profiler {
     cores: [CoreSamples; 2],
     first: Option<Time>,
     last: Time,
+    /// Samples taken but not counted yet ([`Profiler::hold`]), by core.
+    held: Option<Vec<(usize, Taken)>>,
+}
+
+/// One core's sample.
+#[derive(Clone, Debug)]
+enum Taken {
+    Off,
+    LockedUp,
+    Stack { funcs: Vec<u32>, truncated: bool, sleeping: bool, exception: u32 },
+}
+
+/// Where a profiler was ([`Profiler::mark`]), to go back to ([`Profiler::back_to`]).
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct ProfileMark {
+    next: Time,
+    rng: u64,
+    first: Option<Time>,
+    last: Time,
+    held: usize,
 }
 
 impl Profiler {
@@ -321,6 +341,7 @@ impl Profiler {
             cores: Default::default(),
             first: None,
             last: start,
+            held: None,
         };
         p.next = start + p.step();
         p
@@ -360,33 +381,87 @@ impl Profiler {
         self.first.get_or_insert(m.now);
         self.last = m.now;
         let mem = MachineMemory { m, symbols: &self.symbols };
-        for c in 0..2 {
+        let taken: [Taken; 2] = std::array::from_fn(|c| {
             let cpu = &m.cores[c];
-            let s = &mut self.cores[c];
             if !m.core_enabled[c] {
-                s.off += 1;
-                continue;
-            }
-            if cpu.is_locked_up() {
-                s.locked_up += 1;
-                continue;
-            }
-            let regs = Registers { r: std::array::from_fn(|i| cpu.reg(i)), psp: cpu.psp() };
-            let stack = unwind::unwind(&self.table, &mem, &regs);
-            let mut funcs: Vec<u32> = Vec::with_capacity(stack.frames.len() + 2);
-            if stack.truncated {
-                funcs.push(TRUNCATED);
-                s.truncated += 1;
-            }
-            funcs.extend(stack.frames.iter().rev().map(|&a| self.symbols.function(a)));
-            if cpu.is_sleeping() {
-                funcs.push(SLEEP);
-                s.sleeping += 1;
+                Taken::Off
+            } else if cpu.is_locked_up() {
+                Taken::LockedUp
             } else {
-                s.running += 1;
-                *s.exceptions.entry(cpu.ipsr()).or_default() += 1;
+                let regs = Registers { r: std::array::from_fn(|i| cpu.reg(i)), psp: cpu.psp() };
+                let stack = unwind::unwind(&self.table, &mem, &regs);
+                let mut funcs: Vec<u32> = Vec::with_capacity(stack.frames.len() + 2);
+                if stack.truncated {
+                    funcs.push(TRUNCATED);
+                }
+                funcs.extend(stack.frames.iter().rev().map(|&a| self.symbols.function(a)));
+                let sleeping = cpu.is_sleeping();
+                if sleeping {
+                    funcs.push(SLEEP);
+                }
+                Taken::Stack { funcs, truncated: stack.truncated, sleeping, exception: cpu.ipsr() }
             }
-            *s.stacks.entry(funcs).or_default() += 1;
+        });
+        for (c, taken) in taken.into_iter().enumerate() {
+            match &mut self.held {
+                Some(held) => held.push((c, taken)),
+                None => self.count(c, taken),
+            }
+        }
+    }
+
+    /// Counts one core's sample.
+    fn count(&mut self, c: usize, taken: Taken) {
+        let s = &mut self.cores[c];
+        match taken {
+            Taken::Off => s.off += 1,
+            Taken::LockedUp => s.locked_up += 1,
+            Taken::Stack { funcs, truncated, sleeping, exception } => {
+                s.truncated += truncated as u64;
+                if sleeping {
+                    s.sleeping += 1;
+                } else {
+                    s.running += 1;
+                    *s.exceptions.entry(exception).or_default() += 1;
+                }
+                *s.stacks.entry(funcs).or_default() += 1;
+            }
+        }
+    }
+
+    /// Holds the samples it takes from now on until [`Profiler::commit`] counts them, so that a robot running the
+    /// board ahead can take back those of a run it rolls back ([`Profiler::back_to`]).
+    pub(crate) fn hold(&mut self) {
+        self.held.get_or_insert_with(Vec::new);
+    }
+
+    /// Counts the samples held so far (they are final), and goes on holding.
+    pub(crate) fn commit(&mut self) {
+        if let Some(held) = self.held.as_mut().map(std::mem::take) {
+            for (c, taken) in held {
+                self.count(c, taken);
+            }
+        }
+    }
+
+    /// Counts the samples held, and stops holding them.
+    pub(crate) fn release(&mut self) {
+        self.commit();
+        self.held = None;
+    }
+
+    /// Where it is now: when it samples next, and the samples held.
+    pub(crate) fn mark(&self) -> ProfileMark {
+        let held = self.held.as_ref().map_or(0, Vec::len);
+        ProfileMark { next: self.next, rng: self.rng, first: self.first, last: self.last, held }
+    }
+
+    /// Back to `mark` (taken while holding, since the last commit): the samples taken since are dropped, and the
+    /// next ones are taken at the same times again.
+    pub(crate) fn back_to(&mut self, mark: &ProfileMark) {
+        (self.next, self.rng, self.first, self.last) = (mark.next, mark.rng, mark.first, mark.last);
+        if let Some(held) = &mut self.held {
+            held.truncate(mark.held);
         }
     }
 

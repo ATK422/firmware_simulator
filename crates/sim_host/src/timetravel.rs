@@ -181,6 +181,19 @@ impl CanEndpoint for TappedCan {
         let log = self.log.lock().unwrap();
         Some(log.next_recorded().map_or(live, |c| c.until.min(live)))
     }
+    /// As the endpoint is: what a live one handed in was ready at the step that read it, and so it is replayed.
+    fn live(&self) -> bool {
+        self.inner.live()
+    }
+    /// Replaying, whether the next call is the next recorded one that gave frames; live, the endpoint's own.
+    fn waiting(&mut self, until: Time) -> bool {
+        let log = self.log.lock().unwrap();
+        if log.replaying() {
+            return log.next_recorded().is_some_and(|c| c.until <= until);
+        }
+        drop(log);
+        self.inner.waiting(until)
+    }
 }
 
 /// An Ethernet endpoint, recorded like [`TappedCan`].
@@ -1679,5 +1692,27 @@ mod tests {
         }
         let g = TappedCan { inner: Box::new(Unknown), log: TapLog::new() };
         assert_eq!(g.idle_until(), None);
+    }
+
+    /// A tapped live endpoint is live; it tells a frame is waiting as the endpoint does, and while replaying, from
+    /// the recording: when the next call is the one that gave frames.
+    #[test]
+    fn a_tapped_live_endpoint_is_live_and_tells_what_is_waiting() {
+        let us = Time::from_us;
+        let f = CanFrame::fd(0x10, false, &[1]);
+        let inner = crate::socketcan::Live(Script(vec![(us(7), f.clone())]));
+        let log = TapLog::new();
+        let mut e = TappedCan { inner: Box::new(inner), log: log.clone() };
+        assert!(e.live() && e.idle_until().is_none());
+        assert!(!e.waiting(us(5)) && e.take_tx(us(5)).is_empty());
+        assert!(e.waiting(us(10)));
+        assert_eq!(e.take_tx(us(10)), [(us(10), f.clone())], "stamped with the step that read it");
+        e.take_tx(us(15));
+        TapControl::seek(&mut log.clone(), 0);
+        assert!(!e.waiting(us(5)), "the first call gave nothing");
+        e.take_tx(us(5));
+        assert!(e.waiting(us(10)));
+        assert_eq!(e.take_tx(us(10)), [(us(10), f)]);
+        assert!(!e.waiting(us(15)));
     }
 }

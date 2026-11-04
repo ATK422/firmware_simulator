@@ -406,3 +406,67 @@ fn robot_in_a_box_and_nereus_scripts() {
     assert_eq!(code, 2);
     let _ = std::fs::remove_dir_all(&d);
 }
+
+/// Talos tunnelled to a "robot computer" over cannelloni (a live endpoint, as SocketCAN is), which sends frames on
+/// the wall clock while the robot runs ahead in real time: `--arrivals-log` notes where each entered the bus, and
+/// `--replay-arrivals` repeats the run from it to the frame, running ahead or (`--no-run-ahead`) slice by slice.
+#[test]
+fn robot_live_run_replays_from_its_arrivals() {
+    use sim_devices::can::{CanEndpoint, CanFrame};
+    if !talos_built() {
+        return;
+    }
+    let d = scratch("arrivals");
+    let (arr, a, b, c) = (d.join("arrivals.log"), d.join("a.log"), d.join("b.log"), d.join("c.log"));
+    let near = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+    let far = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+    let (near_addr, far_addr) = (near.local_addr().unwrap(), far.local_addr().unwrap());
+    drop((near, far));
+    let mut tunnel = sim_host::cannelloni::Cannelloni::bind(far_addr, near_addr).unwrap();
+    let mut first = exe();
+    first
+        .args(["robot", "robots/talos.toml", "--time", "1s", "--realtime", "--threads", "3", "--cannelloni"])
+        .arg(format!("internal={near_addr},{far_addr}"))
+        .arg("--arrivals-log")
+        .arg(&arr)
+        .arg("--candump-log")
+        .arg(&a)
+        .current_dir(repo());
+    let child = first.stdout(std::process::Stdio::null()).stderr(std::process::Stdio::piped()).spawn().unwrap();
+    // Once the emulator has its end of the tunnel (after loading the boards), the frames go out while it runs
+    let t0 = std::time::Instant::now();
+    while std::net::UdpSocket::bind(near_addr).is_ok() {
+        assert!(t0.elapsed() < std::time::Duration::from_secs(60), "the emulator never bound {near_addr}");
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    // The boards' controllers are up (and acknowledge) after about 135 ms
+    std::thread::sleep(std::time::Duration::from_millis(400));
+    for k in 0..20u32 {
+        tunnel.receive(&CanFrame::fd(0x600 + k, false, &[k as u8; 4]), sim_core::time::Time::ZERO);
+        tunnel.flush();
+        std::thread::sleep(std::time::Duration::from_millis(7));
+    }
+    let out = child.wait_with_output().unwrap();
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "{err}");
+    assert!(err.contains("arrivals log: 20 frame(s) from the host"), "{err}");
+    let arrivals = std::fs::read_to_string(&arr).unwrap();
+    assert!(arrivals.lines().all(|l| l.contains(" internal ")), "{arrivals}");
+    for (log, extra) in [(&b, None), (&c, Some("--no-run-ahead"))] {
+        let mut again = exe();
+        again.args(["robot", "robots/talos.toml", "--time", "1s", "--threads", "3", "--replay-arrivals"]);
+        again.arg(&arr).arg("--candump-log").arg(log).args(extra).current_dir(repo());
+        let (code, _, err) = run(&mut again);
+        assert_eq!(code, 0, "{err}");
+        assert!(err.contains("20 of 20 frame(s) sent"), "{err}");
+    }
+    let want = std::fs::read_to_string(&a).unwrap();
+    assert!(want.lines().count() > 20, "{want}");
+    for k in 0..20 {
+        let id = format!(" internal {:03X}##", 0x600 + k);
+        assert_eq!(want.lines().filter(|l| l.contains(&id)).count(), 1, "{id}: {want}");
+    }
+    assert_eq!(std::fs::read_to_string(&b).unwrap(), want, "replayed, running ahead");
+    assert_eq!(std::fs::read_to_string(&c).unwrap(), want, "replayed, slice by slice");
+    let _ = std::fs::remove_dir_all(&d);
+}

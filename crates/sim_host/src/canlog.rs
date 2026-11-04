@@ -252,6 +252,14 @@ pub fn format_line(time_ns: u64, iface: &str, frame: &CanFrame) -> String {
     format!("({secs:010}.{us:06}) {iface} {}", compact(frame))
 }
 
+/// [`format_line`] to the nanosecond (the log's reader takes up to nine decimals), for times that must come back
+/// exactly ([`Arrivals`]).
+pub fn format_line_ns(time_ns: u64, iface: &str, frame: &CanFrame) -> String {
+    let secs = time_ns / 1_000_000_000;
+    let ns = time_ns % 1_000_000_000;
+    format!("({secs:010}.{ns:09}) {iface} {}", compact(frame))
+}
+
 /// Writes a `candump -l` log of one or more buses to a file. Clone it to hand a hook to each bus; it flushes at
 /// least every half second of wall time, so a run stopped with Ctrl-C leaves a usable log, and when dropped.
 #[derive(Clone)]
@@ -298,6 +306,16 @@ impl CandumpWriter {
         }
         let line = format_line(rec.end.as_ns(), iface, &rec.frame);
         if let Err(e) = writeln!(s.out, "{line}") {
+            s.error.get_or_insert(e.to_string());
+            return;
+        }
+        s.written += 1;
+    }
+
+    /// Writes a frame a live endpoint handed in at `at`, to the nanosecond ([`Arrivals`]).
+    pub fn arrival(&self, iface: &str, at: Time, frame: &CanFrame) {
+        let mut s = self.0.lock().unwrap();
+        if let Err(e) = writeln!(s.out, "{}", format_line_ns(at.as_ns(), iface, frame)) {
             s.error.get_or_insert(e.to_string());
             return;
         }
@@ -540,6 +558,57 @@ impl CanEndpoint for Replay {
     }
 
     fn receive(&mut self, _frame: &CanFrame, _at: Time) {}
+
+    /// Its next frame's time: a robot runs its boards ahead of each other up to there.
+    fn idle_until(&self) -> Option<Time> {
+        Some(self.first_time().unwrap_or(Time::MAX))
+    }
+}
+
+/// Records when a live endpoint's frames entered the bus ([`CanEndpoint::live`]: what reached a SocketCAN interface
+/// or a cannelloni tunnel, handed in at the bus step that read it), as a log ([`CandumpWriter::arrival`]) with
+/// each frame at that step's time, to the nanosecond, as `iface`. [`arrivals_replay`] hands the same frames in at
+/// the same steps again, so a run with real host tools can be repeated exactly, taking turns or running ahead.
+pub struct Arrivals {
+    pub inner: Box<dyn CanEndpoint + Send>,
+    pub iface: String,
+    pub log: CandumpWriter,
+}
+
+impl CanEndpoint for Arrivals {
+    fn take_tx(&mut self, until: Time) -> Vec<(Time, CanFrame)> {
+        let out = self.inner.take_tx(until);
+        for (at, f) in &out {
+            self.log.arrival(&self.iface, *at, f);
+        }
+        out
+    }
+
+    fn receive(&mut self, frame: &CanFrame, at: Time) {
+        self.inner.receive(frame, at);
+    }
+
+    fn tx_queue_limit(&self) -> Option<usize> {
+        self.inner.tx_queue_limit()
+    }
+
+    fn idle_until(&self) -> Option<Time> {
+        self.inner.idle_until()
+    }
+
+    fn live(&self) -> bool {
+        self.inner.live()
+    }
+
+    fn waiting(&mut self, until: Time) -> bool {
+        self.inner.waiting(until)
+    }
+}
+
+/// The frames of `iface` in a log of arrivals ([`Arrivals`]), handed in at the times logged, as they were then.
+pub fn arrivals_replay(log: &[LogFrame], iface: &str) -> Replay {
+    let opts = ReplayOptions { ifaces: vec![iface.to_string()], origin_ns: Some(0), ..Default::default() };
+    Replay::from_log(log, &opts)
 }
 
 /// A [`Replay`] shared with whoever wants to watch its progress after handing it to a bus.
@@ -559,6 +628,10 @@ impl CanEndpoint for SharedReplay {
 
     fn receive(&mut self, frame: &CanFrame, at: Time) {
         self.0.lock().unwrap().receive(frame, at)
+    }
+
+    fn idle_until(&self) -> Option<Time> {
+        self.0.lock().unwrap().idle_until()
     }
 }
 
@@ -592,6 +665,42 @@ pub fn interfaces(log: &[LogFrame]) -> Vec<String> {
 mod tests {
     use super::*;
     use sim_devices::can::{CanBus, Monitor};
+
+    /// Arrivals are logged to the nanosecond and replayed at exactly those times; a replay tells when it sends.
+    #[test]
+    fn arrivals_replay_at_their_times() {
+        #[derive(Clone, Default)]
+        struct Buf(Arc<Mutex<Vec<u8>>>);
+        impl Write for Buf {
+            fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(b);
+                Ok(b.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let buf = Buf::default();
+        let log = CandumpWriter::new(Box::new(buf.clone()));
+        let (a, b) = (CanFrame::fd(0x123, true, &[1, 2]), CanFrame::classic(0x6F, false, &[0xC0]));
+        let inner =
+            Monitor { outbox: vec![(Time(1_234_567_891), a.clone()), (Time(5), b.clone())], ..Default::default() };
+        let mut ep = Arrivals { inner: Box::new(crate::socketcan::Live(inner)), iface: "internal".into(), log };
+        assert!(ep.live() && ep.idle_until().is_none());
+        let at = Time::from_ns(1_234_567_900);
+        assert_eq!(ep.take_tx(at).len(), 2);
+        ep.log.flush().unwrap();
+        let text = String::from_utf8(buf.0.lock().unwrap().clone()).unwrap();
+        assert_eq!(text.lines().next(), Some("(0000000001.234567900) internal 00000123##10102"));
+        let mut r = arrivals_replay(&parse(&text).unwrap(), "internal");
+        assert!(arrivals_replay(&parse(&text).unwrap(), "external").remaining() == 0);
+        assert_eq!(r.idle_until(), Some(at));
+        assert!(r.take_tx(at - Time(1)).is_empty());
+        assert_eq!(r.take_tx(at), [(at, a), (at, b)]);
+        assert_eq!(r.idle_until(), Some(Time::MAX));
+        let shared = SharedReplay::new(Replay::new(vec![(Time::from_us(7), CanFrame::classic(1, false, &[]))]));
+        assert_eq!(shared.idle_until(), Some(Time::from_us(7)));
+    }
 
     #[test]
     fn parses_candump_l() {

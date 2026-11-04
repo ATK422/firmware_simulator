@@ -15,7 +15,10 @@
 //! `talos_mt` is Talos with its boards on up to four threads (`robot --threads 4`), or as many as `--threads N` says
 //! (0: one per core); `talos_t2`, `talos_t3` and `talos_t6` on up to two, three and six, and `talos_t3_ls` on three in
 //! step slice by slice (without letting the boards run ahead of each other, `Robot::run_ahead`). Their fingerprints
-//! match `talos`'s. `--threads` also prints how the boards were spread over the threads.
+//! match `talos`'s. `--threads` also prints how the boards were spread over the threads. `nereus`, `nereus_t3` and
+//! `nereus_t3_ls` run `robots/talos_nereus.toml` as nereus drives it over vcan (every host side behind a live
+//! endpoint, the external vehicle's pose set between 10 ms runs) on one thread, three, and three slice by slice;
+//! their fingerprints match each other's.
 //!
 //! For each case: the virtual time run, the best wall time over the repeats, virtual/wall (above 1 keeps up with
 //! `--realtime`), the CPU time of that run (less disturbed than the wall clock by a busy machine), instructions
@@ -34,6 +37,8 @@ use std::time::{Duration, Instant};
 
 use sim_core::cpu::Cpu;
 use sim_core::sched::Fnv;
+use sim_devices::can::{CanEndpoint, CanFrame};
+use sim_host::socketcan::Live;
 use sim_test::{Bench, RobotBench, Session, Time};
 
 struct Case {
@@ -46,7 +51,14 @@ enum Kind {
     Board { elf: &'static str, board: &'static str, client: u8 },
     /// A robot file with mock bridges `(bus, client)`, its boards run on `threads` threads (see `Robot::threads`;
     /// negative: on that many, slice by slice, without `Robot::run_ahead`).
-    Robot { file: &'static str, bridges: &'static [(&'static str, u8)], threads: isize },
+    /// `live`: the mock bridges behind live endpoints, as titan_bridge is behind a SocketCAN interface
+    /// (`sim_host::socketcan::Live`).
+    Robot { file: &'static str, bridges: &'static [(&'static str, u8)], threads: isize, live: bool },
+    /// `robots/talos_nereus.toml` as nereus drives it over vcan: a mock bridge for each board and the controller's
+    /// thruster frames, all behind live endpoints as a SocketCAN interface is (`sim_host::socketcan::Live`), and
+    /// the external vehicle's pose set every 10 ms between runs, as the nereus bridge posts it to the dashboard.
+    /// `threads` as for `Robot`.
+    Nereus { threads: isize },
 }
 
 /// Talos's mock bridges: the PoAC board's on the internal bus, and the smart battery's on the external bus, where it
@@ -58,16 +70,44 @@ const CASES: &[Case] = &[
     Case { name: "template", kind: Kind::Board { elf: "template", board: "mk2/power_board", client: 1 } },
     Case { name: "esc_board", kind: Kind::Board { elf: "esc_board", board: "mk2/esc_board", client: 2 } },
     Case { name: "ivc_board2", kind: Kind::Board { elf: "ivc_board2", board: "talos/ivc_board", client: 8 } },
-    Case { name: "talos", kind: Kind::Robot { file: "talos.toml", bridges: TALOS_BRIDGES, threads: 1 } },
-    Case { name: "talos_mt", kind: Kind::Robot { file: "talos.toml", bridges: TALOS_BRIDGES, threads: 4 } },
-    Case { name: "talos_t2", kind: Kind::Robot { file: "talos.toml", bridges: TALOS_BRIDGES, threads: 2 } },
-    Case { name: "talos_t3", kind: Kind::Robot { file: "talos.toml", bridges: TALOS_BRIDGES, threads: 3 } },
-    Case { name: "talos_t6", kind: Kind::Robot { file: "talos.toml", bridges: TALOS_BRIDGES, threads: 6 } },
+    Case { name: "talos", kind: Kind::Robot { file: "talos.toml", bridges: TALOS_BRIDGES, threads: 1, live: false } },
+    Case {
+        name: "talos_mt",
+        kind: Kind::Robot { file: "talos.toml", bridges: TALOS_BRIDGES, threads: 4, live: false },
+    },
+    Case {
+        name: "talos_t2",
+        kind: Kind::Robot { file: "talos.toml", bridges: TALOS_BRIDGES, threads: 2, live: false },
+    },
+    Case {
+        name: "talos_t3",
+        kind: Kind::Robot { file: "talos.toml", bridges: TALOS_BRIDGES, threads: 3, live: false },
+    },
+    Case {
+        name: "talos_t6",
+        kind: Kind::Robot { file: "talos.toml", bridges: TALOS_BRIDGES, threads: 6, live: false },
+    },
     // On three threads in step slice by slice (`Robot::run_ahead` off), for comparison
-    Case { name: "talos_t3_ls", kind: Kind::Robot { file: "talos.toml", bridges: TALOS_BRIDGES, threads: -3 } },
+    Case {
+        name: "talos_t3_ls",
+        kind: Kind::Robot { file: "talos.toml", bridges: TALOS_BRIDGES, threads: -3, live: false },
+    },
+    // Talos with its bridge behind a live endpoint (as on vcan); fingerprints match each other's
+    Case {
+        name: "talos_live_t3",
+        kind: Kind::Robot { file: "talos.toml", bridges: TALOS_BRIDGES, threads: 3, live: true },
+    },
+    Case {
+        name: "talos_live_t3_ls",
+        kind: Kind::Robot { file: "talos.toml", bridges: TALOS_BRIDGES, threads: -3, live: true },
+    },
+    // nereus over vcan (live endpoints, an external vehicle); its fingerprints match each other's
+    Case { name: "nereus", kind: Kind::Nereus { threads: 1 } },
+    Case { name: "nereus_t3", kind: Kind::Nereus { threads: 3 } },
+    Case { name: "nereus_t3_ls", kind: Kind::Nereus { threads: -3 } },
     Case {
         name: "ivc2_pool",
-        kind: Kind::Robot { file: "ivc2_pool.toml", bridges: &[("talos", 8), ("surface", 8)], threads: 1 },
+        kind: Kind::Robot { file: "ivc2_pool.toml", bridges: &[("talos", 8), ("surface", 8)], threads: 1, live: false },
     },
 ];
 
@@ -105,7 +145,7 @@ fn hash_session(h: &mut Fnv, s: &Session) {
 
 fn threads_of(case: &Case) -> usize {
     match case.kind {
-        Kind::Robot { threads, .. } => threads.unsigned_abs(),
+        Kind::Robot { threads, .. } | Kind::Nereus { threads } => threads.unsigned_abs(),
         Kind::Board { .. } => 1,
     }
 }
@@ -181,8 +221,16 @@ fn run(
                 fingerprint: h.finish(),
             })
         }
-        Kind::Robot { file, bridges, .. } => {
+        Kind::Robot { file, bridges, live, .. } => {
             let mut r = RobotBench::load(file, bridges, |_| {})?;
+            if live {
+                for (rb, b) in r.robot.buses.iter_mut().zip(&r.bridges) {
+                    rb.endpoints.clear();
+                    if let Some(b) = b {
+                        rb.endpoints.push(Box::new(Live(b.clone())));
+                    }
+                }
+            }
             r.robot.threads = match override_threads {
                 Some(n) if case.name == "talos_mt" => n,
                 _ => threads_of(case),
@@ -223,7 +271,83 @@ fn run(
             let skipped = r.robot.boards.iter().map(skipped).sum();
             Ok(Outcome { travel: stats, wall, skipped, cpu, instructions, fingerprint: h.finish() })
         }
+        Kind::Nereus { threads } => {
+            let mut r = RobotBench::load("talos_nereus.toml", &[], |_| {})?;
+            r.robot.threads = threads.unsigned_abs();
+            r.robot.run_ahead = threads > 0;
+            let mut bridges = Vec::new();
+            for client in 1..=4 {
+                let b = sim_test::MockBridge::new(client, true, Time::ZERO);
+                b.set_kill(Some(false));
+                r.robot.buses[0].endpoints.push(Box::new(Live(b.clone())));
+                bridges.push(b);
+            }
+            // On its own (wall) clock: off the 10 ms grid of the runs
+            r.robot.buses[0].endpoints.push(Box::new(Live(Controller { next: Time::from_us(50_330) })));
+            if coverage {
+                for s in r.robot.boards.iter_mut() {
+                    s.machine.enable_coverage();
+                }
+            }
+            let mut tt = travel.map(|t| {
+                let inputs = r.robot.inputs.clone();
+                record(&mut r.robot, inputs, t)
+            });
+            let (wall, cpu) = (Instant::now(), cpu_time());
+            while r.now() < time {
+                let x = r.now().as_secs_f64();
+                let pose = sim_host::vehicle::ExternalPose {
+                    position: [x, 0.0, 0.6 + 0.4 * (6.0 * x).sin()],
+                    attitude: sim_physics::Quat::from_euler(0.0, 0.0, x),
+                    velocity: None,
+                    rate: None,
+                };
+                r.robot.vehicles[0].set_pose(&pose);
+                let until = (r.now() + Time::from_ms(10)).min(time);
+                match &mut tt {
+                    None => r.run_until(until),
+                    Some(tt) => {
+                        tt.run_until(&mut r.robot, until);
+                    }
+                }
+            }
+            let stats = tt.map(|tt| tt.stats());
+            let (wall, cpu) = (wall.elapsed(), cpu_time().zip(cpu).map(|(b, a)| b - a));
+            for s in &r.robot.boards {
+                hash_session(&mut h, s);
+            }
+            for b in &bridges {
+                for (t, m) in &b.state().received {
+                    t.hash(&mut h);
+                    format!("{m:?}").hash(&mut h);
+                }
+            }
+            let instructions = r.robot.boards.iter().map(instructions).sum();
+            let skipped = r.robot.boards.iter().map(skipped).sum();
+            Ok(Outcome { travel: stats, wall, skipped, cpu, instructions, fingerprint: h.finish() })
+        }
     }
+}
+
+/// `complete_controller`'s raw thruster frames (CANmore utility channel 0 of ESC boards 2 and 3), every 20 ms.
+struct Controller {
+    next: Time,
+}
+
+impl CanEndpoint for Controller {
+    fn take_tx(&mut self, until: Time) -> Vec<(Time, CanFrame)> {
+        let mut out = Vec::new();
+        while self.next <= until {
+            for client in [2u32, 3] {
+                let rpm: Vec<u8> = [1200i16, -800, 0, 400].iter().flat_map(|r| r.to_be_bytes()).collect();
+                out.push((self.next, CanFrame::classic((client << 6) | (1 << 5) | (1 << 4), false, &rpm)));
+            }
+            self.next += Time::from_ms(20);
+        }
+        out
+    }
+
+    fn receive(&mut self, _frame: &CanFrame, _at: Time) {}
 }
 
 /// User + system CPU time of the process so far (Linux: `/proc/self/stat`, in clock ticks of 10 ms). Less

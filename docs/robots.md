@@ -98,6 +98,7 @@ as `[t] NAME uart0: ...`); the run ends with the stop time, the wall time and ea
 | `--can BUS=IFACE` | | Bridges a bus to a SocketCAN interface, e.g. `internal=vcan0` (repeatable) |
 | `--candump` | | Prints every frame with its bus |
 | `--candump-log FILE`, `--replay FILE`, `--replay-filter`, `--replay-offset`, `--replay-iface IFACE=BUS`, `--cannelloni BUS=LOCAL,PEER` | | [Below](#can-logs-recording-replaying-comparing) |
+| `--arrivals-log FILE`, `--replay-arrivals FILE` | | Logs where each frame from `--can`/`--cannelloni` entered a bus; replays such a log at exactly those times ([below](#repeating-a-run-with-host-tools)) |
 | `--usb-cdc BOARD=SINK` | | Opens a board's USB CDC port (pico-sdk stdio_usb, titan_dual_stdio_usb's text log): `stdout` prints its lines as `[t] BOARD usb: ...`, `pty` or `pty:PATH` puts it on a terminal (repeatable; replaces the robot file's `usb_cdc`) |
 | `--usb-cdc2 BOARD=SINK` | | Opens its second CDC port (titan_firmware's micro-ROS USB transport) on `pty` or `pty:PATH` (repeatable; replaces `usb_cdc2`) |
 | `--ivc-send TIME@BOARD:BYTE` | | Makes an IVC board transmit a byte at a virtual time through its mock bridge, e.g. `4s@talos_ivc:0x5a` (repeatable; [below](#mock-bridges)) |
@@ -200,14 +201,26 @@ and stops where its own next frame could; the others stop there too. A board tha
 knew is rolled back and run again, and the calling thread replays every bus, vehicle and host hook in slice order
 as it goes, so the run is exactly the one taking turns gives (tests check Talos frame by frame, log line by log line
 and state by state, also with boards rolled back thousands of times). Boards whose inputs a vehicle drives (the
-camera cage's depth sensor) run slice by slice on the calling thread, after the vehicle. This is what lets the two
-ESC boards, whose heavy slices do not line up, stop waiting for each other every slice. It needs every bus endpoint
-to know when it sends (mock bridges, recordings), so with `--can`, `--cannelloni`, a `--vcd` waveform, `--trace`,
-`--profile-dir`, a pty or `--usbip` the boards stay in step slice by slice, as with `--no-run-ahead`.
-`Robot::run_ahead` switches it in code. A run recorded for time travel (`--checkpoint-every`, `--dashboard`) runs
-ahead too, live and when it replays (checkpoints are taken where every board is committed, and the recorded bridges
-tell when they send from the recording); with `--gdb` the boards take turns, so stops are as without threads.
-`--coverage` counts only what the committed run executed: what a board ran before it was rolled back does not count.
+camera cage's depth sensor) run slice by slice on the calling thread, after the vehicle (not for an external
+vehicle, which stays where `POST /api/vehicle` put it during a run). This is what lets the two ESC boards, whose
+heavy slices do not line up, stop waiting for each other every slice.
+
+Host tools run ahead too. What arrives on `--can` (SocketCAN) or `--cannelloni` cannot be known in advance, but it
+enters the bus where taking turns would put it: at the slice boundary whose bus step reads it. Running ahead reads
+it at every boundary as it commits them, and boards that already ran past where the frame can arrive are rolled
+back to before it, so a frame never lands in a board's past. With `--realtime`, windows also end no more than 2 ms
+ahead of the wall clock, so host frames are read, and the boards' answers go out, about when they are due. A
+terminal (a pty on a USB CDC port) is read by its board at each boundary the same way and what it read is kept for
+a rerun; `--vcd`, `--trace` (except `--trace instructions`) and `--profile-dir` see only what the boards finally
+did. Runs with real host tools differ only in when frames arrive: `--arrivals-log FILE` logs where each frame from
+`--can`/`--cannelloni` entered a bus, and `--replay-arrivals FILE` (in place of those options) repeats the run from
+it exactly, running ahead or not. With an Ethernet cable (`--udp`, `--eth-mock-bridge`), `--usbip`, instruction
+tracing or an acoustic environment the boards stay in step slice by slice, as with `--no-run-ahead`.
+`Robot::run_ahead` switches it in code.
+A run recorded for time travel (`--checkpoint-every`, `--dashboard`) runs ahead too, live and when it replays
+(checkpoints are taken where every board is committed, and the recorded bridges tell when they send from the
+recording); with `--gdb` the boards take turns, so stops are as without threads. `--coverage` counts only what the
+committed run executed: what a board ran before it was rolled back does not count.
 
 A board alone on a bus with nothing to acknowledge its frames (Talos's smart battery on the external bus when no
 bridge is there for client 21) retries each frame without end, as a CAN controller does (the firmware does since
@@ -310,6 +323,22 @@ firmware_simulator robot robots/talos.toml --replay hw.log --replay-iface can0=i
 Because the emulator is deterministic, replaying the bridge's side of an emulator log into a fresh run reproduces
 it exactly; `crates/sim_test/tests/can_log.rs` does this, and replays a recorded upload through the C Titan
 bootloader into a fresh board, which reflashes it.
+
+### Repeating a run with host tools
+
+With `--can` or `--cannelloni`, what the host tools send reaches the bus whenever it arrives, so two runs differ.
+Each frame enters the bus at the slice boundary whose bus step read it; `robot --arrivals-log FILE` writes every
+such frame with that boundary's time, to the nanosecond, as a `candump -l` log with the bus name as the interface:
+
+```
+(0000000000.512300000) internal 00000123##10102
+```
+
+`robot --replay-arrivals FILE`, in place of the `--can` and `--cannelloni` options, hands each frame in at exactly
+that time again (each interface to the bus of that name), so the run is repeated exactly: the same frames at the
+same times, the same logs, the same state, with or without `--threads` and `--no-run-ahead` and without the host
+tools, vcan or ROS. (A frame the boards answered is answered the same; what the host tools would have sent in
+reply to something different is not recomputed.)
 
 ### Comparing: `can-diff`
 
@@ -486,7 +515,11 @@ cd $TITAN_FIRMWARE_DIR/talos/ESCBoard && mkdir -p build && cd build && cmake .. 
 
 The micro-ROS agent's sessions and timeouts are on the wall clock and the firmware's on virtual time; Talos as a
 whole runs slower than real time on one core (see [Speed](#how-a-robot-runs)), so watch the emulator's "behind the
-wall clock" warnings. With nereus as the physics instead of the emulator's own, see [nereus.md](nereus.md).
+wall clock" warnings. On threads (the scripts' default `--threads 0`) the boards run ahead of each other with the
+vcan interfaces too: Talos keeps up with three free cores (about 1.1x before pacing; slice by slice, as before
+this, it was about 0.7x with a live endpoint), and the emulator stays within 2 ms of the wall clock. Add
+`--arrivals-log FILE` to keep a session's host traffic: `--replay-arrivals FILE` in place of `--can` repeats it,
+without vcan or ROS. With nereus as the physics instead of the emulator's own, see [nereus.md](nereus.md).
 
 **The Rust images and titan_bridge.** The same with `--rust`, or by hand:
 
@@ -501,7 +534,8 @@ upload_tool -b talos/ivc_board path/to/ivc_board   # over CAN, to a board runnin
 ```
 
 For a single board: `run IMAGE --board ... --can vcan0 --realtime`. `titan_bridge` drops the link after 700 ms
-without pings, so check the emulator's "behind the wall clock" warnings.
+without pings, so check the emulator's "behind the wall clock" warnings (a robot on threads runs its boards ahead
+of each other with `--can` as well; see [Running ahead](#how-a-robot-runs)).
 
 `docker/robot_computer/` has a ROS 2 Humble image with titan_bridge, upload_tool and canmore_cli and a compose
 file that runs it next to the emulator on the host's vcan interfaces (both with `network_mode: host`); see
