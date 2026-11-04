@@ -240,6 +240,18 @@ impl CanEndpoint for MockBridge {
         Some(sim_devices::can::ENDPOINT_TX_QUEUE)
     }
 
+    /// The next ping or scheduled message; now if a message is pending (it goes out at the next opportunity).
+    fn idle_until(&self) -> Option<Time> {
+        let s = self.state();
+        if !s.running {
+            return Some(Time::MAX);
+        }
+        if !s.pending.is_empty() {
+            return Some(Time::ZERO);
+        }
+        Some(s.scheduled.first().map_or(s.next_ping, |(t, _)| (*t).min(s.next_ping)))
+    }
+
     fn receive(&mut self, frame: &CanFrame, at: Time) {
         let mut s = self.state();
         let fields = Fields::decode(frame.id, frame.extended);
@@ -290,6 +302,25 @@ mod tests {
         assert_eq!((f.client_id, f.direction, f.frame_type), (1, Direction::AgentToClient, FrameType::Msg));
         b.stop();
         assert!(b.take_tx(Time::from_ms(1000)).is_empty());
+    }
+
+    /// `idle_until` is the first time `take_tx` hands in anything.
+    #[test]
+    fn idle_until_bounds_what_take_tx_hands_in() {
+        let mut b = MockBridge::new(1, true, Time::from_ms(5));
+        assert_eq!(b.idle_until(), Some(Time::from_ms(5)));
+        assert!(b.take_tx(Time::from_ms(5) - Time(1)).is_empty());
+        assert!(!b.take_tx(Time::from_ms(5)).is_empty());
+        assert_eq!(b.idle_until(), Some(Time::from_ms(105)));
+        b.send_at(Time::from_ms(42), IvcModem::Ivc2.transmit(1));
+        assert_eq!(b.idle_until(), Some(Time::from_ms(42)));
+        assert!(b.take_tx(Time::from_ms(42) - Time(1)).is_empty());
+        assert_eq!(b.take_tx(Time::from_ms(42)).len(), 1);
+        b.send(IvcModem::Ivc2.transmit(2));
+        assert_eq!(b.idle_until(), Some(Time::ZERO), "a pending message goes out at once");
+        assert_eq!(b.take_tx(Time::from_ms(43)).len(), 1);
+        b.stop();
+        assert_eq!(b.idle_until(), Some(Time::MAX));
     }
 
     #[test]

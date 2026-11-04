@@ -1470,6 +1470,11 @@ impl CanNode for Mcp251xfd {
         Mcp251xfd::error_passive(self) && !self.bus_off
     }
 
+    fn idle_changes_nothing(&self) -> bool {
+        // What `recessive_sequences` changes
+        self.dominant_run == 0 && !self.stuck_transmitter && !(self.bus_off && self.on_bus())
+    }
+
     fn recessive_sequences(&mut self, _at: Time, n: u64) {
         self.dominant_run = 0;
         self.stuck_transmitter = false;
@@ -1888,6 +1893,31 @@ mod tests {
         bus.step(&mut [&mut d], &mut [], t0 + Time::from_ps(bit.as_ps() * 128 * 11));
         assert_eq!(d.error_counters().state, ErrorState::Active, "recovered");
         assert_ne!(read32(&mut d, &mut c, 0x03C) & 1 << 23, 0, "TXBOERR");
+    }
+
+    /// An idle bus changes a controller only while it counts dominant bits or recovers from bus-off.
+    #[test]
+    fn idle_bus_changes_only_counting_controllers() {
+        let (mut d, _c) = configured();
+        assert!(d.idle_changes_nothing());
+        d.dominant_bits(Time::ZERO, 6);
+        assert!(!d.idle_changes_nothing(), "a dominant run to end");
+        d.recessive_sequences(Time::ZERO, 1);
+        assert!(d.idle_changes_nothing());
+        let (mut d, mut c) = configured();
+        queue_frame(&mut d, &mut c, 0x10, &[0], 1);
+        write(&mut d, &mut c, 0x050 + 2, &[3 << 5]);
+        for n in 0..32 {
+            let r = d.tx_request().unwrap();
+            d.tx_error(r.token, Time::from_us(30 * n), BusError::Bit { data_phase: false });
+        }
+        assert!(!d.idle_changes_nothing(), "bus-off: counts recessive sequences");
+        d.recessive_sequences(Time::from_ms(2), 128);
+        assert!(d.idle_changes_nothing(), "recovered");
+        // What it says holds: an idle report then changes nothing that can be read
+        let before = (d.error_counters(), trec(&mut d, &mut c), read32(&mut d, &mut c, 0x03C));
+        d.recessive_sequences(Time::from_ms(3), 5);
+        assert_eq!(before, (d.error_counters(), trec(&mut d, &mut c), read32(&mut d, &mut c, 0x03C)));
     }
 
     #[test]

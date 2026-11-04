@@ -46,7 +46,7 @@ fn cores() -> usize {
 }
 
 /// The most threads `robot` may use.
-fn max_threads(robot: &Robot) -> usize {
+pub(crate) fn max_threads(robot: &Robot) -> usize {
     let n = if robot.threads == 0 { cores() } else { robot.threads };
     n.min(robot.boards.len()).max(1)
 }
@@ -64,8 +64,8 @@ pub(crate) fn worth_it(robot: &Robot, end: Time) -> bool {
 const THREAD_COST_NS: f64 = 3000.0;
 
 /// Slices between regroupings; the first comes sooner, when nothing is known about the boards yet.
-const REGROUP_SLICES: usize = 64;
-const FIRST_REGROUP_SLICES: usize = 16;
+pub(crate) const REGROUP_SLICES: usize = 64;
+pub(crate) const FIRST_REGROUP_SLICES: usize = 16;
 
 /// Regroupings to wait, with every board on the calling thread, before trying threads again after they did not pay;
 /// twice as many each time they again do not, up to the maximum.
@@ -96,7 +96,12 @@ impl Balance {
         &self.thread
     }
 
-    fn fit(&mut self, boards: usize, max_threads: usize) {
+    /// Whether no measurements were taken yet.
+    pub(crate) fn unmeasured(&self) -> bool {
+        self.cost.is_empty()
+    }
+
+    pub(crate) fn fit(&mut self, boards: usize, max_threads: usize) {
         if self.thread.len() != boards || self.thread.iter().any(|&t| t >= max_threads) {
             self.thread = vec![0; boards];
             self.cost.clear();
@@ -114,7 +119,7 @@ impl Balance {
     /// clock (`wall`, ns, real-time pacing left out), and regroups if that is clearly better. If threads did not
     /// make the slices clearly shorter than running the boards in turn would have been (other programs keep the
     /// cores busy, or the threads share cores), every board goes back to the calling thread for a while.
-    fn regroup(&mut self, spent: &[u64], slices: usize, max_threads: usize, wall: u64) {
+    pub(crate) fn regroup(&mut self, spent: &[u64], slices: usize, max_threads: usize, wall: u64) {
         if self.fixed {
             return;
         }
@@ -209,7 +214,7 @@ fn relabel(groups: &[usize], old: &[usize], cost: &[f64], max_threads: usize) ->
 }
 
 /// Waits until `ready`: spins for a while, then yields, then parks (whoever makes it ready unparks the waiter).
-fn wait_for(mut ready: impl FnMut() -> bool) {
+pub(crate) fn wait_for(mut ready: impl FnMut() -> bool) {
     const SPIN: Duration = Duration::from_micros(50);
     const YIELD: Duration = Duration::from_millis(2);
     for _ in 0..256 {
@@ -236,7 +241,7 @@ fn wait_for(mut ready: impl FnMut() -> bool) {
     }
 }
 
-fn lock<'a, T>(m: &'a Mutex<T>) -> MutexGuard<'a, T> {
+pub(crate) fn lock<'a, T>(m: &'a Mutex<T>) -> MutexGuard<'a, T> {
     m.lock().unwrap_or_else(PoisonError::into_inner)
 }
 

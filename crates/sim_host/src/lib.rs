@@ -197,6 +197,7 @@ pub mod profile;
 pub mod pty;
 pub mod robot;
 pub mod rtt;
+pub mod runahead;
 pub mod session;
 pub mod signal;
 pub mod socketcan;
