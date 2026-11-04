@@ -1,0 +1,59 @@
+# Mercury: the boards of the vehicle UWRT's new "Mercury" software stack runs on (osu-uwrt/mercury_release and its
+# mercury_* packages, replacing riptide). titan_firmware names the robot `mercury` (lib/titan_boards/include/robots/
+# mercury.h: ROS namespace "mercury", internal CAN FD 1/5 Mbit/s, external classic CAN 250 kbit/s) and has two board
+# apps for it, added in April 2026 as the "Triton" boards (tools/DeviceList.jsonc: "Triton ESC Board 0", "Triton
+# ESC Board 1", "Triton PoHalf Board"):
+#
+#   * mercury/PoHalfBoard on boards/mercury/po_half (client 1): the kill switch (physical on GPIO 2, software on 4),
+#     the aux switch, the MS5837-02BA depth sensor (state/depth/raw), electrical readings;
+#   * mercury/ESCBoard on boards/mercury/esc_board, twice (clients 2 and 3, by the ID strap on GPIO 29): four
+#     bidirectional DShot ESCs each, a copy of talos/ESCBoard with the ESC pins moved, no inverted thrusters
+#     (mask 0b0000) and mercury_msgs instead of riptide_msgs2.
+#
+# All three are C titan_firmware apps with micro-ROS over CAN, so this file takes them from your titan_firmware
+# checkout (TITAN_FIRMWARE_DIR), each project built in its own build/ as titan_firmware's docs do it (they need the
+# micro-ROS library built with mercury_common's mercury_msgs, lib/micro_ros_pico/build.sh, in Docker):
+#
+#   cd $TITAN_FIRMWARE_DIR/mercury/ESCBoard && mkdir -p build && cd build && cmake .. && make
+#   cd $TITAN_FIRMWARE_DIR/mercury/PoHalfBoard && mkdir -p build && cd build && cmake .. && make
+#   firmware_simulator robot robots/mercury.toml --can internal=can0 --realtime --time 100000s
+#
+# and the robot computer's side is `micro_ros_agent can -D can0`. There are no titan_firmware_rs images for these
+# boards (titan_firmware_rs's po_half_board is Lilboat's PoHalf, other pins; its esc_board has the mk2 pins), so
+# there is nothing for a mock bridge (titan_link) to talk to: the clients are 1, 2 and 3 on the internal bus, for
+# candump and the agent. scenarios/boot_mercury.yaml is the smoke test (skipped while TITAN_FIRMWARE_DIR is unset).
+#
+# Firmware finding (titan_firmware 058df2a): mercury/ESCBoard's thruster_cmd_callback reads each RPM as
+# (buf[idx] << 8) | buf[idx], the high byte twice, the bug PR #26 ("Actually read the low byte") fixed for
+# talos/ESCBoard only. Raw CAN thruster commands reach the Mercury ESCs with their low byte replaced.
+#
+# No vehicle: mercury_common's mercury_descriptions is empty (only mercury/.gitkeep) and mercury_simulator loads
+# riptide's talos.yaml by default, so Mercury's mass, geometry and thruster layout are not written down anywhere
+# found. The ESC boards' motors still spin (their speeds show on the dashboard and in scenarios' `esc` checks).
+
+[[bus]]
+name = "internal"
+rates = "internal"
+
+[[board]]
+name = "pohalf"
+board = "../boards/mercury/po_half.toml"
+elf = "${TITAN_FIRMWARE_DIR}/mercury/PoHalfBoard/build/po_half_with_bl.uf2"
+rom_boot = true
+bus = "internal"
+
+[[board]]
+name = "esc0"
+board = "../boards/mercury/esc_board.toml"
+elf = "${TITAN_FIRMWARE_DIR}/mercury/ESCBoard/build/esc_board_with_bl.uf2"
+rom_boot = true
+bus = "internal"
+
+[[board]]
+name = "esc1"
+board = "../boards/mercury/esc_board.toml"
+elf = "${TITAN_FIRMWARE_DIR}/mercury/ESCBoard/build/esc_board_with_bl.uf2"
+rom_boot = true
+bus = "internal"
+power_on_ms = 3
+gpio = [{ pin = 29, level = "high" }]

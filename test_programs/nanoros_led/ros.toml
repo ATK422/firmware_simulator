@@ -1,0 +1,31 @@
+# The nano-ROS test program's topics, in the keys nano_ros_codegen reads (`topic_type`, `msg_type`; its README's
+# `direction`, `ros_type` and `qos` are the planned spelling, which the emulator also reads). The codegen numbers
+# subscribers from 0 and publishers from 127, in this order.
+[board]
+name = "nanoros_led"
+transport = "can"
+
+[[topics]]
+name = "bit_sub"
+topic_type = "subscriber"
+msg_type = "std_msgs/msg/UInt8"
+
+[[topics]]
+name = "imu_cmd"
+topic_type = "subscriber"
+msg_type = "sensor_msgs/msg/Imu"
+
+[[topics]]
+name = "firmware_status"
+topic_type = "publisher"
+msg_type = "riptide_msgs2/msg/FirmwareStatus"
+
+[[topics]]
+name = "imu_data"
+topic_type = "publisher"
+msg_type = "sensor_msgs/msg/Imu"
+
+[[topics]]
+name = "bit_echo"
+topic_type = "publisher"
+msg_type = "std_msgs/msg/UInt8"

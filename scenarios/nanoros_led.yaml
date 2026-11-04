@@ -1,0 +1,23 @@
+# The nano-ROS test board (test_programs/nanoros_led, robots/nanoros_led.toml) with a nano-ROS mock agent: the
+# handshake, what the board publishes as the agent decodes it, and the board answering what the agent sends.
+# Early: nano-ROS is still changing (docs/nanoros.md).
+name: nano-ROS board registers, publishes and takes messages
+robot: robots/nanoros_led.toml
+agents: [nanoros:led]
+time: 2s
+steps:
+  - expect: {board: led, log: done reg, within: 500ms}
+  - expect:
+      board: led
+      topic: imu_data
+      msg: {header: {frame_id: imu_link}, orientation: {w: 1}, linear_acceleration: {z: {min: 9.8, max: 9.82}}}
+      within: 200ms
+  - send: {board: led, topic: bit_sub, msg: {data: 41}}
+  - expect: {board: led, log: bit_sub 41, within: 200ms}
+  - expect: {board: led, topic: bit_echo, msg: {data: 42}, within: 200ms}
+  - send: {board: led, topic: imu_cmd, msg: {header: {frame_id: cmd}, orientation: {z: 0.6, w: 0.8}}, at: 1s}
+  - expect: {board: led, topic: imu_data, msg: {header: {frame_id: cmd}, orientation: {z: 0.6, w: 0.8}}, within: 300ms}
+  - expect: {board: led, topic: firmware_status, msg: {board_name: nanoros_led, client_id: 6, uptime_ms: {min: 1000}}, at: 1.5s}
+  - send: {board: led, topic: bit_sub, msg: {data: 1}, every: 100ms, until: 1.8s}
+  - expect: {board: led, topic: bit_echo, msg: {data: 2}, count: {min: 3}, until: 1.95s}
+  - never: {board: led, log: PANIC}

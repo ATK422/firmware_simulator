@@ -208,6 +208,7 @@ fn shipped_robot_files_load_their_vehicles() {
         ("talos_c.toml", "talos", 8, false),
         ("talos_c_nereus.toml", "talos", 8, true),
         ("talos_nereus.toml", "talos", 8, true),
+        ("tempest.toml", "tempest", 8, false),
     ] {
         let r = shipped(file);
         let v = &r.vehicles[0];
@@ -222,8 +223,12 @@ fn shipped_robot_files_load_their_vehicles() {
         } else {
             assert_eq!(v.vehicle.floating_depth(), Some(v.vehicle.state.position[2]), "{file}");
         }
-        // Every thruster is wired
-        assert!(v.wiring().iter().all(Option::is_some), "{file}");
+        // Every thruster is wired, but on Tempest, whose thruster board has no firmware
+        if name == "tempest" {
+            assert!(v.wiring().iter().all(Option::is_none), "{file}");
+        } else {
+            assert!(v.wiring().iter().all(Option::is_some), "{file}");
+        }
     }
 }
 

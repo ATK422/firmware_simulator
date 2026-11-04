@@ -68,10 +68,11 @@ fn the_controllers_can_frames_spin_the_thrusters_nereus_applies() {
         r.robot.buses[0].endpoints.push(Box::new(b.clone()));
         bridges.push(b);
     }
-    // What riptide's force_to_rpm curve gives for 12 N, -5 N, 16 N and -8 N, the signs as the solver sends them.
-    // (Its 24 N limit, 3171 RPM, is out of reach: the boards' hard limit of 725 throttle is about 2900 RPM.)
-    let cmd: [i16; 8] = [2275, -1408, 2604, 0, -1408, 2275, 2604, -1720];
-    let force: [f64; 8] = [12.0, -5.0, 16.0, 0.0, -5.0, 12.0, 16.0, -8.0];
+    // What riptide's force_to_rpm curve gives for 12 N, -5 N, 24 N, -5 N, -24 N, 16 N and -8 N (thruster 3 off), the
+    // signs as the solver sends them. 24 N is riptide's per-thruster limit: 2932 RPM astern is within the boards'
+    // throttle hard limit (725, 3100 RPM astern on the bench fit), 3171 RPM ahead is not (3068 RPM).
+    let cmd: [i16; 8] = [2275, -1408, 3171, 0, -1408, -2932, 2604, -1720];
+    let force: [f64; 8] = [12.0, -5.0, 24.0, 0.0, -5.0, -24.0, 16.0, -8.0];
     r.robot.buses[0].endpoints.push(Box::new(Controller { next: Time::from_ms(100), rpm: cmd }));
     // nereus has it 1.2 m down, turned to the east; the bridge holds it at the surface until the depth sensor has
     // zeroed (the first 3 s here)
@@ -89,34 +90,46 @@ fn the_controllers_can_frames_spin_the_thrusters_nereus_applies() {
     // Where it was put, its own physics off (it would have floated up, or dived on these thrusts)
     let v = &r.robot.vehicles[0];
     assert_eq!(v.vehicle.state.position, [3.0, 4.0, 1.2]);
-    // Each motor at its target, the inverted ones (1 and 4 of each board) turning the other way. Reverse targets
-    // settle about 330 RPM short: the ESC model needs more throttle for a speed than the feed-forward fit in
-    // esc_core (from the real thrusters) gives, P alone leaves an error just above the I term's 300 RPM bound, and
-    // the I term never starts. A model calibration to revisit; forward targets get inside the bound and converge.
+    // Each motor at its target, the inverted ones (1 and 4 of each board) turning the other way: the ESC model's
+    // speed for a throttle is the bench fit the firmware's feed-forward was made from, so feed-forward and P bring
+    // each motor inside the I term's 300 RPM bound and the I term takes the rest out, ahead and astern alike. The one
+    // exception is 24 N ahead, which the boards' hard limit stops at the fit's 3068 RPM.
     let rpm = v.rpms(&r.robot.boards, r.now());
     let invert = [-1.0, 1.0, 1.0, -1.0, -1.0, 1.0, 1.0, -1.0];
-    for (k, got) in rpm.iter().enumerate() {
-        let want = cmd[k] as f64 * invert[k];
-        if cmd[k] >= 0 {
-            assert!((got - want).abs() < 15.0, "thruster {k}: {rpm:?}");
-        } else {
-            let short = want.abs() - got.abs();
-            assert!(got.signum() == want.signum() && (250.0..400.0).contains(&short), "thruster {k}: {rpm:?}");
-        }
-    }
-    // The thrust nereus is given, thruster k at index k: the curve at the motor's speed, so the force the
-    // controller chose each speed for where the motor got there (within the curve fit's 4%)
     let names = r.robot.names.clone();
     let boards: Vec<&sim_host::Session> = r.robot.boards.iter().collect();
     let api = sim_host::dashboard::thrusters_json(&names, &boards, &r.robot.vehicles, r.now());
     let thrusters = api["vehicles"][0]["thrusters"].as_array().unwrap();
+    for k in 0..8 {
+        eprintln!(
+            "thruster {k}: {:5} RPM ({:5.1} N) asked, {:7.1} RPM, {:6.2} N",
+            cmd[k],
+            force[k],
+            rpm[k] * invert[k],
+            thrusters[k]["thrust_n"].as_f64().unwrap()
+        );
+    }
+    let limit = sim_devices::dshot::SpeedCurve::APD_T200.rpm(48 + 725);
+    assert!((limit - 3068.0).abs() < 1.0, "{limit}");
+    for (k, got) in rpm.iter().enumerate() {
+        let want = if cmd[k] > 3068 { limit } else { cmd[k] as f64 } * invert[k];
+        assert!((got - want).abs() < 15.0, "thruster {k}: {rpm:?}");
+    }
+    // The thrust nereus is given, thruster k at index k: the curve at the motor's speed, so the force the
+    // controller chose each speed for (within the curve's fit to riptide's)
     for (k, f) in force.iter().enumerate() {
         let got = thrusters[k]["thrust_n"].as_f64().unwrap();
         let curve = v.vehicle.thrusters[k].thrust(rpm[k]);
         assert!((got - curve).abs() < 1e-9, "thruster {k}: {got} N vs the curve's {curve} N");
         assert!(*f == 0.0 || got.signum() == f.signum(), "thruster {k}: {got} N");
-        if cmd[k] >= 0 {
-            assert!((got - f).abs() < 0.04 * f.abs() + 0.05, "thruster {k}: {got} N vs {f} N");
+        if k == 2 {
+            // 24 N asked, the hard limit's speed gives (3068 / 3171)^2 of it
+            let capped = 24.0 * (3068.0f64 / 3170.95).powi(2);
+            assert!((got - capped).abs() < 0.15 && got < 22.6, "thruster {k}: {got} N vs {capped} N");
+        } else {
+            // The curve's fit to riptide's: 4% from 12 N up, 11% from 5 N up
+            let tol = if f.abs() >= 12.0 { 0.04 } else { 0.11 };
+            assert!((got - f).abs() < tol * f.abs() + 0.05, "thruster {k}: {got} N vs {f} N");
         }
     }
     let escs = api["escs"].as_array().unwrap();

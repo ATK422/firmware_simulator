@@ -48,7 +48,11 @@ fn check_lists_every_shipped_scenario_without_running_it() {
     assert!(t.contains("Talos boots and every board connects"), "{t}");
     assert!(t.contains("case \"sensor unplugged\":"), "{t}");
     assert!(t.contains("expect camera_cage log \"Lost connection to ROS\" within 1s"), "{t}");
-    assert!(t.contains("scenario(s) in 8 file(s): OK"), "{t}");
+    let files = std::fs::read_dir(repo().join("scenarios"))
+        .unwrap()
+        .filter(|e| e.as_ref().unwrap().path().extension().is_some_and(|x| x == "yaml"))
+        .count();
+    assert!(t.contains(&format!("scenario(s) in {files} file(s): OK")), "{t}");
 }
 
 #[test]

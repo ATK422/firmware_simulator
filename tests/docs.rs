@@ -77,6 +77,8 @@ const OUTSIDE: &[(&str, &str)] = &[
     ("--repeat", "the bench example"),
     ("--scope", "claude mcp add"),
     ("--reverse", "GDB/MI's -exec-continue and -exec-step"),
+    ("--ros-prefix", "nano_ros_codegen"),
+    ("--user-msgs", "nano_ros_codegen"),
 ];
 
 /// The options of this repository's scripts and the nereus bridge, from their `--help`.

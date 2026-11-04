@@ -25,7 +25,8 @@ fn steady(name: &str, rpm: impl Fn(usize, &str) -> f64) -> Vehicle {
 #[test]
 fn shipped_vehicles_perform_plausibly() {
     for (name, horizontal) in [("talos", 0..4), ("puddles", 0..4)] {
-        let full = 4000.0;
+        // The T200's top speed at 16 V (Blue Robotics' data)
+        let full = 3533.0;
         let ahead = steady(name, |i, _| if horizontal.contains(&i) { full } else { 0.0 });
         let dive = steady(name, |i, _| if horizontal.contains(&i) { 0.0 } else { full });
         // Turning: the starboard pair (0, 2) ahead, the port pair (1, 3) astern
@@ -63,7 +64,7 @@ fn shipped_vehicles_perform_plausibly() {
         assert!((0.5..1.5).contains(&heave), "{name} heave {heave}");
         assert!(yaw_rate < -30.0 && yaw_rate > -300.0, "{name} yaw {yaw_rate}");
         // Going straight ahead at any speed it rights the disturbance instead of pitching over
-        for rpm in [1000.0, 2000.0, 3000.0, 4000.0] {
+        for rpm in [1000.0, 2000.0, 3000.0, full] {
             let v = steady(name, |i, _| if horizontal.contains(&i) { rpm } else { 0.0 });
             let [roll, pitch, yaw] = v.state.attitude.euler().map(f64::to_degrees);
             assert!(

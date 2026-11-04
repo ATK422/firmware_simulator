@@ -1,0 +1,83 @@
+# Tempest, UWRT's AUV before Talos, as riptide's description of it gives it (osu-uwrt/riptide_core,
+# riptide_descriptions/config/tempest.yaml, unchanged since riptide_core's first commit in December 2022, when it was
+# carried over from the earlier riptide stack; robots/tempest.xacro uses it with meshes/Tempest.dae). For
+# robots/tempest.toml.
+#
+# Taken from tempest.yaml, re-expressed in this emulator's frames (body forward-starboard-down from the centre of
+# mass; the yaml is forward-left-up from its own datum, and its numbers place the thrusters at x 0.019 forward and
+# -0.764 aft, y -0.051 starboard and 0.763 port):
+#   * mass 32.3214 kg, inertia [0.9978, 1.6934, 2.1284] kg m2, volume 0.0331 m3 (6.7 N positive in fresh water),
+#     com [-0.418, 0.357, -0.11] and cob [-0.400001, 0.35511, -0.10810] in its datum (see cob_m below);
+#   * linear and quadratic drag: the controller's damping model (controller.linear/angular.damping, magnitudes);
+#   * the eight thrusters: `thrusters` poses, each pushing along its frame's +X as riptide's thruster frames do,
+#     H* (pitched 90 degrees) vertical, V* (yawed +-45 and +-135 degrees) the vectored horizontal ones; `type: 1`
+#     (the attack direction) is `inverted`.
+#
+# ASSUMED (tempest.yaml has none of it): the added mass (Talos's assumed values, vehicles/talos.toml), the hull
+# height (0.45 m), the Munk moment share (0.25, as the other files) and the thrust curve. Tempest's thrusters were
+# driven by its coprocessor as PWM ESCs from 1100 to 1900 us (titan_firmware's Copro, HW_USE_PWM; tempest.yaml's
+# THRUST and SU_THRUST slopes are PWM intercepts at 1552 / 1444 us and 22 N `max_force`), the Blue Robotics
+# T200/ESC convention, so the curve is the T200 at 16 V as in vehicles/talos.toml.
+name = "tempest"
+
+mass_kg = 32.3214
+volume_m3 = 0.0331
+inertia_kg_m2 = [0.9978, 1.6934, 2.1284]
+# tempest.yaml's cob is 1.8 cm ahead of the centre of mass and only 1.9 mm above it, which would float the vehicle
+# pitched up about 50 degrees (the real one was trimmed level). Kept: the height above it (weak righting in roll and
+# pitch); dropped: the horizontal offsets.
+cob_m = [0.0, 0.0, -0.0019]
+height_m = 0.45
+added_mass = [8.0, 25.0, 30.0, 0.5, 1.2, 1.0]
+linear_drag = [17.0, 17.0, 35.0, 2.0, 4.5, 2.5]
+quadratic_drag = [180.0, 180.0, 460.0, 6.0, 12.0, 12.0]
+munk_moment_scale = 0.25
+
+# T200 at 16 V (see vehicles/talos.toml)
+thruster_model = { forward_n = 50.82, reverse_n = 40.53, at_rpm = 3533.0 }
+
+# Heave thrusters: positive pushes the vehicle down
+[[thruster]]
+name = "HSF"
+inverted = true
+position_m = [0.437, 0.408, -0.032]
+direction = [0.0, 0.0, 1.0]
+
+[[thruster]]
+name = "HSA"
+position_m = [-0.346, 0.408, -0.032]
+direction = [0.0, 0.0, 1.0]
+
+[[thruster]]
+name = "HPA"
+inverted = true
+position_m = [-0.346, -0.406, -0.032]
+direction = [0.0, 0.0, 1.0]
+
+[[thruster]]
+name = "HPF"
+position_m = [0.437, -0.406, -0.032]
+direction = [0.0, 0.0, 1.0]
+
+# Vectored horizontal thrusters at the corners
+[[thruster]]
+name = "VSF"
+position_m = [0.378, 0.349, -0.0394]
+direction = [-0.7071, 0.7071, 0.0]
+
+[[thruster]]
+name = "VSA"
+position_m = [-0.258, 0.349, -0.0394]
+direction = [0.7071, 0.7071, 0.0]
+
+[[thruster]]
+name = "VPA"
+inverted = true
+position_m = [-0.258, -0.317, -0.0394]
+direction = [0.7071, -0.7071, 0.0]
+
+[[thruster]]
+name = "VPF"
+inverted = true
+position_m = [0.378, -0.317, -0.0394]
+direction = [-0.7071, -0.7071, 0.0]

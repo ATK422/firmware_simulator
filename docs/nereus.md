@@ -232,13 +232,13 @@ nereus's existing parameter.
 
 ## Limitations
 
-* **Reverse RPM targets settle short on the emulated ESCs** (about 330 RPM, so 20-25% less reverse thrust than
-  asked): the ESC model's speed per throttle is below what esc_core's feed-forward fit (from the real thrusters)
-  expects, the P term alone leaves an error just above the I term's 300 RPM bound, and the I term never starts.
-  Forward targets get inside the bound and converge. `crates/sim_test/tests/vehicle_nereus.rs` pins this; it is the
-  ESC model's calibration (`max_rpm`, linear throttle) to revisit, not the firmware.
-* The boards' hard limit (725 of 999 throttle) caps the emulated motors near 2900 RPM, about 20 N forward: less than
-  riptide's 24 N per-thruster limit.
+* **24 N ahead is out of the boards' reach.** The ESC boards' throttle hard limit (725 of 999) stops a motor at
+  3068 RPM ahead, which riptide's curve makes 22.4 N, against the 3171 RPM it chooses for its 24 N per-thruster
+  limit; astern, 24 N (2932 RPM) is within the limit's 3100 RPM. This is the real system's: the emulated ESCs turn
+  at the speed the firmware's feed-forward fit (from the same bench runs as riptide's curve) gives for a throttle
+  ([boards.md](boards.md#the-esc-boards-speed-curve)), so every other target, ahead or astern, settles within a few
+  RPM (`crates/sim_test/tests/vehicle_nereus.rs`). Before that calibration the ESC model was linear (4000 RPM at
+  full throttle): reverse targets settled about 330 RPM short and the limit was 2904 RPM.
 * Only the boards in the loop run. The actuator board (claw), LED, SBC, smart battery and IVC are left out; nereus
   keeps simulating the mechanisms, and the PoAC firmware reports actuator state.
 * nereus's own thruster dynamics are off and its propellers' surface fade still applies to the firmware's thrust.

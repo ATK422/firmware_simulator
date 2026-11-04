@@ -45,3 +45,45 @@ status_ledb_pin = 15
 status_ledg_pin = 14
 status_ledr_pin = 13
 vcc_meas_pin = 28
+
+# ---- boards/overlays/mercury/esc_board.toml
+# Four bidirectional DShot600 ESCs, wired differently from the mk2 board: ESC1-4 on GPIO 1, 7, 3, 5 with UART
+# telemetry on GPIO 0, 6, 2, 4; 7 pole pairs. The ESC firmware notes and patch (mercury/ESCBoard/
+# esc_firmware_patching) are the mk2 board's, word for word: APD 80F3s in patched 3D mode. Which thrusters they drive
+# on Mercury's vehicle is not written down anywhere found; the speed curve is the Talos bench fit (APD 80F3 + T200)
+# that this firmware's feed-forward, also unchanged, was made from (see boards/overlays/mk2/esc_board.toml).
+[[dshot_esc]]
+name = "esc1"
+signal_pin = 1
+telemetry_pin = 0
+throttle_fit = { forward = [12.369874, 0.103410, 0.000042], reverse = [14.791378, 0.098938, 0.000042] }
+
+[[dshot_esc]]
+name = "esc2"
+signal_pin = 7
+telemetry_pin = 6
+throttle_fit = { forward = [12.369874, 0.103410, 0.000042], reverse = [14.791378, 0.098938, 0.000042] }
+
+[[dshot_esc]]
+name = "esc3"
+signal_pin = 3
+telemetry_pin = 2
+throttle_fit = { forward = [12.369874, 0.103410, 0.000042], reverse = [14.791378, 0.098938, 0.000042] }
+
+[[dshot_esc]]
+name = "esc4"
+signal_pin = 5
+telemetry_pin = 4
+throttle_fit = { forward = [12.369874, 0.103410, 0.000042], reverse = [14.791378, 0.098938, 0.000042] }
+
+# ESC rail sense on GPIO 28 (ADC 2), as on the mk2 board (the same dshot.c measures it)
+[[analog]]
+adc = 2
+name = "esc_vcc"
+volts = 16.0
+divider_ohms = [10_000, 1_000]
+
+# Board detection: GPIO 29 low is ESC board 0 (thrusters 1-4, client 2), high ESC board 1 (client 3)
+[[gpio]]
+pin = 29
+level = "low"

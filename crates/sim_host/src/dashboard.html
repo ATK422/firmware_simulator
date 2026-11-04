@@ -377,6 +377,22 @@ function linkLines(link) {
   return out;
 }
 
+// A protocol-neutral mock agent (a nano-ROS agent): a summary line and a line per topic, [text, class] each
+function agentLines(a) {
+  const conn = a.connected ? `registered at ${fmt(a.connected_at_s, 3)} s` : `not registered (${a.discovers ?? 0} discover)`;
+  const errs = a.decode_errors ? ` · ${a.decode_errors} error(s)` : "";
+  const head = [`${a.protocol} · ${a.running ? "running" : "stopped"} · client ${a.client} · ${conn} · ${a.messages} in, ${a.sent ?? 0} out${errs}`,
+    !a.running || a.decode_errors ? "warn" : (a.connected ? "ok" : "muted")];
+  const topics = (a.topics || []).map((t) => {
+    const dir = t.direction === "publisher" ? "→" : "←";
+    const last = t.last === undefined || t.last === null ? "-" : JSON.stringify(t.last);
+    const flag = t.ros2_layout_differs ? " · ROS 2 layout differs" : "";
+    return [`${dir} ${t.name} [${t.id}] ${t.type} · ${t.direction === "publisher" ? t.received : t.sent}${flag} · ${last}`,
+      t.registered ? (t.ros2_layout_differs ? "warn" : "") : "muted"];
+  });
+  return { head, topics, errors: (a.recent_errors || []).map((e) => [e, "bad"]) };
+}
+
 function logLine(l) {
   const kind = String(l.kind || "").replace(/[^a-z0-9]/gi, "");
   const d = el("div", { class: "k-" + kind }, el("span", { class: "t", text: fmt(l.t, 6) }), " ");
@@ -455,6 +471,12 @@ function buildBoard(c, b) {
       rows.push(row(label, c.link[key]));
     }
   }
+  c.agent = null;
+  if (b.agent) {
+    c.agent = { head: el("div", { class: "line" }), topics: el("div", {}) };
+    rows.push(row("Agent", c.agent.head));
+    rows.push(row("Topics", c.agent.topics));
+  }
   rows.push(el("div", { class: "sep" }));
   c.leds = b.leds.map((l) => { const dot = el("i"); return { chip: el("span", { class: "chip led", title: `${l.name}: GPIO ${l.pin}` }, dot, l.name) }; });
   c.strips = b.strips.map((s) => {
@@ -511,6 +533,11 @@ function updateBoard(b) {
       const [text, cls] = ll[key];
       setText(c.link[key], text); setClass(c.link[key], "line " + cls); setTitle(c.link[key], text);
     }
+  }
+  if (c.agent && b.agent) {
+    const al = agentLines(b.agent);
+    setText(c.agent.head, al.head[0]); setClass(c.agent.head, "line " + al.head[1]); setTitle(c.agent.head, al.head[0]);
+    c.agent.topics.replaceChildren(...al.topics.concat(al.errors).map(([text, cls]) => el("div", { class: "line " + cls, text, title: text })));
   }
   b.leds.forEach((l, i) => setClass(c.leds[i].chip, "chip led" + (l.on ? " on" : "")));
   b.strips.forEach((s, i) => s.colors.forEach((col, j) => {

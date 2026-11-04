@@ -90,6 +90,12 @@ struct RobotArgs {
     /// Attach a scripted titan_bridge for a client on a bus: `BUS:CLIENT`, e.g. `talos:8` (repeatable).
     #[arg(long = "mock-bridge", value_parser = parse_bus_client)]
     mock_bridges: Vec<(String, u8)>,
+    /// Attach a scripted host side in the board's protocol: `PROTOCOL[:BUS][:BOARD][=CONFIG]` (repeatable).
+    /// `nanoros:BOARD` is a nano-ROS agent (early: nano-ROS is still changing, see docs/nanoros.md) reading the
+    /// board's `ros_toml` from the robot file, or `nanoros:BOARD=ros.toml` that file; `titan_link:BOARD` is
+    /// `--mock-bridge` for the board's client. Each message from the board is printed with its topic.
+    #[arg(long = "mock-agent", value_parser = parse_agent_spec)]
+    mock_agents: Vec<sim_host::host_protocol::AgentSpec>,
     /// Bridge a bus to a SocketCAN interface: `BUS=IFACE`, e.g. `talos=vcan0` (repeatable).
     #[arg(long = "can", value_parser = parse_bus_iface)]
     cans: Vec<(String, String)>,
@@ -306,6 +312,32 @@ fn parse_bus_client(s: &str) -> Result<(String, u8), String> {
     Ok((bus.to_string(), client.parse().map_err(|e| format!("{client:?}: {e}"))?))
 }
 
+fn parse_agent_spec(s: &str) -> Result<sim_host::host_protocol::AgentSpec, String> {
+    s.parse()
+}
+
+/// Prints each message an agent gets, `[t] NAME <- TOPIC {json}`.
+fn print_agent_messages(agent: &dyn sim_host::host_protocol::HostAgent, name: String) {
+    agent.on_message(Box::new(move |m| println!("[{}] {name} <- {} {}", m.t, m.topic, m.msg)));
+}
+
+/// What a mock agent saw, at the end of a run.
+fn agent_summary(name: &str, agent: &dyn sim_host::host_protocol::HostAgent, now: Time) {
+    let errors = agent.errors();
+    let st = agent.status(now);
+    eprintln!(
+        "{name}: {} agent {}, {} message(s) from the board, {} sent, {} error(s)",
+        agent.protocol(),
+        if agent.connected(now) { "connected" } else { "not connected" },
+        agent.message_count(),
+        st["sent"].as_u64().unwrap_or(0),
+        st["decode_errors"].as_u64().unwrap_or(errors.len() as u64)
+    );
+    for e in errors.iter().take(5) {
+        eprintln!("  {e}");
+    }
+}
+
 fn parse_bus_iface(s: &str) -> Result<(String, String), String> {
     let (bus, iface) = s.split_once('=').ok_or("expected BUS=IFACE")?;
     Ok((bus.to_string(), iface.to_string()))
@@ -347,9 +379,23 @@ fn robot(args: RobotArgs) -> Result<()> {
     for line in r.open_usb_ptys().map_err(anyhow::Error::msg)? {
         eprintln!("{line}");
     }
+    let mut mock_bridges = args.mock_bridges.clone();
+    let mut agents = Vec::new();
+    for spec in &args.mock_agents {
+        if spec.protocol == sim_host::host_protocol::Protocol::TitanLink {
+            let p = sim_host::host_protocol::place(&r, spec).map_err(anyhow::Error::msg)?;
+            mock_bridges.push((r.bus_names[p.bus].clone(), p.client));
+            continue;
+        }
+        let (p, agent) = sim_host::host_protocol::attach(&mut r, spec, Path::new(".")).map_err(anyhow::Error::msg)?;
+        let name = p.board.map_or_else(|| format!("{}:{}", r.bus_names[p.bus], p.client), |i| r.names[i].clone());
+        print_agent_messages(&*agent, name.clone());
+        log::info!("{} mock agent for client {} on {}", agent.protocol(), p.client, r.bus_names[p.bus]);
+        agents.push((p, name, agent));
+    }
     let mut bridges: Vec<Option<sim_host::mock_bridge::MockBridge>> = vec![None; r.buses.len()];
     let mut all_bridges = Vec::new();
-    for (bus, client) in &args.mock_bridges {
+    for (bus, client) in &mock_bridges {
         let j = r.bus_names.iter().position(|n| n == bus).with_context(|| format!("no bus {bus:?}"))?;
         let b = sim_host::mock_bridge::MockBridge::new(*client, r.buses[j].bus.rates.data.is_some(), Time::ZERO);
         b.set_kill(Some(false));
@@ -530,7 +576,10 @@ fn robot(args: RobotArgs) -> Result<()> {
             for (j, rb) in r.buses.iter_mut().enumerate() {
                 d.tap_bus(j, rb);
             }
-            for (bus, client) in &args.mock_bridges {
+            for (p, _, a) in &agents {
+                d.add_agent(p.board, a.handle());
+            }
+            for (bus, client) in &mock_bridges {
                 let j = r.bus_names.iter().position(|n| n == bus).unwrap();
                 let board =
                     (0..r.boards.len()).find(|&i| r.board_bus[i] == Some(j) && r.client_ids[i] == Some(*client));
@@ -660,6 +709,9 @@ fn robot(args: RobotArgs) -> Result<()> {
     can_host.finish()?;
     let interrupted = if why == "Interrupted" { " (Interrupted)" } else { "" };
     eprintln!("stopped at {}{interrupted}; {:.2?} wall", r.now, wall.elapsed());
+    for (_, name, a) in &agents {
+        agent_summary(name, &**a, r.now);
+    }
     if let Some(path) = &args.coverage {
         write_coverage(path, r.images.iter().map(String::as_str).zip(r.boards.iter().map(|b| &b.machine)))?;
     }
@@ -882,6 +934,11 @@ struct RunArgs {
     /// Attach a scripted titan_bridge stand-in for this CANmore client ID (pings, enables the vehicle).
     #[arg(long)]
     mock_bridge: Option<u8>,
+    /// Attach a scripted host side in the firmware's protocol: `nanoros[:CLIENT][=ros.toml]`, a nano-ROS agent
+    /// (early: nano-ROS is still changing, see docs/nanoros.md) for the board file's client (or CLIENT) with the
+    /// firmware's `ros.toml`; `titan_link[:CLIENT]` is `--mock-bridge`. Each message from the board is printed.
+    #[arg(long, value_parser = parse_agent_spec)]
+    mock_agent: Option<sim_host::host_protocol::AgentSpec>,
     /// Print every CAN frame on the bus, candump style.
     #[arg(long)]
     candump: bool,
@@ -1169,6 +1226,36 @@ fn run(args: RunArgs) -> Result<()> {
 
     let mut bridge_ctl: Option<Box<dyn sim_host::fault::BridgeControl>> = None;
     let mut link: Option<sim_host::dashboard::Link> = None;
+    let mut agent: Option<Box<dyn sim_host::host_protocol::HostAgent>> = None;
+    // A titan_link agent is the mock bridge; any other needs the board's CAN bus
+    let mut mock_bridge = args.mock_bridge;
+    if let Some(spec) = &args.mock_agent {
+        anyhow::ensure!(spec.bus.is_none(), "--mock-agent {spec}: a single board has one bus: PROTOCOL[:CLIENT]");
+        let client = match &spec.target {
+            Some(t) => t.parse::<u8>().map_err(|_| anyhow::anyhow!("--mock-agent {spec}: {t:?} is not a client ID"))?,
+            None => board.as_ref().and_then(|b| b.can.as_ref()?.client_id).with_context(|| {
+                format!("--mock-agent {spec}: the board file gives no CANmore client ID; give PROTOCOL:CLIENT")
+            })?,
+        };
+        match (spec.protocol, board.as_ref().and_then(|b| b.can_rates())) {
+            (sim_host::host_protocol::Protocol::TitanLink, _) => mock_bridge = Some(client),
+            (protocol, Some(rates)) => {
+                let a = sim_host::host_protocol::create(
+                    protocol,
+                    client,
+                    rates.data.is_some(),
+                    Time::ZERO,
+                    spec.config.as_deref(),
+                )
+                .map_err(|e| anyhow::anyhow!("--mock-agent {spec}: {e}"))?;
+                print_agent_messages(&*a, format!("client {client}"));
+                session.can_endpoints.push(a.endpoint());
+                log::info!("{} mock agent for client {client} attached", a.protocol());
+                agent = Some(a);
+            }
+            (_, None) => bail!("--mock-agent {spec}: needs a --board with a CAN bus"),
+        }
+    }
     if let Some(rates) = board.as_ref().and_then(|b| b.can_rates()) {
         let mut bus = sim_devices::can::CanBus::new(args.can.as_deref().unwrap_or("can"), rates);
         if args.candump {
@@ -1181,7 +1268,7 @@ fn run(args: RunArgs) -> Result<()> {
             session.can_endpoints.push(Box::new(sock));
             log::info!("CAN bus bridged to {iface}");
         }
-        if let Some(client) = args.mock_bridge {
+        if let Some(client) = mock_bridge {
             let bridge = sim_host::mock_bridge::MockBridge::new(client, rates.data.is_some(), sim_core::Time::ZERO);
             bridge.set_kill(Some(false));
             session.can_endpoints.push(Box::new(bridge.clone()));
@@ -1190,7 +1277,7 @@ fn run(args: RunArgs) -> Result<()> {
             log::info!("mock bridge for client {client} attached");
         }
     } else if session.machine.sys.ethernet.is_some() {
-        if args.mock_bridge.is_some() {
+        if mock_bridge.is_some() {
             let bridge = sim_host::ethernet::PuddlesBridge::new(Time::ZERO);
             bridge.set_kill(Some(false));
             session.eth_endpoints.push(Box::new(bridge.clone()));
@@ -1205,7 +1292,7 @@ fn run(args: RunArgs) -> Result<()> {
             session.eth_endpoints.push(Box::new(relay));
             log::info!("board UDP relayed: host {local} <-> {peer}");
         }
-    } else if args.can.is_some() || args.mock_bridge.is_some() || args.udp.is_some() {
+    } else if args.can.is_some() || mock_bridge.is_some() || args.udp.is_some() {
         bail!("--can and --mock-bridge need a --board with a CAN bus (or Ethernet), --udp one with Ethernet");
     }
     session.realtime = args.realtime;
@@ -1286,6 +1373,9 @@ fn run(args: RunArgs) -> Result<()> {
             d.tap_session(0, &mut session);
             if let Some(l) = link.take() {
                 d.add_link(Some(0), None, l);
+            }
+            if let Some(a) = &agent {
+                d.add_agent(Some(0), a.handle());
             }
             eprintln!("dashboard on http://{}/", d.addr);
             Some(d)
@@ -1438,6 +1528,9 @@ fn run(args: RunArgs) -> Result<()> {
         where_(machine.cores[0].pc()),
         elapsed
     );
+    if let Some(a) = &agent {
+        agent_summary(&format!("client {}", a.client_id()), &**a, machine.now);
+    }
     if let Some(note) = &lockups {
         eprintln!("{note}");
     }
