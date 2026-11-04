@@ -15,6 +15,60 @@ pub fn titan_rs_release_dir(repo: &std::path::Path) -> std::path::PathBuf {
     }
 }
 
+/// The titan_firmware_rs release image `name` ([`titan_rs_release_dir`]), for a test: `None` when it has not been
+/// built, which the test takes as a reason to skip (saying so), unless [`titan_rs_required`], when it panics.
+pub fn titan_rs_image(repo: &std::path::Path, name: &str) -> Option<std::path::PathBuf> {
+    let p = titan_rs_release_dir(repo).join(name);
+    if p.exists() {
+        return Some(p);
+    }
+    let how =
+        "cd external/titan_firmware_rs/firmware && cargo build --workspace --release, or set TITAN_RS_RELEASE_DIR";
+    if titan_rs_required() {
+        panic!("{} not built ({how}); SIM_REQUIRE_TITAN_RS is set, so this fails instead of skipping", p.display());
+    }
+    eprintln!("skipping: {} not built ({how})", p.display());
+    None
+}
+
+/// Whether a test fails instead of skipping when a titan_firmware_rs image is missing: `SIM_REQUIRE_TITAN_RS` is set
+/// to anything but empty or `0`. titan_firmware_rs's CI sets it, so missing images cannot pass as skipped tests.
+pub fn titan_rs_required() -> bool {
+    required(std::env::var_os("SIM_REQUIRE_TITAN_RS").as_deref())
+}
+
+fn required(v: Option<&std::ffi::OsStr>) -> bool {
+    v.is_some_and(|v| !v.is_empty() && v != "0")
+}
+
+#[cfg(test)]
+mod required_tests {
+    #[test]
+    fn sim_require_titan_rs_values() {
+        let r = |v: Option<&str>| super::required(v.map(std::ffi::OsStr::new));
+        assert!(!r(None));
+        assert!(!r(Some("")));
+        assert!(!r(Some("0")));
+        assert!(r(Some("1")));
+        assert!(r(Some("yes")));
+    }
+
+    #[test]
+    fn a_built_image_is_found() {
+        let dir = std::env::temp_dir().join(format!("titan-rs-image-{}", std::process::id()));
+        let release = dir.join(super::RS_RELEASE_SUFFIX);
+        std::fs::create_dir_all(&release).unwrap();
+        std::fs::write(release.join("template"), b"").unwrap();
+        if std::env::var_os("TITAN_RS_RELEASE_DIR").is_none() {
+            assert_eq!(super::titan_rs_image(&dir, "template"), Some(release.join("template")));
+            if !super::titan_rs_required() {
+                assert_eq!(super::titan_rs_image(&dir, "nope"), None);
+            }
+        }
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+}
+
 const RS_RELEASE_SUFFIX: &str = "external/titan_firmware_rs/firmware/target/thumbv6m-none-eabi/release";
 
 /// An image path from a robot file, with the titan_firmware_rs release directory replaced by

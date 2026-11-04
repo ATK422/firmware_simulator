@@ -112,6 +112,7 @@ as `[t] NAME uart0: ...`); the run ends with the stop time, the wall time and ea
 | `--vcd FILE`, `--vcd-pins SPEC`, `--vcd-events` | all pins | A VCD waveform with a scope per board (and per bus) |
 | `--dashboard ADDR`, `--dashboard-hold`, `--dashboard-pause-at T` | | A live dashboard of all boards, buses and vehicles |
 | `--log-json FILE` | | Every log line, UART line, CAN frame and fault as JSON lines |
+| `--gdb BOARD=ADDR` | | Waits for GDB on one board, e.g. `esc0=127.0.0.1:3333`; continuing runs the whole robot ([running.md](running.md#debugging-with-gdb)) |
 | `--unmodelled MODE` | `summary` | Registers the emulator does not model, as for `run` ([running.md](running.md#traces)): one note, then a line per board at the end listing them; `first`, `every` or `off` |
 
 A board whose core locks up runs on until its watchdog resets it, as on the chip (`--stop-on-lockup` stops the

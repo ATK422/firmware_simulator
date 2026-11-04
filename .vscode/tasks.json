@@ -1,0 +1,208 @@
+// Tasks that start the emulator for the debug configurations in launch.json (docs/running.md, "Debugging in VS
+// Code"). Each builds the emulator (cargo run --release), links the chosen ELF to target/vscode/debug.elf and waits
+// for GDB on 127.0.0.1:3333; VS Code goes on once the emulator logs "waiting for GDB". The emulator runs only while
+// GDB drives it and ends with the debug session. The image list follows crates/sim_test/tests/smoke.rs.
+{
+  "version": "2.0.0",
+  "tasks": [
+    {
+      "label": "emulator: titan_firmware_rs image",
+      "type": "shell",
+      "command": "${workspaceFolder}/scripts/vscode_gdb.sh",
+      "args": [
+        "run",
+        "${input:rsImage}"
+      ],
+      "isBackground": true,
+      "problemMatcher": {
+        "owner": "firmware_simulator",
+        "pattern": {
+          "regexp": "^__no_problems_to_report__$"
+        },
+        "background": {
+          "activeBegins": true,
+          "beginsPattern": ".",
+          "endsPattern": "waiting for GDB on"
+        }
+      },
+      "presentation": {
+        "reveal": "always",
+        "panel": "dedicated",
+        "clear": true
+      }
+    },
+    {
+      "label": "emulator: Talos robot board",
+      "type": "shell",
+      "command": "${workspaceFolder}/scripts/vscode_gdb.sh",
+      "args": [
+        "robot",
+        "robots/talos.toml",
+        "${input:talosBoard}"
+      ],
+      "isBackground": true,
+      "problemMatcher": {
+        "owner": "firmware_simulator",
+        "pattern": {
+          "regexp": "^__no_problems_to_report__$"
+        },
+        "background": {
+          "activeBegins": true,
+          "beginsPattern": ".",
+          "endsPattern": "waiting for GDB on"
+        }
+      },
+      "presentation": {
+        "reveal": "always",
+        "panel": "dedicated",
+        "clear": true
+      }
+    },
+    {
+      "label": "emulator: C pico-sdk ELF",
+      "type": "shell",
+      "command": "${workspaceFolder}/scripts/vscode_gdb.sh",
+      "args": [
+        "elf",
+        "${input:cElf}"
+      ],
+      "isBackground": true,
+      "problemMatcher": {
+        "owner": "firmware_simulator",
+        "pattern": {
+          "regexp": "^__no_problems_to_report__$"
+        },
+        "background": {
+          "activeBegins": true,
+          "beginsPattern": ".",
+          "endsPattern": "waiting for GDB on"
+        }
+      },
+      "presentation": {
+        "reveal": "always",
+        "panel": "dedicated",
+        "clear": true
+      }
+    }
+  ],
+  "inputs": [
+    {
+      "id": "rsImage",
+      "type": "pickString",
+      "description": "titan_firmware_rs image to debug (on its board, with a mock titan_bridge)",
+      "options": [
+        {
+          "label": "template  (mk2/power_board, client 1)",
+          "value": "template mk2/power_board 1"
+        },
+        {
+          "label": "power_board  (mk2/power_board, client 1)",
+          "value": "power_board mk2/power_board 1"
+        },
+        {
+          "label": "esc_board  (mk2/esc_board, client 2)",
+          "value": "esc_board mk2/esc_board 2"
+        },
+        {
+          "label": "camera_cage_bb  (mk2/camera_cage_bb, client 4)",
+          "value": "camera_cage_bb mk2/camera_cage_bb 4"
+        },
+        {
+          "label": "actuator_board  (mk2/actuator_board, client 5)",
+          "value": "actuator_board mk2/actuator_board 5"
+        },
+        {
+          "label": "led_board  (talos/led_board, client 6)",
+          "value": "led_board talos/led_board 6"
+        },
+        {
+          "label": "led_board2  (talos/led_board, client 6)",
+          "value": "led_board2 talos/led_board 6"
+        },
+        {
+          "label": "sbc_board  (talos/sbc_board, client 7)",
+          "value": "sbc_board talos/sbc_board 7"
+        },
+        {
+          "label": "ivc_board  (talos/ivc_board, client 8)",
+          "value": "ivc_board talos/ivc_board 8"
+        },
+        {
+          "label": "ivc_board2  (talos/ivc_board, client 8)",
+          "value": "ivc_board2 talos/ivc_board 8"
+        },
+        {
+          "label": "ivc_dac  (talos/ivc_board, client 8)",
+          "value": "ivc_dac talos/ivc_board 8"
+        },
+        {
+          "label": "poac_board  (talos/poac_board, client 1)",
+          "value": "poac_board talos/poac_board 1"
+        },
+        {
+          "label": "smart_battery  (mk2/sbh_mcu, client 21)",
+          "value": "smart_battery mk2/sbh_mcu 21"
+        },
+        {
+          "label": "hbridge_board  (lilboat/hbridge_board, client 2)",
+          "value": "hbridge_board lilboat/hbridge_board 2"
+        },
+        {
+          "label": "po_half_board  (lilboat/po_half, client 1)",
+          "value": "po_half_board lilboat/po_half 1"
+        }
+      ],
+      "default": "template mk2/power_board 1"
+    },
+    {
+      "id": "talosBoard",
+      "type": "pickString",
+      "description": "Talos board to debug (robots/talos.toml; the others run with it)",
+      "options": [
+        {
+          "label": "poac  (poac_board)",
+          "value": "poac poac_board internal:1"
+        },
+        {
+          "label": "esc0  (esc_board)",
+          "value": "esc0 esc_board internal:2"
+        },
+        {
+          "label": "esc1  (esc_board)",
+          "value": "esc1 esc_board internal:3"
+        },
+        {
+          "label": "camera_cage  (camera_cage_bb)",
+          "value": "camera_cage camera_cage_bb internal:4"
+        },
+        {
+          "label": "actuator  (actuator_board)",
+          "value": "actuator actuator_board internal:5"
+        },
+        {
+          "label": "led  (led_board)",
+          "value": "led led_board internal:6"
+        },
+        {
+          "label": "sbc  (sbc_board)",
+          "value": "sbc sbc_board internal:7"
+        },
+        {
+          "label": "ivc  (ivc_board2)",
+          "value": "ivc ivc_board2 internal:8"
+        },
+        {
+          "label": "battery  (smart_battery)",
+          "value": "battery smart_battery external:21"
+        }
+      ],
+      "default": "esc0 esc_board internal:2"
+    },
+    {
+      "id": "cElf",
+      "type": "promptString",
+      "description": "C pico-sdk ELF to debug (scripts/build_c_firmware.sh builds these)",
+      "default": "build/c/basic_template/template_project.elf"
+    }
+  ]
+}

@@ -1,0 +1,86 @@
+// Step through firmware running in the emulator with Cortex-Debug (marus25.cortex-debug; docs/running.md,
+// "Debugging in VS Code"). Each configuration's preLaunchTask (tasks.json) starts the emulator with --gdb, and
+// Cortex-Debug connects to it as an external GDB server. Each core is a thread; the SVD gives the peripheral view.
+//
+// * gdbPath: gdb-multiarch (Debian, Ubuntu); use arm-none-eabi-gdb where that is what you have (macOS, Arm's
+//   toolchain), or set "cortex-debug.gdbPath" in your user settings and delete it here.
+// * Launch does not reset the chip: the emulator waits for GDB at the reset vector (a reset would be a watchdog
+//   reset, which titan firmware counts). Restart and Reset do `monitor reset halt`, then make GDB re-read the
+//   registers.
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "Emulator: titan_firmware_rs image",
+      "type": "cortex-debug",
+      "request": "launch",
+      "servertype": "external",
+      "gdbTarget": "localhost:3333",
+      "gdbPath": "gdb-multiarch",
+      "executable": "${workspaceFolder}/target/vscode/debug.elf",
+      "device": "RP2040",
+      "svdFile": "${workspaceFolder}/crates/rp2040/svd/rp2040.svd",
+      "runToEntryPoint": "main",
+      "overrideLaunchCommands": [
+        "monitor halt"
+      ],
+      "overrideRestartCommands": [
+        "monitor reset halt",
+        "maintenance flush register-cache"
+      ],
+      "overrideResetCommands": [
+        "monitor reset halt",
+        "maintenance flush register-cache"
+      ],
+      "preLaunchTask": "emulator: titan_firmware_rs image"
+    },
+    {
+      "name": "Emulator: Talos robot board",
+      "type": "cortex-debug",
+      "request": "launch",
+      "servertype": "external",
+      "gdbTarget": "localhost:3333",
+      "gdbPath": "gdb-multiarch",
+      "executable": "${workspaceFolder}/target/vscode/debug.elf",
+      "device": "RP2040",
+      "svdFile": "${workspaceFolder}/crates/rp2040/svd/rp2040.svd",
+      "runToEntryPoint": "main",
+      "overrideLaunchCommands": [
+        "monitor halt"
+      ],
+      "overrideRestartCommands": [
+        "monitor reset halt",
+        "maintenance flush register-cache"
+      ],
+      "overrideResetCommands": [
+        "monitor reset halt",
+        "maintenance flush register-cache"
+      ],
+      "preLaunchTask": "emulator: Talos robot board"
+    },
+    {
+      "name": "Emulator: C pico-sdk ELF",
+      "type": "cortex-debug",
+      "request": "launch",
+      "servertype": "external",
+      "gdbTarget": "localhost:3333",
+      "gdbPath": "gdb-multiarch",
+      "executable": "${workspaceFolder}/target/vscode/debug.elf",
+      "device": "RP2040",
+      "svdFile": "${workspaceFolder}/crates/rp2040/svd/rp2040.svd",
+      "runToEntryPoint": "main",
+      "overrideLaunchCommands": [
+        "monitor halt"
+      ],
+      "overrideRestartCommands": [
+        "monitor reset halt",
+        "maintenance flush register-cache"
+      ],
+      "overrideResetCommands": [
+        "monitor reset halt",
+        "maintenance flush register-cache"
+      ],
+      "preLaunchTask": "emulator: C pico-sdk ELF"
+    }
+  ]
+}
