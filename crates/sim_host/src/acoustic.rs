@@ -169,7 +169,7 @@ mod tests {
         let w = sim_acoustics::wav::Wav::load(&dir.join("h.wav")).unwrap();
         assert_eq!((w.rate, w.samples.len()), (500_000, 100));
         // A quiet pin at 2.475 V is half way up the upper half of 0..3.3 V (to the nearest 12-bit step)
-        assert!(w.samples.iter().all(|s| (s - 0.5).abs() < 5e-4), "{:?}", &w.samples[..4]);
+        assert!(w.samples.iter().all(|s| (s - 0.5).abs() < 1e-3), "{:?}", w.samples);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

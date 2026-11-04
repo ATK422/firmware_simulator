@@ -39,7 +39,7 @@ fn num(v: &toml::Value) -> f64 {
 #[test]
 fn calibrate_thrusters_from_a_test_stand_csv() {
     let mut esc = sim_devices::dshot::Esc::new("truth", 0, None);
-    esc.max_rpm = 3600.0;
+    esc.curve = sim_devices::dshot::SpeedCurve::Fit { forward: [10.0, 0.11, 0.00004], reverse: [16.0, 0.095, 0.00005] };
     esc.tau = sim_core::time::Time::from_ms(45);
     let curve = sim_physics::ThrustCurve { forward_n: 47.0, reverse_n: 36.0, at_rpm: 3800.0 };
     let csv = temp("stand.csv");
@@ -57,23 +57,36 @@ fn calibrate_thrusters_from_a_test_stand_csv() {
         path(&out),
     ]);
     assert_eq!(code, 0, "{text}");
-    assert!(text.contains("thrust curve:") && text.contains("max_rpm"), "{text}");
+    // The board file's ESCs have a throttle fit (the APD 80F3 bench fit): the same form is fitted
+    assert!(text.contains("thrust curve:") && text.contains("forward_c1"), "{text}");
     let fitted = std::fs::read_to_string(out.join("thrusters.toml")).unwrap();
     // The two halves of the file are TOML: the vehicle's line and the ESC's keys
     let t: toml::Table = toml::from_str(&fitted).unwrap();
     let c = t["thruster_model"].as_table().unwrap();
-    assert!((num(&c["forward_n"]) - 47.0).abs() < 0.3 && (num(&c["reverse_n"]) - 36.0).abs() < 0.3, "{fitted}");
-    assert!((num(&t["max_rpm"]) - 3600.0).abs() < 5.0 && (num(&t["tau_ms"]) - 45.0).abs() < 2.0, "{fitted}");
+    // At the vehicle file's at_rpm: compare the thrust at the truth's 3800 RPM
+    let k = (3800.0 / num(&c["at_rpm"])).powi(2);
+    assert!((num(&c["forward_n"]) * k - 47.0).abs() < 0.3 && (num(&c["reverse_n"]) * k - 36.0).abs() < 0.3, "{fitted}");
+    assert!((num(&t["tau_ms"]) - 45.0).abs() < 2.0, "{fitted}");
     for f in ["report.md", "thrust.svg", "rpm.svg", "rpm_time.svg"] {
         assert!(out.join(f).exists(), "{f}");
     }
-    // The ESC keys load in a board file
-    let board = format!(
-        "name = \"x\"\n[[dshot_esc]]\nsignal_pin = 1\nmax_rpm = {}\ntau_ms = {}\n",
-        num(&t["max_rpm"]),
-        num(&t["tau_ms"])
-    );
-    sim_host::board::Board::parse(&board).unwrap().apply(&mut rp2040::Machine::new(Default::default())).unwrap();
+    // The ESC keys load in a board file, and its ESC turns as fast as the truth for each throttle
+    let keys: String = fitted
+        .lines()
+        .filter(|l| l.starts_with("throttle_fit") || l.starts_with("tau_ms"))
+        .map(|l| format!("{l}\n"))
+        .collect();
+    let board = sim_host::board::Board::parse(&format!("name = \"x\"\n[[dshot_esc]]\nsignal_pin = 1\n{keys}")).unwrap();
+    let mut m = rp2040::Machine::new(Default::default());
+    board.apply(&mut m).unwrap();
+    let got = m.sys.pin_devices[0].as_any().downcast_ref::<sim_devices::dshot::Esc>().unwrap().curve;
+    for d in [148u16, 400, 700, 1047, 1150, 1500, 2047] {
+        assert!((got.rpm(d) - esc.curve.rpm(d)).abs() < 15.0, "{d}: {} vs {}\n{fitted}", got.rpm(d), esc.curve.rpm(d));
+    }
+    // A linear curve on request
+    let (code, text) = sim(&["calibrate", "thrusters", path(&csv), "--curve", "linear", "-o", path(&out)]);
+    assert_eq!(code, 0, "{text}");
+    assert!(std::fs::read_to_string(out.join("thrusters.toml")).unwrap().contains("max_rpm = "));
     let (code, text) = sim(&["calibrate", "thrusters", path(&csv), "--fit", "nope", "-o", path(&out)]);
     assert_ne!(code, 0);
     assert!(text.contains("no ESC parameter \"nope\""), "{text}");

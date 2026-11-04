@@ -210,7 +210,7 @@ pulses outside the datasheet's windows are counted as timing errors.
 | `throttle_fit` | | A measured speed curve instead: `{ forward = [c0, c1, c2], reverse = [c0, c1, c2] }`, the throttle step (DShot value minus 48 ahead, minus 1048 astern) at which the motor settles at `rpm`, `c0 + c1 rpm + c2 rpm²`; below `c0` it stands still. The mk2 and Mercury ESC boards give it the bench fit of their APD 80F3 ESCs and T200 thrusters ([below](#the-esc-boards-speed-curve)) |
 | `pole_pairs` | 7 | Motor pole pairs (for eRPM) |
 | `signal_loss_ms` | 250 | The motor stops this long after the last valid frame and coasts down (0: never). Assumed from BLHeli_S/Bluejay behaviour, not measured on the UWRT ESCs |
-| `tau_ms` | 60 | Time constant of the motor's first-order response to a throttle change (assumed; `calibrate thrusters` fits it and `max_rpm` from test-stand data, [calibration.md](calibration.md#thrusters)) |
+| `tau_ms` | 60 | Time constant of the motor's first-order response to a throttle change (assumed; `calibrate thrusters` fits it and the speed curve from test-stand data, [calibration.md](calibration.md#thrusters)) |
 
 The model decodes DShot150-1200 frames (rate measured from the frame), answers bidirectional DShot (a line idling
 high) with its eRPM 30 µs after each frame, sends telemetry when asked, and turns a motor that follows the throttle

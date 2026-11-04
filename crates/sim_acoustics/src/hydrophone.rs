@@ -354,11 +354,12 @@ impl Hydrophone {
         let r = self.recording.as_ref()?;
         let start = r.first()?.0;
         let end = r.last()?.0;
-        let n = ((end - start).as_secs_f64() * rate as f64) as usize + 1;
+        let n = ((end - start).as_secs_f64() * rate as f64).round() as usize + 1;
         let mut samples = vec![0.0f32; n];
         let (mid, half) = ((range_v[0] + range_v[1]) / 2.0, (range_v[1] - range_v[0]) / 2.0);
         for (t, v) in r {
-            let i = ((*t - start).as_secs_f64() * rate as f64) as usize;
+            // Rounded: ADC samples a hair under a sample period apart must not skip a slot
+            let i = ((*t - start).as_secs_f64() * rate as f64).round() as usize;
             if let Some(s) = samples.get_mut(i) {
                 let mut x = *v as f64;
                 if bits > 0 {

@@ -788,7 +788,8 @@ mod signal_loss {
     fn commands_without_a_pin_drive_the_motor_like_frames() {
         // A frame through the pin is a command at the time it was decoded
         let (a, _) = spun_up();
-        assert_eq!(a.target_rpm, 2000.0);
+        assert_eq!(a.target_rpm, a.curve.rpm(a.last_throttle().unwrap()));
+        assert!(a.target_rpm > 1900.0);
         // Half throttle forward, then the lag: 1 - 1/e of the way after one time constant
         let mut c = Esc::new("c", 0, None);
         c.signal_loss_timeout = None;

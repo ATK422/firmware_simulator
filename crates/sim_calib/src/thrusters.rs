@@ -14,7 +14,7 @@
 use std::fmt::Write as _;
 
 use sim_core::time::Time;
-use sim_devices::dshot::Esc;
+use sim_devices::dshot::{Esc, SpeedCurve};
 use sim_physics::{ThrustCurve, Thruster, ThrusterSpec};
 
 use crate::fit::{self, Fit, Options, Param};
@@ -23,31 +23,81 @@ use crate::table::{Series, Table, markdown, svg_plot};
 /// A parameter of the ESC model that calibration can fit.
 pub struct EscParam {
     pub name: &'static str,
-    /// The key in a board file's `[[dshot_esc]]`.
-    pub board_key: &'static str,
-    pub get: fn(&Esc) -> f64,
+    /// Its value on an ESC, if the ESC's model has it (the speed curve's form decides which do).
+    pub get: fn(&Esc) -> Option<f64>,
     pub set: fn(&mut Esc, f64),
     pub lo: f64,
     pub hi: f64,
+    /// Fitted on a log scale (relative steps), or linearly with this finite-difference step.
+    pub log: bool,
+    pub step: f64,
 }
 
-/// The ESC model's fittable parameters.
+fn linear_max(e: &Esc) -> Option<f64> {
+    match e.curve {
+        SpeedCurve::Linear { max_rpm } => Some(max_rpm),
+        SpeedCurve::Fit { .. } => None,
+    }
+}
+
+fn fit_coef(e: &Esc, reverse: bool, k: usize) -> Option<f64> {
+    match e.curve {
+        SpeedCurve::Fit { forward, reverse: r } => Some(if reverse { r[k] } else { forward[k] }),
+        SpeedCurve::Linear { .. } => None,
+    }
+}
+
+fn set_coef(e: &mut Esc, reverse: bool, k: usize, v: f64) {
+    if let SpeedCurve::Fit { forward, reverse: r } = &mut e.curve {
+        if reverse { r[k] = v } else { forward[k] = v }
+    }
+}
+
+macro_rules! coef {
+    ($name:literal, $rev:literal, $k:literal, $lo:expr, $hi:expr, $log:literal, $step:expr) => {
+        EscParam {
+            name: $name,
+            get: |e| fit_coef(e, $rev, $k),
+            set: |e, v| set_coef(e, $rev, $k, v),
+            lo: $lo,
+            hi: $hi,
+            log: $log,
+            step: $step,
+        }
+    };
+}
+
+/// The ESC model's fittable parameters (`sim_devices::dshot::Esc`): the speed curve's (`max_rpm` of a linear
+/// curve, or the throttle fit's `c0 + c1 rpm + c2 rpm²` per direction) and the motor's lag. A new parameter of the
+/// model needs one entry here; a change to its equations needs none, since predictions run the model itself.
 pub const ESC_PARAMS: &[EscParam] = &[
     EscParam {
         name: "max_rpm",
-        board_key: "max_rpm",
-        get: |e| e.max_rpm,
-        set: |e, v| e.max_rpm = v,
+        get: linear_max,
+        set: |e, v| {
+            if let SpeedCurve::Linear { max_rpm } = &mut e.curve {
+                *max_rpm = v;
+            }
+        },
         lo: 100.0,
         hi: 100_000.0,
+        log: true,
+        step: 1e-3,
     },
+    coef!("forward_c0", false, 0, -200.0, 500.0, false, 0.05),
+    coef!("forward_c1", false, 1, 1e-6, 100.0, true, 1e-3),
+    coef!("forward_c2", false, 2, 0.0, 1.0, false, 1e-7),
+    coef!("reverse_c0", true, 0, -200.0, 500.0, false, 0.05),
+    coef!("reverse_c1", true, 1, 1e-6, 100.0, true, 1e-3),
+    coef!("reverse_c2", true, 2, 0.0, 1.0, false, 1e-7),
     EscParam {
         name: "tau_ms",
-        board_key: "tau_ms",
-        get: |e| e.tau.as_secs_f64() * 1000.0,
+        get: |e| Some(e.tau.as_secs_f64() * 1000.0),
         set: |e, v| e.tau = Time::from_secs_f64(v / 1000.0),
         lo: 0.5,
         hi: 5000.0,
+        log: true,
+        step: 1e-3,
     },
 ];
 
@@ -58,6 +108,40 @@ fn esc_param(name: &str) -> Result<&'static EscParam, String> {
             ESC_PARAMS.iter().map(|p| p.name).collect::<Vec<_>>().join(", ")
         )
     })
+}
+
+/// Which form of speed curve to fit.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CurveForm {
+    /// Proportional to the throttle (`max_rpm`).
+    Linear,
+    /// A quadratic throttle fit per direction (`throttle_fit`).
+    Fit,
+}
+
+impl std::str::FromStr for CurveForm {
+    type Err = String;
+    fn from_str(s: &str) -> Result<CurveForm, String> {
+        match s {
+            "linear" => Ok(CurveForm::Linear),
+            "fit" | "throttle_fit" => Ok(CurveForm::Fit),
+            _ => Err(format!("{s:?}: expected linear or fit")),
+        }
+    }
+}
+
+/// The same ESC with its speed curve in the given form: the same top speeds (a fit becomes the line through its
+/// full-throttle speed), or a line written as a fit (`c0` the offset of the 48 and 1048 bases, `c2` zero).
+pub fn in_form(esc: &Esc, form: CurveForm) -> Esc {
+    let mut e = esc.clone();
+    e.curve = match (esc.curve, form) {
+        (SpeedCurve::Fit { .. }, CurveForm::Linear) => SpeedCurve::Linear { max_rpm: esc.curve.rpm(1047) },
+        (SpeedCurve::Linear { max_rpm }, CurveForm::Fit) => {
+            SpeedCurve::Fit { forward: [-1.0, 1000.0 / max_rpm, 0.0], reverse: [0.0, 999.0 / max_rpm, 0.0] }
+        }
+        (c, _) => c,
+    };
+    e
 }
 
 /// DShot 3D throttle for a signed fraction of full throttle, as the ESC model reads it: 48-1047 forward,
@@ -270,11 +354,21 @@ pub fn calibrate(runs: &[Run], opts: &StandOptions) -> Result<Calibration, Strin
     // Which ESC parameters: those asked for, or what the data tell (the lag needs a time series)
     let names: Vec<String> = if !opts.fit.is_empty() {
         for n in &opts.fit {
-            esc_param(n)?;
+            if (esc_param(n)?.get)(&opts.esc).is_none() {
+                return Err(format!(
+                    "{n}: not a parameter of this ESC's speed curve ({:?}; --curve changes it)",
+                    opts.esc.curve
+                ));
+            }
         }
         opts.fit.clone()
     } else if has_rpm {
-        ESC_PARAMS.iter().map(|p| p.name.to_string()).filter(|n| timed || n != "tau_ms").collect()
+        ESC_PARAMS
+            .iter()
+            .filter(|p| (p.get)(&opts.esc).is_some())
+            .map(|p| p.name.to_string())
+            .filter(|n| timed || n != "tau_ms")
+            .collect()
     } else {
         Vec::new()
     };
@@ -325,7 +419,12 @@ pub fn calibrate(runs: &[Run], opts: &StandOptions) -> Result<Calibration, Strin
                 .iter()
                 .map(|n| {
                     let p = esc_param(n).unwrap();
-                    Param::positive(n, (p.get)(&opts.esc), 1e-3).bounded(p.lo, p.hi)
+                    let v = (p.get)(&opts.esc).unwrap();
+                    if p.log && v > 0.0 {
+                        Param::positive(n, v, p.step).bounded(p.lo, p.hi)
+                    } else {
+                        Param::new(n, v, p.step).bounded(p.lo, p.hi)
+                    }
                 })
                 .collect();
             let scale =
@@ -370,10 +469,10 @@ pub fn calibrate(runs: &[Run], opts: &StandOptions) -> Result<Calibration, Strin
         }
         if !has_rpm {
             notes.push(format!(
-                "no measured RPM: the thrust curve is fitted at the ESC model's RPM for each command (max_rpm \
-                 {:.0}), so it is only as good as max_rpm; measure RPM (ESC telemetry or an optical tachometer) to \
-                 separate the two",
-                esc.max_rpm
+                "no measured RPM: the thrust curve is fitted at the ESC model's RPM for each command ({:.0} RPM at \
+                 full throttle), so it is only as good as the ESC's speed curve; measure RPM (ESC telemetry or an \
+                 optical tachometer) to separate the two",
+                esc.curve.rpm(1047)
             ));
         }
         let fwd = thrust_points.iter().any(|p| p.0 > 0.0);
@@ -425,7 +524,7 @@ pub fn calibrate(runs: &[Run], opts: &StandOptions) -> Result<Calibration, Strin
         toml: String::new(),
         plots: Vec::new(),
     };
-    cal.toml = render_toml(&cal);
+    cal.toml = render_toml(&cal, &esc);
     cal.plots = plots(runs, &cal, &esc, &thrust_points, opts);
     cal.report = render_report(runs, &cal, &esc, opts);
     Ok(cal)
@@ -438,7 +537,7 @@ fn fmt_groups(g: &[Option<i64>]) -> String {
         .join(", ")
 }
 
-fn render_toml(cal: &Calibration) -> String {
+fn render_toml(cal: &Calibration, esc: &Esc) -> String {
     let mut o =
         String::from("# Fitted by `firmware_simulator calibrate thrusters`; see report.md for the residuals.\n");
     if let Some(c) = &cal.curve {
@@ -452,9 +551,19 @@ fn render_toml(cal: &Calibration) -> String {
     if let Some(f) = &cal.esc_fit {
         let v = cal.voltage_v.map_or(String::new(), |v| format!(" at {v:.1} V"));
         let _ = writeln!(o, "\n# In each [[dshot_esc]] of the ESC's board file (boards/overlays/...){v}:");
-        for p in &f.params {
-            let key = esc_param(&p.name).unwrap().board_key;
-            let _ = writeln!(o, "{key} = {:.3}", p.value);
+        if f.params.iter().any(|p| p.name != "tau_ms") {
+            match esc.curve {
+                SpeedCurve::Linear { max_rpm } => {
+                    let _ = writeln!(o, "max_rpm = {max_rpm:.1}");
+                }
+                SpeedCurve::Fit { forward, reverse } => {
+                    let c = |v: [f64; 3]| v.map(|x| format!("{x:.6e}").parse::<f64>().unwrap().to_string()).join(", ");
+                    let _ = writeln!(o, "throttle_fit = {{ forward = [{}], reverse = [{}] }}", c(forward), c(reverse));
+                }
+            }
+        }
+        if let Some(t) = f.value("tau_ms") {
+            let _ = writeln!(o, "tau_ms = {t:.2}");
         }
     }
     o
@@ -592,7 +701,7 @@ fn render_report(runs: &[Run], cal: &Calibration, esc: &Esc, opts: &StandOptions
     if let Some(f) = &cal.esc_fit {
         let v = cal.voltage_v.map_or(String::new(), |v| format!(" at {v:.1} V"));
         let _ = writeln!(o, "## ESC and motor model{v}\n");
-        o += &fit_table(f, &|n| (esc_param(n).unwrap().get)(&opts.esc));
+        o += &fit_table(f, &|n| (esc_param(n).unwrap().get)(&opts.esc).unwrap_or(f64::NAN));
         let _ = writeln!(
             o,
             "\nRPM residuals (in units of 1 % of the largest RPM): RMS {:.2} at the start, {:.2} fitted. By direction:\n",
@@ -683,7 +792,7 @@ mod tests {
 
     fn truth() -> (Esc, ThrustCurve) {
         let mut e = Esc::new("truth", 0, None);
-        e.max_rpm = 3550.0;
+        e.curve = SpeedCurve::Linear { max_rpm: 3550.0 };
         e.tau = Time::from_ms(85);
         (e, ThrustCurve { forward_n: 44.0, reverse_n: 33.5, at_rpm: 3800.0 })
     }
@@ -733,10 +842,53 @@ mod tests {
     }
 
     #[test]
+    fn fits_a_quadratic_throttle_curve_per_direction() {
+        // The ESC boards' bench fit, and one with a weaker reverse and a later start, as another ESC might have
+        let mut truth = Esc::new("truth", 0, None);
+        truth.curve = SpeedCurve::Fit { forward: [9.0, 0.112, 0.000035], reverse: [20.0, 0.09, 0.00006] };
+        let curve = ThrustCurve { forward_n: 44.0, reverse_n: 33.5, at_rpm: 3800.0 };
+        let data = synthetic_stand(&truth, &curve, 5.0, 0.1, 16.0, 3);
+        let runs = [Run { name: "stand".into(), rows: read_stand(&data).unwrap() }];
+        let mut start = Esc::new("start", 0, None);
+        start.curve = SpeedCurve::APD_T200;
+        let cal = calibrate(&runs, &StandOptions { esc: start.clone(), ..Default::default() }).unwrap();
+        let f = cal.esc_fit.as_ref().unwrap();
+        assert_eq!(f.params.len(), 7, "the six coefficients and the lag");
+        // The fitted curve gives the truth's speed for every throttle the stand ran (to a few RPM)
+        let fitted = esc_with(
+            &start,
+            &f.params.iter().map(|p| p.name.as_str()).collect::<Vec<_>>(),
+            &f.params.iter().map(|p| p.value).collect::<Vec<_>>(),
+        );
+        for frac in [0.1, 0.25, 0.4, 0.6, 0.8, 1.0, -0.1, -0.3, -0.5, -0.7, -1.0] {
+            let d = dshot_for(frac);
+            let (want, got) = (truth.curve.rpm(d), fitted.curve.rpm(d));
+            assert!((got - want).abs() < 8.0, "{frac}: {got} vs {want}\n{}", cal.report);
+        }
+        assert!(cal.toml.contains("throttle_fit = { forward = ["), "{}", cal.toml);
+        let line = cal.toml.lines().find(|l| l.starts_with("throttle_fit")).unwrap();
+        let t: toml::Table = toml::from_str(line).unwrap();
+        assert_eq!(t["throttle_fit"]["forward"].as_array().unwrap().len(), 3);
+        // A linear curve fitted to the same data instead, from the fit's top speed
+        let lin = in_form(&start, CurveForm::Linear);
+        assert!((linear_max(&lin).unwrap() - SpeedCurve::APD_T200.rpm(1047)).abs() < 1e-9);
+        let cal = calibrate(&runs, &StandOptions { esc: lin, ..Default::default() }).unwrap();
+        assert!(cal.toml.contains("max_rpm = "), "{}", cal.toml);
+        // A line written as a fit is the same line
+        let as_fit = in_form(&Esc::new("l", 0, None), CurveForm::Fit);
+        for d in [48u16, 500, 1047, 1049, 1600, 2047] {
+            assert!((as_fit.curve.rpm(d) - Esc::new("l", 0, None).curve.rpm(d)).abs() < 1e-9, "{d}");
+        }
+        // Parameters of the other form are refused
+        let e = calibrate(&runs, &StandOptions { esc: start, fit: vec!["max_rpm".into()], ..Default::default() });
+        assert!(e.unwrap_err().contains("not a parameter of this ESC's speed curve"));
+    }
+
+    #[test]
     fn voltage_groups_steady_tables_and_missing_rpm() {
         let (mut esc, curve) = truth();
         let a = synthetic_stand(&esc, &curve, 0.0, 0.0, 16.0, 1);
-        esc.max_rpm = 3100.0;
+        esc.curve = SpeedCurve::Linear { max_rpm: 3100.0 };
         let b = synthetic_stand(&esc, &curve, 0.0, 0.0, 14.0, 1);
         let runs = [
             Run { name: "16V".into(), rows: read_stand(&a).unwrap() },
@@ -754,7 +906,7 @@ mod tests {
         let opts = StandOptions {
             esc: {
                 let mut e = Esc::new("x", 0, None);
-                e.max_rpm = 4000.0;
+                e.curve = SpeedCurve::Linear { max_rpm: 4000.0 };
                 e
             },
             ..Default::default()

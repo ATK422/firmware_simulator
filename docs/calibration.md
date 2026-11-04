@@ -7,7 +7,7 @@ commands turn them into fitted model files, and a CAN log from a pool test into 
 | Command | Data | Writes |
 |---|---|---|
 | `firmware_simulator calibrate acoustics MANIFEST` | Hydrophone recordings (WAV) with their geometry | A `[transducer]` overlay, an environment file, a report, plots, the simulated captures |
-| `firmware_simulator calibrate thrusters CSV...` | Thrust test-stand runs (CSV) | `thruster_model` for a vehicle file, `max_rpm` and `tau_ms` for the ESC board's `[[dshot_esc]]`, a report, plots |
+| `firmware_simulator calibrate thrusters CSV...` | Thrust test-stand runs (CSV) | `thruster_model` for a vehicle file, the speed curve (`throttle_fit` or `max_rpm`) and `tau_ms` for the ESC board's `[[dshot_esc]]`, a report, plots |
 | `firmware_simulator calibrate vehicle CSV... --vehicle FILE` | Pool-test logs: thruster RPM against depth, IMU and DVL (CSV, from a ROS bag with `scripts/bag_to_calib.py`) | A fitted vehicle file, a report, plots |
 | `firmware_simulator replay-pool-test LOG...` | candump logs from the Orin (`can0`, `can1`), optionally the recorded pose | A report of where the emulated boards' CAN traffic differs from the real boards' |
 
@@ -178,8 +178,9 @@ firmware_simulator calibrate thrusters stand_16v.csv stand_14v.csv --vehicle veh
     --board boards/mk2/esc_board.toml -o calibration/thrusters
 #   thrust curve: 47.012 N forward, 35.988 N reverse at 3800 RPM
 #   ESC model at 16.0 V:
-#     max_rpm                  3600.8 ± 0.4
-#     tau_ms                   45.02 ± 0.05
+#     forward_c0               10.1083 ± 0.215
+#     ...
+#     tau_ms                   45.0213 ± 0.052
 ```
 
 It fits, through the emulator's own models:
@@ -188,15 +189,19 @@ It fits, through the emulator's own models:
   command change, `--settle`), at the measured RPM, or at the ESC model's RPM when the data has none (then the
   curve is only as good as `max_rpm`; the report says so). The vehicle file's `at_rpm` is kept (`--at-rpm`
   changes it);
-* **the ESC model** (`sim_devices::dshot::Esc`: throttle to RPM, the motor's first-order lag) from the RPM
-  column: `max_rpm` from any data, `tau_ms` from a time series (`--fit max_rpm` fits only that). Rows are fitted
-  per supply voltage (the model has none); the output is for `--voltage`, or the voltage with the most rows.
+* **the ESC model** (`sim_devices::dshot::Esc`: its speed curve from throttle to RPM, the motor's first-order
+  lag) from the RPM column. The speed curve is fitted in the form the board file gives it (`--board`): a
+  `throttle_fit` (the throttle step at which the motor settles at a speed, `c0 + c1 rpm + c2 rpm²`, per direction:
+  `forward_c0` ... `reverse_c2`; the mk2 ESC board's APD 80F3 bench fit is the start) or a `max_rpm` line;
+  `--curve linear` or `--curve fit` picks the form. `tau_ms` is fitted from a time series. `--fit` names a subset
+  (`--fit tau_ms`). Rows are fitted per supply voltage (the model has none); the output is for `--voltage`, or the
+  voltage with the most rows.
 
 `thrusters.toml` holds the line for the vehicle file and the keys for each `[[dshot_esc]]` of the ESC board's
 overlay; `report.md` the residuals, by direction too (a large error in one direction means the model needs another
 parameter, such as a different top speed in reverse); `thrust.svg`, `rpm.svg` and `rpm_time.svg` the fits. The
 ESC model's fittable parameters are listed in `sim_calib::thrusters::ESC_PARAMS`: a change to the model's
-equations needs nothing here, a new parameter one entry there.
+equations needs nothing there (the fit runs the model), a new parameter one entry.
 
 ## The vehicle
 

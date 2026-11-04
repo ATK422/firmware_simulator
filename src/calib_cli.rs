@@ -29,6 +29,10 @@ fn parse_method(s: &str) -> Result<Method, String> {
     s.parse()
 }
 
+fn parse_curve(s: &str) -> Result<thrusters::CurveForm, String> {
+    s.parse()
+}
+
 #[derive(clap::Args)]
 pub struct AcousticsArgs {
     /// The manifest (see docs/calibration.md).
@@ -61,8 +65,12 @@ pub struct ThrustersArgs {
     /// The speed the fitted curve gives its thrusts at (instead of the vehicle file's or 3800 RPM).
     #[arg(long)]
     at_rpm: Option<f64>,
-    /// ESC parameters to fit (comma separated; by default all the data can tell: max_rpm, and tau_ms from a time
-    /// series).
+    /// The form of ESC speed curve to fit: `linear` (`max_rpm`) or `fit` (`throttle_fit`, a quadratic per
+    /// direction); by default the board file's (or linear).
+    #[arg(long, value_parser = parse_curve)]
+    curve: Option<thrusters::CurveForm>,
+    /// ESC parameters to fit (comma separated; by default all the data can tell: the curve's (`max_rpm`, or
+    /// `forward_c0`..`reverse_c2`), and `tau_ms` from a time series).
     #[arg(long, value_delimiter = ',')]
     fit: Vec<String>,
     /// The supply voltage to write the ESC model for (by default the voltage with the most rows).
@@ -191,10 +199,17 @@ pub fn calibrate(cmd: CalibrateCommand) -> Result<()> {
             if let Some(b) = &a.board {
                 let board = sim_host::board::Board::load(b).map_err(anyhow::Error::msg)?;
                 let e = board.dshot_esc.first().with_context(|| format!("{} has no [[dshot_esc]]", b.display()))?;
-                opts.esc.max_rpm = e.max_rpm.unwrap_or(opts.esc.max_rpm);
+                if let Some(f) = &e.throttle_fit {
+                    opts.esc.curve = sim_devices::dshot::SpeedCurve::Fit { forward: f.forward, reverse: f.reverse };
+                } else if let Some(max_rpm) = e.max_rpm {
+                    opts.esc.curve = sim_devices::dshot::SpeedCurve::Linear { max_rpm };
+                }
                 if let Some(ms) = e.tau_ms {
                     opts.esc.tau = Time::from_secs_f64(ms / 1000.0);
                 }
+            }
+            if let Some(form) = a.curve {
+                opts.esc = thrusters::in_form(&opts.esc, form);
             }
             opts.fit = a.fit.clone();
             opts.voltage_v = a.voltage;
