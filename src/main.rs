@@ -202,6 +202,10 @@ struct RobotArgs {
     /// Memory the time-travel checkpoints may take, in MB; older ones are thinned out beyond it.
     #[arg(long, default_value_t = 512)]
     checkpoint_memory: usize,
+    /// Collect firmware code coverage and write it to this lcov file (`genhtml`, VS Code Coverage Gutters) at the
+    /// end, with a table of functions and lines hit per crate. The cores run one instruction at a time.
+    #[arg(long, value_name = "FILE")]
+    coverage: Option<PathBuf>,
 }
 
 /// Starts time travel for `target` when asked (`--checkpoint-every` above 0) or on by default (`default_on`: GDB or a
@@ -240,6 +244,21 @@ fn travel_reason(r: sim_host::timetravel::Ran) -> StopReason {
         sim_host::timetravel::Ran::Interrupted => StopReason::Requested,
         sim_host::timetravel::Ran::Stopped { reason, .. } => reason,
     }
+}
+
+/// Writes what ran of each image (`machines`: image name and machine) to the lcov file `path` and prints the
+/// table of functions and lines hit.
+fn write_coverage<'a>(path: &Path, machines: impl Iterator<Item = (&'a str, &'a Machine)>) -> Result<()> {
+    let mut cov = sim_host::coverage::Coverage::new();
+    for (name, m) in machines {
+        cov.add_machine(name, m);
+    }
+    let report = cov.report();
+    let name = cov.names().join(",");
+    report.write_lcov(path, &name).with_context(|| format!("writing {}", path.display()))?;
+    eprint!("coverage of {name}:\n{}", report.summary());
+    eprintln!("coverage: {}", path.display());
+    Ok(())
 }
 
 fn parse_board_addr(s: &str) -> Result<(String, String), String> {
@@ -428,6 +447,11 @@ fn robot(args: RobotArgs) -> Result<()> {
         }
     }
     let can_host = host_tools::attach_robot(&args.can_host, &mut r, &args.cans)?;
+    if args.coverage.is_some() {
+        for b in r.boards.iter_mut() {
+            b.machine.enable_coverage();
+        }
+    }
     r.realtime = args.realtime;
     r.threads = args.threads;
     if !args.trace.is_empty() {
@@ -627,6 +651,9 @@ fn robot(args: RobotArgs) -> Result<()> {
     can_host.finish()?;
     let interrupted = if why == "Interrupted" { " (Interrupted)" } else { "" };
     eprintln!("stopped at {}{interrupted}; {:.2?} wall", r.now, wall.elapsed());
+    if let Some(path) = &args.coverage {
+        write_coverage(path, r.images.iter().map(String::as_str).zip(r.boards.iter().map(|b| &b.machine)))?;
+    }
     if let (Some(v), Some(path)) = (&vcd, &args.vcd) {
         finish_vcd(v, path, r.now)?;
     }
@@ -862,6 +889,10 @@ struct RunArgs {
     /// Memory the time-travel checkpoints may take, in MB; older ones are thinned out beyond it.
     #[arg(long, default_value_t = 512)]
     checkpoint_memory: usize,
+    /// Collect firmware code coverage and write it to this lcov file (`genhtml`, VS Code Coverage Gutters) at the
+    /// end, with a table of functions and lines hit per crate. The cores run one instruction at a time.
+    #[arg(long, value_name = "FILE")]
+    coverage: Option<PathBuf>,
     /// Set one of the board's physical inputs, e.g. `sht41.temperature_c=31.5` (repeatable).
     #[arg(long = "input", value_parser = parse_input)]
     inputs: Vec<(String, f64)>,
@@ -1051,6 +1082,9 @@ fn run(args: RunArgs) -> Result<()> {
     }
     machine.load(&image).map_err(anyhow::Error::msg)?;
     machine.hle_enabled = args.hle_flash;
+    if args.coverage.is_some() {
+        machine.enable_coverage();
+    }
     if let Some(f) = &args.flash_file {
         if machine.load_flash_file(f).with_context(|| format!("reading {}", f.display()))? {
             log::info!("flash contents from {}", f.display());
@@ -1341,6 +1375,11 @@ fn run(args: RunArgs) -> Result<()> {
         let title = title.map_or("firmware".into(), |t| t.to_string_lossy().into_owned());
         let folded = p.report().write(path, &title).with_context(|| format!("writing {}", path.display()))?;
         eprintln!("profile: {} and {}", path.display(), folded.display());
+    }
+    if let Some(path) = &args.coverage {
+        let name = args.image.as_ref().or(args.picoboot_load.as_ref()).and_then(|p| p.file_name());
+        let name = name.map_or("firmware".into(), |t| t.to_string_lossy().into_owned());
+        write_coverage(path, std::iter::once((name.as_str(), &session.machine)))?;
     }
     if let Some(path) = &args.screenshot {
         match session.machine.sys.i2c_device::<sim_devices::ssd1306::Ssd1306>() {

@@ -7,6 +7,7 @@
 //! * [`unmodelled`]: the logging fallback for registers not modelled yet
 //! * [`machine`]: two Cortex-M0+ cores plus the system, and the deterministic run loop ([`Machine`])
 
+pub mod coverage;
 pub mod hle;
 pub mod irq;
 pub mod machine;

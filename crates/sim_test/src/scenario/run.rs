@@ -89,6 +89,8 @@ pub struct Options {
     /// time and steps up to it) share one run up to there: the first to get there keeps a checkpoint of everything
     /// (as `cases` do), the others go on from copies of it (`scenario --from-checkpoint NAME`).
     pub from_checkpoint: Option<String>,
+    /// Collect firmware code coverage ([`Outcome::coverage`]; the boards run one instruction at a time).
+    pub coverage: bool,
 }
 
 /// Checkpoints kept by `pause` steps for [`Options::from_checkpoint`], by what led to them.
@@ -170,6 +172,8 @@ pub struct Outcome {
     /// Each board and the image it ran.
     pub images: Vec<(String, PathBuf)>,
     pub record: Option<Record>,
+    /// What ran of each image, with [`Options::coverage`] (boards running the same image merged).
+    pub coverage: Option<sim_host::coverage::Coverage>,
 }
 
 impl Outcome {
@@ -198,6 +202,7 @@ impl Outcome {
             wall: Default::default(),
             images: Vec::new(),
             record: None,
+            coverage: None,
         }
     }
 }
@@ -1552,6 +1557,11 @@ fn build(s: &Scenario, opts: &Options, spec: &RobotSpec, dir: &Path) -> R<World>
             }
         }
     }
+    if opts.coverage {
+        for b in w.robot.boards.iter_mut() {
+            b.machine.enable_coverage();
+        }
+    }
     if let Some(interval) = opts.profile {
         for b in &mut w.robot.boards {
             b.start_profile(interval);
@@ -2111,6 +2121,13 @@ impl Engine {
             wall: wall.elapsed(),
             images: images.to_vec(),
             record,
+            coverage: self.w.robot.boards.iter().any(|b| b.machine.coverage.is_some()).then(|| {
+                let mut c = sim_host::coverage::Coverage::new();
+                for (b, name) in self.w.robot.boards.iter().zip(&self.w.robot.images) {
+                    c.add_machine(name, &b.machine);
+                }
+                c
+            }),
             ..Outcome::empty(s)
         }
     }
@@ -2197,7 +2214,7 @@ pub fn run(s: &Scenario, opts: &Options) -> Vec<Outcome> {
                 s.time,
                 s.threads,
                 &s.steps[..=p],
-                (opts.record, opts.profile)
+                (opts.record, opts.profile, opts.coverage)
             );
             checkpoints().lock().unwrap().entry(key).or_default().clone()
         });

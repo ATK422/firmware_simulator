@@ -3,8 +3,10 @@
 //!
 //! ```text
 //! cargo run --release -p sim_test --example bench -- [--time 2s] [--repeat 3] [--only esc_board,talos] [--threads N]
-//!     [--checkpoint-every 10ms] [--checkpoint-memory 512]
+//!     [--checkpoint-every 10ms] [--checkpoint-memory 512] [--coverage]
 //! ```
+//!
+//! `--coverage` collects code coverage (the cores run one instruction at a time): the fingerprints must not change.
 //!
 //! `--checkpoint-every` records the runs for time travel (`sim_host::timetravel`, as `run --gdb` and the dashboard
 //! do), with a checkpoint that often (and `--checkpoint-memory` MB for them), and prints what the checkpoints took;
@@ -126,12 +128,21 @@ fn record(
 }
 
 /// `override_threads`: replaces `talos_mt`'s thread count, and prints where the boards ran.
-fn run(case: &Case, time: Time, override_threads: Option<usize>, travel: Option<Travel>) -> Result<Outcome, String> {
+fn run(
+    case: &Case,
+    time: Time,
+    override_threads: Option<usize>,
+    travel: Option<Travel>,
+    coverage: bool,
+) -> Result<Outcome, String> {
     let mut h = Fnv::default();
     match case.kind {
         Kind::Board { elf, board, client } => {
             let elf = sim_test::titan_rs(elf).ok_or("image not built")?;
             let mut b = Bench::builder(&elf).board(board).bridge(client).boot()?;
+            if coverage {
+                b.session.machine.enable_coverage();
+            }
             let (wall, cpu) = (Instant::now(), cpu_time());
             let mut stats = None;
             match travel {
@@ -167,6 +178,11 @@ fn run(case: &Case, time: Time, override_threads: Option<usize>, travel: Option<
                 Some(n) if case.name == "talos_mt" => n,
                 _ => threads_of(case),
             };
+            if coverage {
+                for s in r.robot.boards.iter_mut() {
+                    s.machine.enable_coverage();
+                }
+            }
             let (wall, cpu) = (Instant::now(), cpu_time());
             let mut stats = None;
             match travel {
@@ -232,6 +248,7 @@ fn main() {
     let mut threads = None;
     let mut travel: Option<Travel> = None;
     let mut budget = sim_host::timetravel::DEFAULT_BUDGET;
+    let mut coverage = false;
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
         let mut value = || args.next().unwrap_or_else(|| panic!("{a} needs a value"));
@@ -241,6 +258,7 @@ fn main() {
             "--only" => only = Some(value().split(',').map(str::to_string).collect()),
             "--threads" => threads = Some(value().parse().expect("--threads N")),
             "--checkpoint-every" => travel = Some(Travel { every: parse_time(&value()), budget }),
+            "--coverage" => coverage = true,
             "--checkpoint-memory" => budget = value().parse::<usize>().expect("--checkpoint-memory MB") << 20,
             "--bench" => {} // passed by `cargo bench`-style runners
             other => panic!("unknown argument {other} (--time T, --repeat N, --only a,b, --threads N)"),
@@ -259,7 +277,7 @@ fn main() {
         }
         let mut best: Option<Outcome> = None;
         for _ in 0..repeat.max(1) {
-            let o = match run(case, time, threads, travel) {
+            let o = match run(case, time, threads, travel, coverage) {
                 Ok(o) => o,
                 Err(e) => {
                     println!("{:<11} skipped: {e}", case.name);

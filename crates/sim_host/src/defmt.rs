@@ -126,7 +126,7 @@ mod tests {
     fn decoder(encoding: &str) -> DefmtDecoder {
         let json = format!(r#"{{"timestamp":null,"entries":{{}},"bitflags":{{}},"encoding":"{encoding}"}}"#);
         let table: &'static Table = Box::leak(Box::new(serde_json::from_str(&json).unwrap()));
-        DefmtDecoder { table, decoder: table.new_stream_decoder() }
+        DefmtDecoder { table, decoder: table.new_stream_decoder(), tail: Vec::new() }
     }
 
     /// A malformed frame in a raw-encoded stream (here an index the table doesn't have, as after RTT dropped

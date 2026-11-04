@@ -183,6 +183,7 @@ pub mod bridges;
 pub mod candiff;
 pub mod canlog;
 pub mod cannelloni;
+pub mod coverage;
 pub mod dashboard;
 pub mod defmt;
 pub mod demangle;

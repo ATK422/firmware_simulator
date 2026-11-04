@@ -260,6 +260,9 @@ pub struct Machine {
     watch_hit: Option<(u32, WatchKind)>,
     /// A watchpoint was hit: the core stops before its next step (`(core, addr, kind, at)`).
     watch_stop: Option<(usize, u32, WatchKind, Time)>,
+    /// Code coverage: the instructions executed (see [`crate::coverage`]). While it is on, the cores run one
+    /// instruction at a time; the run is the same.
+    pub coverage: Option<Box<crate::coverage::CoverageMap>>,
 }
 
 /// Consecutive quiet quanta of one core looked at for a loop that spans several (see [`SpinWindow`]): a loop
@@ -386,6 +389,7 @@ impl Machine {
             resume: None,
             watch_hit: None,
             watch_stop: None,
+            coverage: None,
         };
         m.clk_sys = m.sys.clk_sys;
         m.sys.clk_sys_changed = false;
@@ -501,6 +505,12 @@ impl Machine {
     /// kind, the time the accessing step started)`.
     pub fn pending_watch(&self) -> Option<(usize, u32, WatchKind, Time)> {
         self.watch_stop
+    }
+
+    /// Turns code coverage on (see [`crate::coverage`]), keeping what was collected if it is on already.
+    pub fn enable_coverage(&mut self) {
+        let size = self.sys.flash.len();
+        self.coverage.get_or_insert_with(|| Box::new(crate::coverage::CoverageMap::new(size)));
     }
 
     /// Asks [`Machine::run_until`] to return at the next instruction boundary.
@@ -908,6 +918,7 @@ impl Machine {
             }
             self.usb_boot_requested = true;
         }
+        let executed = self.cores[c].instructions();
         let mut bus = CoreBus { sys: &mut self.sys, trace: &mut *self.trace, core: c as u8, now };
         let outcome = if self.watchpoints.is_empty() {
             self.cores[c].step_on(&mut bus)
@@ -917,6 +928,11 @@ impl Machine {
             self.watch_hit = bus.hit;
             outcome
         };
+        if let Some(cov) = &mut self.coverage
+            && self.cores[c].instructions() != executed
+        {
+            cov.mark(pc);
+        }
         match outcome {
             StepOutcome::Ran(cycles) => {
                 self.clocks[c].advance(&self.clk_sys, cycles as u64);
@@ -964,6 +980,7 @@ impl Machine {
             && !self.trace_instructions
             && !self.cores[c].log_exceptions
             && self.watchpoints.is_empty()
+            && self.coverage.is_none()
     }
 
     /// Runs up to `max_steps` steps of core `c` as one batch (see [`CortexM0Plus::run_batch`]), ending once its
@@ -1575,6 +1592,7 @@ impl Machine {
             resume: self.resume,
             watch_hit: None,
             watch_stop: self.watch_stop,
+            coverage: self.coverage.clone(),
         }
     }
 
