@@ -5,14 +5,14 @@
 //! some ways that must not be skipped (a signed comparison, a counter, flags or a register left from before a
 //! decision), which must still give the same run.
 
-use rp2040::memmap::{IO_BANK0_BASE, RESETS_BASE, SIO_BASE, SRAM_BASE, TIMER_BASE, WATCHDOG_BASE};
+use rp2040::memmap::{IO_BANK0_BASE, PIO0_BASE, RESETS_BASE, SIO_BASE, SRAM_BASE, TIMER_BASE, WATCHDOG_BASE};
 use rp2040::{Machine, MachineConfig, StopReason};
 use sim_core::bus::Size;
 use sim_core::cpu::Cpu;
 use sim_core::time::Time;
 use sim_core::trace::{Category, NullSink, VecSink};
 
-const COUNTER: u32 = SRAM_BASE + 0x1F0;
+const COUNTER: u32 = SRAM_BASE + 0x200;
 /// Where the wait loop starts.
 const WAIT: u32 = 0x10C;
 
@@ -78,7 +78,16 @@ fn waits() -> Vec<(&'static str, Vec<u16>, bool)> {
     ]
 }
 
-fn machine(wait: &[u16], alarm: bool, timer_waits: bool) -> (Machine, VecSink) {
+/// What interrupts the waits: nothing, a timer alarm (every seven ticks, and armed for the deadline once a wait
+/// has ended), or a PIO state machine raising its IRQ every 64 cycles.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Irq {
+    None,
+    Alarm,
+    Pio,
+}
+
+fn machine(wait: &[u16], irq: Irq, timer_waits: bool) -> (Machine, VecSink) {
     let mut m = Machine::new(MachineConfig::default());
     m.skip_timer_waits = timer_waits;
     let sink = VecSink::new(&[Category::Gpio]);
@@ -87,6 +96,8 @@ fn machine(wait: &[u16], alarm: bool, timer_waits: bool) -> (Machine, VecSink) {
         (0x00, 0x2000_2000),
         (0x04, SRAM_BASE + 0x101),
         (0x40, SRAM_BASE + 0x181), // TIMER_IRQ_0
+        (0x5C, SRAM_BASE + 0x1B1), // PIO0_IRQ_0
+        (0x1D4, PIO0_BASE),
         (0x1C0, TIMER_BASE + 0x24),
         (0x1C4, SIO_BASE + 0x1C),
         (0x1C8, 1 << 25),
@@ -109,6 +120,13 @@ fn machine(wait: &[u16], alarm: bool, timer_waits: bool) -> (Machine, VecSink) {
         code.push((at, hw));
         at += 2;
     }
+    if irq == Irq::Alarm {
+        // Arm the alarm for the deadline, which has passed: it fires at once, in the middle of a quantum, and the
+        // core takes its interrupt where that quantum ends
+        code.push((at, ldr_lit(0, at, 0x1CC))); // ldr r0, =TIMER_BASE
+        code.push((at + 2, 0x6104)); // str r4, [r0, #0x10] (ALARM0)
+        at += 4;
+    }
     code.push((at, 0x602F)); // str r7, [r5]: toggle GPIO 25
     code.push((at + 2, b(at + 2, 0x108)));
     let alarm_code = [
@@ -122,11 +140,31 @@ fn machine(wait: &[u16], alarm: bool, timer_waits: bool) -> (Machine, VecSink) {
         0x6801,                   // ldr r1, [r0]
         0x3101,                   // adds r1, #1
         0x6001,                   // str r1, [r0]
-        0x4770,                   // bx lr
+        // Log where the core was interrupted: COUNTER + 4 + 4 * (count % 64) = the stacked PC
+        0x068A, // lsls r2, r1, #26
+        0x0E12, // lsrs r2, r2, #24
+        0x1812, // adds r2, r2, r0
+        0x3204, // adds r2, #4
+        0x9B06, // ldr r3, [sp, #24]
+        0x6013, // str r3, [r2]
+        0x4770, // bx lr
     ];
     for (i, &hw) in alarm_code.iter().enumerate() {
         let a = 0x180 + 2 * i as u32;
         code.push((a, if i == 6 { ldr_lit(0, a, 0x1D0) } else { hw }));
+    }
+    let pio_handler = [
+        ldr_lit(0, 0x1B0, 0x1D4), // ldr r0, =PIO0_BASE
+        0x2101,                   // movs r1, #1
+        0x6301,                   // str r1, [r0, #0x30] (IRQ: clear flag 0)
+        ldr_lit(0, 0x1B6, 0x1D0), // ldr r0, =COUNTER
+        0x6801,                   // ldr r1, [r0]
+        0x3101,                   // adds r1, #1
+        0x6001,                   // str r1, [r0]
+        0x4770,                   // bx lr
+    ];
+    for (i, &hw) in pio_handler.iter().enumerate() {
+        code.push((0x1B0 + 2 * i as u32, hw));
     }
     for (off, hw) in code {
         assert!(m.sys.poke(SRAM_BASE + off, Size::Half, hw as u32));
@@ -135,21 +173,31 @@ fn machine(wait: &[u16], alarm: bool, timer_waits: bool) -> (Machine, VecSink) {
     let mut w = |addr: u32, v: u32| m.sys.write(&mut NullSink, 0, Time::ZERO, addr, Size::Word, v).unwrap();
     // The timer ticks every 511 cycles of the reset clocks (ROSC), so a tick spans many times round a loop
     w(WATCHDOG_BASE + 0x2C, 1 << 9 | 511);
-    w(RESETS_BASE + 0x3000, 1 << 5 | 1 << 8 | 1 << 21); // IO_BANK0, PADS_BANK0 and TIMER out of reset
+    w(RESETS_BASE + 0x3000, 1 << 5 | 1 << 8 | 1 << 10 | 1 << 21); // IO_BANK0, PADS_BANK0, PIO0, TIMER out of reset
     w(IO_BANK0_BASE + 25 * 8 + 4, 5); // GPIO 25: SIO
     w(SIO_BASE + 0x24, 1 << 25); // GPIO_OE_SET
-    if alarm {
-        w(TIMER_BASE + 0x38, 1); // INTE: alarm 0
-        w(TIMER_BASE + 0x10, 3); // ALARM0 (arms it)
-        m.cores[0].nvic.enabled = 1;
+    match irq {
+        Irq::None => {}
+        Irq::Alarm => {
+            w(TIMER_BASE + 0x38, 1); // INTE: alarm 0
+            w(TIMER_BASE + 0x10, 3); // ALARM0 (arms it)
+            m.cores[0].nvic.enabled = 1;
+        }
+        Irq::Pio => {
+            w(PIO0_BASE + 0x48, 0xDF00); // irq nowait 0 [31]
+            w(PIO0_BASE + 0x4C, 0x1F00); // jmp 0 [31]
+            w(PIO0_BASE + 0x12C, 1 << 8); // IRQ0_INTE: flag 0
+            w(PIO0_BASE, 1); // CTRL: SM0 on
+            m.cores[0].nvic.enabled = 1 << 7;
+        }
     }
     (m, sink)
 }
 
 /// The GPIO trace, the final state and the waits skipped across ticks; `slices` cuts the run as sessions do (100
 /// µs), or finer.
-fn run(wait: &[u16], alarm: bool, timer_waits: bool, slice: Time) -> (Vec<String>, String, u64) {
-    let (mut m, sink) = machine(wait, alarm, timer_waits);
+fn run(wait: &[u16], irq: Irq, timer_waits: bool, slice: Time) -> (Vec<String>, String, u64) {
+    let (mut m, sink) = machine(wait, irq, timer_waits);
     let end = Time::from_ms(40);
     let mut t = Time::ZERO;
     while t < end {
@@ -174,20 +222,22 @@ fn run(wait: &[u16], alarm: bool, timer_waits: bool, slice: Time) -> (Vec<String
 #[test]
 fn timer_waits_skipped_as_ticked() {
     for (name, wait, skippable) in waits() {
-        for alarm in [false, true] {
+        for irq in [Irq::None, Irq::Alarm, Irq::Pio] {
             for slice in [Time::from_ms(40), Time::from_ms(1), Time::from_us(100), Time::from_ns(3_700)] {
-                let (trace, state, skipped) = run(&wait, alarm, true, slice);
-                let (trace_ref, state_ref, none) = run(&wait, alarm, false, slice);
-                let what = format!("{name}, alarm {alarm}, slices of {slice}");
+                let (trace, state, skipped) = run(&wait, irq, true, slice);
+                let (trace_ref, state_ref, none) = run(&wait, irq, false, slice);
+                let what = format!("{name}, {irq:?}, slices of {slice}");
                 assert_eq!(none, 0, "{what}");
                 // (Finer slices end a wait's skip before the next tick: then it is left to the plain skip)
-                if slice >= Time::from_ms(1) {
+                // (The PIO's interrupts come too often for long skips)
+                if slice >= Time::from_ms(1) && irq != Irq::Pio {
                     assert_eq!(skipped > 0, skippable, "{what}: {skipped} waits skipped");
                 }
                 assert!(trace.len() > 10, "{what}: {} GPIO toggles", trace.len());
                 assert_eq!(state, state_ref, "{what}");
                 assert_eq!(trace, trace_ref, "{what}");
-                if alarm {
+                // (lo_equal does not wait, and keeps moving the alarm on)
+                if irq != Irq::None && name != "lo_equal" {
                     assert!(!state.contains("counter 0 "), "{what}: {state}");
                 }
             }

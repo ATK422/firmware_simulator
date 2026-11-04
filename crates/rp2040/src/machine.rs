@@ -131,6 +131,8 @@ pub struct Machine {
     pub skip_timer_waits: bool,
     /// Busy-waits skipped that way (statistics).
     pub timer_waits_skipped: u64,
+    /// After such a skip, what is left of the quantum the core landed in (its next quantum is that long).
+    quantum_left: Option<(usize, u32)>,
     /// Quantum fusing (on by default; off to check that it changes nothing): while only one core can run, nothing
     /// is due before the quantum's limit and the core touches nothing but memory and the timer, one batch runs
     /// through several quanta (see [`Machine::run_until`]).
@@ -237,6 +239,7 @@ impl Machine {
             spin_skipped: 0,
             skip_timer_waits: true,
             timer_waits_skipped: 0,
+            quantum_left: None,
             fuse_quanta: true,
             quanta_fused: 0,
             fuse_next: false,
@@ -1002,7 +1005,14 @@ impl Machine {
         self.cores[c].account_skipped(skipped, steps);
         self.spin_skipped += steps;
         self.timer_waits_skipped += 1;
-        self.now = self.now.max(self.clocks[c].now);
+        // The quanta go on as they would have: the next one ends where theirs would (events an access schedules
+        // within a quantum fire at its end), and the machine's time is that of the last boundary until then
+        let into = (steps % self.quantum.max(1) as u64) as u32;
+        if into == 0 {
+            self.now = self.now.max(self.clocks[c].now);
+        } else {
+            self.quantum_left = Some((c, self.quantum - into));
+        }
         self.budget_carry = None;
         self.spin_window = None;
         self.spin_watch = None;
@@ -1026,6 +1036,8 @@ impl Machine {
         self.stop_requested = false;
         // The host may have changed something since the last quantum
         self.spin_window = None;
+        // (Quanta start afresh in each run, as a run's end cuts the last one short)
+        self.quantum_left = None;
         loop {
             if self.stop_requested {
                 self.stop_requested = false;
@@ -1104,7 +1116,10 @@ impl Machine {
             // Run core c for a quantum, stopping at the next event or the end
             self.last_ran = c;
             let limit = next_event.min(end);
-            let mut left = self.quantum;
+            let mut left = match self.quantum_left.take() {
+                Some((core, left)) if core == c => left,
+                _ => self.quantum,
+            };
             // Cycles until core c reaches `limit`, carried from one batch to the next (and one quantum to the next)
             // while nothing else moved its clock
             let mut budget = match &self.budget_carry {
@@ -1341,6 +1356,7 @@ impl Machine {
             spin_skipped: self.spin_skipped,
             skip_timer_waits: self.skip_timer_waits,
             timer_waits_skipped: self.timer_waits_skipped,
+            quantum_left: None,
             fuse_quanta: self.fuse_quanta,
             quanta_fused: self.quanta_fused,
             fuse_next: false,
@@ -1385,6 +1401,7 @@ impl Machine {
         self.spin_watch = None;
         self.spin_window = None;
         self.fuse_next = false;
+        self.quantum_left = None;
     }
 
     /// Lets attached devices update their outputs (after the host delivered something to them).
