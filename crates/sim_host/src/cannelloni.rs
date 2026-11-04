@@ -242,6 +242,11 @@ impl CanEndpoint for Cannelloni {
     fn tx_queue_limit(&self) -> Option<usize> {
         Some(sim_devices::can::BRIDGE_TX_QUEUE)
     }
+
+    /// What the far side sent is handed in at the step that reads it.
+    fn live(&self) -> bool {
+        true
+    }
 }
 
 /// Connects a SocketCAN interface to a cannelloni peer until the process is stopped: the far end of a tunnel to

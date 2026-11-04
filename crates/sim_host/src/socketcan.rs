@@ -185,6 +185,36 @@ impl CanEndpoint for SocketCan {
     fn tx_queue_limit(&self) -> Option<usize> {
         Some(sim_devices::can::BRIDGE_TX_QUEUE)
     }
+
+    /// What host tools wrote is handed in at the step that reads it.
+    fn live(&self) -> bool {
+        true
+    }
+}
+
+/// Stands in for a SocketCAN interface where there is none (tests, benchmarks, recorded runs): hands in what
+/// `inner` sends as a live endpoint does ([`CanEndpoint::live`]), at the bus step that reads it and stamped with
+/// that step's time, and says nothing about when it will send. With a scripted `inner` (a mock bridge, a replay of
+/// when frames arrived) the arrivals are the same in every run, so a robot run slice by slice and one run ahead
+/// can be compared.
+pub struct Live<E>(pub E);
+
+impl<E: CanEndpoint> CanEndpoint for Live<E> {
+    fn take_tx(&mut self, until: Time) -> Vec<(Time, CanFrame)> {
+        self.0.take_tx(until).into_iter().map(|(_, f)| (until, f)).collect()
+    }
+
+    fn receive(&mut self, frame: &CanFrame, at: Time) {
+        self.0.receive(frame, at);
+    }
+
+    fn tx_queue_limit(&self) -> Option<usize> {
+        Some(sim_devices::can::BRIDGE_TX_QUEUE)
+    }
+
+    fn live(&self) -> bool {
+        true
+    }
 }
 
 #[cfg(test)]

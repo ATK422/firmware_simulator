@@ -189,9 +189,19 @@ pub trait CanEndpoint {
     /// A time before which [`CanEndpoint::take_tx`] hands in no frame (`take_tx(until)` returns nothing for any
     /// `until` before it), as long as nothing but the bus calls the endpoint meanwhile and it receives nothing:
     /// `Some(Time::MAX)` if it will send nothing at all. `None` (the default): it may send at any time (a bridge
-    /// to real host tools). A robot runs its boards ahead of each other only while every endpoint can tell.
+    /// to real host tools). A robot runs its boards ahead of each other only while every endpoint can tell, or
+    /// is [`CanEndpoint::live`].
     fn idle_until(&self) -> Option<Time> {
         None
+    }
+    /// Whether every frame `take_tx(until)` hands in is ready at `until`: the endpoint hands in what reached it
+    /// from outside the simulation since it was last asked (a SocketCAN interface, a cannelloni tunnel), stamped
+    /// with the bus step that reads it. It cannot tell when it will send, but none of its frames enters the bus
+    /// before the step that reads it, so nothing it sends can change a node in that step. A robot running its
+    /// boards ahead reads such an endpoint at every boundary as taking turns would, and ends the window where what
+    /// it handed in could finish. `false` (the default): no such promise.
+    fn live(&self) -> bool {
+        false
     }
 }
 

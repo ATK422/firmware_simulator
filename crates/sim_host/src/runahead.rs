@@ -65,7 +65,7 @@ use sim_devices::dshot::{Esc, Motor};
 
 use crate::parallel::{FIRST_REGROUP_SLICES, REGROUP_SLICES, lock, max_threads, wait_for};
 use crate::robot::{Robot, RobotBus, end_slice, power_on_by, step_bus};
-use crate::session::{Checkpoint, Collected, Session};
+use crate::session::{Checkpoint, Collected, Pacing, Session};
 use crate::vehicle::VehicleSim;
 
 #[cfg(doc)]
@@ -87,6 +87,8 @@ pub struct Stats {
     pub rollbacks: u64,
     /// Windows cut short by a board that follows a vehicle.
     pub follower_cuts: u64,
+    /// Windows cut short by a frame a live endpoint handed in ([`CanEndpoint::live`]).
+    pub live_cuts: u64,
 }
 
 /// Whether `robot` can run its boards ahead of each other (see the module documentation).
@@ -94,7 +96,38 @@ pub(crate) fn possible(robot: &Robot) -> bool {
     robot.run_ahead
         && robot.medium.is_none()
         && robot.boards.iter().all(Session::can_run_ahead)
-        && robot.buses.iter().all(|rb| rb.endpoints.iter().all(|e| e.idle_until().is_some()))
+        && robot.buses.iter().all(|rb| rb.endpoints.iter().all(|e| e.live() || e.idle_until().is_some()))
+}
+
+/// Whether something outside the simulation feeds `robot` as it runs, at times nobody can tell in advance (a live
+/// endpoint): in real time its windows are kept close to the wall clock ([`LIVE_LEAD`]).
+fn has_live_inputs(robot: &Robot) -> bool {
+    robot.buses.iter().any(|rb| rb.endpoints.iter().any(|e| e.live()))
+}
+
+/// In real time with live inputs, a window ends at most this far ahead of the wall clock (virtual time), as far
+/// as taking turns lets virtual time run ahead of it before sleeping: what host tools send is read about as soon
+/// as it arrives, and what the boards send goes out about when it is due.
+pub(crate) const LIVE_LEAD: Time = Time::from_ms(2);
+
+/// The last boundary of a window from `bounds` in real time with live inputs: at most [`LIVE_LEAD`] ahead of the
+/// wall clock. Sleeps first while the robot is more than half of that ahead, so windows stay at least that long.
+/// Returns at least 1, and the time slept.
+fn wall_horizon(pacing: &mut Pacing, bounds: &Bounds) -> (usize, Duration) {
+    let half = Time(LIVE_LEAD.as_ps() / 2);
+    let mut wall = pacing.wall_virtual(bounds.start);
+    let mut slept = Duration::ZERO;
+    if bounds.start > wall + half {
+        let ahead = bounds.start - half - wall;
+        let start = Instant::now();
+        std::thread::sleep(Duration::from_nanos(ahead.as_ns()));
+        slept = start.elapsed();
+        wall = pacing.wall_virtual(bounds.start);
+    }
+    let cap = wall + LIVE_LEAD;
+    let last =
+        if cap <= bounds.start { 0 } else { ((cap - bounds.start).as_ps() / bounds.slice.as_ps().max(1)) as usize };
+    (last.max(1), slept)
 }
 
 /// What one CAN controller showed the bus at a boundary.
@@ -526,7 +559,8 @@ fn horizon(buses: &[RobotBus], bounds: &Bounds) -> usize {
     for rb in buses {
         let Some(queued) = rb.bus.earliest_queued_end() else { return 1 };
         first = first.min(queued);
-        for e in &rb.endpoints {
+        // A live endpoint's frames are handed in where the window is committed, which ends it where they can finish
+        for e in rb.endpoints.iter().filter(|e| !e.live()) {
             let q = e.idle_until().unwrap_or(Time::ZERO);
             if q < Time::MAX {
                 first = first.min(Time(q.as_ps().saturating_add(rb.bus.shortest_frame().as_ps())));
@@ -540,12 +574,14 @@ fn horizon(buses: &[RobotBus], bounds: &Bounds) -> usize {
 pub(crate) fn run_until(robot: &mut Robot, end: Time) -> Option<(usize, StopReason)> {
     let max_threads = max_threads(robot);
     let n = robot.boards.len();
+    let live = has_live_inputs(robot);
     robot.balance.fit(n, max_threads);
     robot.kept_flash.resize_with(n, Versioned::default);
     let mut follower = vec![false; n];
     let mut escs = vec![Vec::new(); n];
     for v in &robot.vehicles {
-        for &b in v.sensor_boards() {
+        // An external vehicle stays where it was put during a run, so the inputs it writes do not change
+        for &b in v.sensor_boards().iter().filter(|_| !v.external) {
             follower[b] = true;
         }
         for &(b, k) in v.wiring().iter().flatten() {
@@ -629,7 +665,12 @@ pub(crate) fn run_until(robot: &mut Robot, end: Time) -> Option<(usize, StopReas
             // A new window from here
             window += 1;
             let bounds = Bounds { start: *now, slice: *slice, end };
-            let last = horizon(buses, &bounds).min(MAX_WINDOW).min(bounds.count());
+            let mut last = horizon(buses, &bounds).min(MAX_WINDOW).min(bounds.count());
+            if *realtime && live {
+                let (wall, slept) = wall_horizon(pacing, &bounds);
+                last = last.min(wall);
+                paced += slept;
+            }
             busy.fill(false);
             for (i, lane) in shared.lanes.iter().enumerate() {
                 let mut l = lock(lane);
@@ -839,6 +880,14 @@ impl Committer {
                     "bus {} changed a node at {t} in a window that should have been quiet there",
                     rb.bus.name
                 );
+                // What a live endpoint handed in here (ready now) can finish at the next boundary at the earliest
+                if rb.endpoints.iter().any(|e| e.live()) {
+                    let end = rb.bus.earliest_queued_end().map_or(j + 1, |e| self.bounds.at_or_after(e));
+                    if end != usize::MAX && end.max(j + 1) < boundary_of(shared.window.load(Ordering::Acquire)) {
+                        shared.announce(self.window, end.max(j + 1));
+                        stats.live_cuts += 1;
+                    }
+                }
             }
             // The followers' end of the slice
             for (_, l) in followers.iter_mut() {

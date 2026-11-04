@@ -540,6 +540,11 @@ impl CanEndpoint for Replay {
     }
 
     fn receive(&mut self, _frame: &CanFrame, _at: Time) {}
+
+    /// Its next frame's time: a robot runs its boards ahead of each other up to there.
+    fn idle_until(&self) -> Option<Time> {
+        Some(self.first_time().unwrap_or(Time::MAX))
+    }
 }
 
 /// A [`Replay`] shared with whoever wants to watch its progress after handing it to a bus.
@@ -559,6 +564,10 @@ impl CanEndpoint for SharedReplay {
 
     fn receive(&mut self, frame: &CanFrame, at: Time) {
         self.0.lock().unwrap().receive(frame, at)
+    }
+
+    fn idle_until(&self) -> Option<Time> {
+        self.0.lock().unwrap().idle_until()
     }
 }
 

@@ -79,6 +79,11 @@ impl CanEndpoint for CanmoreLink {
             _ => {}
         }
     }
+
+    /// What the tool queued is handed in at the step that reads it.
+    fn live(&self) -> bool {
+        true
+    }
 }
 
 /// The register mapped transport: classic frames on the control interface channel; receiving runs the session.

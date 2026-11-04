@@ -618,6 +618,13 @@ impl Pacing {
         None
     }
 
+    /// The virtual time the wall clock is at now, counted from where pacing started (from `now`, if it has not
+    /// started yet: this starts it).
+    pub(crate) fn wall_virtual(&mut self, now: Time) -> Time {
+        let (wall0, virt0) = *self.start.get_or_insert((std::time::Instant::now(), now));
+        virt0 + Time::from_ns(wall0.elapsed().as_nanos() as u64)
+    }
+
     /// Starts afresh from the next call (virtual time was held, e.g. paused from the dashboard).
     pub(crate) fn reset(&mut self) {
         self.start = None;
