@@ -267,3 +267,31 @@ can read it as the repository secret **`TITAN_FIRMWARE_RS_TOKEN`** (a fine-grain
 "Contents: read" on that repository). Without it the submodule is not fetched, the "Firmware images" step fails
 loudly, and the firmware tests would otherwise skip. The c-firmware job needs it too: the emulator's workspace uses
 titan_firmware_rs's host crates (`canmore`, `titan_link`), so its tests can't build without the submodule.
+
+### In titan_firmware_rs
+
+titan_firmware_rs runs this repository's firmware tests on every push and pull request of its own, in
+`.github/workflows/emulator.yml` there ("Emulator CI" in its README). The workflow builds the images with the
+firmware's pinned compiler, checks out this repository at `master` (with the `FIRMWARE_SIMULATOR_TOKEN` secret,
+since this repository may be private), and puts its own checkout in place of `external/titan_firmware_rs`. This
+repository's host crates and images then both come from that commit, and no submodule is fetched. It then runs:
+
+```bash
+cargo test --release -p sim_test --test smoke -- --nocapture   # every board boots and connects; the table goes to the job summary
+cargo test --release -p sim_test --test faults -- --nocapture
+cargo test --release -p sim_test --test robot -- --nocapture
+cargo test --release -p sim_host --test ivc_link -- --nocapture
+```
+
+These take about 1.5 minutes on 4 cores once built (`ivc_link` about a minute, `faults` about 12 s, `robot` 5 s,
+`smoke` 3 s). There, a test that skips for want of an image fails. The workflow sets `SIM_REQUIRE_TITAN_RS=1`, which
+makes `sim_test::titan_rs`, `sim_host::titan_rs_image` and the tests built on them panic instead of skipping. It
+also fails the job on any `skipping: ...thumbv6m-none-eabi/release/...` line. Tests that need the C images still
+skip there.
+
+These tests encode what the firmware is expected to do, including the `firmware_finding_*` tests that pin down
+today's bugs. So when titan_firmware_rs changes behaviour on purpose (a finding fixed, a timing changed), its
+workflow fails against this repository's `master` until the tests here change to match. Make that change on a
+branch here, check it against the new images (`TITAN_RS_RELEASE_DIR=.../release cargo test ...`), and run the
+titan_firmware_rs workflow by hand with `emulator_ref` set to the branch. Bumping the `external/titan_firmware_rs`
+pin here goes with the same change.

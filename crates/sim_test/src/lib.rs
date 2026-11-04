@@ -57,10 +57,10 @@ pub fn repo() -> PathBuf {
 }
 
 /// A titan_firmware_rs release ELF, if it has been built (`cd external/titan_firmware_rs/firmware && cargo build
-/// --workspace --release`). Tests return early (and say so) when it is missing.
+/// --workspace --release`). Tests return early (and say so) when it is missing, or fail when `SIM_REQUIRE_TITAN_RS`
+/// is set (titan_firmware_rs's CI; see [`sim_host::titan_rs_image`]).
 pub fn titan_rs(name: &str) -> Option<PathBuf> {
-    let p = sim_host::titan_rs_release_dir(&repo()).join(name);
-    found(p, "cd external/titan_firmware_rs/firmware && cargo build --workspace --release, or set TITAN_RS_RELEASE_DIR")
+    sim_host::titan_rs_image(&repo(), name)
 }
 
 /// A C titan_firmware build output under `build/c` (`scripts/build_c_firmware.sh`), if present.

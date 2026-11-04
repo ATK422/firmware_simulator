@@ -29,15 +29,10 @@ fn run(cmd: &mut Command) -> (i32, String, String) {
 }
 
 fn talos_built() -> bool {
-    let dir = sim_host::titan_rs_release_dir(&repo());
-    let ok = ["poac_board", "esc_board", "camera_cage_bb", "actuator_board", "led_board", "sbc_board", "ivc_board2"]
+    ["poac_board", "esc_board", "camera_cage_bb", "actuator_board", "led_board", "sbc_board", "ivc_board2"]
         .iter()
         .chain(&["smart_battery"])
-        .all(|e| dir.join(e).exists());
-    if !ok {
-        eprintln!("skipping: titan_firmware_rs images not built in {}", dir.display());
-    }
-    ok
+        .all(|e| sim_host::titan_rs_image(&repo(), e).is_some())
 }
 
 /// Talos with a bridge per client, logged; the bridges' side replayed into a second run; the logs compared.
