@@ -709,7 +709,7 @@ impl CortexM0Plus {
     }
 
     #[inline(never)]
-    fn op_pop_pc<B: Bus + ?Sized>(&mut self, bus: &mut B, list: u32) -> Result<u32, Fault> {
+    fn op_pop_pc<B: Bus + ?Sized>(&mut self, bus: &mut B, list: u32, at: u32) -> Result<u32, Fault> {
         let (n, c) = match self.pop_ram(bus, list) {
             Some((c, Some(pc))) => {
                 let (n, extra) = self.bx_write_pc(bus, pc)?;
@@ -719,15 +719,17 @@ impl CortexM0Plus {
         };
         if let Next::Branch(t) = n {
             self.r[15] = t;
+            self.note_edge(at, t);
         }
         Ok(c)
     }
 
     #[inline(never)]
-    fn op_bx<B: Bus + ?Sized>(&mut self, bus: &mut B, target: u32) -> Result<u32, Fault> {
+    fn op_bx<B: Bus + ?Sized>(&mut self, bus: &mut B, target: u32, at: u32) -> Result<u32, Fault> {
         let (n, c) = self.bx_write_pc(bus, target)?;
         if let Next::Branch(t) = n {
             self.r[15] = t;
+            self.note_edge(at, t);
         }
         Ok(2 + c)
     }
@@ -1058,11 +1060,13 @@ impl CortexM0Plus {
             }
             K::B => {
                 self.r[15] = imm;
+                self.note_edge(pc, imm);
                 return Ok(2);
             }
             K::BCond => {
                 if self.condition_passed(a as u32) {
                     self.r[15] = imm;
+                    self.note_edge(pc, imm);
                     *code = true;
                     return Ok(2);
                 }
@@ -1071,6 +1075,7 @@ impl CortexM0Plus {
             K::Bl => {
                 self.r[14] = pc.wrapping_add(4) | 1;
                 self.r[15] = imm;
+                self.note_edge(pc, imm);
                 return Ok(3);
             }
             K::Bx | K::Blx => {
@@ -1079,11 +1084,11 @@ impl CortexM0Plus {
                 if op.kind == K::Blx {
                     self.r[14] = pc.wrapping_add(2) | 1;
                 }
-                return self.op_bx(bus, target);
+                return self.op_bx(bus, target, pc);
             }
             K::PopPc => {
                 timed!();
-                return self.op_pop_pc(bus, imm);
+                return self.op_pop_pc(bus, imm, pc);
             }
             K::Step => {
                 timed!();

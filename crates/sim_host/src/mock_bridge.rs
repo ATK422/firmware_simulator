@@ -36,6 +36,13 @@ pub struct BridgeState {
     pub pending: Vec<HostToDevice>,
     /// Messages to send once at a set virtual time ([`MockBridge::send_at`]), in time order.
     pub scheduled: Vec<(Time, HostToDevice)>,
+    /// Encoded titan_link messages (any bytes, valid or not) to send once, at the next opportunity, in CANmore
+    /// message frames of the titan_link subtype ([`MockBridge::send_encoded`]).
+    pub pending_encoded: Vec<Vec<u8>>,
+    /// Raw CAN frames to put on the bus, each at its time, in time order ([`MockBridge::send_frame_at`]): what a
+    /// program writing to the bridge's SocketCAN interface would send (`cansend`). They go out whether or not
+    /// the bridge is running.
+    pub raw: Vec<(Time, CanFrame)>,
     /// Called with every titan_link message from the board as it arrives (not copied by [`MockBridge::fork`]).
     pub on_message: Option<MessageHook>,
     /// Pings sent, and when the last one was.
@@ -63,6 +70,8 @@ impl MockBridge {
             errors: Vec::new(),
             pending: Vec::new(),
             scheduled: Vec::new(),
+            pending_encoded: Vec::new(),
+            raw: Vec::new(),
             on_message: None,
             pings: 0,
             last_ping: None,
@@ -106,6 +115,8 @@ impl MockBridge {
             errors: s.errors.clone(),
             pending: s.pending.clone(),
             scheduled: s.scheduled.clone(),
+            pending_encoded: s.pending_encoded.clone(),
+            raw: s.raw.clone(),
             on_message: None,
             pings: s.pings,
             last_ping: s.last_ping,
@@ -116,6 +127,20 @@ impl MockBridge {
 
     pub fn send(&self, msg: HostToDevice) {
         self.state().pending.push(msg);
+    }
+
+    /// Sends `bytes` as an encoded titan_link message (CANmore framing of the titan_link subtype around whatever
+    /// the bytes are, so the firmware's decoder sees them), at the next opportunity like [`MockBridge::send`].
+    pub fn send_encoded(&self, bytes: &[u8]) {
+        self.state().pending_encoded.push(bytes.to_vec());
+    }
+
+    /// Puts `frame` on the bus at virtual time `at` (or as soon as it is handed in, if that is already past),
+    /// running or not. Frames due at the same time go out in the order given.
+    pub fn send_frame_at(&self, at: Time, frame: CanFrame) {
+        let mut s = self.state();
+        let i = s.raw.partition_point(|(t, _)| *t <= at);
+        s.raw.insert(i, (at, frame));
     }
 
     /// Sends `msg` once at virtual time `at` (at the end of the slice that reaches `at` if that is already past; a
@@ -190,6 +215,11 @@ pub fn ivc_received(msg: &DeviceToHost) -> Option<u8> {
 fn frames_for(state: &BridgeState, msg: &HostToDevice, at: Time) -> Vec<(Time, CanFrame)> {
     let mut buf = [0u8; titan_link::MAX_ENCODED_LEN];
     let Ok(encoded) = titan_link::encode(msg, &mut buf) else { return Vec::new() };
+    encoded_frames(state, encoded, at)
+}
+
+/// The CANmore message frames of the titan_link subtype carrying `encoded`.
+fn encoded_frames(state: &BridgeState, encoded: &[u8], at: Time) -> Vec<(Time, CanFrame)> {
     MsgEncoder::new(state.client_id, Direction::AgentToClient, state.fd, canmore::MSG_SUBTYPE_TITAN_LINK, encoded)
         .map(|f| {
             let frame = if state.fd {
@@ -208,9 +238,14 @@ fn frames_for(state: &BridgeState, msg: &HostToDevice, at: Time) -> Vec<(Time, C
 impl CanEndpoint for MockBridge {
     fn take_tx(&mut self, until: Time) -> Vec<(Time, CanFrame)> {
         let mut s = self.state();
-        let mut out = Vec::new();
+        let due = s.raw.partition_point(|(t, _)| *t <= until);
+        let mut out: Vec<(Time, CanFrame)> = s.raw.drain(..due).collect();
         if !s.running {
             return out;
+        }
+        for bytes in std::mem::take(&mut s.pending_encoded) {
+            let at = s.next_ping.min(until);
+            out.extend(encoded_frames(&s, &bytes, at));
         }
         for msg in std::mem::take(&mut s.pending) {
             let at = s.next_ping.min(until);
@@ -243,13 +278,14 @@ impl CanEndpoint for MockBridge {
     /// The next ping or scheduled message; now if a message is pending (it goes out at the next opportunity).
     fn idle_until(&self) -> Option<Time> {
         let s = self.state();
+        let raw = s.raw.first().map_or(Time::MAX, |(t, _)| *t);
         if !s.running {
-            return Some(Time::MAX);
+            return Some(raw);
         }
-        if !s.pending.is_empty() {
+        if !s.pending.is_empty() || !s.pending_encoded.is_empty() {
             return Some(Time::ZERO);
         }
-        Some(s.scheduled.first().map_or(s.next_ping, |(t, _)| (*t).min(s.next_ping)))
+        Some(s.scheduled.first().map_or(s.next_ping, |(t, _)| (*t).min(s.next_ping)).min(raw))
     }
 
     fn receive(&mut self, frame: &CanFrame, at: Time) {
@@ -353,6 +389,40 @@ mod tests {
         // A fork keeps what is still scheduled
         b.send_at(Time::from_ms(400), IvcModem::Ivc2.transmit(1));
         assert_eq!(b.fork().state().scheduled.len(), 1);
+    }
+
+    /// Raw frames go out at their own times, running or not; encoded bytes go out in CANmore message frames.
+    #[test]
+    fn raw_frames_and_encoded_bytes() {
+        let mut b = MockBridge::new(3, false, Time::from_ms(1000));
+        let f1 = CanFrame::classic(0x7FF, false, &[1, 2]);
+        let f2 = CanFrame::fd(0x1234_5678, true, &[0; 12]);
+        b.send_frame_at(Time::from_ms(20), f2.clone());
+        b.send_frame_at(Time::from_ms(10), f1.clone());
+        assert_eq!(b.idle_until(), Some(Time::from_ms(10)));
+        assert!(b.take_tx(Time::from_ms(9)).is_empty());
+        assert_eq!(b.take_tx(Time::from_ms(15)), [(Time::from_ms(10), f1)]);
+        b.stop();
+        assert_eq!(b.idle_until(), Some(Time::from_ms(20)), "a stopped bridge still sends raw frames");
+        assert_eq!(b.fork().state().raw.len(), 1);
+        assert_eq!(b.take_tx(Time::from_ms(30)), [(Time::from_ms(20), f2)]);
+        assert_eq!(b.idle_until(), Some(Time::MAX));
+        b.start(Time::from_ms(1000));
+        // 20 bytes of nonsense: three classic frames (8 + 8 + 4), the last with the CRC
+        let bytes: Vec<u8> = (0..20).collect();
+        b.send_encoded(&bytes);
+        assert_eq!(b.idle_until(), Some(Time::ZERO));
+        let frames = b.take_tx(Time::from_ms(40));
+        assert_eq!(frames.len(), 3);
+        let mut d = MsgDecoder::new(false);
+        let mut got = None;
+        for (t, f) in &frames {
+            assert_eq!(*t, Time::from_ms(40));
+            if let Some(m) = d.decode_frame(f.id, f.extended, &f.data).unwrap() {
+                got = Some((m.subtype, m.data.to_vec()));
+            }
+        }
+        assert_eq!(got, Some((canmore::MSG_SUBTYPE_TITAN_LINK, bytes)));
     }
 
     #[test]

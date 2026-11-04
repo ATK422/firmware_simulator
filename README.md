@@ -205,6 +205,18 @@ cargo test --release -p sim_test --test ivc_sweep -- --nocapture
 The acoustic front end and water are plausible models, not measurements: use them to compare firmware versions
 and settings, not to predict range in the real pool.
 
+**Fuzz the firmware.** `firmware_simulator fuzz` drives many seeded, deterministic cases of malformed and
+adversarial CAN traffic at a board (or every board) from one boot, and watches for the firmware falling over: a
+panic, a lockup, a watchdog reset, a hang, a fault bit raised and never cleared, a wild memory access. New
+branch-edge coverage keeps an input in the corpus (AFL-style feedback), failing cases are minimised, and each
+finding is written out as a scenario reproducer that replays with `firmware_simulator scenario`
+([fuzzing.md](docs/fuzzing.md)).
+
+```bash
+firmware_simulator fuzz esc_board --cases 5000 --jobs 2 --out findings/
+firmware_simulator fuzz --time 20m --jobs 2 --out findings/ --confirm   # every board
+```
+
 ## What it can do
 
 The details, by area; each row links to the page that covers it.

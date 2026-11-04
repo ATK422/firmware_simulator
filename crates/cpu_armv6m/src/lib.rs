@@ -15,6 +15,7 @@
 
 mod block;
 pub mod disasm;
+pub mod edges;
 mod exec;
 pub mod ppb;
 mod timer_wait;
@@ -26,6 +27,7 @@ use sim_core::bus::{Bus, BusFault, Size};
 use sim_core::cpu::{Cpu, StepOutcome};
 
 pub use block::BlockCache;
+pub use edges::EdgeMap;
 pub use ppb::{Mpu, Nvic, Scb, SysTick};
 pub use timer_wait::{TimerWait, WaitRead};
 
@@ -180,6 +182,8 @@ pub struct CortexM0Plus {
     /// Either way they do the same.
     pub decode_blocks: bool,
     pub(crate) blocks: BlockCache,
+    /// Branch edge coverage (see [`edges`]), when on. It costs a check per taken branch while off.
+    pub edges: Option<Box<EdgeMap>>,
 }
 
 impl Default for CortexM0Plus {
@@ -223,6 +227,7 @@ impl CortexM0Plus {
             log_exceptions: false,
             decode_blocks: true,
             blocks: BlockCache::default(),
+            edges: None,
         }
     }
 
@@ -937,9 +942,12 @@ impl Cpu for CortexM0Plus {
     fn reset(&mut self, bus: &mut dyn Bus, vtor: u32) {
         let cpuid = self.cpuid;
         let log = self.log_exceptions;
+        // The edge map outlives a reset: what ran before it was still run
+        let edges = self.edges.take();
         *self = CortexM0Plus::new();
         self.cpuid = cpuid;
         self.log_exceptions = log;
+        self.edges = edges;
         self.scb.vtor = vtor;
         let sp = bus.read(vtor, Size::Word).unwrap_or(0);
         let pc = bus.read(vtor + 4, Size::Word).unwrap_or(0);

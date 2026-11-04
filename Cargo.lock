@@ -994,6 +994,7 @@ name = "sim_test"
 version = "0.1.0"
 dependencies = [
  "canmore",
+ "cpu_armv6m",
  "log",
  "regex",
  "rp2040",

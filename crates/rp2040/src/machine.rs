@@ -480,9 +480,9 @@ impl Machine {
             self.core_enabled[1] = false;
             return;
         }
-        let log = self.cores[1].log_exceptions;
+        let (log, edges) = (self.cores[1].log_exceptions, self.cores[1].edges.take());
         self.cores[1] = CortexM0Plus::new();
-        self.cores[1].log_exceptions = log;
+        (self.cores[1].log_exceptions, self.cores[1].edges) = (log, edges);
         self.clocks[1] = CycleClock::new(now);
         let mut trace = NullSink;
         let mut bus = CoreBus { sys: &mut self.sys, trace: &mut trace, core: 1, now };
@@ -511,6 +511,25 @@ impl Machine {
     pub fn enable_coverage(&mut self) {
         let size = self.sys.flash.len();
         self.coverage.get_or_insert_with(|| Box::new(crate::coverage::CoverageMap::new(size)));
+    }
+
+    /// Turns branch edge coverage on for both cores ([`cpu_armv6m::edges`]), watching branches into `watch`
+    /// (`[lo, hi)` ranges). Unlike [`Machine::enable_coverage`] the cores still run batched; the run is the same.
+    /// Maps already on are kept, with the new watch list.
+    pub fn enable_edges(&mut self, watch: &[(u32, u32)]) {
+        for c in &mut self.cores {
+            c.edges.get_or_insert_with(Box::default).watch = watch.to_vec();
+        }
+    }
+
+    /// Both cores' edge maps merged, if edge coverage is on.
+    pub fn edges(&self) -> Option<cpu_armv6m::EdgeMap> {
+        let mut maps = self.cores.iter().filter_map(|c| c.edges.as_deref());
+        let mut m = maps.next()?.clone();
+        for other in maps {
+            m.merge(other);
+        }
+        Some(m)
     }
 
     /// Asks [`Machine::run_until`] to return at the next instruction boundary.
@@ -562,7 +581,9 @@ impl Machine {
             if off & (1 << psm::PROC1) != 0 {
                 // Core 1 is held in reset while forced off
                 self.core_enabled[1] = false;
+                let edges = self.cores[1].edges.take();
                 self.cores[1] = CortexM0Plus::new();
+                self.cores[1].edges = edges;
             }
             if released & (1 << psm::PROC1) != 0 {
                 // Out of reset again after the PSM sequences the domain back on: core 1 then runs the bootrom and
@@ -599,9 +620,10 @@ impl Machine {
         self.sys.clk_sys_changed = false;
         self.now = t;
         for c in 0..2 {
-            let log = self.cores[c].log_exceptions;
+            let (log, edges) = (self.cores[c].log_exceptions, self.cores[c].edges.take());
             self.cores[c] = CortexM0Plus::new();
-            self.cores[c].log_exceptions = log;
+            // Instrumentation outlives the reset: what ran before it was still run
+            (self.cores[c].log_exceptions, self.cores[c].edges) = (log, edges);
             self.clocks[c] = CycleClock::new(t);
         }
         self.reboot();
@@ -690,9 +712,10 @@ impl Machine {
         self.sys.clk_sys_changed = false;
         self.now = t;
         for c in 0..2 {
-            let log = self.cores[c].log_exceptions;
+            let (log, edges) = (self.cores[c].log_exceptions, self.cores[c].edges.take());
             self.cores[c] = CortexM0Plus::new();
-            self.cores[c].log_exceptions = log;
+            // Instrumentation outlives the reset: what ran before it was still run
+            (self.cores[c].log_exceptions, self.cores[c].edges) = (log, edges);
             self.clocks[c] = CycleClock::new(t);
         }
         self.reboot();
@@ -753,9 +776,9 @@ impl Machine {
     /// peripherals or SIO.
     pub fn core_reset(&mut self, c: usize) {
         log::info!("[{}] core{c} SYSRESETREQ", self.clocks[c].now);
-        let log = self.cores[c].log_exceptions;
+        let (log, edges) = (self.cores[c].log_exceptions, self.cores[c].edges.take());
         self.cores[c] = CortexM0Plus::new();
-        self.cores[c].log_exceptions = log;
+        (self.cores[c].log_exceptions, self.cores[c].edges) = (log, edges);
         if c == 0 && self.rom_boot {
             let mut trace = NullSink;
             let now = self.clocks[0].now;

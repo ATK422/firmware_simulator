@@ -110,7 +110,7 @@ fn commands(text: &str) -> Vec<(String, String)> {
             let rest = &line[at + "firmware_simulator ".len()..];
             let sub = rest.split_whitespace().next().unwrap_or("");
             let sub = sub.trim_matches(|c: char| !c.is_ascii_alphanumeric() && c != '-');
-            if !["run", "robot", "can-diff", "bridges", "can-tunnel", "picoboot", "mcp", "scenario", "compare"]
+            if !["run", "robot", "can-diff", "bridges", "can-tunnel", "picoboot", "mcp", "scenario", "compare", "fuzz"]
                 .contains(&sub)
             {
                 continue;
@@ -146,6 +146,7 @@ fn commands_use_options_their_subcommand_has() {
         ("mcp", help_options(&["mcp"])),
         ("scenario", help_options(&["scenario"])),
         ("compare", help_options(&["compare"])),
+        ("fuzz", help_options(&["fuzz"])),
     ];
     let mut checked = 0;
     let mut wrong = Vec::new();
@@ -177,6 +178,7 @@ fn every_option_mentioned_exists() {
         &["mcp"],
         &["scenario"],
         &["compare"],
+        &["fuzz"],
     ] {
         known.extend(help_options(sub));
     }

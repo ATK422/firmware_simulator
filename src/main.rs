@@ -14,6 +14,7 @@ use sim_core::time::Time;
 use sim_core::trace::{Category, WriterSink};
 use sim_host::Session;
 
+mod fuzz_cli;
 mod host_tools;
 mod mcp;
 mod scenario_cli;
@@ -52,6 +53,9 @@ enum Command {
     /// Runs scenarios with two firmware builds and reports what changed: checks, log lines, CAN traffic, boot and
     /// connect times, faults, resets, ESC speeds (Markdown and JSON).
     Compare(scenario_cli::CompareArgs),
+    /// Fuzzes one or every board with malformed CAN traffic, watching for crashes, hangs, watchdog resets and
+    /// fault states; writes minimised scenario reproducers (docs/fuzzing.md).
+    Fuzz(fuzz_cli::FuzzArgs),
 }
 
 #[derive(Subcommand)]
@@ -1620,7 +1624,7 @@ fn picoboot_load(session: &mut Session, image: &Image, flash_size: u32, via: Loa
 fn main() -> Result<()> {
     let cli = Cli::parse();
     // Scenario runs print their own report; the emulator's notes (faults applied, ...) would only interleave with it
-    let quiet = matches!(cli.command, Command::Scenario(_) | Command::Compare(_));
+    let quiet = matches!(cli.command, Command::Scenario(_) | Command::Compare(_) | Command::Fuzz(_));
     let level = if quiet { "error" } else { "info" };
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or(level)).format_timestamp(None).init();
     if matches!(cli.command, Command::Run(_) | Command::Robot(_) | Command::Picoboot(_)) {
@@ -1664,6 +1668,7 @@ fn run_command(command: Command) -> Result<()> {
         Command::Mcp(args) => mcp::serve(args),
         Command::Scenario(args) => std::process::exit(scenario_cli::scenario(args)?),
         Command::Compare(args) => std::process::exit(scenario_cli::compare(args)?),
+        Command::Fuzz(args) => fuzz_cli::run(args),
     }
 }
 

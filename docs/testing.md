@@ -257,6 +257,7 @@ pass) without them.
 | `crates/sim_test/tests/ivc_sweep.rs` | IVC delivery against range and noise (prints tables with `--nocapture`; the slowest suite) |
 | `crates/sim_test/tests/guide.rs` | This page's walkthrough |
 | `crates/sim_test/tests/scenarios.rs` | Every YAML scenario in `scenarios/` ([scenarios.md](scenarios.md)), the runner's verdicts and evidence, determinism on any number of threads, and A/B comparisons of real runs |
+| `crates/sim_test/tests/fuzz_smoke.rs` | A short fixed-seed fuzz campaign on one board: it runs, finds the same things on any number of threads, and every reproducer replays ([fuzzing.md](fuzzing.md)) |
 | `tests/host_cli.rs` (root package) | The command line: robot record/replay/diff, `bridges` outputs, `scripts/vcan_up.sh` with stand-ins, `robot_in_a_box.sh` and `nereus_firmware_sim.sh` in `--dry-run`, the nereus bridge's Python tests, the Docker files' consistency |
 | `tests/scenario_cli.rs` (root package) | `scenario` and `compare` on the command line: exit statuses, JUnit, JSON, Markdown |
 | `tests/docs.rs` (root package) | Every command line option the docs and the README mention exists |

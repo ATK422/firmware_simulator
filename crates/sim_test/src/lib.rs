@@ -32,6 +32,7 @@
 //! sweeps in `tests/ivc_sweep.rs`.
 
 pub mod compare;
+pub mod fuzz;
 pub mod scenario;
 
 use std::path::{Path, PathBuf};

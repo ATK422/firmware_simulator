@@ -68,6 +68,14 @@ impl CortexM0Plus {
         if cond & 1 == 1 && cond != 0xF { !r } else { r }
     }
 
+    /// Notes a taken branch in the edge map, if it is on.
+    #[inline(always)]
+    pub(crate) fn note_edge(&mut self, from: u32, to: u32) {
+        if let Some(e) = self.edges.as_deref_mut() {
+            e.mark(from, to);
+        }
+    }
+
     /// `BXWritePC`: interworking branch that also performs exception return from handler mode.
     pub(crate) fn bx_write_pc<B: Bus + ?Sized>(&mut self, bus: &mut B, target: u32) -> Result<(Next, u32), Fault> {
         if self.ipsr != 0 && target & 0xF000_0000 == 0xF000_0000 {
@@ -341,7 +349,10 @@ impl CortexM0Plus {
 
         match next {
             Next::Sequential => self.r[15] = pc.wrapping_add(width),
-            Next::Branch(t) => self.r[15] = t,
+            Next::Branch(t) => {
+                self.r[15] = t;
+                self.note_edge(pc, t);
+            }
             Next::AlreadySet => {}
         }
         Ok(cycles)
