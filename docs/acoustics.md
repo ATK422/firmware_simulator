@@ -247,8 +247,8 @@ build, since a different compiler moves when the detector's captures fall; the A
 delivered are noise taken for an ACK (titan_firmware_rs PR #1 describes the trade-off). The IVCBoard2 table is the
 same with both builds except at 95 dB, its cliff (delivered with 1.99.0, lost with 1.97.0).
 
-In `robots/ivc_pool.toml` the first-generation boards lose a byte when one moves at 0.5 m/s, and also at some
-fixed ranges. That is the modem, not Doppler or the moving-path model: its fixed threshold on the "other" band is
+In `robots/ivc_pool.toml` the first-generation boards lose bytes at some fixed ranges, and when one moves through
+such spots. That is the modem, not Doppler or the moving-path model: its fixed threshold on the "other" band is
 reached by the previous symbol's reverberation at the assumed 40 dB receive gain
 (`firmware_finding_ivc_symbols_lost_to_pool_reverberation` in `ivc_link.rs`, [faults.md](faults.md#firmware-findings-so-far)).
 In the pool many packets lose a symbol at most positions, so the link there lives on retransmission, and which

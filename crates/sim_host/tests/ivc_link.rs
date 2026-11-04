@@ -327,9 +327,8 @@ fn captures(rec: &[(Time, f32)]) -> Vec<(f64, Vec<u8>)> {
 /// and more of path), about 30 dB below the direct tone. With the assumed 40 dB receive gain the direct tone reads
 /// 10000-20000, so that echo reads 100-450, around the fixed threshold: whether a symbol is decoded depends on how
 /// the echoes add up where the board is, and on exactly when in the slot the receiver's capture falls (which moves
-/// with the firmware build's timing). With Talos's board at 5.6 m most packets lose a symbol; a board moving at
-/// 0.5 m/s goes through such spots during a packet, which is why the drifting-vehicle test (`tests/vehicle.rs`)
-/// loses 0x5A at that speed and not at 0.2 m/s. Retransmission (titan_firmware_rs b278360) does not save a byte
+/// with the firmware build's timing). With Talos's board at 5.6 m most packets lose a symbol; a moving board goes
+/// through such spots during a packet (the drifting-vehicle test, `tests/vehicle.rs`). Retransmission (titan_firmware_rs b278360) does not save a byte
 /// here, since the echoes are the same on every attempt. A threshold relative to the stronger band would not care.
 #[test]
 fn firmware_finding_ivc_symbols_lost_to_pool_reverberation() {
