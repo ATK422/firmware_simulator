@@ -824,3 +824,72 @@ fn robot_board_faults_stay_local() {
     let e = sim_host::fault::can_error_counters(&mut r.robot.boards[poac]);
     assert_eq!(e[0].state, ErrorState::Active);
 }
+
+/// Found by `firmware_simulator fuzz` (docs/fuzzing.md): one `Ping` with a wrong `protocol_version` from the bridge,
+/// while ROS is connected, raises `FAULT_ROS_ERROR` and it stays raised while valid pings keep the link up. The
+/// link task lowers `FAULT_ROS_ERROR` only when a *fresh* connection starts (`titan_rp2040/src/link.rs`), so the
+/// error from a single stray frame latches until the link drops. The minimised reproducer is this one op.
+#[test]
+fn firmware_finding_fuzz_bad_protocol_ping_latches_ros_error() {
+    const FAULT_ROS_ERROR: u32 = 1 << 3;
+    let Some(mut b) = power_board() else { return };
+    b.run_for(ms(1500));
+    assert_eq!(b.faults().unwrap() & FAULT_ROS_ERROR, 0, "clear on a clean link");
+    let sent = b.now();
+    b.send(HostToDevice::Ping { protocol_version: 172 });
+    // Valid pings carry on every 100 ms: the link never drops
+    b.run_for(ms(4000));
+    assert!(!b.logged("Lost connection to ROS"), "the link stayed up throughout");
+    let later: Vec<u32> = b.statuses().iter().filter(|s| s.0 > sent + ms(1500)).map(|s| s.1.faults).collect();
+    assert!(later.len() >= 2, "statuses kept coming");
+    // Today: still raised seconds later, though every ping since was valid
+    assert!(later.iter().all(|f| f & FAULT_ROS_ERROR != 0), "FAULT_ROS_ERROR latched: {later:x?}");
+}
+
+/// Found by `firmware_simulator fuzz`: a babbling node flooding frames *addressed to the board* (extended id
+/// `0x1669410`: a CANmore message frame from the agent to client 1, which passes the power board's filter) at 83 %
+/// bus load for 200 ms overflows the 16-deep RX FIFO. `can_task` raises `FAULT_CAN_INTERNAL_ERROR` on the overflow
+/// and nothing in `titan_rp2040` ever lowers it, so the fault stays set for the rest of the run after the bus is
+/// quiet again. Whether a real board overflows at this load depends on the SPI service time (the emulator's model):
+/// to verify on hardware. The latching does not depend on it.
+#[test]
+fn firmware_finding_fuzz_rx_overflow_latches_can_internal_error() {
+    let Some(mut b) = power_board() else { return };
+    b.run_for(ms(1500));
+    assert_eq!(b.faults().unwrap() & FAULT_CAN_INTERNAL_ERROR, 0, "clear on a clean bus");
+    b.inject(Fault::CanFlood { id: 0x0166_9410, extended: true, len: 8, load: 0.832 }).unwrap();
+    b.run_for(ms(200));
+    b.inject(Fault::CanFloodStop).unwrap();
+    let quiet = b.now();
+    b.run_for(ms(4000));
+    assert!(!heartbeats_after(&b, quiet + ms(1000)).is_empty(), "the board answers again on a quiet bus");
+    let later: Vec<u32> = b.statuses().iter().filter(|s| s.0 > quiet + ms(1500)).map(|s| s.1.faults).collect();
+    assert!(later.len() >= 2, "statuses kept coming");
+    // Today: still raised seconds after the flood stopped
+    assert!(later.iter().all(|f| f & FAULT_CAN_INTERNAL_ERROR != 0), "FAULT_CAN_INTERNAL_ERROR latched: {later:x?}");
+}
+
+/// Found by `firmware_simulator fuzz`: two `CYCLE_COMPUTER` electrical commands to the camera cage in a row (a ROS
+/// command delivered twice, say) raise `FAULT_ROS_BAD_COMMAND` on the second, from the repeat guard in
+/// `camera_cage_bb/src/cage.rs`, and nothing lowers it. The guard itself rearms once the cycle is done
+/// (`CYCLE_ACTIVE` is cleared), so later requests work again, but the board reports the fault for the rest of the
+/// run. Minimised reproducer: the two commands (`send: {bytes: "060200"}` twice, 7 ms apart).
+#[test]
+fn firmware_finding_fuzz_repeated_cycle_command_latches_bad_command() {
+    use sim_test::titan_link::camera_cage::HostToDevice as Cage;
+    const FAULT_ROS_BAD_COMMAND: u32 = 1 << 5;
+    let Some(elf) = sim_test::titan_rs("camera_cage_bb") else { return };
+    let mut b = Bench::builder(&elf).board("mk2/camera_cage_bb").bridge(4).boot().unwrap();
+    b.run_until(ms(1500)).unwrap();
+    assert_eq!(b.faults().unwrap() & FAULT_ROS_BAD_COMMAND, 0, "clear before");
+    b.send(HostToDevice::CameraCage(Cage::ElectricalCommand(0)));
+    b.run_for(ms(10));
+    b.send(HostToDevice::CameraCage(Cage::ElectricalCommand(0)));
+    let sent = b.now();
+    b.run_for(ms(6000));
+    assert!(b.logged("Attempting to request multiple cycles in a row"));
+    let later: Vec<u32> = b.statuses().iter().filter(|s| s.0 > sent + ms(3000)).map(|s| s.1.faults).collect();
+    assert!(later.len() >= 2, "statuses kept coming");
+    // Today: still raised long after the cycle finished and the guard rearmed
+    assert!(later.iter().all(|f| f & FAULT_ROS_BAD_COMMAND != 0), "FAULT_ROS_BAD_COMMAND latched: {later:x?}");
+}

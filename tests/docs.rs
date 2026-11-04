@@ -123,6 +123,7 @@ fn commands(text: &str) -> Vec<(String, String)> {
                 "compare",
                 "calibrate",
                 "replay-pool-test",
+                "fuzz",
             ]
             .contains(&sub)
             {
@@ -165,6 +166,7 @@ fn commands_use_options_their_subcommand_has() {
         ("compare", help_options(&["compare"])),
         ("calibrate", calibrate),
         ("replay-pool-test", help_options(&["replay-pool-test"])),
+        ("fuzz", help_options(&["fuzz"])),
     ];
     let mut checked = 0;
     let mut wrong = Vec::new();
@@ -200,6 +202,7 @@ fn every_option_mentioned_exists() {
         &["calibrate", "thrusters"],
         &["calibrate", "vehicle"],
         &["replay-pool-test"],
+        &["fuzz"],
     ] {
         known.extend(help_options(sub));
     }

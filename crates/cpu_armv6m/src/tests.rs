@@ -1612,3 +1612,51 @@ fn systick_counts_the_cycles_of_a_hardfault_entry() {
         assert_eq!(rig.cpu.systick.cvr, 85, "{blocks:?}");
     }
 }
+
+/// The edge map sees the same taken branches whether the core interprets each instruction or runs decoded blocks.
+#[test]
+fn edge_map_records_taken_branches_in_every_mode() {
+    let bl = bl(CODE + 6, CODE + 0x10);
+    let program = [
+        movs(0, 3),
+        subs_i8(0, 1),
+        bcond(1, -3), // bne back to the subs
+        bl[0],
+        bl[1],
+        b(-2), // b . at CODE + 0xa
+        NOP,
+        NOP,
+        push(0, true), // CODE + 0x10
+        pop(0, true),
+    ];
+    let expected = [(CODE + 4, CODE + 2), (CODE + 6, CODE + 0x10), (CODE + 0x12, CODE + 0xa), (CODE + 0xa, CODE + 0xa)];
+    let mut maps = Vec::new();
+    for mode in 0..3 {
+        let mut rig = Rig::new(&program);
+        rig.cpu.edges = Some(Box::default());
+        rig.cpu.edges.as_mut().unwrap().watch = vec![(CODE + 0xa, CODE + 0xc)];
+        match mode {
+            0 => {
+                rig.run(20);
+            }
+            1 => {
+                batch_on(&mut rig, true, 20, u64::MAX);
+            }
+            _ => {
+                batch_on(&mut rig, false, 20, u64::MAX);
+            }
+        }
+        let e = rig.cpu.edges.take().unwrap();
+        for (from, to) in expected {
+            assert!(e.hit(from, to), "mode {mode}: {from:#x} -> {to:#x}");
+        }
+        assert_eq!(e.count(), expected.len(), "mode {mode}: only taken branches (the bne falls through once)");
+        assert_eq!(e.watched, 1, "mode {mode}: the branch to itself is watched");
+        maps.push(e);
+    }
+    assert!(maps.windows(2).all(|w| w[0] == w[1]));
+    // Off, nothing is recorded and nothing changes
+    let mut rig = Rig::new(&program);
+    rig.run(20);
+    assert!(rig.cpu.edges.is_none());
+}

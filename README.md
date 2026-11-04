@@ -21,7 +21,7 @@ Every run is repeatable: the same firmware and inputs give exactly the same resu
 **Full guide: [docs/](docs/README.md)** · Design and milestones: [PLAN.md](PLAN.md)
 
 - [Quick start](#quick-start)
-- [More ways to use it](#more-ways-to-use-it): tests in YAML and firmware A/B comparisons, coding agents (MCP), C firmware with micro-ROS, nano-ROS boards, the robot computer on vcan, the firmware in nereus, IVC in the water, calibration and pool-test replay
+- [More ways to use it](#more-ways-to-use-it): tests in YAML and firmware A/B comparisons, coding agents (MCP), C firmware with micro-ROS, nano-ROS boards, the robot computer on vcan, the firmware in nereus, IVC in the water, calibration and pool-test replay, fuzzing
 - [What it can do](#what-it-can-do)
 - [Boards, firmware and robots](#boards-firmware-and-robots)
 - [Architecture](#architecture)
@@ -217,6 +217,18 @@ firmware_simulator calibrate thrusters stand.csv --vehicle vehicles/talos.toml -
 firmware_simulator replay-pool-test candump-can0.log --robot robots/talos.toml --report replay.md
 ```
 
+**Fuzz the firmware.** `firmware_simulator fuzz` drives many seeded, deterministic cases of malformed and
+adversarial CAN traffic at a board (or every board) from one boot, and watches for the firmware falling over: a
+panic, a lockup, a watchdog reset, a hang, a fault bit raised and never cleared, a wild memory access. New
+branch-edge coverage keeps an input in the corpus (AFL-style feedback), failing cases are minimised, and each
+finding is written out as a scenario reproducer that replays with `firmware_simulator scenario`
+([fuzzing.md](docs/fuzzing.md)).
+
+```bash
+firmware_simulator fuzz esc_board --cases 5000 --jobs 2 --out findings/
+firmware_simulator fuzz --time 20m --jobs 2 --out findings/ --confirm   # every board
+```
+
 ## What it can do
 
 The details, by area; each row links to the page that covers it.
@@ -289,7 +301,7 @@ Vehicles: [`talos`, `talos_nereus`, `puddles`, `tempest`](vehicles) ([vehicles.m
 | [`sim_host`](crates/sim_host) | Sessions and robots, board and robot files, mock bridges, SocketCAN, UDP, GDB, USB tools, CAN logs, faults, profiler, VCD, dashboard |
 | [`sim_test`](crates/sim_test) | The firmware test harness: `Bench`, `RobotBench`, `sweep` |
 | [`sim_calib`](crates/sim_calib) | Calibration: fitting the acoustic, thruster and vehicle models to recordings; replaying pool tests |
-| `firmware_simulator` (root) | The command line: `run`, `robot`, `can-diff`, `bridges`, `can-tunnel`, `picoboot`, `calibrate`, `replay-pool-test` |
+| `firmware_simulator` (root) | The command line: `run`, `robot`, `can-diff`, `bridges`, `can-tunnel`, `picoboot`, `calibrate`, `replay-pool-test`, `fuzz` |
 
 Dependencies point one way: `sim_core` ← `cpu_armv6m`, `sim_devices`, `sim_acoustics`, `sim_physics` ← `rp2040`
 ← `sim_host` ← `sim_test` and the CLI. How a board's firmware reaches the buses, the water and the host:
