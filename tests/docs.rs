@@ -107,7 +107,9 @@ fn commands(text: &str) -> Vec<(String, String)> {
             let rest = &line[at + "firmware_simulator ".len()..];
             let sub = rest.split_whitespace().next().unwrap_or("");
             let sub = sub.trim_matches(|c: char| !c.is_ascii_alphanumeric() && c != '-');
-            if !["run", "robot", "can-diff", "bridges", "can-tunnel", "picoboot", "mcp"].contains(&sub) {
+            if !["run", "robot", "can-diff", "bridges", "can-tunnel", "picoboot", "mcp", "scenario", "compare"]
+                .contains(&sub)
+            {
                 continue;
             }
             // Up to the end of the code span or the line, with `\` continuations
@@ -139,6 +141,8 @@ fn commands_use_options_their_subcommand_has() {
         ("can-tunnel", help_options(&["can-tunnel"])),
         ("picoboot", picoboot),
         ("mcp", help_options(&["mcp"])),
+        ("scenario", help_options(&["scenario"])),
+        ("compare", help_options(&["compare"])),
     ];
     let mut checked = 0;
     let mut wrong = Vec::new();
@@ -160,8 +164,17 @@ fn commands_use_options_their_subcommand_has() {
 #[test]
 fn every_option_mentioned_exists() {
     let mut known = BTreeSet::new();
-    for sub in [&["run"][..], &["robot"], &["can-diff"], &["bridges"], &["can-tunnel"], &["picoboot", "load"], &["mcp"]]
-    {
+    for sub in [
+        &["run"][..],
+        &["robot"],
+        &["can-diff"],
+        &["bridges"],
+        &["can-tunnel"],
+        &["picoboot", "load"],
+        &["mcp"],
+        &["scenario"],
+        &["compare"],
+    ] {
         known.extend(help_options(sub));
     }
     known.extend(OUTSIDE.iter().map(|(o, _)| o.to_string()));

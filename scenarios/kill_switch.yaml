@@ -1,0 +1,21 @@
+# The kill switch as titan_bridge forwards it (`state/kill` with every ping): asserted, released, then no longer
+# forwarded, after which the firmware's kill switch times out. Each board reports its kill switches in its firmware
+# status every second.
+name: Kill switch asserted, released and timed out
+robot: {file: robots/talos.toml, boards: [actuator, led]}
+bridges: all
+time: 9s
+steps:
+  - expect: {board: actuator, status: {killed: false, kill_timed_out: false}, within: 1.5s}
+  - at: 2s
+    fault: actuator:kill:on
+  - expect: {board: actuator, status: {killed: true}, within: 1.5s}
+  - at: 4s
+    fault: actuator:kill:off
+  - expect: {board: actuator, status: {killed: false, kill_timed_out: false}, within: 1.5s}
+  - at: 5.5s
+    fault: actuator:kill:none
+  - expect: {board: actuator, status: {kill_timed_out: true}, within: 3s}
+  # The bridge keeps pinging, so the link stays up throughout; the LED board's kill switch is never touched
+  - always: {board: actuator, link: up, at: 1s}
+  - always: {board: led, status: {killed: false, kill_timed_out: false}, at: 1.5s}

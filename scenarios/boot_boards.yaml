@@ -1,0 +1,96 @@
+# The board images that are not part of Talos (boot_talos.yaml has those), each on its board file next to a mock
+# titan_bridge for its CANmore client: it connects, reports its identity with no fault raised, keeps its link up and
+# does not panic. One YAML document per board; `scenario` runs them side by side.
+name: power_board boots and connects
+board: {image: power_board, file: mk2/power_board}
+bridges: [1]
+time: 2.5s
+steps:
+  - expect: {log: ROS connected, within: 1s}
+  - expect: {status: {board_name: mk2/power_board, client_id: 1, faults: 0}, at: 2.5s}
+  - expect: {link: up, at: 2.5s}
+  - never: {log: PANIC}
+  - always: {resets: 0}
+
+---
+name: template boots and connects
+board: {image: template, file: mk2/power_board}
+bridges: [1]
+time: 2.5s
+steps:
+  - expect: {log: ROS connected, within: 1s}
+  - expect: {status: {board_name: mk2/power_board, client_id: 1, faults: 0}, at: 2.5s}
+  - expect: {link: up, at: 2.5s}
+  - never: {log: PANIC}
+  - always: {resets: 0}
+
+---
+name: led_board2 boots and connects
+board: {image: led_board2, file: talos/led_board}
+bridges: [6]
+time: 2.5s
+steps:
+  - expect: {log: ROS connected, within: 1s}
+  - expect: {status: {board_name: talos/led_board, client_id: 6, faults: 0}, at: 2.5s}
+  - expect: {link: up, at: 2.5s}
+  - never: {log: PANIC}
+  - always: {resets: 0}
+
+---
+name: ivc_board boots and connects
+board: {image: ivc_board, file: talos/ivc_board}
+bridges: [8]
+time: 2.5s
+steps:
+  - expect: {log: ROS connected, within: 1s}
+  - expect: {status: {board_name: talos/ivc_board, client_id: 8, faults: 0}, at: 2.5s}
+  - expect: {link: up, at: 2.5s}
+  - never: {log: PANIC}
+  - always: {resets: 0}
+
+---
+name: ivc_dac boots and connects
+board: {image: ivc_dac, file: talos/ivc_board}
+bridges: [8]
+time: 2.5s
+steps:
+  - expect: {log: ROS connected, within: 1s}
+  - expect: {status: {board_name: talos/ivc_board, client_id: 8, faults: 0}, at: 2.5s}
+  - expect: {link: up, at: 2.5s}
+  - never: {log: PANIC}
+  - always: {resets: 0}
+
+---
+name: hbridge_board boots and connects
+board: {image: hbridge_board, file: lilboat/hbridge_board}
+bridges: [2]
+time: 2.5s
+steps:
+  - expect: {log: ROS connected, within: 1s}
+  - expect: {status: {board_name: lilboat/hbridge_board, client_id: 2, faults: 0}, at: 2.5s}
+  - expect: {link: up, at: 2.5s}
+  - never: {log: PANIC}
+  - always: {resets: 0}
+
+---
+name: po_half_board boots and connects
+board: {image: po_half_board, file: lilboat/po_half}
+bridges: [1]
+time: 2.5s
+steps:
+  - expect: {log: ROS connected, within: 1s}
+  - expect: {status: {board_name: lilboat/po_half, client_id: 1, faults: 0}, at: 2.5s}
+  - expect: {link: up, at: 2.5s}
+  - never: {log: PANIC}
+  - always: {resets: 0}
+
+---
+name: Puddles backplane boots and connects over Ethernet
+robot: robots/puddles.toml
+bridges: [eth:backplane]
+time: 2.5s
+steps:
+  - expect: {board: backplane, log: ROS connected, within: 2s}
+  - expect: {board: backplane, status: {board_name: mk2/puddles_backplane, faults: 0}, at: 2.5s}
+  - expect: {board: backplane, link: up, at: 2.5s}
+  - never: {board: backplane, log: PANIC}

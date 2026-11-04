@@ -16,6 +16,7 @@ use sim_host::Session;
 
 mod host_tools;
 mod mcp;
+mod scenario_cli;
 
 #[derive(Parser)]
 #[command(version, about = "RP2040 emulator for UWRT titan firmware")]
@@ -45,6 +46,12 @@ enum Command {
     /// Serves the Model Context Protocol on stdin/stdout, for coding agents: tools to run the emulator, read a run's
     /// state, logs and CAN frames, and inject faults, set inputs and pause.
     Mcp(mcp::McpArgs),
+    /// Runs YAML scenario files (a robot or board, faults, inputs and checks on logs, statuses, frames and states)
+    /// as tests: prints each step with its time and evidence, writes JUnit XML or JSON, exits with 1 on a failure.
+    Scenario(scenario_cli::ScenarioArgs),
+    /// Runs scenarios with two firmware builds and reports what changed: checks, log lines, CAN traffic, boot and
+    /// connect times, faults, resets, ESC speeds (Markdown and JSON).
+    Compare(scenario_cli::CompareArgs),
 }
 
 #[derive(Subcommand)]
@@ -1369,8 +1376,11 @@ fn picoboot_load(session: &mut Session, image: &Image, flash_size: u32, via: Loa
 }
 
 fn main() -> Result<()> {
-    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).format_timestamp(None).init();
     let cli = Cli::parse();
+    // Scenario runs print their own report; the emulator's notes (faults applied, ...) would only interleave with it
+    let quiet = matches!(cli.command, Command::Scenario(_) | Command::Compare(_));
+    let level = if quiet { "error" } else { "info" };
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or(level)).format_timestamp(None).init();
     if matches!(cli.command, Command::Run(_) | Command::Robot(_) | Command::Picoboot(_)) {
         // SIGINT and SIGTERM end a run the way reaching its time does (flash file saved, logs and trailers written)
         sim_host::signal::install().context("catching SIGINT and SIGTERM")?;
@@ -1410,6 +1420,8 @@ fn run_command(command: Command) -> Result<()> {
         Command::Bridges(args) => host_tools::bridges(args),
         Command::CanTunnel(args) => host_tools::can_tunnel(args),
         Command::Mcp(args) => mcp::serve(args),
+        Command::Scenario(args) => std::process::exit(scenario_cli::scenario(args)?),
+        Command::Compare(args) => std::process::exit(scenario_cli::compare(args)?),
     }
 }
 
