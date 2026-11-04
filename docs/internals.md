@@ -315,6 +315,21 @@ counts, SRAM). The fingerprint must not change when the emulator is made faster.
 machine: compare the best of several repeats, or the instruction counts under `valgrind --tool=callgrind` with
 `--repeat 1`.
 
+Fingerprints are per firmware build: new images, or the same source built by another compiler, give new ones
+(so do instruction counts). titan_firmware_rs pins its compiler in its `rust-toolchain.toml`, so images built from
+the same commit with rustup agree. With the pinned titan_firmware_rs (94a107e, rustc 1.99.0):
+
+| Case | Fingerprint |
+|---|---|
+| `template` | `cf8e88c45976e6e8` |
+| `esc_board` | `7092fc6b0d773de0` |
+| `ivc_board2` | `9316e6e8f76e2f2c` |
+| `talos`, `talos_mt`, `talos_t2`, `talos_t3`, `talos_t6`, `talos_t3_ls` | `0876a31a0782d072` |
+| `ivc2_pool` | `d2a2e6a73362cf3e` |
+
+Before comparing a change against these, check the images are that build (the bench prints the same fingerprints
+for the same images on any machine); when the pin moves, they change and this table with it.
+
 Measured on a shared 4-core machine (CPU time for 2 s of virtual time): template 0.03 s, ESC board 1.35 s,
 IVCBoard2 0.55 s, Talos 3.7 s, IVC2 pool 2.15 s. Talos on threads (wall time): 1.6-1.7 s on three or four
 (1.2-1.25x real time), 2.4 s on two (both ESC boards share a thread with others there); slice by slice on three it

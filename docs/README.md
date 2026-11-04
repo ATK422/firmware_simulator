@@ -30,6 +30,7 @@ real hardware.
 ```bash
 git submodule update --init                 # external/titan_firmware_rs is private: ATK422/titan_firmware_rs
 rustup target add thumbv6m-none-eabi
+(cd external/titan_firmware_rs && rustup toolchain install)   # the firmware's pinned compiler (rust-toolchain.toml)
 ```
 
 **2. Build the firmware and the emulator.**
@@ -56,11 +57,11 @@ firmware_simulator run $FW/power_board --board boards/mk2/power_board.toml --moc
 [INFO  firmware_simulator] direct boot: VTOR 0x10000100, entry 0x100001c0
 [INFO  firmware_simulator] RTT control block at 0x20000008, decoding defmt
 [INFO  firmware_simulator] mock bridge for client 1 attached
-[0.132000s] 0.000025 INFO  mk2/power_board v1.0 (release type 2, git 342ee0d)
-[0.132000s] 0.000123 INFO  Crash counts since power on: CrashCounts { watchdog_timeouts: 0, panics: 0 }
-[0.135200s] 0.003300 INFO  CAN controller online as client 1
-[0.200400s] 0.068450 INFO  ROS connected
-stopped at 2.000000s (TimeLimit); core0 234375135 cycles, pc 0x1000039c <...>; 200.71ms wall
+[0.132000s] 0.000024 INFO  mk2/power_board v1.0 (release type 2, git 94a107e)
+[0.132000s] 0.000089 INFO  Crash counts since power on: CrashCounts { watchdog_timeouts: 0, panics: 0 }
+[0.135100s] 0.003181 INFO  CAN controller online as client 1
+[0.200301s] 0.068408 INFO  ROS connected
+stopped at 2.000000s (TimeLimit); core0 234373475 cycles, pc 0x1000039c <...>; 200.71ms wall
 ```
 
 **4. See what it does.** Each defmt line shows the virtual time it was read, the firmware's own timestamp, the

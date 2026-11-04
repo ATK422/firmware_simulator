@@ -32,7 +32,9 @@ Every run is repeatable: the same firmware and inputs give exactly the same resu
 ## Quick start
 
 **Prerequisites:** Linux or macOS (SocketCAN/vcan for the real `titan_bridge` is Linux only), Rust (stable, 1.85 or newer) with the `thumbv6m-none-eabi` target, git, and read access to the
-private repository `ATK422/titan_firmware_rs`. The C firmware additionally needs `gcc-arm-none-eabi`, `cmake` and
+private repository `ATK422/titan_firmware_rs`. The firmware images build with the compiler titan_firmware_rs pins in
+its `rust-toolchain.toml` (rustc 1.99.0 at the pinned commit): rustup picks it up in that directory, and
+`rustup toolchain install` there installs it with its `thumbv6m-none-eabi` target. The C firmware additionally needs `gcc-arm-none-eabi`, `cmake` and
 `ninja` (optional; only the C tests use it).
 
 **1. Sources and toolchain.**
@@ -41,6 +43,7 @@ private repository `ATK422/titan_firmware_rs`. The C firmware additionally needs
 git clone https://github.com/ATK422/firmware_simulator && cd firmware_simulator
 git submodule update --init       # external/titan_firmware_rs is private: ATK422/titan_firmware_rs
 rustup target add thumbv6m-none-eabi
+(cd external/titan_firmware_rs && rustup toolchain install)   # the firmware's pinned compiler, with its targets
 ```
 
 The workspace uses titan_firmware_rs's host crates (`canmore`, `titan_link`), so the emulator does not build
@@ -71,12 +74,12 @@ firmware_simulator run $FW/power_board --board boards/mk2/power_board.toml --moc
 [INFO  firmware_simulator] direct boot: VTOR 0x10000100, entry 0x100001c0
 [INFO  firmware_simulator] RTT control block at 0x20000008, decoding defmt
 [INFO  firmware_simulator] mock bridge for client 1 attached
-[0.132000s] 0.000025 INFO  mk2/power_board v1.0 (release type 2, git 342ee0d)
-[0.132000s] 0.000123 INFO  Crash counts since power on: CrashCounts { watchdog_timeouts: 0, panics: 0 }
-[0.135200s] 0.003300 INFO  CAN controller online as client 1
-[0.200400s] 0.068450 INFO  ROS connected
-stopped at 2.000000s (TimeLimit); core0 234375135 cycles, pc 0x1000039c <<embassy_executor::platform::thread::Executor>::run::<power_board::__cortex_m_rt_main::{closure#0}>+0x94>; 43.26ms wall
-core1 249575205 cycles, pc 0x00000176, Some(Wfe)
+[0.132000s] 0.000024 INFO  mk2/power_board v1.0 (release type 2, git 94a107e)
+[0.132000s] 0.000089 INFO  Crash counts since power on: CrashCounts { watchdog_timeouts: 0, panics: 0 }
+[0.135100s] 0.003181 INFO  CAN controller online as client 1
+[0.200301s] 0.068408 INFO  ROS connected
+stopped at 2.000000s (TimeLimit); core0 234373475 cycles, pc 0x1000039c <<embassy_executor::platform::thread::Executor>::run::<power_board::__cortex_m_rt_main::{closure#0}>+0x94>; 43.26ms wall
+core1 249573727 cycles, pc 0x00000176, Some(Wfe)
 ```
 
 Each firmware line shows the virtual time it was read, the firmware's own defmt timestamp, the level and the
@@ -93,11 +96,11 @@ firmware_simulator robot robots/talos.toml --mock-bridge internal:1 --mock-bridg
 
 ```
 [INFO  firmware_simulator] 9 board(s) on 2 bus(es)
-[0.131600s] sbc: 0.000023 INFO  talos/sbc_board v1.0 (release type 2, git 342ee0d)
+[0.131600s] sbc: 0.000022 INFO  talos/sbc_board v1.0 (release type 2, git 94a107e)
 [0.133700s] esc0: 0.000014 INFO  ESC board 0 (thrusters 0-3), client ID 2
 ...
-[0.200400s] poac: 0.068333 INFO  ROS connected
-[0.265800s] ivc: 0.131092 INFO  CAN controller online as client 8
+[0.200300s] poac: 0.068290 INFO  ROS connected
+[0.243000s] ivc: 0.108241 INFO  CAN controller online as client 8
 stopped at 1.000000s; 4.43s wall
 vehicle talos: at [5.00, 6.00, 0.25] m, roll 0.0 pitch 0.0 yaw 0.0 deg, 0.00 m/s
 ```
@@ -337,8 +340,10 @@ not modelled or not yet trusted:
   (USB, agent, pinger, faults). The firmware is moving to its own nano-ROS, which needs no Docker; once that builds
   with the plain toolchain, the board apps can join CI with smoke tests like the Rust images.
 * **Same firmware, same results**: firmware built with a different Rust compiler gives slightly different code, so
-  bench fingerprints and timing-sensitive IVC results can differ between machines; compare runs built with the
-  same toolchain.
+  bench fingerprints and timing-sensitive IVC results differ from one build to the next. titan_firmware_rs pins its
+  compiler (`rust-toolchain.toml`), so images built from the same commit with rustup match; the tests check
+  behaviour that holds for any build (checked with rustc 1.97.0 and 1.99.0), and bench fingerprints are per
+  firmware build ([internals.md](docs/internals.md#performance)).
 
 **To verify locally.** The cloud environment this was built in has no vcan module or `CAP_NET_ADMIN`, ROS 2,
 Docker daemon, vhci-hcd module or hardware. These are written and statically checked, but never run for real:
