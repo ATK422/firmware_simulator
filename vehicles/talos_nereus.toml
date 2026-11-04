@@ -1,0 +1,87 @@
+# Talos as nereus (osu-uwrt/nereus, content/packs/robots/talos/robot.yaml at 58763df) and the riptide stack
+# (riptide_core's riptide_descriptions/config/talos.yaml) describe it, for the robot files that run the real
+# riptide controller: robots/talos_c.toml, robots/talos_c_nereus.toml and robots/talos_nereus.toml.
+#
+# Unlike vehicles/talos.toml (whose layout is assumed), the thrusters here are the real ones, named and ordered as
+# the controller numbers them (VUS, VUP, HUS, HUP, HLS, HLP, VLS, VLP: thruster 0 to 7 of riptide's thruster
+# solver, and of nereus's bridge `thrusters.order`). The controller sends thruster k's RPM to ESC board k / 4, ESC
+# k % 4 + 1 (riptide_controllers' send_thruster_cmd_canbus.c), so the robot files wire them in that order.
+#
+# Body: nereus's pool-identified body (wet mass 34.084 kg, the diagonal of its inertia, added mass and damping
+# matrices), re-expressed in this emulator's frames: body forward-starboard-down from the centre of mass (nereus is
+# FLU from the camera cage datum; com is at [-0.150, 0.041, -0.016] there). Products of inertia and the
+# off-diagonal terms are dropped (sim_physics is diagonal). Thruster positions and directions are nereus's
+# `thruster_*` frames (each pushes along its frame's +X) in the same conversion.
+#
+# Thrust curve: riptide's `thruster_solver.force_to_rpm_coefficents` (talos.yaml) gives 3170.95 RPM for 24 N
+# forward and 2932.03 RPM for 24 N in reverse (reading its negative curve as c4 + c5 F + c6 tanh F + c7 |F|^(1/4)
+# for F < 0). A k rpm|rpm| curve through those points gives back the force riptide's curve chose a speed for to
+# within 11% from 5 N up and 4% from 12 N up, either way (more below 5 N, where riptide's curve has an offset), so
+# the force the emulator reports for a propeller speed is close to the force the controller asked for.
+#
+# Inverted thrusters are 1 and 4 of each ESC board (the boards' invert mask 0b1001), which are the thrusters
+# talos.yaml gives `type: 1`.
+name = "talos"
+
+mass_kg = 34.084
+# nereus displaced_volume_m3: 0.8 N positive in fresh water (997 kg/m3)
+volume_m3 = 0.034268310829795354
+inertia_kg_m2 = [1.8429, 1.0051, 1.8607]
+# nereus buoyancy_center_m [0.0046, -0.0017, 0.0143] (FLU, from com): 1.4 cm above the centre of mass
+cob_m = [0.0046, 0.0017, -0.0143]
+# nereus buoyancy_radii_m z (0.275) both ways
+height_m = 0.55
+added_mass = [32.124, 80.106, 74.338, 0.0624, 0.0602, 1.1008]
+linear_drag = [30.653, 11.494, 12.061, 9.911, 3.005, 0.870]
+quadratic_drag = [123.857, 166.873, 266.424, 2.772, 1.499, 3.638]
+# As in the other vehicle files: an open frame feels a fraction of the potential-flow Munk moment
+munk_moment_scale = 0.25
+
+# 24 N at 3170.95 RPM forward; 24 N at 2932.03 RPM in reverse, i.e. 28.07 N at 3170.95 RPM
+thruster_model = { forward_n = 24.0, reverse_n = 28.07, at_rpm = 3170.95 }
+
+# ESC board 0 (thrusters 0-3)
+[[thruster]]
+name = "VUS"
+inverted = true
+position_m = [0.016, 0.41, -0.258]
+direction = [1.0, 0.0, 0.0]
+
+[[thruster]]
+name = "VUP"
+position_m = [0.016, -0.397, -0.258]
+direction = [1.0, 0.0, 0.0]
+
+[[thruster]]
+name = "HUS"
+position_m = [0.01, 0.301, -0.157]
+direction = [-0.0001, -0.7074, -0.7068]
+
+[[thruster]]
+name = "HUP"
+inverted = true
+position_m = [0.01, -0.287, -0.157]
+direction = [-0.0001, 0.7074, -0.7068]
+
+# ESC board 1 (thrusters 4-7)
+[[thruster]]
+name = "HLS"
+inverted = true
+position_m = [0.01, 0.301, 0.125]
+direction = [-0.0001, -0.7074, 0.7068]
+
+[[thruster]]
+name = "HLP"
+position_m = [0.01, -0.287, 0.125]
+direction = [-0.0001, 0.7074, 0.7068]
+
+[[thruster]]
+name = "VLS"
+position_m = [0.016, 0.413, 0.228]
+direction = [1.0, 0.0, 0.0]
+
+[[thruster]]
+name = "VLP"
+inverted = true
+position_m = [0.016, -0.399, 0.228]
+direction = [1.0, 0.0, 0.0]

@@ -21,7 +21,7 @@ Every run is repeatable: the same firmware and inputs give exactly the same resu
 **Full guide: [docs/](docs/README.md)** · Design and milestones: [PLAN.md](PLAN.md)
 
 - [Quick start](#quick-start)
-- [More ways to use it](#more-ways-to-use-it): coding agents (MCP), C firmware with micro-ROS, IVC in the water
+- [More ways to use it](#more-ways-to-use-it): coding agents (MCP), C firmware with micro-ROS, the robot computer on vcan, the firmware in nereus, IVC in the water
 - [What it can do](#what-it-can-do)
 - [Boards, firmware and robots](#boards-firmware-and-robots)
 - [Architecture](#architecture)
@@ -156,6 +156,22 @@ Then `ros2 run micro_ros_agent micro_ros_agent serial --dev /tmp/ivc-ros`, and t
 micro-ROS library, which is built in Docker (`lib/micro_ros_pico/build.sh`). Several micro-ROS boards at once need
 one DDS discovery server per run, because the client, not the agent, picks the domain.
 
+**Put the robot computer's side on it (robot in a box).** `scripts/robot_in_a_box.sh` runs Talos's C board apps
+(`robots/talos_c.toml`, your titan_firmware build) on vcan interfaces named `can0` and `can1`, like the Orin's, and
+starts riptide's `copro_agent.launch.py` (`micro_ros_agent can -D can0`) when it finds a sourced riptide workspace;
+`--rust` runs the titan_firmware_rs images with one `titan_bridge` each instead
+([robots.md](docs/robots.md#robot-in-a-box-the-orins-side-on-vcan)).
+
+**Watch the firmware drive Talos in nereus.** `scripts/nereus_firmware_sim.sh` brings up vcan, the emulated
+PoAC, ESC boards and camera cage, [nereus](https://github.com/osu-uwrt/nereus) with the riptide stack and its viewer,
+and a bridge: the controller's RPM commands go over `can0` to the emulated ESC boards, the thrust their motors make
+moves nereus's vehicle, and the camera cage feels nereus's depth. nereus is slowed to the emulator's speed so both
+stay on one clock ([nereus.md](docs/nereus.md); to verify locally).
+
+```bash
+scripts/nereus_firmware_sim.sh --nereus ~/osu-uwrt/release/nereus      # ROS 2 and the riptide workspace sourced
+```
+
 **Test IVC in the water.** `robots/ivc2_pool.toml` puts two IVCBoard2s 5 m apart in a pool;
 `robots/ivc2_interop.toml` puts the Rust IVCBoard2 next to your build of the C one (set `TITAN_FIRMWARE_DIR`), and
 `--ivc-send 30s@talos_ivc:0x5a` makes a Rust board transmit from the command line. The C and Rust modems exchange
@@ -180,7 +196,7 @@ The details, by area; each row links to the page that covers it.
 | **Robots and the water** | Robot files with several boards on CAN FD and classic buses, power-on offsets and ID straps; acoustic environments (pool, open water, harbour) with multipath, noise and Doppler between IVC boards (C and Rust IVCBoard2 checked against each other); a 6-DOF vehicle the firmware's DShot frames move, with depth sensors and transducers following it | [robots.md](docs/robots.md), [acoustics.md](docs/acoustics.md), [vehicles.md](docs/vehicles.md) |
 | **Host integration** | Mock `titan_bridge` built on the real `canmore`/`titan_link` crates; SocketCAN (vcan) for the real host tools; Puddles over Ethernet/UDP; CAN log recording, replay and `can-diff`; cannelloni tunnels; `titan_bridge` command lines; USB with BOOTSEL, PICOBOOT, UF2 drive, CDC (on robot boards too, for micro-ROS over USB) and USB/IP; GDB server | [robots.md](docs/robots.md#can-logs-recording-replaying-comparing), [running.md](docs/running.md#usb-bootsel-picoboot-uf2-and-cdc) |
 | **Testing and faults** | The `sim_test` harness (`Bench`, `RobotBench`, snapshots, parallel sweeps); a smoke test for every board image; fault injection that fails the hardware, not the firmware's state (CAN bit errors, stuck bus, absent I2C devices, ADC shorts, brownouts, hangs, bridge loss, kill switch) | [testing.md](docs/testing.md), [faults.md](docs/faults.md) |
-| **Developer tools** | Sampling firmware profiler with stack walks and flame-graph stacks; VCD waveforms with decoded traffic; a live web dashboard with fault, input and pause controls; an MCP server so coding agents can run, read and drive the emulator through tools; JSON logs; instruction, exception, GPIO and device traces | [tools.md](docs/tools.md) |
+| **Developer tools** | Sampling firmware profiler with stack walks and flame-graph stacks; VCD waveforms with decoded traffic; a live web dashboard with fault, input and pause controls; an MCP server so coding agents can run, read and drive the emulator through tools; JSON logs; instruction, exception, GPIO and device traces; a GDB server (both cores, any board of a robot) and VS Code launch configurations to step through firmware with Cortex-Debug, peripherals from the SVD | [tools.md](docs/tools.md), [running.md](docs/running.md#debugging-in-vs-code) |
 
 ## Boards, firmware and robots
 
@@ -216,9 +232,11 @@ The generator also writes files for boards that have no titan_firmware_rs image 
 | [`robots/ivc_pool.toml`](robots/ivc_pool.toml) | Two vehicles in `environments/pool.toml`, each with a first-generation IVCBoard on its own bus |
 | [`robots/ivc2_pool.toml`](robots/ivc2_pool.toml) | The same with IVCBoard2 |
 | [`robots/ivc2_interop.toml`](robots/ivc2_interop.toml) | The Rust IVCBoard2 and your build of the C one (micro-ROS over USB) in the pool, for acoustic interop |
+| [`robots/talos_c.toml`](robots/talos_c.toml) | Talos with your build of titan_firmware's C board apps (micro-ROS over CAN), as the robot runs them, in its real thruster layout |
+| [`robots/talos_c_nereus.toml`](robots/talos_c_nereus.toml), [`robots/talos_nereus.toml`](robots/talos_nereus.toml) | PoAC, the ESC boards and the camera cage (C or Rust) in a vehicle that nereus moves |
 
 Environments: [`pool`, `open_water`, `harbour`](environments) ([acoustics.md](docs/acoustics.md#environment-files)).
-Vehicles: [`talos`, `puddles`](vehicles) ([vehicles.md](docs/vehicles.md#vehicle-files)).
+Vehicles: [`talos`, `talos_nereus`, `puddles`](vehicles) ([vehicles.md](docs/vehicles.md#vehicle-files)).
 
 ## Architecture
 
@@ -310,8 +328,10 @@ not modelled or not yet trusted:
 Docker daemon, vhci-hcd module or hardware. These are written and statically checked, but never run for real:
 
 * SocketCAN on vcan with the real `titan_bridge`, `canmore_cli` and `upload_tool`, and the `bridges` script and
-  launch file in `riptide-shell` ([robot in a box](docs/robots.md#robot-in-a-box-vcan-titan_bridge-docker)).
+  launch file in `riptide-shell` ([robot in a box](docs/robots.md#robot-in-a-box-the-orins-side-on-vcan)).
 * The `docker/robot_computer` image and compose file.
+* `scripts/robot_in_a_box.sh` with the C images and riptide's micro-ROS agents, and the firmware in nereus
+  (`scripts/nereus_firmware_sim.sh`, its bridge node and launch file; [the checklist](docs/nereus.md#to-verify-locally)).
 * `--usbip` against the kernel's vhci-hcd (tested only with an in-process USB/IP client).
 * VCD files in GTKWave/Surfer/PulseView; the MCP server from Claude Code itself (tested with scripted clients)
   ([tools.md](docs/tools.md#to-verify-locally)).

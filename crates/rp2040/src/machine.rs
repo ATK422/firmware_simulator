@@ -1169,6 +1169,8 @@ impl Machine {
             let mut touched = false;
             while left > 0 {
                 if self.can_batch(c) {
+                    // No breakpoints: nothing to resume from once breakpoints are set again
+                    self.skip_breakpoint[c] = false;
                     let extra = if fuse { self.quantum.saturating_mul(FUSE_QUANTA - 1) } else { 0 };
                     let (b, quiet, slow) = self.run_batch(c, left.saturating_add(extra), limit, &mut budget, fuse);
                     touched |= slow;
@@ -1217,13 +1219,17 @@ impl Machine {
                 touched = true;
                 fuse = false;
                 let pc = self.cores[c].pc();
-                if !self.breakpoints.is_empty() && self.breakpoints.contains(&pc) && !self.cores[c].is_sleeping() {
-                    if self.skip_breakpoint[c] {
-                        self.skip_breakpoint[c] = false;
-                    } else {
+                if self.breakpoints.is_empty() {
+                    self.skip_breakpoint[c] = false;
+                } else {
+                    if self.breakpoints.contains(&pc) && !self.cores[c].is_sleeping() && !self.skip_breakpoint[c] {
                         self.skip_breakpoint[c] = true;
                         return StopReason::Breakpoint { core: c as u8, pc };
                     }
+                    // Only the instruction the core stopped at is let through: once it (or any other) runs, the
+                    // next breakpoint stops the core again, wherever the PC went meanwhile (a reset, a debugger
+                    // writing the PC)
+                    self.skip_breakpoint[c] = false;
                 }
                 match self.step_core(c) {
                     StepOutcome::Ran(_) => {}

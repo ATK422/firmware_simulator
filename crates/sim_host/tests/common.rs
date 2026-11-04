@@ -12,18 +12,10 @@ pub fn repo() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..")
 }
 
-/// A titan_firmware_rs release ELF, if it has been built (see CLAUDE.md); tests skip when it is missing.
+/// A titan_firmware_rs release ELF, if it has been built (see CLAUDE.md); tests skip when it is missing (fail, with
+/// `SIM_REQUIRE_TITAN_RS` set: see [`sim_host::titan_rs_image`]).
 pub fn titan_elf(name: &str) -> Option<PathBuf> {
-    let p = sim_host::titan_rs_release_dir(&repo()).join(name);
-    if p.exists() {
-        Some(p)
-    } else {
-        eprintln!(
-            "skipping: {} not built (cd external/titan_firmware_rs/firmware && cargo build --workspace --release)",
-            p.display()
-        );
-        None
-    }
+    sim_host::titan_rs_image(&repo(), name)
 }
 
 /// Boots an image like the CLI does: B1 bootrom mapped, direct boot.

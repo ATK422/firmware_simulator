@@ -15,3 +15,6 @@ log.workspace = true
 toml = "0.8"
 canmore = { path = "../../external/titan_firmware_rs/crates/canmore" }
 titan_link = { path = "../../external/titan_firmware_rs/crates/titan_link" }
+
+[dev-dependencies]
+sim_physics.workspace = true

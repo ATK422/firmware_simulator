@@ -252,12 +252,9 @@ fn tools_drive_a_run() {
 /// A titan_firmware_rs image on its board with a mock bridge: firmware logs, CANmore traffic, decoded status.
 #[test]
 fn a_rust_board_with_a_mock_bridge() {
-    let dir = sim_host::titan_rs_release_dir(&repo());
-    let image = dir.join("template");
-    if !image.exists() {
-        eprintln!("skipping: {} not built", image.display());
+    let Some(image) = sim_host::titan_rs_image(&repo(), "template") else {
         return;
-    }
+    };
     let image = image.to_str().unwrap();
     let mut c = Client::start();
     c.initialize();

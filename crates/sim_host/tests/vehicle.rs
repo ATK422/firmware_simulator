@@ -188,24 +188,121 @@ fn wiring_mistakes_are_reported() {
     assert!(load(&two).err().unwrap().contains("two vehicles"));
 }
 
+/// A shipped robot file with every board booting the small program instead of its firmware (the vehicle wiring only
+/// needs the boards' files); C images (`rom_boot`) too, so `$TITAN_FIRMWARE_DIR` is not needed.
+fn shipped(file: &str) -> Robot {
+    let path = common::repo().join("robots").join(file);
+    let mut spec: RobotSpec = toml::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+    for b in &mut spec.board {
+        b.elf = "../test_programs/embassy_blinky.elf".into();
+        b.rom_boot = false;
+    }
+    Robot::from_spec(&spec, path.parent().unwrap()).unwrap()
+}
+
 #[test]
 fn shipped_robot_files_load_their_vehicles() {
-    for (file, name, thrusters) in [("talos.toml", "talos", 8), ("puddles.toml", "puddles", 8)] {
-        let path = common::repo().join("robots").join(file);
-        let mut spec: RobotSpec = toml::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
-        // The vehicle wiring only needs the boards' files: boot them with the small program instead
-        for b in &mut spec.board {
-            b.elf = "../test_programs/embassy_blinky.elf".into();
-        }
-        let r = Robot::from_spec(&spec, path.parent().unwrap()).unwrap();
+    for (file, name, thrusters, external) in [
+        ("talos.toml", "talos", 8, false),
+        ("puddles.toml", "puddles", 8, false),
+        ("talos_c.toml", "talos", 8, false),
+        ("talos_c_nereus.toml", "talos", 8, true),
+        ("talos_nereus.toml", "talos", 8, true),
+    ] {
+        let r = shipped(file);
         let v = &r.vehicles[0];
         assert_eq!(v.vehicle.name, name);
         assert_eq!(v.vehicle.thrusters.len(), thrusters);
         assert_eq!(v.rpms(&r.boards, Time::ZERO).len(), thrusters);
-        // Afloat: positively buoyant, at the depth where it floats
+        assert_eq!(v.external, external, "{file}");
+        // Positively buoyant; afloat, at the depth where it floats, or (moved by nereus) at the surface
         assert!(v.vehicle.params.net_buoyancy_n(&v.vehicle.water) > 0.0);
-        assert_eq!(v.vehicle.floating_depth(), Some(v.vehicle.state.position[2]));
+        if external {
+            assert_eq!(v.vehicle.state.position, [0.0; 3], "{file}");
+        } else {
+            assert_eq!(v.vehicle.floating_depth(), Some(v.vehicle.state.position[2]), "{file}");
+        }
+        // Every thruster is wired
+        assert!(v.wiring().iter().all(Option::is_some), "{file}");
     }
+}
+
+/// The robot files for the riptide controller wire thruster k (its order, and nereus's) to ESC board k / 4, ESC
+/// k % 4 + 1, the way `send_thruster_cmd_canbus.c` addresses them, and invert thrusters 1 and 4 of each board as the
+/// boards' invert mask does.
+#[test]
+fn riptide_robot_files_wire_the_controllers_thruster_order() {
+    let order = ["VUS", "VUP", "HUS", "HUP", "HLS", "HLP", "VLS", "VLP"];
+    for file in ["talos_c.toml", "talos_c_nereus.toml", "talos_nereus.toml"] {
+        let r = shipped(file);
+        let v = &r.vehicles[0];
+        let names: Vec<&str> = v.vehicle.thrusters.iter().map(|t| t.name.as_str()).collect();
+        assert_eq!(names, order, "{file}");
+        for (k, w) in v.wiring().iter().enumerate() {
+            let (b, d) = w.unwrap();
+            let esc = r.boards[b].machine.sys.pin_devices[d].as_any().downcast_ref::<Esc>().unwrap();
+            assert_eq!(r.names[b], ["esc0", "esc1"][k / 4], "{file} thruster {k}");
+            assert_eq!(esc.name, format!("esc{}", k % 4 + 1), "{file} thruster {k}");
+            assert_eq!(v.vehicle.thrusters[k].inverted, k % 4 == 0 || k % 4 == 3, "{file} thruster {k}");
+        }
+        // The thrust curve gives back what riptide's force_to_rpm chose a speed for at its 24 N limit, both ways
+        let t = &v.vehicle.thrusters[1];
+        assert!((t.thrust(3170.95) - 24.0).abs() < 0.01 && (t.thrust(-2932.03) + 24.0).abs() < 0.02);
+    }
+}
+
+/// An external vehicle does not move by itself, whatever its thrusters and buoyancy do: it is where it was last put,
+/// its sensors and transducers follow that pose, and its thrusters report the thrust their ESCs make.
+#[test]
+fn an_external_vehicle_stays_where_it_is_put() {
+    let mut r =
+        load(&spec(|t| *t = t.replace("rpy_deg = [0.0, 0.0, 90.0]", "rpy_deg = [0.0, 0.0, 90.0]\nexternal = true")))
+            .unwrap();
+    assert!(r.vehicles[0].external);
+    let start = r.vehicles[0].vehicle.state;
+    let esc = |r: &mut Robot, rpm: f64| {
+        for d in r.boards[0].machine.sys.pin_devices.iter_mut() {
+            if let Some(e) = d.as_any_mut().and_then(|a| a.downcast_mut::<Esc>()) {
+                e.rpm = rpm;
+            }
+        }
+    };
+    esc(&mut r, 3000.0);
+    r.vehicles[0].vehicle.state.velocity = [0.5, 0.0, -0.3];
+    assert!(r.run_until(Time::from_ms(200)).is_none());
+    let v = &r.vehicles[0].vehicle;
+    assert_eq!(v.state.position, start.position, "buoyant, moving and pushed, yet still there");
+    assert!((v.time - 0.2).abs() < 1e-9, "its clock follows the robot's");
+    // The thrust is the curve's at the ESC's speed, coasting down since nothing drives it (fwd_stbd and
+    // heave_aft_port are inverted: forward speed pushes them backwards)
+    let rpm = r.vehicles[0].rpms(&r.boards, r.now);
+    let v = &r.vehicles[0].vehicle;
+    assert!(rpm[0] > 0.0);
+    assert_eq!(v.thrust_n[0], v.thrusters[0].thrust(rpm[0]));
+    assert!(v.thrust_n[0] < 0.0 && v.thrust_n[7] < 0.0, "{:?}", v.thrust_n);
+    // Put somewhere else: the depth sensor sees it at once, the transducer from the next slice
+    let pose = sim_host::vehicle::ExternalPose {
+        position: [7.0, 6.0, 2.0],
+        attitude: sim_physics::Quat::from_euler(0.0, 0.0, 0.0),
+        velocity: Some([0.0; 3]),
+        rate: None,
+    };
+    r.vehicles[0].set_pose(&pose);
+    assert_eq!(r.vehicles[0].poses_set, 1);
+    let v = r.vehicles[0].vehicle.clone();
+    assert_eq!(v.state.position, [7.0, 6.0, 2.0]);
+    let pressure = 101_325.0 + 997.0 * 9.80665 * 2.1;
+    assert!((r.inputs[1].get("depth.pressure_pa") - pressure).abs() < 1e-6);
+    esc(&mut r, 0.0);
+    assert!(r.run_until(Time::from_ms(300)).is_none());
+    assert_eq!(r.vehicles[0].vehicle.state.position, [7.0, 6.0, 2.0]);
+    let h = sim_host::acoustic::hydrophones(&mut r.boards[2].machine).next().unwrap();
+    let at = h.trajectory.at(0.3);
+    let want = v.point(MOUNT);
+    assert!(sim_physics::math::norm(sim_physics::math::sub(at, want)) < 1e-9, "{at:?} vs {want:?}");
+    // ... and before it was moved, the hydrophone was where the vehicle was then
+    let before = h.trajectory.at(0.1);
+    assert!((before[0] - 5.0).abs() < 1e-9 && (before[1] - 5.8).abs() < 1e-9, "{before:?}");
 }
 
 /// The first-generation IVC boards of `robots/ivc_pool.toml` still talk when Talos's board rides on a vehicle that

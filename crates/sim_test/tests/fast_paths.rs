@@ -23,10 +23,7 @@ fn run(elf: &str, board: &str, client: u8, setup: impl Fn(&mut Machine)) -> Opti
 
 /// [`run`], also returning how many instructions busy-wait skipping skipped.
 fn run_skipped(elf: &str, board: &str, client: u8, setup: impl Fn(&mut Machine)) -> Option<(Vec<String>, u64, u64)> {
-    let Some(path) = sim_test::titan_rs(elf) else {
-        eprintln!("skipping {elf}: image not built");
-        return None;
-    };
+    let path = sim_test::titan_rs(elf)?;
     let mut b = Bench::builder(&path).board(board).bridge(client).boot().unwrap();
     setup(&mut b.session.machine);
     b.run_until(Time::from_ms(300)).unwrap();

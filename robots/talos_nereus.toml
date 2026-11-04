@@ -1,0 +1,69 @@
+# Talos's titan_firmware_rs images in nereus (osu-uwrt/nereus): the boards the riptide controller needs, on the
+# internal CAN FD bus, in a vehicle that nereus moves. The Rust boards talk to ROS through titan_bridge (one per
+# board, `firmware_simulator bridges robots/talos_nereus.toml`) instead of the micro-ROS agent; everything else is
+# as in robots/talos_c_nereus.toml, which runs the C images the robot runs today.
+#
+#   scripts/nereus_firmware_sim.sh --rust             # vcan, this robot, titan_bridge, nereus, the bridge
+#
+# Only the boards in the loop: PoAC (kill switch: its state/kill is nereus's kill too), the two ESC boards, and the
+# camera cage (depth: nereus's depth/pose is switched off, riptide's depth_converter makes it from the firmware's
+# reading). Fewer boards keep the emulator closer to real time, which nereus is slowed down to match
+# (integrations/nereus/README.md, "Time").
+#
+# The vehicle is external: integrations/nereus/firmware_bridge.py posts nereus's base_link pose to the dashboard
+# (POST /api/vehicle) and reads back the thrust (GET /api/thrusters), so the vehicle file only gives the thrust
+# curves and which thrusters are inverted, and the depth sensor's mount is measured from base_link.
+
+[[bus]]
+name = "internal"
+rates = "internal"
+
+[[board]]
+name = "poac"
+board = "../boards/talos/poac_board.toml"
+elf = "../external/titan_firmware_rs/firmware/target/thumbv6m-none-eabi/release/poac_board"
+bus = "internal"
+
+[[board]]
+name = "esc0"
+board = "../boards/mk2/esc_board.toml"
+elf = "../external/titan_firmware_rs/firmware/target/thumbv6m-none-eabi/release/esc_board"
+bus = "internal"
+
+[[board]]
+name = "esc1"
+board = "../boards/mk2/esc_board.toml"
+elf = "../external/titan_firmware_rs/firmware/target/thumbv6m-none-eabi/release/esc_board"
+bus = "internal"
+power_on_ms = 3
+gpio = [{ pin = 29, level = "high" }]
+
+[[board]]
+name = "camera_cage"
+board = "../boards/mk2/camera_cage_bb.toml"
+elf = "../external/titan_firmware_rs/firmware/target/thumbv6m-none-eabi/release/camera_cage_bb"
+bus = "internal"
+
+# Thruster k of the controller (and of nereus's thruster order) is ESC board k / 4, ESC k % 4 + 1. It starts at the
+# surface, where the depth sensor zeroes at boot; the bridge holds it there until the sensor has zeroed.
+[[vehicle]]
+name = "talos"
+file = "../vehicles/talos_nereus.toml"
+position_m = [0.0, 0.0, 0.0]
+external = true
+thrusters = [
+    { thruster = "VUS", board = "esc0", esc = "esc1" },
+    { thruster = "VUP", board = "esc0", esc = "esc2" },
+    { thruster = "HUS", board = "esc0", esc = "esc3" },
+    { thruster = "HUP", board = "esc0", esc = "esc4" },
+    { thruster = "HLS", board = "esc1", esc = "esc1" },
+    { thruster = "HLP", board = "esc1", esc = "esc2" },
+    { thruster = "VLS", board = "esc1", esc = "esc3" },
+    { thruster = "VLP", board = "esc1", esc = "esc4" },
+]
+
+# talos.yaml's (and nereus's) depth sensor pose, from base_link: 16.5 cm aft, 15.5 cm to starboard, 13.5 cm up
+[[vehicle.sensor]]
+board = "camera_cage"
+input = "depth.pressure_pa"
+mount_m = [-0.165, 0.155, -0.135]

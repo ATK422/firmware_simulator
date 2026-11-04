@@ -347,6 +347,27 @@ impl Vehicle {
         self.time = self.steps as f64 * dt;
     }
 
+    /// Puts the vehicle at `state` (another simulator moves it, or a scenario teleports it); its acceleration, for
+    /// the IMU, is taken as zero until the next step.
+    pub fn place(&mut self, state: State) {
+        self.state = state;
+        self.accel = ([0.0; 3], [0.0; 3]);
+    }
+
+    /// Advances the clock to `t` seconds (the last whole step before it) without moving: an external simulator
+    /// owns the motion. Each thruster's thrust is still what it would push at `rpm` (the curve only, without the
+    /// surface fade, which is the other simulator's business), for whoever reads [`Vehicle::thrust_n`].
+    pub fn hold_to(&mut self, t: f64, rpm: &[f64]) {
+        for (i, th) in self.thrusters.iter().enumerate() {
+            self.thrust_n[i] = th.thrust(rpm.get(i).copied().unwrap_or(0.0));
+        }
+        let steps = ((t + 1e-9) / self.dt).floor().max(0.0) as u64;
+        if steps > self.steps {
+            self.steps = steps;
+            self.time = steps as f64 * self.dt;
+        }
+    }
+
     /// Steps until `t` seconds (to the last whole step before it), with RPMs from `rpm` at the start of each step.
     pub fn advance_to(&mut self, t: f64, mut rpm: impl FnMut(f64) -> Vec<f64>) -> usize {
         let mut n = 0;
@@ -742,5 +763,28 @@ direction = [1.0, 0.0, 0.0]
         let own = format!("{ok}curve = {{ forward_n = 50.0, reverse_n = 40.0, at_rpm = 0.0 }}\n");
         assert!(VehicleFile::parse(&own).unwrap_err().contains("thrust curve"));
         assert!(VehicleFile::parse(&ok.replace("forward_n = 50.0", "forward_n = -50.0")).is_err());
+    }
+
+    #[test]
+    fn holding_keeps_the_pose_and_reports_the_thrust() {
+        let mut v = vehicle(1.1, &[([0.0, 0.0, 0.0], [1.0, 0.0, 0.0]), ([0.0, 0.0, 0.0], [0.0, 0.0, 1.0])]);
+        let start = v.state;
+        // Floating up and pushed by both thrusters, yet it stays put: someone else moves it
+        v.hold_to(0.5, &[4000.0, -4000.0]);
+        assert_eq!(v.state, start);
+        assert_eq!(v.thrust_n, vec![50.0, -40.0], "the curve, with no fade near the surface");
+        assert!((v.time - 0.5).abs() < 1e-12);
+        // Time never goes back, and a half step is not a step
+        v.hold_to(0.2, &[0.0, 0.0]);
+        assert!((v.time - 0.5).abs() < 1e-12);
+        v.hold_to(0.5005, &[0.0, 0.0]);
+        assert!((v.time - 0.5).abs() < 1e-12);
+        // Placed elsewhere, it is there, and the IMU sees no acceleration until it steps
+        let there = State::at_rest([1.0, 2.0, 3.0], [0.0, 0.0, 1.0]);
+        v.place(there);
+        assert_eq!(v.state, there);
+        let imu = v.imu();
+        assert!((imu.accel_mps2[2] + G).abs() < 1e-9 && imu.accel_mps2[0].abs() < 1e-9);
+        assert!((v.pressure_at([0.0; 3]) - (101_325.0 + RHO * G * 3.0)).abs() < 1e-6);
     }
 }
