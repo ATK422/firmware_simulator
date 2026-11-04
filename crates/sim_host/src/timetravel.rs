@@ -1056,6 +1056,7 @@ impl TimeTravel {
             return Travelled::Arrived;
         }
         loop {
+            self.cross_barrier(target);
             if self.at_frontier() {
                 return Travelled::Frontier;
             }
@@ -1220,6 +1221,17 @@ impl TimeTravel {
     }
 
     /// Moves the base checkpoint up to the latest one not after the current position.
+    /// A replay that comes to a barrier checkpoint (a host change that is not in the log) goes on from it.
+    fn cross_barrier(&mut self, target: &mut dyn Rewindable) {
+        self.advance_base();
+        let i = self.base;
+        let c = &self.checkpoints[i];
+        if c.barrier && c.cursor == self.cursor && !self.cursor.inside && self.here == Pos::Boundary(c.time) {
+            // (Restoring it again where it was just restored changes nothing)
+            self.restore(target, i);
+        }
+    }
+
     fn advance_base(&mut self) {
         let (cursor, now) = (self.cursor, self.here.time());
         while self.base + 1 < self.checkpoints.len() {
@@ -1352,37 +1364,51 @@ impl TimeTravel {
             return self.goto_cached(target, prev);
         }
         self.steps_cache = None;
-        let first = self.checkpoints[0].time;
-        let mut window = Time::from_us(2);
+        // Window by window back from here (a window ends at the next checkpoint: replays never go through a
+        // checkpoint, which may be a host change), the last part of each first
+        let mut end = here;
+        let mut i = self.base;
         loop {
-            let from = t.saturating_sub(window).max(first);
-            let i = self.checkpoints[..=self.base].iter().rposition(|c| c.time <= from).unwrap_or(0);
-            self.restore(target, i);
-            let mut steps = Vec::new();
-            let r = self.replay(
-                target,
-                Goal::Pos(here),
-                Probe::Steps { board, core, from, steps: &mut steps, ephemeral: true },
-            );
-            if r == Travelled::Interrupted {
-                return r;
-            }
-            steps.retain(|&s| s < t);
-            if let Some(&prev) = steps.last() {
-                match &mut self.steps_cache {
-                    Some(c) => {
-                        c.steps = steps;
-                        return self.goto_cached(target, prev);
-                    }
-                    None => return self.seek(target, i, Pos::At { board, core, time: prev }),
+            let start = self.checkpoints[i].time;
+            let mut window = Time::from_us(2);
+            loop {
+                let from = end.time().saturating_sub(window).max(start);
+                self.restore(target, i);
+                let mut steps = Vec::new();
+                let r = self.replay(
+                    target,
+                    Goal::Pos(end),
+                    Probe::Steps { board, core, from, steps: &mut steps, ephemeral: true },
+                );
+                if r == Travelled::Interrupted {
+                    return r;
                 }
+                if end == here {
+                    steps.retain(|&s| s < t);
+                } else {
+                    // (A window's end is a boundary: every step found is before it)
+                }
+                if let Some(&prev) = steps.last() {
+                    return match &mut self.steps_cache {
+                        Some(c) => {
+                            c.steps = steps;
+                            self.goto_cached(target, prev)
+                        }
+                        None => self.seek(target, i, Pos::At { board, core, time: prev }),
+                    };
+                }
+                self.steps_cache = None;
+                if from <= start {
+                    break;
+                }
+                window = Time(window.as_ps().saturating_mul(4));
             }
-            self.steps_cache = None;
-            if from <= first {
+            if i == 0 {
                 self.restore(target, 0);
                 return Travelled::Beginning;
             }
-            window = Time(window.as_ps().saturating_mul(4));
+            end = Pos::Boundary(self.checkpoints[i].time);
+            i -= 1;
         }
     }
 }
