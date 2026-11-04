@@ -120,13 +120,13 @@ cargo test --release --workspace                              # everything (seve
 
 ```
 board               connected   statuses  faults      wall
-template            0.200401s          2  0x00000000  334.00ms  mk2/power_board
-power_board         0.200400s          2  0x00000000  375.41ms  mk2/power_board
-esc_board           0.200401s          2  0x00000000   2.73s  mk2/esc_board
+template            0.200300s          2  0x00000000  43.55ms  mk2/power_board
+power_board         0.200301s          2  0x00000000  275.26ms  mk2/power_board
+esc_board           0.200301s          2  0x00000000   1.95s  mk2/esc_board
 ...
-smart_battery       0.200701s          2  0x00000000  355.65ms  mk2/sbh_mcu
-hbridge_board       0.200400s          2  0x00000000  407.49ms  lilboat/hbridge_board
-po_half_board       0.200400s          2  0x00000000  380.73ms  lilboat/po_half
+smart_battery       0.200600s          2  0x00000000  345.04ms  mk2/sbh_mcu
+hbridge_board       0.200300s          2  0x00000000  321.50ms  lilboat/hbridge_board
+po_half_board       0.200301s          2  0x00000000  225.22ms  lilboat/po_half
 test every_board_boots_and_connects ... ok
 ```
 

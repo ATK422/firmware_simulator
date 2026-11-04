@@ -86,7 +86,7 @@ firmware_simulator robot robots/ivc2_pool.toml --mock-bridge talos:8 --mock-brid
 firmware_simulator robot robots/puddles.toml --eth-mock-bridge backplane --time 10s --vehicle-csv puddles.csv
 ```
 
-Each board's log lines are prefixed with its name (`[0.200400s] poac: 0.068333 INFO  ROS connected`, UART lines
+Each board's log lines are prefixed with its name (`[0.200300s] poac: 0.068290 INFO  ROS connected`, UART lines
 as `[t] NAME uart0: ...`); the run ends with the stop time, the wall time and each vehicle's pose.
 
 | Option | Default | What it does |
