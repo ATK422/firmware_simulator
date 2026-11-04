@@ -167,47 +167,46 @@ fn can_unplugged_board_goes_error_passive_not_bus_off() {
     assert!(heartbeats_after(&b, unplugged + ms(10)).is_empty());
 }
 
-/// Once its frames run out of retransmission attempts with the transmit queue full, the board stays silent on a
-/// healthy bus until the 10 s "offline" reset of the CAN driver.
+/// Fixed finding (titan_firmware_rs c59474f): with the cable out every frame runs out of attempts. The transmit
+/// queue used 3 attempts per frame (TXAT = 3), after which the MCP2517FD cleared TXREQ and the driver only set it
+/// again when it queued a new frame, which it could not with the queue full: the board stayed silent on a healthy
+/// bus until the driver's 10 s "offline" reset. Now the queue retries without limit, so it drains as soon as the
+/// cable is back.
 #[test]
-fn firmware_finding_tx_queue_stalls_after_retransmission_attempts_run_out() {
+fn can_tx_queue_drains_when_the_cable_is_plugged_back_in() {
     let Some(mut b) = power_board() else { return };
     b.inject(Fault::CanUnplugged(true)).unwrap();
     b.run_until(ms(3000)).unwrap();
+    assert!(heartbeats_after(&b, ms(1010)).is_empty(), "nothing gets through with the cable out");
     b.inject(Fault::CanUnplugged(false)).unwrap();
     // Plugged back in: the board hears the bridge again straight away...
     let back = b.wait_for_log_after("ROS connected", ms(3000), ms(500)).unwrap();
     assert!(back < ms(3200));
-    b.run_until(ms(10_000)).unwrap();
-    // ...but sends nothing: every queued frame used its 3 attempts (TXQ with TXAT = 3), the MCP2517FD cleared
-    // TXREQ, and the driver only sets TXREQ when it queues a new frame, which it cannot while the queue is full
-    assert!(heartbeats_after(&b, ms(3000)).is_empty(), "silent on a working bus");
-    assert_eq!(statuses_after(&b, ms(3000)), 0);
-    // The driver's offline reset (10 s without a confirmed heartbeat) re-initialises the controller
-    let reset = b.wait_for_log_after("CAN offline for", ms(3000), ms(3000)).unwrap();
-    assert!(reset > ms(10_500) && reset < ms(11_500), "{reset}");
+    // ...and its queued frames go out at once, then heartbeats every 500 ms and the firmware statuses
     b.run_until(ms(12_500)).unwrap();
-    assert!(!heartbeats_after(&b, reset).is_empty(), "talking again after the reset");
-    assert!(statuses_after(&b, reset) >= 1);
+    let hb = heartbeats_after(&b, ms(3000));
+    assert!(!hb.is_empty() && hb[0] < ms(3050), "{hb:?}");
+    assert!(hb.len() >= 15, "{} heartbeats in 9.5 s", hb.len());
+    assert!(statuses_after(&b, ms(3000)) >= 5);
+    // No 10 s "offline" reset of the CAN driver is needed
+    assert!(!b.logged("CAN offline for"), "{:#?}", b.session.logs);
 }
 
-/// Every loss of the ROS link raises FAULT_WATCHDOG_WARNING, although the watchdog was never close to firing.
+/// Fixed finding (titan_firmware_rs 8d4dfd6): every loss of the ROS link used to raise FAULT_WATCHDOG_WARNING (the
+/// safety task compared the setup timeout's 500 ms margin with the 250 ms countdown it last fed), and it was never
+/// lowered. The margin now goes with the timeout that was actually fed.
 #[test]
-fn firmware_finding_watchdog_warning_on_every_disconnect() {
+fn ros_disconnect_raises_no_watchdog_warning() {
     let Some(mut b) = power_board() else { return };
     b.inject(Fault::Bridge(false)).unwrap();
     let lost = b.wait_for_log("Lost connection to ROS", ms(1000)).unwrap();
-    let warn = b.wait_for_log("Fault FAULT_WATCHDOG_WARNING raised", ms(100)).unwrap();
-    // One safety tick later: `safety_task` switches to the 3 s setup timeout and its 500 ms margin, but compares
-    // them against the 250 ms timeout it last fed with (elapsed 10 ms + margin 500 ms > 250 ms). The argument is
-    // the "remaining" time, 240 ms.
-    assert!(warn - lost < ms(15), "{lost} {warn}");
-    let line = &b.session.logs.iter().find(|(_, l)| l.message.contains("FAULT_WATCHDOG_WARNING")).unwrap().1.message;
-    assert!(line.contains("0x3a981"), "{line}");
+    b.run_until(lost + ms(500)).unwrap();
+    assert!(!b.logged("FAULT_WATCHDOG_WARNING"), "{:#?}", b.session.logs);
     b.inject(Fault::Bridge(true)).unwrap();
     b.run_for(ms(1500));
-    // It is never lowered, so the board reports it (and the heartbeat error bit) from then on
-    assert_eq!(b.faults(), Some(FAULT_WATCHDOG_WARNING));
+    assert!(b.log_times("ROS connected").len() >= 2, "reconnected");
+    assert_eq!(b.faults().map(|f| f & FAULT_WATCHDOG_WARNING), Some(0));
+    assert_eq!(b.faults(), Some(0), "no fault reported after reconnecting");
 }
 
 // ------------------------------------------------------------------------------------------------ links and kill
@@ -388,9 +387,10 @@ fn esc_thrusters_go_neutral_when_killed() {
     }
     let noticed = b.log_time("Core 1 did not check in").expect("core 0 notices");
     assert!(noticed - base.now() > ms(240) && noticed - base.now() < ms(280), "{noticed}");
-    // The panic resets the board (counted as a watchdog timeout, see the panic finding); after the reboot core 1
-    // sends neutral again, since the ESCs are held neutral for 5 s after power-up
-    let reboot = b.log_time("Crash counts since power on: CrashCounts { watchdog_timeouts: 1").expect("rebooted");
+    // The panic resets the board (recorded as a panic); after the reboot core 1 sends neutral again, since the
+    // ESCs are held neutral for 5 s after power-up
+    let reboot =
+        b.log_time("Crash counts since power on: CrashCounts { watchdog_timeouts: 0, panics: 1").expect("rebooted");
     // Meanwhile the ESCs stop the motors themselves, their signal-loss timeout (250 ms, assumed) after the last
     // frame, before the rebooted board sends its first neutral frame
     for e in escs(b) {
@@ -763,21 +763,21 @@ fn panic_and_brownout_resets() {
     assert_eq!(b.session.machine.sys.watchdog.reason, 0);
 }
 
-/// A panic while ROS is connected is recorded as a watchdog timeout: the panic handler busy-waits
-/// `cortex_m::asm::delay(12_500_000)` (12.5 M loop iterations of 3 cycles, 300 ms at 125 MHz) before it triggers
-/// the watchdog, longer than the 250 ms active timeout, so the timer fires first and `setup` takes the
-/// `TimedOut` branch, which ignores the panic marker.
+/// Fixed finding (titan_firmware_rs b2afb53): a panic while ROS is connected (250 ms active watchdog timeout) used
+/// to be recorded as a watchdog timeout, because the panic handler busy-waited 300 ms before forcing the reset and
+/// `setup` ignored the panic marker after a timeout. Now the handler reloads the watchdog before its 100 ms log
+/// drain, then forces the reset, and the next boot reports a panic.
 #[test]
-fn firmware_finding_panic_while_connected_counts_as_watchdog_timeout() {
+fn panic_while_connected_is_recorded_as_a_panic() {
     let Some(mut b) = power_board() else { return };
     b.inject(Fault::Panic).unwrap();
     let t = b.now();
     b.wait_for_log_after("Crash counts since power on", t, ms(1000)).unwrap();
     assert!(b.logged("PANIC: panicked"));
-    assert!(!b.logged("Reset by panic"));
-    assert!(b.logged("Watchdog timeout after"));
-    assert!(b.logged("watchdog_timeouts: 1, panics: 0"), "{:#?}", b.session.logs);
-    assert_eq!(b.session.machine.sys.watchdog.reason, 1, "WATCHDOG_REASON.TIMER, not FORCE");
+    assert!(b.logged("Reset by panic after"), "{:#?}", b.session.logs);
+    assert!(!b.logged("Watchdog timeout after"));
+    assert!(b.logged("watchdog_timeouts: 0, panics: 1"), "{:#?}", b.session.logs);
+    assert_eq!(b.session.machine.sys.watchdog.reason, 2, "WATCHDOG_REASON.FORCE, not TIMER");
 }
 
 // ------------------------------------------------------------------------------------------------ robot

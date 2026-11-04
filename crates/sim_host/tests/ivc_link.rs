@@ -51,6 +51,27 @@ fn tone_v(rec: &[(Time, f32)], from: f64, to: f64, hz: f64) -> f64 {
     2.0 * (re * re + im * im).sqrt() / n
 }
 
+/// The typical amplitude of the `hz` component over `[from, to)` seconds: the median over the 5 ms windows that the
+/// recording covers. The receiver's ADC records in bursts (IVCBoard2: about 8 ms every 43 ms, while its detector
+/// runs in between), and the PWM tone is a little off the nominal frequency (51.5 kHz comes out about 37 Hz high
+/// from the 8.4 divider), so a single DFT over hundreds of ms of bursts adds them with drifting phases and can come
+/// out at any fraction of the amplitude, depending on where the bursts fall: on the firmware build.
+fn tone_median(rec: &[(Time, f32)], from: f64, to: f64, hz: f64) -> f64 {
+    let mut amps = Vec::new();
+    let mut a = from;
+    while a + 0.005 <= to {
+        let n = rec.iter().filter(|(t, _)| (a..a + 0.005).contains(&t.as_secs_f64())).count();
+        // Only windows the recording fills (2500 samples at 500 kS/s)
+        if n >= 2000 {
+            amps.push(tone_v(rec, a, a + 0.005, hz));
+        }
+        a += 0.005;
+    }
+    assert!(amps.len() >= 3, "{} recorded windows in {from}..{to}", amps.len());
+    amps.sort_by(f64::total_cmp);
+    amps[amps.len() / 2]
+}
+
 fn hydrophone(r: &mut Robot, board: usize) -> &mut sim_acoustics::Hydrophone {
     sim_host::acoustic::hydrophones(&mut r.boards[board].machine).next().unwrap()
 }
@@ -76,11 +97,11 @@ fn ivc2_boards_exchange_a_byte_across_the_pool() {
     let start = r.boards[0].logs.iter().find(|(_, l)| l.message.contains("Transmitting")).unwrap().0.as_secs_f64();
     let rec = hydrophone(&mut r, 1).recording.take().unwrap();
     let (a, b) = (start + 0.1, start + 0.4);
-    let sync = tone_v(&rec, a, b, 50_500.0);
-    assert!(sync > 0.05 && sync > 10.0 * tone_v(&rec, a, b, 51_500.0), "{sync}");
+    let (sync, other) = (tone_median(&rec, a, b, 50_500.0), tone_median(&rec, a, b, 51_500.0));
+    assert!(sync > 0.05 && sync > 10.0 * other, "{sync} {other}");
     let (a, b) = (start + 1.1, start + 1.4);
-    let high = tone_v(&rec, a, b, 51_500.0);
-    assert!(high > 0.05 && high > 10.0 * tone_v(&rec, a, b, 50_500.0), "{high}");
+    let (high, other) = (tone_median(&rec, a, b, 51_500.0), tone_median(&rec, a, b, 50_500.0));
+    assert!(high > 0.05 && high > 10.0 * other, "{high} {other}");
     // Talos's projector was driven for the whole packet (18 slots of 500 ms), the surface's never
     let m = r.medium.as_ref().unwrap().lock().unwrap();
     assert!(m.projectors[0].edge_count > 800_000, "{}", m.projectors[0].edge_count);
@@ -154,36 +175,118 @@ fn ivc_bytes(bridge: &MockBridge) -> Vec<(Time, u8)> {
         .collect()
 }
 
+/// Log lines of `board` containing `text`, with their times.
+fn log_times(r: &Robot, board: usize, text: &str) -> Vec<Time> {
+    r.boards[board].logs.iter().filter(|(_, l)| l.message.contains(text)).map(|(t, _)| *t).collect()
+}
+
+const ACK: &str = "Got response of true from receiver";
+
+/// Runs `r` in 10 ms steps until `done` or `limit`; whether it got there.
+fn run_until(r: &mut Robot, limit: Time, done: impl Fn(&Robot) -> bool) -> bool {
+    while !done(r) {
+        if r.now >= limit {
+            return false;
+        }
+        let next = r.now + Time::from_ms(10);
+        r.run_until(next);
+    }
+    true
+}
+
+/// The pool link with the first-generation IVCBoard, booted until Talos's link is established: the sender only
+/// retransmits once it has seen an ACK. The heartbeat Talos sends at boot comes too early for the surface board
+/// (switched on 37 ms later); the next one, 5 s later, is answered.
+fn ivc_pool_linked(edit: impl FnOnce(&mut RobotSpec)) -> (Robot, MockBridge, MockBridge, Time) {
+    let (mut r, talos, surface) = robot("ivc_pool.toml", edit);
+    r.run_until(Time::from_ms(600));
+    assert!(r.boards[0].logged("This board is talos"));
+    assert!(r.boards[1].logged("This board is not talos"));
+    assert!(run_until(&mut r, Time::from_ms(7500), |r| !log_times(r, 0, ACK).is_empty()), "{:?}", r.boards[0].logs);
+    let linked = r.now;
+    (r, talos, surface, linked)
+}
+
+/// Talos sends two bytes across the pool: each arrives once, in order, and the last copy of each is acknowledged.
+/// The pool's reverberation and its pinger (each ping starts a phantom packet that keeps a receiver busy for
+/// 825 ms) cost single packets, so which attempt gets through depends on the firmware build's timing (one rustc
+/// to the next); what holds is that retransmission gets every byte there within its attempts.
 #[test]
 fn ivc_boards_exchange_bytes_across_the_pool() {
     if common::titan_elf("ivc_board").is_none() {
         return;
     }
-    let (mut r, talos, surface) = robot("ivc_pool.toml", |_| {});
-    r.run_until(Time::from_ms(600));
-    assert!(r.boards[0].logged("This board is talos"));
-    assert!(r.boards[1].logged("This board is not talos"));
-    // Talos sends two bytes; each is acknowledged
+    let (mut r, talos, surface, linked) = ivc_pool_linked(|_| {});
+    let sent = [0x5A, 0xC3];
+    for b in sent {
+        talos.send(HostToDevice::Ivc(titan_link::ivc::HostToDevice::Tx(b)));
+    }
+    // The bound: each byte gets up to 1 + MAX_MISSED_PACKETS (5) attempts, 1410 ms apart, and the 5 s heartbeats
+    // go in between
+    let first = |bytes: &[(Time, u8)]| {
+        let mut seen = Vec::new();
+        for (_, b) in bytes {
+            if !seen.contains(b) {
+                seen.push(*b);
+            }
+        }
+        seen
+    };
+    let delivered = run_until(&mut r, linked + Time::from_secs(22), |_| first(&ivc_bytes(&surface)).len() == 2);
+    let got = ivc_bytes(&surface);
+    assert!(delivered, "{got:?} {:?}", r.boards[0].logs);
+    assert_eq!(first(&got), sent, "in order: {got:?}");
+    assert!(got.iter().all(|(_, b)| sent.contains(b)), "no wrong bytes: {got:?}");
+    // The ACK is heard about 40-370 ms after the receiver passes the byte on
+    r.run_until(r.now + Time::from_ms(600));
+    let acks = log_times(&r, 0, ACK);
+    for b in sent {
+        let last = got.iter().rfind(|(_, x)| *x == b).unwrap().0;
+        assert!(acks.iter().any(|&a| a > last && a < last + Time::from_ms(500)), "{b:#x} at {last}: {acks:?}");
+    }
+    let broken = log_times(&r, 0, "IVC link broken");
+    assert!(broken.iter().all(|&t| t < linked), "the link held: {broken:?}");
+    assert!(ivc_bytes(&talos).is_empty(), "the sender doesn't hear itself");
+    let attempts = log_times(&r, 0, "Got response of").iter().filter(|&&t| t > linked).count();
+    eprintln!("ivc pool: {got:?} after {attempts} packets from Talos (heartbeats included)");
+}
+
+/// Firmware finding (protocol, also in the C firmware's schedule): the surface vehicle's ("SSFB") answer to a
+/// packet is lost when Talos has another packet queued. SSFB may only transmit in the 400 ms after its ACK, so its
+/// answer starts about 830 ms after Talos's packet began, while Talos waits out its interframe space (it listens
+/// again only at 1410 ms, when it sends its next packet). Talos never hears the answer; and SSFB, listening for
+/// its ACK from 760 ms after its own start, hears Talos's next packet instead: a 1 symbol there counts as the ACK,
+/// so SSFB takes the answer as delivered and never retransmits it. Talos's second packet, sent while SSFB was
+/// transmitting, is lost too and gets through on a retry. Timing by protocol constants, the same with any build.
+#[test]
+fn firmware_finding_ivc_answer_lost_when_talos_sends_on() {
+    if common::titan_elf("ivc_board").is_none() {
+        return;
+    }
+    let (mut r, talos, surface, linked) = ivc_pool_linked(|_| {});
     for b in [0x5A, 0xC3] {
         talos.send(HostToDevice::Ivc(titan_link::ivc::HostToDevice::Tx(b)));
     }
-    r.run_until(Time::from_ms(4000));
-    assert_eq!(ivc_bytes(&surface).iter().map(|b| b.1).collect::<Vec<_>>(), [0x5A, 0xC3]);
-    let acks =
-        |r: &Robot| r.boards[0].logs.iter().filter(|(_, l)| l.message == "Got response of true from receiver").count();
-    // Both bytes acknowledged. (The heartbeat Talos sends at boot comes too early for the surface board, switched
-    // on 37 ms later, and fails its CRC.)
-    assert_eq!(acks(&r), 2);
-    // The surface vehicle answers
+    // The surface vehicle answers as soon as 0x5A arrives (retransmissions included)
+    assert!(run_until(&mut r, linked + Time::from_secs(10), |_| !ivc_bytes(&surface).is_empty()));
+    assert_eq!(ivc_bytes(&surface)[0].1, 0x5A);
+    let answered = r.now;
     surface.send(HostToDevice::Ivc(titan_link::ivc::HostToDevice::Tx(0x17)));
-    r.run_until(Time::from_ms(8000));
-    let got = ivc_bytes(&talos);
-    assert_eq!(got.iter().map(|b| b.1).collect::<Vec<_>>(), [0x17], "{:?}", r.boards[0].logs);
-    // The reply goes out in the window after the last packet from Talos, collides with Talos's 5 s heartbeat and
-    // gets through on a retry
-    assert!(r.boards[1].logged("Got response of false from receiver"));
-    assert!(r.boards[1].logged("Got response of true from receiver"));
-    assert_eq!(ivc_bytes(&surface).len(), 2, "nothing heard twice");
+    r.run_until(answered + Time::from_secs(12));
+    // SSFB's ACK listener "hears" an ACK within its window: Talos's 0xC3 packet
+    let acks = log_times(&r, 1, ACK);
+    assert!(acks.first().is_some_and(|&a| a > answered + Time::from_ms(700) && a < answered + Time::from_ms(1300)));
+    assert!(!r.boards[1].logged("Got response of false"), "so it never retransmits: {:?}", r.boards[1].logs);
+    assert!(ivc_bytes(&talos).is_empty(), "the answer never arrives");
+    // 0xC3 needed another attempt: its first one went out while SSFB was transmitting
+    let got: Vec<u8> = ivc_bytes(&surface).iter().map(|b| b.1).collect();
+    assert_eq!(got, [0x5A, 0xC3]);
+    let c3 = ivc_bytes(&surface)[1].0;
+    assert!(
+        log_times(&r, 0, "Got response of false").iter().any(|&t| t > answered && t < c3),
+        "{:?}",
+        r.boards[0].logs
+    );
 }
 
 /// The magnitudes `ivc_core::BandDetector` finds at 17 and 19 kHz (the single DFT bin in each band) in a capture
@@ -217,16 +320,16 @@ fn captures(rec: &[(Time, f32)]) -> Vec<(f64, Vec<u8>)> {
         .collect()
 }
 
-/// Firmware finding: the first-generation IVC receiver can lose a packet to the pool's own reverberation at full
-/// signal strength, wherever it is, moving or not. `ivc_core::classify` takes a symbol as a 1 only if the 19 kHz
-/// band is above 300 *and* the 17 kHz band below 300 (and the other way round for a 0). Mid-slot, 25 ms after the
-/// tone switched, the previous symbol still arrives over the longer reflected paths (up to three bounces off the
-/// walls, bottom and surface: 30 m and more of path), about 30 dB below the direct tone. With the assumed 40 dB
-/// receive gain the direct tone reads 10000-20000, so that echo reads 100-450, around the fixed threshold: whether
-/// a 0-to-1 symbol is decoded depends on how the echoes add up where the board is. Talos's board at 5.0 m (the
-/// robot file) gets 0x5A through, at 5.6 m it does not; a board moving at 0.5 m/s goes through such spots during a
-/// packet, which is why the drifting-vehicle test (`tests/vehicle.rs`) loses 0x5A at that speed and not at 0.2 m/s.
-/// A threshold relative to the stronger band would not care.
+/// Firmware finding: the first-generation IVC receiver loses packets to the pool's own reverberation at full
+/// signal strength. `ivc_core::classify` takes a symbol as a 1 only if the 19 kHz band is above 300 *and* the
+/// 17 kHz band below 300 (and the other way round for a 0). Mid-slot, 25 ms after the tone switched, the previous
+/// symbol still arrives over the longer reflected paths (up to three bounces off the walls, bottom and surface: 30 m
+/// and more of path), about 30 dB below the direct tone. With the assumed 40 dB receive gain the direct tone reads
+/// 10000-20000, so that echo reads 100-450, around the fixed threshold: whether a symbol is decoded depends on how
+/// the echoes add up where the board is, and on exactly when in the slot the receiver's capture falls (which moves
+/// with the firmware build's timing). With Talos's board at 5.6 m most packets lose a symbol; a moving board goes
+/// through such spots during a packet (the drifting-vehicle test, `tests/vehicle.rs`). Retransmission (titan_firmware_rs b278360) does not save a byte
+/// here, since the echoes are the same on every attempt. A threshold relative to the stronger band would not care.
 #[test]
 fn firmware_finding_ivc_symbols_lost_to_pool_reverberation() {
     if common::titan_elf("ivc_board").is_none() {
@@ -235,39 +338,50 @@ fn firmware_finding_ivc_symbols_lost_to_pool_reverberation() {
     let (mut r, talos, surface) = robot("ivc_pool.toml", |spec| spec.board[0].position_m = Some([5.6, 6.0, 1.5]));
     hydrophone(&mut r, 1).recording = Some(Vec::new());
     r.run_until(Time::from_ms(600));
-    talos.send(HostToDevice::Ivc(titan_link::ivc::HostToDevice::Tx(0x5A)));
-    r.run_until(Time::from_ms(2400));
-    assert!(ivc_bytes(&surface).is_empty());
-    let bad = r.boards[1].logs.iter().rfind(|(_, l)| l.message.contains("Got CRC_BAD")).unwrap();
-    assert!(bad.1.message.contains("expected 8"), "{}", bad.1.message);
-
-    // What the receiver's detector saw at the middle of each symbol slot: it starts its ACK (and logs the CRC)
-    // 725 ms after the start symbol's onset
-    let onset = bad.0.as_secs_f64() - 0.725;
-    let caps = captures(&hydrophone(&mut r, 1).recording.take().unwrap());
-    let at = |t: f64| band_magnitudes(&caps[caps.partition_point(|c| c.0 <= t) - 1].1);
-    let word = ivc_core_word(0x5A);
-    let mut lost = 0;
-    for (i, bit) in word.iter().enumerate() {
-        let [low, high] = at(onset + 0.050 * (i + 1) as f64 + 0.025);
-        let (wanted, other) = if *bit { (high, low) } else { (low, high) };
-        // The wanted tone is far above the threshold every time ...
-        assert!(wanted > 5000.0, "symbol {i}: {low} {high}");
-        // ... the previous symbol's echo is only some 30 dB below it, and above the threshold on some 1s
-        assert!(other < wanted / 20.0, "symbol {i}: {low} {high}");
-        if other > 300.0 {
-            lost += 1;
-        }
+    // Several packets, each at a different time and so a different phase of the receiver's captures
+    let sent = [0x5A, 0xC3, 0x17, 0x3C, 0xA5, 0x66];
+    for b in sent {
+        talos.send(HostToDevice::Ivc(titan_link::ivc::HostToDevice::Tx(b)));
     }
-    assert!(lost >= 1, "no symbol lost");
-}
+    r.run_until(Time::from_ms(12_000));
+    // The packets the surface board heard: every CRC line but the phantoms (a ping, or nothing, taken for a start
+    // symbol: all 13 symbols missing)
+    let heard: Vec<(Time, String)> = r.boards[1]
+        .logs
+        .iter()
+        .filter(|(_, l)| l.message.starts_with("Got CRC_") && !l.message.contains("13 of 13"))
+        .map(|(t, l)| (*t, l.message.clone()))
+        .collect();
+    let lost: Vec<&(Time, String)> = heard.iter().filter(|(_, m)| m.contains("symbols not detected")).collect();
+    let delivered = ivc_bytes(&surface).len();
+    eprintln!(
+        "reverberation at 5.6 m: {} packets heard, {} lost symbols, {delivered} bytes delivered",
+        heard.len(),
+        lost.len()
+    );
+    assert!(heard.len() >= 5, "{heard:?}");
+    assert!(2 * lost.len() > heard.len(), "most packets lose a symbol: {heard:?}");
+    assert!(delivered < sent.len() / 2, "{:?}", ivc_bytes(&surface));
 
-/// The 13 symbols of a data packet after the start symbol (heartbeat flag, 8 data bits, 4 CRC bits), MSB first.
-fn ivc_core_word(data: u8) -> Vec<bool> {
-    let crc = (0..8).rev().fold(0u8, |crc, i| {
-        let c = (crc << 1) | ((data >> i) & 1);
-        if c & 0x10 != 0 { c ^ 0x1B } else { c }
-    }) & 0xF;
-    let word = (data as u16) << 4 | crc as u16;
-    (0..13).rev().map(|b| (word >> b) & 1 != 0).collect()
+    // The physics, from every 1 ms capture of the surface board's hydrophone while a tone was sounding (Talos's
+    // packets, and the surface board's own answers): the stronger band is the symbol, the weaker one its echo
+    let caps = captures(&hydrophone(&mut r, 1).recording.take().unwrap());
+    let mut tones: Vec<[f64; 2]> = caps
+        .iter()
+        .map(|(_, c)| {
+            let [low, high] = band_magnitudes(c);
+            [low.max(high), low.min(high)]
+        })
+        .filter(|[wanted, _]| *wanted > 2000.0)
+        .collect();
+    tones.sort_by(|a, b| a[0].total_cmp(&b[0]));
+    let median = tones[tones.len() / 2][0];
+    // An echo over the threshold although the symbol is more than 26 dB stronger (captures across a symbol change
+    // hold both tones and are left out)
+    let echo_over = tones.iter().filter(|[wanted, other]| *other > 300.0 && *other < wanted / 20.0).count();
+    eprintln!("  {} captures with a tone: median {median:.0}; echo over 300 in {echo_over}", tones.len());
+    // The wanted tone is far above the threshold ...
+    assert!(median > 5000.0, "{median}");
+    // ... and the previous symbol's echo, though some 30 dB below it, over the threshold in a good share of them
+    assert!(echo_over * 20 >= tones.len(), "{echo_over} of {}", tones.len());
 }

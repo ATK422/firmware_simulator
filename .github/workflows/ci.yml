@@ -1,4 +1,5 @@
-# Builds the emulator and the titan_firmware_rs images, then runs every test: the emulator's own, a smoke test for
+# Builds the emulator and the titan_firmware_rs images (with the compiler titan_firmware_rs pins in its
+# rust-toolchain.toml), then runs every test: the emulator's own, a smoke test for
 # every board image, the robot, IVC link and sweep tests, Puddles over UDP, and the YAML scenarios in scenarios/.
 #
 # external/titan_firmware_rs is the private repository ATK422/titan_firmware_rs: give the workflow a token that can
@@ -36,6 +37,14 @@ jobs:
         run: |
           rustup toolchain install stable --profile minimal --component rustfmt,clippy
           rustup target add thumbv6m-none-eabi
+          # The firmware builds with the compiler titan_firmware_rs pins (its rust-toolchain.toml, read by rustup in
+          # that directory): install it and its target, so the images are the same build as everyone else's
+          if [ -f external/titan_firmware_rs/rust-toolchain.toml ]; then
+            (cd external/titan_firmware_rs && rustup toolchain install)
+            FW_TOOLCHAIN=$(sed -n 's/^channel *= *"\(.*\)"/\1/p' external/titan_firmware_rs/rust-toolchain.toml)
+            rustup target add thumbv6m-none-eabi --toolchain "$FW_TOOLCHAIN"
+            (cd external/titan_firmware_rs/firmware && rustc --version)
+          fi
 
       - uses: Swatinem/rust-cache@v2
         with:
@@ -96,6 +105,14 @@ jobs:
         run: |
           rustup toolchain install stable --profile minimal --component clippy
           rustup target add thumbv6m-none-eabi
+          # The firmware builds with the compiler titan_firmware_rs pins (its rust-toolchain.toml, read by rustup in
+          # that directory): install it and its target, so the images are the same build as everyone else's
+          if [ -f external/titan_firmware_rs/rust-toolchain.toml ]; then
+            (cd external/titan_firmware_rs && rustup toolchain install)
+            FW_TOOLCHAIN=$(sed -n 's/^channel *= *"\(.*\)"/\1/p' external/titan_firmware_rs/rust-toolchain.toml)
+            rustup target add thumbv6m-none-eabi --toolchain "$FW_TOOLCHAIN"
+            (cd external/titan_firmware_rs/firmware && rustc --version)
+          fi
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: |

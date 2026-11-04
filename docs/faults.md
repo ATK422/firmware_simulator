@@ -19,15 +19,15 @@ From the command line, at a virtual time (repeatable):
 firmware_simulator run $FW/power_board --board boards/mk2/power_board.toml --mock-bridge 1 \
     --fault 1s@can-stuck --fault 3s@can-release --time 4s
 #   [INFO  sim_host::fault] [1.000000s] fault: CanStuckDominant(true)
-#   [1.600402s] 1.468463 INFO  Lost connection to ROS
-#   [1.602302s] 1.470278 ERROR Fault FAULT_WATCHDOG_WARNING raised (arg 0x3a981) at titan_rp2040/src/safety.rs:418
+#   [WARN  sim_devices::can] CAN bus can: endpoint 0's transmit queue is full, dropping its frames
+#   [1.600303s] 1.468418 INFO  Lost connection to ROS
 #   [INFO  sim_host::fault] [3.000000s] fault: CanStuckDominant(false)
-#   [3.000800s] 2.868853 INFO  ROS connected
+#   [3.000500s] 2.868612 INFO  ROS connected
 
 # robot: TIME@BOARD:FAULT
 firmware_simulator robot robots/talos.toml --mock-bridge internal:4 --fault 1.5s@camera_cage:i2c-absent:0x76
-#   [1.522000s] camera_cage: 1.390034 ERROR Depth sensor failed: Comm(NoAcknowledge)
-#   [1.522200s] camera_cage: 1.390065 ERROR Fault FAULT_DEPTH_INIT_ERROR raised (arg 0x5) at camera_cage_bb/src/cage.rs:131
+#   [1.521600s] camera_cage: 1.389617 ERROR Depth sensor failed: Comm(NoAcknowledge)
+#   [1.521700s] camera_cage: 1.389639 ERROR Fault FAULT_DEPTH_INIT_ERROR raised (arg 0x5) at camera_cage_bb/src/cage.rs:131
 ```
 
 With `--candump`, frames destroyed by an injected error are marked `(destroyed: Bit { data_phase: true })`.
@@ -133,24 +133,25 @@ good (the watchdog reset left the watchdog off). Run firmware that erases or pro
 
 ## Firmware findings so far
 
-Behaviour of the firmware (not the emulator) that looks wrong, each pinned down by a test asserting today's
-behaviour of the pinned `external/titan_firmware_rs`, so a fix shows up as a test to update. No firmware was
-changed here; fixes for findings 1-3 have been proposed to titan_firmware_rs separately, and these tests change
-when the submodule moves to them. Unless noted, the tests are in
+Behaviour of the firmware (not the emulator) that looks wrong, each pinned down by a test asserting the behaviour
+of the pinned `external/titan_firmware_rs`, so a fix shows up as a test to update. No firmware was changed here.
+Findings 1-3 were fixed in titan_firmware_rs (its PR #1, merged as 4d86d47; pinned here from 94a107e): their tests
+now check the fixed behaviour, and the rows say which commit fixed them. Unless noted, the tests are in
 `crates/sim_test/tests/faults.rs`.
 
 | # | Finding | Test |
 |---|---|---|
-| 1 | **The CAN transmit queue stalls after its retransmission attempts run out, muting the board for up to 10 s on a healthy bus.** The TXQ uses 3 attempts; each exhausted set clears TXREQ, and `Mcp251xfd::transmit` only sets TXREQ again when it queues a new frame, which it cannot once the queue is full. After a cable is re-plugged the board hears the bridge at once ("ROS connected") but sends nothing until the driver's offline reset about 10 s later. The TXATIF handling is dead code (TXATIE is never set on the TXQ). Depends on the modelled TXAT semantics: check on hardware | `firmware_finding_tx_queue_stalls_after_retransmission_attempts_run_out` |
-| 2 | **Every loss of ROS raises `FAULT_WATCHDOG_WARNING`, and it is never lowered.** After `deinit` the safety task compares the setup timeout's 500 ms margin with the 250 ms timeout it last fed (visible in the CLI example above) | `firmware_finding_watchdog_warning_on_every_disconnect` |
-| 3 | **A panic while ROS is connected is recorded as a watchdog timeout.** The panic handler busy-waits 300 ms before triggering the watchdog, longer than the 250 ms active timeout, and the `TimedOut` path ignores the panic marker. Before ROS connects (3 s timeout) panics are counted correctly | `firmware_finding_panic_while_connected_counts_as_watchdog_timeout` |
+| 1 | **Fixed in titan_firmware_rs c59474f.** The CAN transmit queue stalled after its retransmission attempts ran out, muting the board for up to 10 s on a healthy bus: the TXQ used 3 attempts, each exhausted set cleared TXREQ, and `Mcp251xfd::transmit` only set TXREQ again when it queued a new frame, which it could not once the queue was full. After a cable was re-plugged the board heard the bridge at once ("ROS connected") but sent nothing until the driver's offline reset about 10 s later. Now the TXQ retries without limit and drains as soon as the cable is back. Depends on the modelled TXAT semantics: check on hardware | `can_tx_queue_drains_when_the_cable_is_plugged_back_in` |
+| 2 | **Fixed in titan_firmware_rs 8d4dfd6.** Every loss of ROS raised `FAULT_WATCHDOG_WARNING`, and it was never lowered: after `deinit` the safety task compared the setup timeout's 500 ms margin with the 250 ms timeout it last fed | `ros_disconnect_raises_no_watchdog_warning` |
+| 3 | **Fixed in titan_firmware_rs b2afb53.** A panic while ROS was connected was recorded as a watchdog timeout: the panic handler busy-waited 300 ms before triggering the watchdog, longer than the 250 ms active timeout, and the `TimedOut` path ignored the panic marker. Now the handler reloads the watchdog before its 100 ms log drain, and a timeout with the marker set counts as a panic | `panic_while_connected_is_recorded_as_a_panic`; `crates/sim_host/tests/flash.rs`, `panic_leaves_a_crash_record_across_watchdog_resets` |
 | 4 | **On the power board, `state/kill` lands on the physical kill switch's slot** (`KILL_SWITCH_ROS` and `KILL_SWITCH_PHYSICAL` are both 0 there), so a forwarded ROS kill only pulses the kill output for ~10 ms. titan_bridge skips that subscription for power boards; the firmware relies on it | `firmware_finding_power_board_ros_kill_lands_on_the_physical_switch` |
 | 5 | **CAN error states are invisible to the firmware.** The Rust driver does not enable CERRIF, so error passive and bus-off are never logged or raised as faults; at a 60 % error rate the board goes bus-off, recovers, and ends with no fault and no log line | `can_bus_off_and_automatic_recovery` |
 | 6 | **Latched faults that never clear**: `FAULT_DEPTH_ERROR` after the depth sensor answers again (also in the C camera cage), `FAULT_BQ40_COMMAND_FAIL` after the gauge comes back | `depth_sensor_failures_on_the_camera_cage`, `smart_battery_gauge_lost_and_found` |
 | 7 | **No plausibility checks on sensor values**: bit flips on the MS5837's reads publish wild depths; a frozen depth sensor goes unnoticed while the vehicle dives; a shorted or open battery sense input publishes 0 V or a wandering value. (The SHT41's CRC does catch glitches, and an absent MCP3426 raises `FAULT_ADC_ERROR`) | `depth_sensor_failures_on_the_camera_cage`, `stuck_depth_sensor_goes_unnoticed`, `sensor_faults_on_the_power_board` |
-| 8 | **The first-generation IVC modem loses symbols to pool reverberation at full receive gain.** A symbol counts only if the wanted band is above 300 *and the other band below 300*; mid-slot, the previous symbol still arrives over reflected paths about 30 dB down, which with the assumed 40 dB gain reads around that fixed threshold. A board moving at 0.5 m/s, or fixed at some ranges (5.6 m), loses a byte. A threshold relative to the stronger band would not care. Depends on the assumed reflection coefficients and gain | `crates/sim_host/tests/ivc_link.rs`, `firmware_finding_ivc_symbols_lost_to_pool_reverberation` |
+| 8 | **The first-generation IVC modem loses symbols to pool reverberation at full receive gain.** A symbol counts only if the wanted band is above 300 *and the other band below 300*; mid-slot, the previous symbol still arrives over reflected paths about 30 dB down, which with the assumed 40 dB gain reads around that fixed threshold (over it in about 7 % of the captures at 5.6 m). Which symbols are lost depends on where the board is and on when its captures fall in the slot, which moves with the firmware build; at 5.6 m most packets lose one, retransmissions included (the echoes are the same every time), and a moving board passes through such spots. A threshold relative to the stronger band would not care. Depends on the assumed reflection coefficients and gain | `crates/sim_host/tests/ivc_link.rs`, `firmware_finding_ivc_symbols_lost_to_pool_reverberation` |
 | 9 | **The bootrom acknowledges PICOBOOT commands without a data phase whatever their result** (B1 and B2 alike), so a misaligned FLASH_ERASE "succeeds" and erases nothing | `crates/sim_host/tests/usb.rs`, `picoboot_rejects_bad_commands_and_recovers` |
 | 10 | **The C IVCBoard2 (titan_firmware `blake/ivc`) overwrites a packet in flight with the next queued byte.** `attempt_writing` dequeues on every main loop pass, also while transmitting, and only replaces `data_to_write`; two bytes enqueued together go out as one packet with the second, and the first is lost. The Rust `ivc_board2` waits for the packet to end. (Read but not run: `debug_tx`/`tx_debug` register `void tx_disable(void *)` as a pico-sdk alarm callback, which takes `(alarm_id_t, void *)` and returns the reschedule time, so the debug tone's end alarm gets the alarm id as its context and returns whatever is in r0) | `crates/sim_host/tests/ivc_link.rs`, `firmware_finding_c_ivc_board2_overwrites_the_packet_in_flight` (on `test_programs/c_ivc_modem`, [acoustics.md](acoustics.md#c-and-rust-ivcboard2-interop)) |
+| 11 | **The IVC surface vehicle's answer is lost when Talos has another packet queued** (protocol, the same schedule as the C firmware). SSFB may only transmit in the 400 ms after its ACK, so its answer starts about 830 ms into Talos's packet period, while Talos waits out its interframe space until 1410 ms and then sends its next packet. Talos never hears the answer, and SSFB, listening for its ACK from 760 ms after its own start, hears Talos's packet instead: a 1 symbol there is taken for the ACK, so the answer counts as delivered and is never retransmitted. Related, seen in the pool runs but not pinned down: every pinger ping starts a phantom packet (all 13 symbols missing) that keeps a receiver busy for 825 ms and opens SSFB's transmit window like a real packet; and both ends retransmit every 1410 ms, so two packets that collided keep colliding until both links break | `crates/sim_host/tests/ivc_link.rs`, `firmware_finding_ivc_answer_lost_when_talos_sends_on` |
 
 Observations not pinned down by a test: in a Talos run IVCBoard2's CANmore heartbeat comes every 523 ms and its
 link heartbeat every 105 ms instead of 500/100 ms like the other boards (deterministic, so either the firmware's

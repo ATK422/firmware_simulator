@@ -86,7 +86,7 @@ firmware_simulator robot robots/ivc2_pool.toml --mock-bridge talos:8 --mock-brid
 firmware_simulator robot robots/puddles.toml --eth-mock-bridge backplane --time 10s --vehicle-csv puddles.csv
 ```
 
-Each board's log lines are prefixed with its name (`[0.200400s] poac: 0.068333 INFO  ROS connected`, UART lines
+Each board's log lines are prefixed with its name (`[0.200300s] poac: 0.068290 INFO  ROS connected`, UART lines
 as `[t] NAME uart0: ...`); the run ends with the stop time, the wall time and each vehicle's pose.
 
 | Option | Default | What it does |
@@ -221,6 +221,13 @@ A run recorded for time travel (`--checkpoint-every`, `--dashboard`) runs ahead 
 (checkpoints are taken where every board is committed, and the recorded bridges tell when they send from the
 recording); with `--gdb` the boards take turns, so stops are as without threads. `--coverage` counts only what the
 committed run executed: what a board ran before it was rolled back does not count.
+
+A board alone on a bus with nothing to acknowledge its frames (Talos's smart battery on the external bus when no
+bridge is there for client 21) retries each frame without end, as a CAN controller does (the firmware does since
+titan_firmware_rs c59474f; before, its transmit queue gave up after three attempts and fell silent). Each retry is a
+frame on the bus, every 284 µs, and each ends a window, so running ahead gains nothing: Talos on four threads took
+16 s of wall time for 2 s instead of 1.8 s. Give such a bus a bridge (`--mock-bridge external:21`, as the bench and
+the run-ahead tests do), which is also what the robot has: the Orin's CAN interface acknowledges every frame.
 
 **Speed.** On one core of the 4-core machine it was measured on, Talos (nine boards) runs at about 0.54x real
 time, and at about 1.2-1.25x on three or four threads (2.2-2.3x faster), so `--realtime` with all of Talos keeps

@@ -50,39 +50,39 @@ firmware_simulator scenario scenarios/can_cable_pull.yaml
 
 ```
 ● Camera cage recovers after its CAN cable is pulled  (scenarios/can_cable_pull.yaml)
-  ✓      0.200500s  expect camera_cage log "ROS connected" within 1s
-                      [0.200500s] camera_cage: 0.068501 INFO  ROS connected
+  ✓      0.200400s  expect camera_cage log "ROS connected" within 1s
+                      [0.200400s] camera_cage: 0.068458 INFO  ROS connected
   ✓      2.000000s  fault camera_cage: can-unplug at 2s
                       applied to camera_cage
-  ✓      2.600500s  expect camera_cage log "Lost connection to ROS" within 1s
-                      [2.600500s] camera_cage: 2.468513 INFO  Lost connection to ROS
+  ✓      2.600400s  expect camera_cage log "Lost connection to ROS" within 1s
+                      [2.600400s] camera_cage: 2.468468 INFO  Lost connection to ROS
   ✓      2.601000s  expect camera_cage link down within 1s
-                      last link heartbeat at 1.900774s (down at 2.601000s)
+                      last link heartbeat at 1.900643s (down at 2.601000s)
   ✓      4.000000s  fault camera_cage: can-plug at 4s
                       applied to camera_cage
-  ✓      4.000700s  expect camera_cage log "ROS connected" within 500ms
-                      [4.000700s] camera_cage: 3.868726 INFO  ROS connected
-  ✓     11.640000s  expect camera_cage link up within 12s
-                      last link heartbeat at 11.639678s (up at 11.640000s)
-  ✓     13.140000s  expect frame 0x12f on internal count >= 2 within 1.5s
-                      3 matching from 11.640000s to 13.140000s (count >= 2)
-  ✓     14.001054s  expect camera_cage status clear=FAULT_CAN_INTERNAL_ERROR board_name=mk2/camera_cage_bb within 1.5s
-                      [14.001054s] internal:4 status: mk2/camera_cage_bb client 4: faults 0x2 (FAULT_WATCHDOG_WARNING), uptime 13.87 s, enabled
+  ✓      4.000800s  expect camera_cage log "ROS connected" within 500ms
+                      [4.000800s] camera_cage: 3.868862 INFO  ROS connected
+  ✓      4.001000s  expect camera_cage link up within 12s
+                      last link heartbeat at 4.000812s (up at 4.001000s)
+  ✓      5.501000s  expect frame 0x12f on internal count >= 2 within 1.5s
+                      3 matching from 4.001000s to 5.501000s (count >= 2)
+  ✓      6.001145s  expect camera_cage status clear=FAULT_CAN_INTERNAL_ERROR board_name=mk2/camera_cage_bb within 1.5s
+                      [6.001145s] internal:4 status: mk2/camera_cage_bb client 4: faults 0x0 (none), uptime 5.87 s, enabled
   ✓     17.000000s  never poac log "Lost connection to ROS" over the whole run
                       none from 0.000000s to 17.000000s
   ...
-  PASS: 17.000000s of virtual time in 9.19s wall
+  PASS: 17.000000s of virtual time in 2.57s wall
 1 scenario(s): 1 passed, 0 failed, 0 skipped
 ```
 
 Each line is a step: ✓ held, ✗ did not, · was never reached (the run ended first). The time is when it was
 decided: the matching line's time, the sample that satisfied it, the end of its window. Under it is the evidence:
 the line, frame, status or state that decided it, or for a failure what was there instead (the window searched,
-the board's last lines, the last status). That run shows a firmware finding in passing: the camera cage hears ROS
-again at once after the replug (4.0 s), but its own traffic only comes back at 11.6 s, when the CAN driver's offline
-reset frees the transmit queue that stalled while unplugged ([faults.md](faults.md#firmware-findings-so-far),
-finding 1). Later titan_firmware_rs builds are back at 4.0 s; [the A/B section](#firmware-ab-comparisons) shows the
-comparison that catches it.
+the board's last lines, the last status). The camera cage hears ROS again at once after the replug (4.0 s), and its
+own traffic is back straight away too. With titan_firmware_rs before c59474f (the build pinned until 94a107e) that
+traffic only came back at 11.6 s, when the CAN driver's offline reset freed the transmit queue that stalled while
+unplugged ([faults.md](faults.md#firmware-findings-so-far), finding 1); the scenario's 12 s window passes with both,
+and [the A/B section](#firmware-ab-comparisons) shows the comparison that catches the difference.
 
 ## Running scenarios
 
@@ -342,7 +342,8 @@ A run with a dashboard keeps named checkpoints of its own to come back to: `POST
 ## The shipped scenarios
 
 `scenarios/` holds scenarios that pass with the current images. They assert what the firmware is meant to do, in
-ways both the pinned titan_firmware_rs and its later fixes share (where those differ, a comment says how).
+ways both the titan_firmware_rs pinned now (94a107e) and the one pinned before its fixes (342ee0d) share (where
+those differ, a comment says how).
 
 | File | What it checks |
 |---|---|
@@ -412,8 +413,8 @@ The JSON has all of it, unfiltered. Runs are deterministic, so two runs of the s
 report says "Every step has the same result at the same time", and so on); with `--profile`, profiling cuts the
 runs at sample times, which on boards that use both cores can shift how the cores interleave.
 
-What the comparison of the pinned titan_firmware_rs (342ee0d) and its master (4d86d47) found, from the scenarios
-here (`--profile` on the IVC pool):
+What the comparison of titan_firmware_rs 342ee0d (pinned before) and 4d86d47 (its fixes, merged; now pinned as
+94a107e, which only adds the toolchain pin and CI) found, from the scenarios here (`--profile` on the IVC pool):
 
 * `can_cable_pull.yaml`: the camera cage's link is back 4.0 s after the replug instead of 11.6 s, and
   `FAULT_WATCHDOG_WARNING` is no longer raised (and latched) when ROS is lost; the `CAN offline for 10000 ms` line
@@ -423,4 +424,18 @@ here (`--profile` on the IVC pool):
   crash counts read `panics: 1` instead of `watchdog_timeouts: 1`, and the board is back 142 ms sooner (finding 3).
 * `ivc_pool.yaml`: IVCBoard2's core 0 runs 82 % of the time instead of 86 %: `rom_table_lookup` drops from 62 000
   samples to none (`rom-func-cache`), and the surface board connects 82 ms sooner.
+* `thrusters_dive.yaml`: the first `RpmFeedback` after the kill (7.10 s) reports the ESC commands of the tick
+  before the kill, ±300, where 342ee0d reported 0. Expected, not a regression: the bridge forwards the kill with its
+  next ping (7.100119 s), the thruster command comes 85 µs later and the feedback 0.67 ms after that, built from
+  the last *completed* control-loop tick; whether core 1 has finished a tick with the kill latched by then is a
+  race of a fraction of a millisecond, which the faster soft float (`rom-func-cache`) moves. The DShot frames go
+  neutral within a control tick of the kill either way (`faults.rs::esc_thrusters_go_neutral_when_killed`), the
+  next feedback (7.20 s) reports 0, and the ESCs spin down the same. Images from rustc 1.97.0 and 1.99.0 of the same
+  source agree on it.
 * Every image's version line changes (`git 342ee0d` to `git 4d86d47`).
+
+Comparing builds of the *same* source from two compilers (`--b` a directory of images from rustc 1.97.0 against
+the pinned 1.99.0) shows no check, boot, connect, fault or log difference beyond the 20 ms tolerance in any shipped
+scenario; only payload details move (an `Esc::Telemetry` tick count by one, depth readings in the fourth digit,
+IVC2 heartbeats and statuses a few ms apart). Bench fingerprints differ, as they do for any change to the images
+([testing.md](testing.md)).
