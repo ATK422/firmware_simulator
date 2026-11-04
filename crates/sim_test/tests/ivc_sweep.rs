@@ -7,6 +7,9 @@ use sim_test::{RobotBench, Time, Trajectory, sweep};
 
 const THREADS: usize = 4;
 
+/// What the IVCBoard sender logs for an acknowledged packet.
+const ACK: &str = "Got response of true from receiver";
+
 #[derive(Clone, Copy, Debug)]
 struct Point {
     range_m: f64,
@@ -53,10 +56,16 @@ fn outcome(point: Point, sent: &[u8], got: &[u8]) -> Outcome {
     Outcome { point, delivered, sent: sent.len(), duplicates, wrong, acked: 0 }
 }
 
-/// The delivery rate must not grow along a sweep of increasing difficulty (allowing one byte of jitter), and the
-/// easiest point must deliver everything.
-fn check_degrades(rows: &[Outcome]) {
-    assert_eq!(rows[0].delivered, rows[0].sent, "the easiest point delivers everything: {rows:?}");
+/// The delivery rate must not grow along a sweep of increasing difficulty (allowing one byte of jitter: near a
+/// cliff single points flip with the firmware build's timing and the noise), the easiest point must deliver
+/// everything, once and correctly (and, with `acked`, see every byte acknowledged), and the hardest must lose bytes.
+fn check_degrades(rows: &[Outcome], acked: bool) {
+    let easiest = &rows[0];
+    assert_eq!(easiest.delivered, easiest.sent, "the easiest point delivers everything: {rows:?}");
+    assert_eq!((easiest.duplicates, easiest.wrong), (0, 0), "{rows:?}");
+    if acked {
+        assert!(easiest.acked >= easiest.sent, "and every byte is acknowledged: {rows:?}");
+    }
     for w in rows.windows(2) {
         assert!(w[1].delivered <= w[0].delivered + 1, "{rows:?}");
     }
@@ -64,8 +73,8 @@ fn check_degrades(rows: &[Outcome]) {
     assert!(last.delivered < last.sent, "the hardest point loses bytes: {rows:?}");
 }
 
-/// First generation IVCBoard (17/19 kHz, ACKed, 650 ms packets) between Talos and the surface vehicle in open
-/// water at 5 m depth.
+/// First generation IVCBoard (17/19 kHz, ACKed and retransmitted, 650 ms packets) between Talos and the surface
+/// vehicle in open water at 5 m depth.
 #[test]
 fn ivc_delivery_degrades_with_range_and_noise() {
     if sim_test::titan_rs("ivc_board").is_none() {
@@ -77,8 +86,13 @@ fn ivc_delivery_degrades_with_range_and_noise() {
         spec.board[1].position_m = Some([25.0, 0.0, 5.0]);
     })
     .unwrap();
-    // Past the boot heartbeat
-    base.run_until(Time::from_ms(1500));
+    // Until the link is established: the sender only retransmits once it has seen an ACK. The heartbeat Talos sends
+    // at boot comes too early for the surface board (switched on 37 ms later); the next, 5 s later, is answered.
+    let acks = |b: &RobotBench| b.board("talos_ivc").logs.iter().filter(|(_, l)| l.message == ACK).count();
+    while acks(&base) == 0 {
+        assert!(base.now() < Time::from_ms(7500), "no ACK: {:?}", base.board("talos_ivc").logs);
+        base.run_for(Time::from_ms(100));
+    }
     let bytes = [0x11u8, 0x22, 0x33, 0x44];
     let run = |mut b: RobotBench, p: &Point| {
         b.place("surface_ivc", Trajectory::Fixed([p.range_m, 0.0, 5.0]));
@@ -88,12 +102,7 @@ fn ivc_delivery_degrades_with_range_and_noise() {
         }
         let from = b.now();
         b.run_for(Time::from_secs(9));
-        let acked = b
-            .board("talos_ivc")
-            .logs
-            .iter()
-            .filter(|(t, l)| *t > from && l.message == "Got response of true from receiver")
-            .count();
+        let acked = b.board("talos_ivc").logs.iter().filter(|(t, l)| *t > from && l.message == ACK).count();
         let got: Vec<u8> = b
             .picked("surface", |m| match m {
                 DeviceToHost::Ivc(ivc::DeviceToHost::Rx(x)) => Some(*x),
@@ -109,13 +118,13 @@ fn ivc_delivery_degrades_with_range_and_noise() {
         [60.0, 74.0, 76.0, 77.0, 78.0, 85.0].map(|n| Point { range_m: 25.0, noise_db: n }).to_vec();
     let rows = sweep(&base, &by_noise, THREADS, run);
     table("IVCBoard, noise at 25 m", &rows);
-    check_degrades(&rows);
+    check_degrades(&rows, true);
 
     let by_range: Vec<Point> =
         [25.0, 50.0, 80.0, 86.0, 92.0, 150.0].map(|r| Point { range_m: r, noise_db: 70.0 }).to_vec();
     let rows = sweep(&base, &by_range, THREADS, run);
     table("IVCBoard, range at 70 dB", &rows);
-    check_degrades(&rows);
+    check_degrades(&rows, true);
 }
 
 /// Second generation IVCBoard2 (50.5/51/51.5 kHz, 9 s packets, no ACK) between the two vehicles.
@@ -153,10 +162,10 @@ fn ivc2_delivery_degrades_with_range_and_noise() {
     let by_noise: Vec<Point> = [50.0, 95.0, 105.0, 115.0].map(|n| Point { range_m: 10.0, noise_db: n }).to_vec();
     let rows = sweep(&base, &by_noise, THREADS, run);
     table("IVCBoard2, noise at 10 m", &rows);
-    check_degrades(&rows);
+    check_degrades(&rows, false);
 
     let by_range: Vec<Point> = [10.0, 300.0, 600.0, 1000.0].map(|r| Point { range_m: r, noise_db: 70.0 }).to_vec();
     let rows = sweep(&base, &by_range, THREADS, run);
     table("IVCBoard2, range at 70 dB", &rows);
-    check_degrades(&rows);
+    check_degrades(&rows, false);
 }
