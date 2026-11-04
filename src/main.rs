@@ -195,6 +195,51 @@ struct RobotArgs {
     /// `--fault`s due meanwhile are applied once GDB detaches.
     #[arg(long, value_parser = parse_board_addr)]
     gdb: Option<(String, String)>,
+    /// Time travel (reverse debugging in GDB, `POST /api/rewind`): record the run with a checkpoint this often in
+    /// virtual time; 0 turns it off. On by default (10ms) with `--gdb` and `--dashboard`, off otherwise.
+    #[arg(long, value_parser = parse_time)]
+    checkpoint_every: Option<Time>,
+    /// Memory the time-travel checkpoints may take, in MB; older ones are thinned out beyond it.
+    #[arg(long, default_value_t = 512)]
+    checkpoint_memory: usize,
+}
+
+/// Starts time travel for `target` when asked (`--checkpoint-every` above 0) or on by default (`default_on`: GDB or a
+/// dashboard), unless the profiler is on (it cuts runs at its sample times, which replays do not do), in which case
+/// only when asked.
+fn time_travel(
+    target: &mut dyn sim_host::timetravel::Rewindable,
+    inputs: Vec<sim_host::board::Inputs>,
+    every: Option<Time>,
+    memory_mb: usize,
+    default_on: bool,
+    profiling: bool,
+) -> Option<sim_host::timetravel::TimeTravel> {
+    let on = match every {
+        Some(t) => t > Time::ZERO,
+        None if profiling && default_on => {
+            log::info!("time travel is off with the profiler (--checkpoint-every turns it on)");
+            false
+        }
+        None => default_on,
+    };
+    if !on {
+        return None;
+    }
+    let mut tt = sim_host::timetravel::TimeTravel::new(target, inputs);
+    tt.every = every.unwrap_or(sim_host::timetravel::DEFAULT_EVERY);
+    tt.budget = memory_mb << 20;
+    log::info!("time travel: a checkpoint every {} (up to {memory_mb} MB)", tt.every);
+    Some(tt)
+}
+
+/// What a time-travel run's end means to a run loop.
+fn travel_reason(r: sim_host::timetravel::Ran) -> StopReason {
+    match r {
+        sim_host::timetravel::Ran::Reached => StopReason::TimeLimit,
+        sim_host::timetravel::Ran::Interrupted => StopReason::Requested,
+        sim_host::timetravel::Ran::Stopped { reason, .. } => reason,
+    }
 }
 
 fn parse_board_addr(s: &str) -> Result<(String, String), String> {
@@ -486,15 +531,31 @@ fn robot(args: RobotArgs) -> Result<()> {
     let mut faults = faults.into_iter().peekable();
     let mut pending: Option<(Time, usize, sim_host::fault::Fault)> = None;
     r.stop_flag = Some(&sim_host::signal::STOP);
+    let inputs = r.inputs.clone();
+    let default_on = args.gdb.is_some() || dash.is_some();
+    let profiling = args.profile_dir.is_some();
+    let mut tt = time_travel(&mut r, inputs, args.checkpoint_every, args.checkpoint_memory, default_on, profiling);
     if let Some((board, addr)) = &args.gdb {
         let i = r.index(board).with_context(|| format!("--gdb: no board {board:?}"))?;
         let listener = std::net::TcpListener::bind(addr).with_context(|| format!("binding {addr}"))?;
         log::info!("waiting for GDB on {addr} (board {board})");
-        let mut target = sim_host::gdb::RobotBoard { robot: &mut r, board: i };
-        if sim_host::gdb::serve_target(&listener, &mut target)? == sim_host::gdb::Ended::Killed {
+        let ended = match &mut tt {
+            Some(tt) => {
+                let mut target = sim_host::gdb::Travel { tt, target: &mut r, board: i };
+                sim_host::gdb::serve_target(&listener, &mut target)?
+            }
+            None => {
+                let mut target = sim_host::gdb::RobotBoard { robot: &mut r, board: i };
+                sim_host::gdb::serve_target(&listener, &mut target)?
+            }
+        };
+        if ended == sim_host::gdb::Ended::Killed {
             eprintln!("GDB ended the session at {}", r.now);
             return Ok(());
         }
+    }
+    if let Some(d) = &mut dash {
+        d.travel = tt.take();
     }
     let stopped = loop {
         if pending.is_none() {
@@ -502,7 +563,14 @@ fn robot(args: RobotArgs) -> Result<()> {
         }
         let target = pending.as_ref().map_or(args.time, |f| f.0);
         let until = if dash.is_some() { target.min(r.now + DASHBOARD_PIECE) } else { target };
-        let stopped = r.run_until(until);
+        let stopped = match (&mut dash, &mut tt) {
+            (Some(d), _) => d.run_robot(&mut r, until),
+            (None, Some(tt)) => match tt.run_until(&mut r, until) {
+                sim_host::timetravel::Ran::Stopped { board, reason } => Some((board, reason)),
+                _ => None,
+            },
+            (None, None) => r.run_until(until),
+        };
         if let Some(d) = &mut dash {
             d.service_robot(&mut r, &bridges);
             while d.paused() && !sim_host::signal::requested() {
@@ -531,6 +599,9 @@ fn robot(args: RobotArgs) -> Result<()> {
         let bridge = r.board_bus[i].and_then(|j| bridges[j].clone());
         let ctl = bridge.as_ref().map(|b| b as &dyn sim_host::fault::BridgeControl);
         let applied = sim_host::fault::robot_target(&mut r, i, ctl).apply(&fault);
+        if let Some(tt) = dash.as_mut().and_then(|d| d.travel.as_mut()).or(tt.as_mut()) {
+            tt.changed(&mut r);
+        }
         if let Some(d) = &mut dash {
             let name = r.names[i].clone();
             d.note_fault(r.now, &name, &format!("{fault:?}"), &applied);
@@ -784,6 +855,13 @@ struct RunArgs {
     /// Wait for GDB on this address (e.g. `127.0.0.1:3333`) before running.
     #[arg(long)]
     gdb: Option<String>,
+    /// Time travel (reverse debugging in GDB, `POST /api/rewind`): record the run with a checkpoint this often in
+    /// virtual time; 0 turns it off. On by default (10ms) with `--gdb` and `--dashboard`, off otherwise.
+    #[arg(long, value_parser = parse_time)]
+    checkpoint_every: Option<Time>,
+    /// Memory the time-travel checkpoints may take, in MB; older ones are thinned out beyond it.
+    #[arg(long, default_value_t = 512)]
+    checkpoint_memory: usize,
     /// Set one of the board's physical inputs, e.g. `sht41.temperature_c=31.5` (repeatable).
     #[arg(long = "input", value_parser = parse_input)]
     inputs: Vec<(String, f64)>,
@@ -1092,11 +1170,26 @@ fn run(args: RunArgs) -> Result<()> {
     let can_host = host_tools::attach_run(&args.can_host, &mut session)?;
 
     let wall = std::time::Instant::now();
+    if args.usbip.is_some() && args.checkpoint_every.is_some_and(|t| t > Time::ZERO) {
+        log::warn!("time travel does not record USB/IP traffic: going back past it will not see it again");
+    }
+    let default_on = args.gdb.is_some() || args.dashboard.is_some();
+    let inputs = vec![board_inputs.clone()];
+    let profiling = args.profile.is_some();
+    let mut tt =
+        time_travel(&mut session, inputs, args.checkpoint_every, args.checkpoint_memory, default_on, profiling);
     if let Some(addr) = &args.gdb {
         let listener = std::net::TcpListener::bind(addr).with_context(|| format!("binding {addr}"))?;
         log::info!("waiting for GDB on {addr}");
         // Stopped (SIGINT, SIGTERM while GDB was attached): the run below ends at once, with the usual summary
-        if sim_host::gdb::serve(&listener, &mut session)? == sim_host::gdb::Ended::Killed {
+        let ended = match &mut tt {
+            Some(tt) => {
+                let mut target = sim_host::gdb::Travel { tt, target: &mut session, board: 0 };
+                sim_host::gdb::serve_target(&listener, &mut target)?
+            }
+            None => sim_host::gdb::serve(&listener, &mut session)?,
+        };
+        if ended == sim_host::gdb::Ended::Killed {
             eprintln!("GDB ended the session at {}", session.machine.now);
             return Ok(());
         }
@@ -1146,6 +1239,7 @@ fn run(args: RunArgs) -> Result<()> {
             let mut d = sim_host::dashboard::Dashboard::start(addr, vec![info], buses)
                 .with_context(|| format!("binding {addr}"))?;
             d.pause_at(args.dashboard_pause_at);
+            d.travel = tt.take();
             d.tap_session(0, &mut session);
             if let Some(l) = link.take() {
                 d.add_link(Some(0), None, l);
@@ -1181,7 +1275,11 @@ fn run(args: RunArgs) -> Result<()> {
         let target = pending.as_ref().map_or(end, |f| f.0);
         // With a dashboard, run in short pieces so what it shows and what it is asked to do stay current
         let until = if dash.is_some() { target.min(session.machine.now + DASHBOARD_PIECE) } else { target };
-        let reason = session.run_until(until);
+        let reason = match (&mut dash, &mut tt) {
+            (Some(d), _) => d.run_session(&mut session, until),
+            (None, Some(tt)) => travel_reason(tt.run_until(&mut session, until)),
+            (None, None) => session.run_until(until),
+        };
         if let Some(d) = &mut dash {
             d.service_session(&mut session);
             while d.paused() && !sim_host::signal::requested() {
@@ -1204,6 +1302,9 @@ fn run(args: RunArgs) -> Result<()> {
         }
         let Some((_, fault)) = pending.take() else { break reason };
         let applied = sim_host::fault::apply_to_session(&mut session, bridge_ctl.as_deref(), &fault);
+        if let Some(tt) = dash.as_mut().and_then(|d| d.travel.as_mut()).or(tt.as_mut()) {
+            tt.changed(&mut session);
+        }
         if let Some(d) = &mut dash {
             d.note_fault(session.machine.now, "", &format!("{fault:?}"), &applied);
         }
@@ -1276,6 +1377,10 @@ fn run(args: RunArgs) -> Result<()> {
             where_(pc)
         ),
         StopReason::Deadlock => eprintln!("deadlock: every core sleeps and nothing is scheduled"),
+        StopReason::Watchpoint { core, pc, addr, kind, .. } => {
+            eprintln!("core{core} stopped at a {kind:?} watchpoint on {addr:#010x}, before {}", where_(pc))
+        }
+        StopReason::Reached { core, pc } => eprintln!("core{core} stopped at {}", where_(pc)),
         StopReason::Requested => {}
     }
     eprintln!(

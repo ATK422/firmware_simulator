@@ -32,6 +32,7 @@ use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 
 use rp2040::{Machine, StopReason};
+use sim_core::cpu::Cpu;
 use sim_core::time::Time;
 use sim_devices::can::{CanEndpoint, CanFrame};
 
@@ -925,7 +926,7 @@ impl TimeTravel {
             if inputs != self.last_inputs {
                 self.note_inputs(target);
             } else {
-                match self.replay_quiet(target, Goal::Time(end), Probe::Report) {
+                match self.replay_quiet(target, Goal::After(end), Probe::Report) {
                     Travelled::Frontier => {}
                     Travelled::Hit(h) => {
                         let board = match h.pos {
@@ -1049,7 +1050,7 @@ impl TimeTravel {
     }
 
     fn replay_entries(&mut self, target: &mut dyn Rewindable, goal: Goal, probe: &mut Probe) -> Travelled {
-        if let Goal::Pos(Pos::Boundary(t)) | Goal::Time(t) = goal
+        if let Goal::Pos(Pos::Boundary(t)) | Goal::Time(t) | Goal::After(t) = goal
             && self.here == Pos::Boundary(target.now())
             && target.now() >= t
         {
@@ -1081,25 +1082,30 @@ impl TimeTravel {
                     // A goal time or boundary in this run: run slice by slice up to it (in one go where slices are
                     // on a grid)
                     let goal_time = match goal {
-                        Goal::Time(t) => Some((t, false)),
-                        Goal::Pos(Pos::Boundary(t)) => Some((t, true)),
+                        Goal::Time(t) => Some((t, Within::AtOrBefore)),
+                        Goal::Pos(Pos::Boundary(t)) => Some((t, Within::Exact)),
+                        Goal::After(t) => Some((t, Within::AtOrAfter)),
                         Goal::Pos(Pos::At { .. }) => None,
                     };
                     loop {
                         let mut stop = run_end;
-                        if let Some((t, exact)) = goal_time
+                        if let Some((t, within)) = goal_time
                             && t < run_end
                         {
                             let b = target.next_boundary(run_end);
-                            if b > t || (exact && target.now() >= t) {
+                            let arrived = match within {
+                                Within::AtOrBefore => b > t,
+                                Within::Exact | Within::AtOrAfter => target.now() >= t,
+                            };
+                            if arrived {
                                 self.here = Pos::Boundary(target.now());
                                 self.advance_base();
                                 return Travelled::Arrived;
                             }
-                            stop = if target.exact_slices() {
-                                boundary_at_or_before(&*target, t, run_end).unwrap_or(b)
-                            } else {
-                                b
+                            stop = match (target.exact_slices(), within) {
+                                (false, _) => b,
+                                (true, Within::AtOrAfter) => boundary_at_or_after(&*target, t, run_end),
+                                (true, _) => boundary_at_or_before(&*target, t, run_end).unwrap_or(b),
                             };
                         }
                         self.arm(target, goal, recorded, probe);
@@ -1149,9 +1155,29 @@ impl TimeTravel {
                                     self.cursor = Cursor { entry: k + 1, inside: false };
                                 }
                                 if is_goal {
+                                    // A watchpoint hit by the step before: its stop would have come here
+                                    if let Probe::Collect { hits, .. } = probe
+                                        && let Some((c, addr, kind, at)) = target.session(board).machine.pending_watch()
+                                    {
+                                        let pc = target.session(board).machine.cores[c].pc();
+                                        let reason = StopReason::Watchpoint { core: c as u8, pc, addr, kind, at };
+                                        hits.push(Hit { pos: Pos::At { board, core: c, time: at }, reason });
+                                    }
                                     return Travelled::Arrived;
                                 }
                                 if is_recorded {
+                                    // The run stopped here (it may have been for a breakpoint that is set now): the
+                                    // position is reached first, so a breakpoint here is a hit as well
+                                    let m = &target.session(board).machine;
+                                    let pc = m.cores[core].pc();
+                                    if m.breakpoints.contains(&pc) && !m.cores[core].is_sleeping() {
+                                        let hit = Hit { pos, reason: StopReason::Breakpoint { core: core as u8, pc } };
+                                        match probe {
+                                            Probe::Report => return Travelled::Hit(hit),
+                                            Probe::Collect { hits, before } if pos != *before => hits.push(hit),
+                                            _ => {}
+                                        }
+                                    }
                                     break;
                                 }
                                 if matches!(reason, StopReason::Reached { .. }) {
@@ -1302,7 +1328,7 @@ impl TimeTravel {
     pub fn forward(&mut self, target: &mut dyn Rewindable, goal: Option<Pos>, until: Time) -> Travelled {
         let goal = match goal {
             Some(p) => Goal::Pos(p),
-            None => Goal::Time(until),
+            None => Goal::After(until),
         };
         self.replay_quiet(target, goal, Probe::Report)
     }
@@ -1418,6 +1444,15 @@ enum Goal {
     Pos(Pos),
     /// The last slice boundary at or before a time.
     Time(Time),
+    /// The first slice boundary at or after a time.
+    After(Time),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Within {
+    AtOrBefore,
+    Exact,
+    AtOrAfter,
 }
 
 /// Where a debugger stop left board `board`: the stopped core and the time on its clock.
@@ -1454,6 +1489,16 @@ fn boundary_at_or_before(target: &dyn Rewindable, t: Time, end: Time) -> Option<
     }
     let slice = target.slice().as_ps().max(1);
     Some(Time(b0.as_ps() + (t - b0).as_ps() / slice * slice).min(end))
+}
+
+/// The first slice boundary of a run to `end` from where `target` is (on a grid) that is at or after `t`.
+fn boundary_at_or_after(target: &dyn Rewindable, t: Time, end: Time) -> Time {
+    let b0 = target.next_boundary(end);
+    if t <= b0 {
+        return b0;
+    }
+    let slice = target.slice().as_ps().max(1);
+    Time(b0.as_ps() + (t - b0).as_ps().div_ceil(slice) * slice).min(end)
 }
 
 fn restore_from(

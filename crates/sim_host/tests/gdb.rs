@@ -385,3 +385,155 @@ fn breakpoints_stop_again_after_a_reset_or_a_pc_write() {
 fn hex_le(v: u32) -> String {
     v.to_le_bytes().iter().map(|b| format!("{b:02x}")).collect()
 }
+
+/// Serves `session` recorded for time travel (as `run --gdb` does): GDB can run it backwards.
+fn serve_travel(mut session: Session) -> (u16, std::sync::mpsc::Receiver<(Ended, Session)>) {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut tt = sim_host::timetravel::TimeTravel::new(&mut session, vec![]);
+        tt.every = sim_core::Time::from_ms(2);
+        let mut target = gdb::Travel { tt: &mut tt, target: &mut session, board: 0 };
+        let ended = gdb::serve_target(&listener, &mut target).unwrap();
+        let _ = tx.send((ended, session));
+    });
+    (port, rx)
+}
+
+/// The time on core 0's clock as `monitor time` says it (`core0 at T`), in seconds.
+fn core_time(c: &mut Client) -> String {
+    let out = c.monitor("time");
+    out.split("core0 at ").nth(1).map(|t| t.split(';').next().unwrap().to_string()).unwrap_or(out)
+}
+
+/// `reverse-continue` (`bc`) and `reverse-stepi` (`bs`): back to the previous breakpoint hit with the registers it
+/// had, step by step back over what ran, the start of the history, and forward again through it.
+#[test]
+fn reverse_continue_and_reverse_step() {
+    let (image, session) = blinky();
+    let main = image.symbol("main").unwrap().addr & !1;
+    let (port, rx) = serve_travel(session);
+    let mut c = Client::connect(port);
+    let sup = c.cmd("qSupported:swbreak+;hwbreak+");
+    assert!(sup.contains("ReverseStep+") && sup.contains("ReverseContinue+"), "{sup}");
+    assert!(c.monitor("help").contains("rewind"));
+
+    // Forward: main, then a few steps, remembering each PC and the registers
+    assert_eq!(c.cmd(&format!("Z0,{main:x},2")), "OK");
+    assert_eq!(c.cmd("vCont;c"), "T05thread:1;swbreak:;");
+    let at_main = c.cmd("g");
+    let main_time = core_time(&mut c);
+    let mut steps = vec![(c.cmd("g"), core_time(&mut c))];
+    for _ in 0..20 {
+        assert_eq!(c.cmd("vCont;s:1"), "T05thread:1;");
+        steps.push((c.cmd("g"), core_time(&mut c)));
+    }
+    // Back one step at a time: the same registers at each
+    for (regs, t) in steps.iter().rev().skip(1) {
+        assert_eq!(c.cmd("bs"), "T05thread:1;");
+        assert_eq!(&c.cmd("g"), regs);
+        assert_eq!(&core_time(&mut c), t);
+    }
+    // Forward again in the recorded history: the steps as they were
+    for (regs, _) in steps.iter().skip(1).take(5) {
+        assert_eq!(c.cmd("vCont;s:1"), "T05thread:1;");
+        assert_eq!(&c.cmd("g"), regs);
+    }
+    assert!(c.monitor("time").contains("in the recorded history"));
+
+    // Run on (live past the history), then back to the breakpoint in main
+    assert_eq!(c.cmd(&format!("z0,{main:x},2")), "OK");
+    c.send("c");
+    std::thread::sleep(Duration::from_millis(100));
+    c.send_raw(&[0x03]);
+    assert_eq!(c.reply(), "T02thread:1;");
+    assert!(c.monitor("time").contains("live"));
+    assert_eq!(c.cmd(&format!("Z0,{main:x},2")), "OK");
+    assert_eq!(c.cmd("bc"), "T05thread:1;swbreak:;");
+    assert_eq!(c.cmd("g"), at_main);
+    assert_eq!(core_time(&mut c), main_time);
+    // Nothing earlier: the start of the history, at the reset vector
+    assert_eq!(c.cmd("bc"), "T05replaylog:begin;thread:1;");
+    assert_eq!(le_hex_to_u32(&c.cmd("p0f")), image.symbol("Reset").unwrap().addr & !1);
+    // Forward to main again
+    assert_eq!(c.cmd("vCont;c"), "T05thread:1;swbreak:;");
+    assert_eq!(c.cmd("g"), at_main);
+
+    // monitor rewind goes to a time
+    assert!(c.monitor("rewind 1ms").starts_with("at 0.001"), "rewound");
+    assert!(c.monitor("checkpoints").contains("checkpoints"));
+    c.send_raw(b"$D#44");
+    assert_eq!(c.reply(), "OK");
+    assert_eq!(ended(&rx).0, Ended::Detached);
+}
+
+/// Watchpoints (`Z2` write, `Z3` read, `Z4` access) stop after the access; going back to one stops before the
+/// instruction that made it.
+#[test]
+fn watchpoints_both_ways() {
+    let (image, session) = blinky();
+    let main = image.symbol("main").unwrap().addr & !1;
+    let (port, rx) = serve_travel(session);
+    let mut c = Client::connect(port);
+    assert_eq!(c.cmd(&format!("Z0,{main:x},2")), "OK");
+    assert_eq!(c.cmd("vCont;c"), "T05thread:1;swbreak:;");
+    assert_eq!(c.cmd(&format!("z0,{main:x},2")), "OK");
+    // A word just below the stack pointer: the next call writes it
+    let sp = le_hex_to_u32(&c.cmd("p0d"));
+    let addr = sp - 4;
+    assert_eq!(c.cmd(&format!("Z2,{addr:x},4")), "OK");
+    let r = c.cmd("vCont;c");
+    assert_eq!(r, format!("T05thread:1;watch:{addr:x};"));
+    let written = c.cmd(&format!("m{addr:x},4"));
+    let after_pc = le_hex_to_u32(&c.cmd("p0f"));
+    // Back: before the write, the old value there
+    assert_eq!(c.cmd("bc"), format!("T05thread:1;watch:{addr:x};"));
+    let before_pc = le_hex_to_u32(&c.cmd("p0f"));
+    assert_ne!(before_pc, after_pc);
+    // One step forward makes the write again
+    assert_eq!(c.cmd(&format!("z2,{addr:x},4")), "OK");
+    assert_eq!(c.cmd("vCont;s:1"), "T05thread:1;");
+    assert_eq!(c.cmd(&format!("m{addr:x},4")), written);
+    assert_eq!(le_hex_to_u32(&c.cmd("p0f")), after_pc);
+    // Read and access watchpoints are accepted and removed
+    for z in ["3", "4"] {
+        assert_eq!(c.cmd(&format!("Z{z},{addr:x},4")), "OK");
+        assert_eq!(c.cmd(&format!("z{z},{addr:x},4")), "OK");
+    }
+    c.send_raw(b"$D#44");
+    assert_eq!(c.reply(), "OK");
+    assert_eq!(ended(&rx).0, Ended::Detached);
+}
+
+/// A register written in the past is part of the run from then on: the recorded future is dropped, and going back
+/// and forward again over the write makes it again.
+#[test]
+fn writes_in_the_past_change_the_run_from_there() {
+    let (image, session) = blinky();
+    let main = image.symbol("main").unwrap().addr & !1;
+    let (port, rx) = serve_travel(session);
+    let mut c = Client::connect(port);
+    assert_eq!(c.cmd(&format!("Z0,{main:x},2")), "OK");
+    assert_eq!(c.cmd("vCont;c"), "T05thread:1;swbreak:;");
+    for _ in 0..5 {
+        c.cmd("vCont;s:1");
+    }
+    for _ in 0..3 {
+        assert_eq!(c.cmd("bs"), "T05thread:1;");
+    }
+    assert!(c.monitor("time").contains("in the recorded history"));
+    assert_eq!(c.cmd("P8=78563412"), "OK");
+    assert!(c.monitor("time").contains("live"), "the future after a write is dropped");
+    assert_eq!(c.cmd("vCont;s:1"), "T05thread:1;");
+    let regs = c.cmd("g");
+    assert_eq!(c.cmd("bs"), "T05thread:1;");
+    assert_eq!(c.cmd("bs"), "T05thread:1;");
+    assert_ne!(le_hex_to_u32(&c.cmd("p08")), 0x1234_5678, "before the write");
+    assert_eq!(c.cmd("vCont;s:1"), "T05thread:1;");
+    assert_eq!(c.cmd("vCont;s:1"), "T05thread:1;");
+    assert_eq!(c.cmd("g"), regs, "the write made again");
+    c.send_raw(b"$D#44");
+    assert_eq!(c.reply(), "OK");
+    assert_eq!(ended(&rx).0, Ended::Detached);
+}

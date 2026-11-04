@@ -497,6 +497,12 @@ impl Machine {
         sp_ok && pc_ok
     }
 
+    /// A watchpoint hit whose stop is still to come (the core stops before its next step): `(core, watched address,
+    /// kind, the time the accessing step started)`.
+    pub fn pending_watch(&self) -> Option<(usize, u32, WatchKind, Time)> {
+        self.watch_stop
+    }
+
     /// Asks [`Machine::run_until`] to return at the next instruction boundary.
     pub fn request_stop(&mut self) {
         self.stop_requested = true;
