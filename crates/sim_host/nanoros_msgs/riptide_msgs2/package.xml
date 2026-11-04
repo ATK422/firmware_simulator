@@ -1,0 +1,6 @@
+<?xml version="1.0"?>
+<!-- Only the message definitions the emulator's nano-ROS mock agent (and nano_ros_codegen, as --ros-prefix) need.
+     From osu-uwrt/riptide_core's riptide_msgs (BSD), comments and constants kept. -->
+<package format="3">
+  <name>riptide_msgs2</name>
+</package>

@@ -24,7 +24,7 @@ For contributors. The design and its reasons are in [PLAN.md](../PLAN.md); this 
 | [`sim_devices`](../crates/sim_devices) | External chips, SoC independent: the SPI/I2C/UART/pin device traits, the CAN bus, MCP2517FD/MCP2518FD, W5500, the sensors, the PIO-driven devices, the USB host controller, fault injectors |
 | [`sim_acoustics`](../crates/sim_acoustics) | Water, transducers, receive chains, sources, the image method, the shared medium. No board knowledge |
 | [`sim_physics`](../crates/sim_physics) | The 6-DOF vehicle model. No board knowledge |
-| [`sim_host`](../crates/sim_host) | Everything that connects a machine to the world: `Session` (a board plus RTT/defmt, UARTs, CAN, Ethernet, USB host side), `Robot`, board and robot files, mock bridges, SocketCAN, Ethernet/UDP, GDB, ptys, USB tools and USB/IP, CAN logs, `can-diff`, cannelloni, `bridges`, the bootloader upload, fault application, vehicles |
+| [`sim_host`](../crates/sim_host) | Everything that connects a machine to the world: `Session` (a board plus RTT/defmt, UARTs, CAN, Ethernet, USB host side), `Robot`, board and robot files, mock bridges and the protocol-neutral mock agents (`host_protocol`, the nano-ROS agent in `nanoros`: [nanoros.md](nanoros.md)), SocketCAN, Ethernet/UDP, GDB, ptys, USB tools and USB/IP, CAN logs, `can-diff`, cannelloni, `bridges`, the bootloader upload, fault application, vehicles |
 | [`sim_test`](../crates/sim_test) | The test harness: `Bench`, `RobotBench`, `sweep` ([testing.md](testing.md)) |
 | `firmware_simulator` (root) | The command line (`src/main.rs`, `src/host_tools.rs`) |
 

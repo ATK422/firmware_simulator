@@ -54,4 +54,20 @@ c_ivc_pinger:
 	ninja -C ../build/c/c_ivc_pinger
 	arm-none-eabi-strip --strip-debug -o c_ivc_pinger/c_ivc_pinger.elf ../build/c/c_ivc_pinger/c_ivc_pinger.elf
 
-.PHONY: all clean pico c_dual_usb c_ivc_modem c_ivc_pinger
+# osu-uwrt/nano_ros's libnanoros in a small board program (CMake, against titan_firmware and a nano_ros checkout,
+# neither modified): nano_ros_codegen (built in the checkout: cargo build --release in nano_ros_codegen) generates
+# the topic code from ros.toml into ../build/c/nanoros_led/gen, with the emulator's .msg files as the ROS install.
+# REPO_DIR (optional) is a titan_firmware checkout with its pico-sdk, by default ../external/titan_firmware.
+NANO_ROS_DIR ?= $(HOME)/nano_ros
+NANO_ROS_CODEGEN ?= $(NANO_ROS_DIR)/nano_ros_codegen/target/release/nano_ros_codegen
+NANOROS_GEN = $(abspath ../build/c/nanoros_led/gen)
+nanoros_led:
+	mkdir -p $(NANOROS_GEN)
+	cp nanoros_led/ros.toml $(NANOROS_GEN)/
+	$(NANO_ROS_CODEGEN) $(NANOROS_GEN)/ros.toml --ros-prefix ../crates/sim_host/nanoros_msgs --user-msgs ../crates/sim_host/nanoros_msgs
+	cmake -G Ninja -S nanoros_led -B ../build/c/nanoros_led/build -DNANO_ROS_DIR=$(abspath $(NANO_ROS_DIR)) \
+		-DNANO_ROS_GEN_DIR=$(NANOROS_GEN)/generated $(if $(REPO_DIR),-DREPO_DIR=$(abspath $(REPO_DIR)))
+	ninja -C ../build/c/nanoros_led/build
+	arm-none-eabi-strip --strip-debug -o nanoros_led/nanoros_led.elf ../build/c/nanoros_led/build/nanoros_led.elf
+
+.PHONY: all clean pico c_dual_usb c_ivc_modem c_ivc_pinger nanoros_led
