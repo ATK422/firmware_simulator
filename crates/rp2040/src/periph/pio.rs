@@ -77,11 +77,37 @@ struct Sm {
     next_cycle: u64,
     /// Values of the last OUT/SET to pins, re-asserted with OUT_STICKY.
     sticky: Option<(u32, u32, u32)>,
-    /// Watching for a pure loop: the registers after a pure tick, the tick index they are at, and the pure ticks
-    /// since.
-    probe: Option<(Regs, u64, u32)>,
-    /// In a pure loop of this many ticks, not ticked through it: the registers hold the state at tick `next_k`.
-    looping: Option<u64>,
+    /// Watching for a pure loop.
+    probe: Option<Probe>,
+    /// In a pure loop, not ticked through it: the registers hold the state at tick `next_k`.
+    looping: Option<Looping>,
+}
+
+/// Watching a state machine for a pure loop: the registers after a pure tick, the tick index they are at, the pure
+/// ticks since, the addresses of the instructions they executed (a bit each), and after how many ticks to start
+/// watching afresh if the machine has not come back (Brent's cycle detection: 1, 2, 4... up to 64, so that a loop is
+/// found wherever the watching started).
+#[derive(Clone, Copy, Debug)]
+struct Probe {
+    start: Regs,
+    at: u64,
+    ticks: u32,
+    pcs: u32,
+    window: u32,
+}
+
+/// A pure loop a state machine is not ticked through (see [`Pio::run`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Looping {
+    /// Ticks per iteration.
+    period: u64,
+    /// A counted loop: X (false) or Y (true) drops by one each iteration, in its only `JMP X--`/`JMP Y--`, and
+    /// nothing else reads or writes it. Iterations repeat while the counter is not zero at the loop's start (the
+    /// state at `next_k`); the iteration that starts with it at zero is ticked again. With the `clk_sys` cycle of
+    /// that iteration's first tick.
+    counted: Option<(bool, u64)>,
+    /// The GPIOs the loop reads: it repeats as long as they do not change.
+    pins: u32,
 }
 
 /// The registers a pure loop can change (with the PC), compared to find one.
@@ -235,6 +261,16 @@ impl Sm {
         self.probe = None;
     }
 
+    /// X (`false`) or Y.
+    fn counter(&self, y: bool) -> u32 {
+        if y { self.y } else { self.x }
+    }
+
+    fn count_down(&mut self, y: bool, n: u32) {
+        let r = if y { &mut self.y } else { &mut self.x };
+        *r = r.wrapping_sub(n);
+    }
+
     fn regs(&self) -> Regs {
         Regs {
             pc: self.pc,
@@ -303,6 +339,21 @@ pub struct Pio {
     pub executed: u64,
     /// Whether pure loops may be skipped (see the module docs); off only to test that skipping changes nothing.
     pub skip_loops: bool,
+    /// Whether counted loops (see [`Looping::counted`]) may be skipped too (with `skip_loops`); off only to test
+    /// that skipping them changes nothing.
+    pub skip_counted: bool,
+    /// Iterations of counted loops skipped (for statistics and tests).
+    pub counted_skipped: u64,
+    /// Whether loops (and loops being watched for) go on through input changes on pins they do not read; off only
+    /// to test that this changes nothing.
+    pub loop_inputs: bool,
+    /// The block ran up to `cycle` and nothing has changed it since: each state machine's next tick that can do
+    /// anything (as [`Pio::wake`] gives them), and the first of them. A run to before that tick only moves `cycle`.
+    idle: Option<([u64; NUM_SM], u64)>,
+    /// Whether [`Pio::run`] and [`Pio::idle_through`] use `idle`, and [`Pio::run`] works out again only the next
+    /// ticks that may have changed (of the machines that ticked, and stalled ones); off only to test that this
+    /// changes nothing.
+    pub fast_run: bool,
     /// Whether the program allows skipping, if known: no instruction in memory waits on an IRQ flag or executes
     /// data, and no state machine re-asserts sticky outputs (those make stalled machines' retries matter).
     skippable: Option<bool>,
@@ -341,6 +392,11 @@ impl Pio {
             outputs_changed: false,
             executed: 0,
             skip_loops: true,
+            skip_counted: true,
+            counted_skipped: 0,
+            loop_inputs: true,
+            idle: None,
+            fast_run: true,
             skippable: None,
         }
     }
@@ -348,10 +404,13 @@ impl Pio {
     /// Back to the reset state, keeping the cycle count.
     pub fn reset(&mut self) {
         let cycle = self.cycle;
-        let skip = self.skip_loops;
+        let (skip, counted, inputs, idle) = (self.skip_loops, self.skip_counted, self.loop_inputs, self.fast_run);
         *self = Pio::new(self.index);
         self.cycle = cycle;
         self.skip_loops = skip;
+        self.skip_counted = counted;
+        self.loop_inputs = inputs;
+        self.fast_run = idle;
     }
 
     /// Something outside the state machines changed (inputs, FIFOs, registers): stalled machines retry, and
@@ -386,29 +445,43 @@ impl Pio {
     /// and ends the skipping.
     fn materialize(&mut self) {
         for i in 0..NUM_SM {
-            let Some(period) = self.sm[i].looping.take() else { continue };
-            let s = &self.sm[i];
-            // Ticks at or before the block's cycle have happened
-            let target = s.first_tick_after(self.cycle);
-            if target <= s.next_k {
-                continue;
-            }
-            let n = target - s.next_k;
-            // Whole iterations change nothing; the rest of one is ticked
-            let k = self.sm[i].next_k + n / period * period;
-            self.sm[i].set_next(k);
-            if n >= period {
-                self.epoch += 1;
-            }
-            let inputs = self.last_inputs;
-            while self.sm[i].next_k < target {
-                let k = self.sm[i].next_k;
-                self.tick(i, k, inputs);
-            }
-            // (The ticks may have seen the loop again: start afresh from the next one)
-            self.sm[i].looping = None;
-            self.sm[i].probe = None;
+            self.materialize_sm(i);
         }
+    }
+
+    /// [`Pio::materialize`] for state machine `i`.
+    fn materialize_sm(&mut self, i: usize) {
+        let Some(Looping { period, counted, .. }) = self.sm[i].looping.take() else { return };
+        let s = &self.sm[i];
+        // Ticks at or before the block's cycle have happened
+        let target = s.first_tick_after(self.cycle);
+        if target <= s.next_k {
+            return;
+        }
+        let n = target - s.next_k;
+        // Whole iterations change nothing (but a counted loop's counter); the rest of one is ticked
+        let whole = match counted {
+            Some((y, _)) => {
+                let whole = (n / period).min(self.sm[i].counter(y) as u64);
+                self.sm[i].count_down(y, whole as u32);
+                self.counted_skipped += whole;
+                whole
+            }
+            None => n / period,
+        };
+        let k = self.sm[i].next_k + whole * period;
+        self.sm[i].set_next(k);
+        if whole > 0 {
+            self.epoch += 1;
+        }
+        let inputs = self.last_inputs;
+        while self.sm[i].next_k < target {
+            let k = self.sm[i].next_k;
+            self.tick(i, k, inputs);
+        }
+        // (The ticks may have seen the loop again: start afresh from the next one)
+        self.sm[i].looping = None;
+        self.sm[i].probe = None;
     }
 
     /// Whether instruction `instr` of state machine `i`, which just completed with `outcome`, is pure: it reads
@@ -446,13 +519,18 @@ impl Pio {
     }
 
     /// Cycle of the next tick of state machine `i` that can do anything, or `u64::MAX`.
+    #[inline]
     fn wake(&self, i: usize) -> u64 {
         if self.enabled & (1 << i) == 0 {
             return u64::MAX;
         }
         let s = &self.sm[i];
-        if s.stalled && s.stall_epoch == self.epoch || s.looping.is_some() {
+        if s.stalled && s.stall_epoch == self.epoch {
             return u64::MAX;
+        }
+        if let Some(l) = s.looping {
+            // A counted loop ends, and is ticked again, at the iteration starting with the counter at zero
+            return l.counted.map_or(u64::MAX, |(_, exit)| exit);
         }
         let next = s.next_cycle;
         if s.stalled && next <= self.cycle {
@@ -466,22 +544,57 @@ impl Pio {
     /// Runs the block until `until` (a `clk_sys` cycle) with the GPIOs reading `inputs`. Returns early when the
     /// block's pin outputs change.
     pub fn run(&mut self, until: u64, inputs: u32) -> Stop {
+        let cached = match self.idle.take() {
+            Some((wakes, next)) if self.fast_run && inputs == self.last_inputs => {
+                if next > until {
+                    self.cycle = self.cycle.max(until);
+                    self.idle = Some((wakes, next));
+                    return Stop::Reached;
+                }
+                Some(wakes)
+            }
+            _ => None,
+        };
         if inputs != self.last_inputs {
-            // Loops ran with the old inputs up to now
-            self.materialize();
+            let changed = inputs ^ self.last_inputs;
+            for i in 0..NUM_SM {
+                if self.loop_inputs {
+                    // Loops and loops being watched for that read none of the pins that changed go on
+                    let reads = match (self.sm[i].looping, self.sm[i].probe) {
+                        (Some(l), _) => Some(l.pins),
+                        (None, Some(p)) => Some(self.pins_read(i, p.pcs)),
+                        (None, None) => None,
+                    };
+                    if reads.is_some_and(|pins| pins & changed == 0) {
+                        continue;
+                    }
+                }
+                // Loops ran with the old inputs up to now
+                self.materialize_sm(i);
+                self.sm[i].probe = None;
+            }
             self.last_inputs = inputs;
-            self.bump();
+            // Stalled machines retry
+            self.epoch += 1;
         }
+        let mut wakes = cached.unwrap_or_else(|| std::array::from_fn(|i| self.wake(i)));
         loop {
-            let wakes: [u64; NUM_SM] = std::array::from_fn(|i| self.wake(i));
+            if !self.fast_run {
+                wakes = std::array::from_fn(|i| self.wake(i));
+            }
             let next = wakes.iter().copied().min().unwrap_or(u64::MAX);
             if next > until {
                 self.cycle = self.cycle.max(until);
+                // (A machine retrying a stall would retry at the same tick after the new cycle: `next` is beyond it)
+                self.idle = Some((wakes, next));
                 return Stop::Reached;
             }
             self.cycle = next;
             for (i, &wake) in wakes.iter().enumerate() {
                 if wake == next {
+                    if self.sm[i].looping.is_some() {
+                        self.end_counted_loop(i);
+                    }
                     let k = {
                         let s = &self.sm[i];
                         if s.stalled && s.next_cycle < next {
@@ -493,11 +606,30 @@ impl Pio {
                     self.tick(i, k, inputs);
                 }
             }
+            if self.fast_run {
+                // Only a machine's own ticks change its next one, but for a stalled machine, which retries after any
+                // change (and a counted loop's end, the tick it was in when it ended)
+                for (i, wake) in wakes.iter_mut().enumerate() {
+                    if *wake == next || self.sm[i].stalled {
+                        *wake = self.wake(i);
+                    }
+                }
+            }
             if self.outputs_changed {
                 self.outputs_changed = false;
+                if self.fast_run {
+                    self.idle = Some((wakes, wakes.iter().copied().min().unwrap_or(u64::MAX)));
+                }
                 return Stop::Outputs;
             }
         }
+    }
+
+    /// Whether running to `until` with the GPIOs reading `inputs` would only move `cycle` there: the block ran
+    /// before and has not been changed since, the inputs are the same and no tick that can do anything comes before.
+    #[inline]
+    pub fn idle_through(&self, until: u64, inputs: u32) -> bool {
+        self.fast_run && inputs == self.last_inputs && self.idle.is_some_and(|(_, next)| next > until)
     }
 
     /// The pins a state machine sees: GPIOs rotated so that `base` is bit 0.
@@ -530,6 +662,7 @@ impl Pio {
 
     /// One tick of state machine `i`, tick index `k`.
     fn tick(&mut self, i: usize, k: u64, inputs: u32) {
+        let pc = self.sm[i].pc;
         let (instr, from_mem) = match self.sm[i].exec {
             Some(e) => (e, false),
             None => (self.instr[self.sm[i].pc as usize & 31], true),
@@ -596,12 +729,12 @@ impl Pio {
         {
             self.write_pins(base, count, v, false);
         }
-        self.watch_for_loop(i, instr, from_mem, outcome);
+        self.watch_for_loop(i, instr, pc, from_mem, outcome);
     }
 
     /// Notes a pure tick of state machine `i`; once the machine is back where a run of pure ticks started, with the
     /// same registers, it is in a loop that repeats until something outside it changes.
-    fn watch_for_loop(&mut self, i: usize, instr: u16, from_mem: bool, outcome: Outcome) {
+    fn watch_for_loop(&mut self, i: usize, instr: u16, pc: u8, from_mem: bool, outcome: Outcome) {
         if !self.skip_loops {
             return;
         }
@@ -610,20 +743,126 @@ impl Pio {
             return;
         }
         let s = &self.sm[i];
-        let regs = s.regs();
         let k = s.next_k;
-        match s.probe {
-            Some((start, at, _)) if start == regs => {
-                if self.skippable() {
-                    let s = &mut self.sm[i];
-                    s.looping = Some(k - at);
-                    s.probe = None;
+        let bit = 1 << (pc & 31);
+        let probe = match s.probe {
+            // Back at the address watching started from: a loop if the registers are the same, or a counted one
+            Some(p) if p.start.pc == s.pc => {
+                let regs = s.regs();
+                if regs == p.start {
+                    if self.skippable() {
+                        let pins = self.pins_read(i, p.pcs | bit);
+                        let s = &mut self.sm[i];
+                        s.looping = Some(Looping { period: k - p.at, counted: None, pins });
+                        s.probe = None;
+                    }
+                    return;
                 }
+                if let Some(y) = self.counts_down(p.start, regs, p.pcs | bit) {
+                    if self.skippable() {
+                        let pins = self.pins_read(i, p.pcs | bit);
+                        let s = &mut self.sm[i];
+                        let period = k - p.at;
+                        let left = s.counter(y) as u64;
+                        if left > 0 {
+                            let exit = s.tick_cycle(k + left * period);
+                            s.looping = Some(Looping { period, counted: Some((y, exit)), pins });
+                        }
+                        s.probe = None;
+                    }
+                    return;
+                }
+                Some(p)
             }
-            // Loops are short; start again from here if this one did not close
-            Some((start, at, n)) if n < 64 => self.sm[i].probe = Some((start, at, n + 1)),
-            _ => self.sm[i].probe = Some((regs, k, 0)),
+            p => p,
+        };
+        let s = &mut self.sm[i];
+        s.probe = Some(match probe {
+            Some(p) if p.ticks + 1 < p.window => Probe { ticks: p.ticks + 1, pcs: p.pcs | bit, ..p },
+            // Loops are short; watch afresh from here if this one did not close
+            p => {
+                let window = p.map_or(1, |p| (p.window * 2).min(64));
+                Probe { start: s.regs(), at: k, ticks: 0, pcs: 0, window }
+            }
+        });
+    }
+
+    /// The GPIOs the pure instructions at the addresses in `pcs` read when state machine `i` executes them.
+    fn pins_read(&self, i: usize, pcs: u32) -> u32 {
+        let s = &self.sm[i];
+        let mut pins = 0;
+        let mut rest = pcs;
+        while rest != 0 {
+            let at = rest.trailing_zeros();
+            rest &= rest - 1;
+            let i = self.instr[at as usize];
+            let arg2 = (i & 0x1F) as u32;
+            pins |= match (i >> 13, (i >> 5) & 7) {
+                // JMP PIN
+                (0, 6) => 1 << ((s.execctrl >> 24) & 0x1F),
+                // WAIT GPIO, WAIT PIN
+                (1, src) if src & 3 == 0 => 1 << arg2,
+                (1, src) if src & 3 == 1 => 1 << ((s.in_base() + arg2) % 32),
+                // MOV from PINS
+                (5, _) if i & 7 == 0 => u32::MAX,
+                _ => 0,
+            };
         }
+        pins
+    }
+
+    /// Whether pure ticks from `start` to `now`, executing the instructions at the addresses in `pcs`, went once
+    /// round a counted loop (see [`Looping::counted`]): back at the same address with the same registers but X or
+    /// Y one less, decremented by a `JMP X--`/`JMP Y--` that saw it non-zero (so jumped) and nothing else reading
+    /// or writing it. Gives the counter (`true`: Y).
+    fn counts_down(&self, start: Regs, now: Regs, pcs: u32) -> Option<bool> {
+        if !self.skip_counted {
+            return None;
+        }
+        let y = if start.x != 0 && now == (Regs { x: start.x.wrapping_sub(1), ..start }) {
+            false
+        } else if start.y != 0 && now == (Regs { y: start.y.wrapping_sub(1), ..start }) {
+            true
+        } else {
+            return None;
+        };
+        // The MOV/SET destination and MOV source number, and the JMP conditions other than the decrement, that name
+        // the counter (X != Y names both)
+        let (reg, test, both) = if y { (2, 3, 5) } else { (1, 1, 5) };
+        let mut rest = pcs;
+        while rest != 0 {
+            let at = rest.trailing_zeros();
+            rest &= rest - 1;
+            let i = self.instr[at as usize];
+            let arg1 = (i >> 5) & 7;
+            let other = match i >> 13 {
+                0 => arg1 != test && arg1 != both,
+                5 => arg1 != reg && i & 7 != reg,
+                7 => arg1 != reg,
+                // WAIT: no registers (the others are not pure)
+                1 => true,
+                _ => false,
+            };
+            if !other {
+                return None;
+            }
+        }
+        Some(y)
+    }
+
+    /// State machine `i` reached the end of the counted loop it was not ticked through: whole iterations bring the
+    /// counter to zero, and the iteration starting with it at zero is ticked.
+    fn end_counted_loop(&mut self, i: usize) {
+        let Some(Looping { period, counted: Some((y, _)), .. }) = self.sm[i].looping else { return };
+        let s = &mut self.sm[i];
+        s.looping = None;
+        let left = s.counter(y);
+        s.count_down(y, left);
+        let k = s.next_k + left as u64 * period;
+        s.set_next(k);
+        s.probe = None;
+        self.counted_skipped += left as u64;
+        self.epoch += 1;
     }
 
     fn status(&self, i: usize) -> u32 {
@@ -934,6 +1173,7 @@ impl Pio {
     /// Executes an instruction written to SMx_INSTR: immediately (at the current cycle), whether or not the state
     /// machine is enabled. If it stalls it stays pending and is retried on the state machine's ticks.
     fn force(&mut self, i: usize, instr: u16, inputs: u32) {
+        self.idle = None;
         self.sm[i].exec = Some(instr);
         self.sm[i].issued = false;
         self.sm[i].stalled = false;
@@ -955,6 +1195,7 @@ impl Pio {
 
     pub fn read(&mut self, offset: u32) -> Option<u32> {
         if !Self::read_is_pure(offset) {
+            self.idle = None;
             self.materialize();
         }
         Some(match offset {
@@ -1045,6 +1286,7 @@ impl Pio {
 
     /// A register write at the block's current cycle (run the block up to the write's time first).
     pub fn write(&mut self, offset: u32, value: u32, mode: WriteMode, inputs: u32) -> bool {
+        self.idle = None;
         self.materialize();
         self.skippable = None;
         self.bump();

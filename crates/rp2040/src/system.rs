@@ -781,31 +781,42 @@ impl System {
         let target = self.pio_cycle(now);
         // When both blocks run, neither gets more than this many cycles ahead of the other
         const MAX_SKEW: u64 = 32;
-        loop {
-            let wire_t = self.wire.next_time().filter(|&t| t <= now);
-            let seg_end = wire_t.map_or(target, |t| self.pio_cycle(t).min(target));
-            let both = self.pio[0].busy() && self.pio[1].busy();
-            let b = (self.pio[1].cycle < self.pio[0].cycle) as usize;
-            if self.pio[b].cycle < seg_end {
-                let limit = if both { seg_end.min(self.pio[1 - b].cycle + MAX_SKEW) } else { seg_end };
-                let inputs = self.gpio.inputs();
-                if self.pio[b].run(limit, inputs) == pio::Stop::Outputs {
-                    let t = self.pio_time(self.pio[b].cycle);
-                    self.update_pins(trace, t);
-                }
-                continue;
+        let inputs = self.gpio.inputs();
+        let idle = self.wire.next_time().is_none_or(|t| t > now)
+            && self.pio[0].idle_through(target, inputs)
+            && self.pio[1].idle_through(target, inputs);
+        if idle {
+            // What the loop below would do: run both blocks there with nothing to tick
+            for p in &mut self.pio {
+                p.cycle = p.cycle.max(target);
             }
-            if self.pio[1 - b].cycle < seg_end {
-                let inputs = self.gpio.inputs();
-                if self.pio[1 - b].run(seg_end, inputs) == pio::Stop::Outputs {
-                    let t = self.pio_time(self.pio[1 - b].cycle);
-                    self.update_pins(trace, t);
+        } else {
+            loop {
+                let wire_t = self.wire.next_time().filter(|&t| t <= now);
+                let seg_end = wire_t.map_or(target, |t| self.pio_cycle(t).min(target));
+                let both = self.pio[0].busy() && self.pio[1].busy();
+                let b = (self.pio[1].cycle < self.pio[0].cycle) as usize;
+                if self.pio[b].cycle < seg_end {
+                    let limit = if both { seg_end.min(self.pio[1 - b].cycle + MAX_SKEW) } else { seg_end };
+                    let inputs = self.gpio.inputs();
+                    if self.pio[b].run(limit, inputs) == pio::Stop::Outputs {
+                        let t = self.pio_time(self.pio[b].cycle);
+                        self.update_pins(trace, t);
+                    }
+                    continue;
                 }
-                continue;
-            }
-            match wire_t {
-                Some(t) if self.pio_cycle(t) <= seg_end => self.apply_wire(trace, t),
-                _ => break,
+                if self.pio[1 - b].cycle < seg_end {
+                    let inputs = self.gpio.inputs();
+                    if self.pio[1 - b].run(seg_end, inputs) == pio::Stop::Outputs {
+                        let t = self.pio_time(self.pio[1 - b].cycle);
+                        self.update_pins(trace, t);
+                    }
+                    continue;
+                }
+                match wire_t {
+                    Some(t) if self.pio_cycle(t) <= seg_end => self.apply_wire(trace, t),
+                    _ => break,
+                }
             }
         }
         self.in_pio = false;
@@ -814,7 +825,7 @@ impl System {
             self.pio_lines = lines;
             self.irq_dirty = true;
         }
-        if self.pio.iter().any(|p| p.busy()) {
+        if self.pio[0].busy() || self.pio[1].busy() {
             self.sched.schedule(Event::Pio, now + Time::from_us(1));
         } else {
             self.sched.cancel(Event::Pio);

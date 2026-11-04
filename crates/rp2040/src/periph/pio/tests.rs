@@ -447,11 +447,27 @@ fn random_program(r: &mut Rng, len: u16) -> Vec<u16> {
 /// Runs the same random scenario on a block with loop skipping and one without, comparing what can be seen at every
 /// step: run results, pins, FIFOs, registers.
 fn compare_scenario(seed: u64, prog: Option<Vec<u16>>) -> u64 {
+    compare_configs(seed, prog, SLOW, FAST).0
+}
+
+/// Every fast path off: `skip_loops`, `skip_counted`, `loop_inputs`, `fast_run`.
+const SLOW: [bool; 4] = [false; 4];
+/// Every fast path on.
+const FAST: [bool; 4] = [true; 4];
+
+fn configure(p: &mut Pio, [skip, counted, inputs, fast]: [bool; 4]) {
+    (p.skip_loops, p.skip_counted, p.loop_inputs, p.fast_run) = (skip, counted, inputs, fast);
+}
+
+/// [`compare_scenario`] with `skip_loops`, `skip_counted`, `loop_inputs` and `fast_run` set as given on the two
+/// blocks. Returns the ticks the second block skipped (of those the first ticked) and the counted loop iterations
+/// it skipped.
+fn compare_configs(seed: u64, prog: Option<Vec<u16>>, first: [bool; 4], second: [bool; 4]) -> (u64, u64) {
     let mut r = Rng(seed | 1);
     let len = 3 + r.below(10) as u16;
     let prog = prog.unwrap_or_else(|| random_program(&mut r, len));
     let mut a = pio(&prog);
-    a.skip_loops = false;
+    configure(&mut a, first);
     for sm in 0..4 {
         let wrap_top = (prog.len() as u32 - 1) << 12;
         let status = (r.below(2) as u32) << 4 | r.below(4) as u32; // STATUS_SEL, STATUS_N
@@ -463,7 +479,7 @@ fn compare_scenario(seed: u64, prog: Option<Vec<u16>>) -> u64 {
         w(&mut a, reg(sm, SMINSTR), jmp(0, r.below(prog.len() as u64) as u16) as u32);
     }
     let mut b = a.clone();
-    b.skip_loops = true;
+    configure(&mut b, second);
     start(&mut a, 1 + r.below(15) as u32);
     start(&mut b, a.read(CTRL).unwrap());
     let mut inputs = r.next() as u32;
@@ -497,7 +513,7 @@ fn compare_scenario(seed: u64, prog: Option<Vec<u16>>) -> u64 {
             }
         }
     }
-    a.executed - b.executed
+    (a.executed - b.executed, b.counted_skipped)
 }
 
 #[test]
@@ -507,6 +523,101 @@ fn skipped_loops_match_ticking_on_random_programs() {
         skipped += compare_scenario(0x5EED_0000 + seed, None);
     }
     assert!(skipped > 100_000, "loops were skipped: {skipped} ticks");
+}
+
+/// A random program built round counted loops: SET X or Y, a few pure instructions (JMP PIN out of the loop, a
+/// delay, WAIT on a pin, MOV to the other register), `JMP X--`/`JMP Y--` back, then random instructions.
+fn counted_program(r: &mut Rng) -> Vec<u16> {
+    let y = r.below(2) as u16;
+    let (reg, dec, other) = if y == 1 { (2, 4, 1) } else { (1, 2, 2) };
+    let body = 1 + r.below(3) as u16;
+    let len = 2 + body + 1 + r.below(4) as u16;
+    let mut prog = vec![set(reg, r.below(32) as u16)];
+    for _ in 0..body {
+        let i = match r.below(5) {
+            0 => jmp(6, (r.below(len as u64)) as u16),
+            1 => wait(r.below(2) as u16, r.below(2) as u16, r.below(4) as u16),
+            2 => mov(other, r.below(2) as u16, [0, 3, 5][r.below(3) as usize]),
+            // Now and then something that reads or writes the counter: not a counted loop
+            3 if r.below(4) == 0 => mov(reg, 0, 0),
+            3 if r.below(3) == 0 => jmp([1, 3, 5][r.below(3) as usize], (r.below(len as u64)) as u16),
+            _ => NOP,
+        };
+        prog.push(if r.below(2) == 0 { delay(i, r.below(8) as u16) } else { i });
+    }
+    prog.push(delay(jmp(dec, 1), r.below(3) as u16));
+    while prog.len() < len as usize {
+        let addr = r.below(len as u64) as u16;
+        prog.push(match r.below(4) {
+            0 => jmp(0, addr),
+            1 => set(reg, r.below(32) as u16),
+            2 => inp(0, 1 + r.below(4) as u16),
+            _ => push(false, false),
+        });
+    }
+    prog
+}
+
+#[test]
+fn skipped_counted_loops_match_ticking() {
+    let (mut ticks, mut counted) = (0, 0);
+    for seed in 0..300 {
+        let mut r = Rng(0xC0_0000 + seed);
+        let prog = counted_program(&mut r);
+        // Against ticking everything, and against skipping only pure loops that come back to the same registers
+        let (t, c) = compare_configs(0xC1_0000 + seed, Some(prog.clone()), SLOW, FAST);
+        ticks += t;
+        counted += c;
+        let (_, c2) = compare_configs(0xC2_0000 + seed, Some(prog), [true, false, true, true], FAST);
+        counted += c2;
+    }
+    assert!(ticks > 100_000, "{ticks} ticks skipped");
+    assert!(counted > 20_000, "{counted} counted iterations skipped");
+}
+
+#[test]
+fn each_fast_path_alone_matches_ticking() {
+    // Each of skip_counted, loop_inputs and fast_run on or off with the others on, and fast_run alone
+    for seed in 0..150 {
+        let mut r = Rng(0xE0_0000 + seed);
+        let len = 3 + r.below(10) as u16;
+        let prog = if seed % 2 == 0 { counted_program(&mut r) } else { random_program(&mut r, len) };
+        for off in 1..4 {
+            let mut cfg = FAST;
+            cfg[off] = false;
+            compare_configs(0xE1_0000 + seed * 4 + off as u64, Some(prog.clone()), cfg, FAST);
+        }
+        compare_configs(0xE2_0000 + seed, Some(prog), SLOW, [false, false, false, true]);
+    }
+}
+
+#[test]
+fn bidirectional_dshot_clock_recovery_is_skipped() {
+    // The ESC board's bidir_dshot.pio receive section: sample, then wait up to 12 two-cycle iterations for an edge
+    // (`JMP PIN` / `JMP Y--`) before sampling again
+    let prog = vec![
+        set(1, 20),          // 0: set x, 20
+        delay(NOP, 13),      // 1: rx_from_edge: nop [13]
+        inp(0, 1),           // 2: rx_immediate: in pins, 1
+        jmp(2, 5),           // 3: jmp x-- clock_recovery
+        jmp(0, 0),           // 4: (end of packet) jmp start
+        jmp(6, 10),          // 5: clock_recovery: jmp pin clkrec_pin_high
+        set(2, 11),          // 6: set y, 11
+        jmp(6, 9),           // 7: clkrec_low_loop: jmp pin pin_low_edge_delay
+        jmp(4, 7),           // 8: jmp y-- clkrec_low_loop
+        delay(jmp(0, 2), 3), // 9: jmp rx_immediate [3] (the edge path is shortened here)
+        set(2, 11),          // 10: clkrec_pin_high: set y, 11
+        jmp(6, 13),          // 11: clkrec_high_loop: jmp pin clkrec_y_cmp
+        jmp(0, 1),           // 12: jmp rx_from_edge
+        jmp(4, 11),          // 13: clkrec_y_cmp: jmp y-- clkrec_high_loop
+        delay(jmp(0, 2), 3), // 14: jmp rx_immediate [3]
+    ];
+    let mut counted = 0;
+    for seed in 0..50 {
+        counted += compare_configs(0xD6_0000 + seed, Some(prog.clone()), SLOW, FAST).1;
+        counted += compare_configs(0xD7_0000 + seed, Some(prog.clone()), [true, false, true, true], FAST).1;
+    }
+    assert!(counted > 5_000, "{counted} counted iterations skipped");
 }
 
 #[test]

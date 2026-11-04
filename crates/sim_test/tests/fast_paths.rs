@@ -8,6 +8,8 @@
 //! * SIO accesses other than to the FIFOs leave the interrupt lines alone (`System::sio_fast_irqs`).
 //! * XOSC reads skip the general path and leave quanta quiet (`System::xosc_fast_reads`), so that embassy-rp's
 //!   wait for the crystal is skipped as a busy-wait; and busy-wait skipping itself (`Machine::skip_spins`).
+//! * PIO state machines skip counted loops (`Pio::skip_counted`), keep looping through changes of pins they do not
+//!   read (`Pio::loop_inputs`), and blocks remember their next ticks between runs (`Pio::fast_run`).
 
 use rp2040::Machine;
 use sim_core::cpu::Cpu;
@@ -145,4 +147,33 @@ fn skipped_as_unskipped() {
     // The XOSC wait (a loop over several quanta), the control loop's timer busy-waits
     same_unskipped("esc_board", "mk2/esc_board", 2);
     same_unskipped("template", "mk2/power_board", 1);
+}
+
+/// Runs `elf` with each of the PIO fast paths `set` switches off on both blocks, comparing with all on.
+fn same_pio_paths(elf: &str, board: &str, client: u8) {
+    let Some((a, _)) = run(elf, board, client, |_| {}) else { return };
+    type Set = fn(&mut rp2040::periph::pio::Pio);
+    let offs: [(&str, Set); 4] = [
+        ("skip_counted", |p| p.skip_counted = false),
+        ("loop_inputs", |p| p.loop_inputs = false),
+        ("fast_run", |p| p.fast_run = false),
+        ("all", |p| (p.skip_counted, p.loop_inputs, p.fast_run) = (false, false, false)),
+    ];
+    for (name, off) in offs {
+        let (b, _) = run(elf, board, client, |m| m.sys.pio.iter_mut().for_each(off)).unwrap();
+        compare(&format!("{elf} without {name}"), &a, &b);
+    }
+}
+
+#[test]
+fn esc_board_pio_paths() {
+    // DShot: the receivers' clock recovery is a counted loop, and the four lines (and the telemetry UARTs) change
+    // under each other's loops
+    same_pio_paths("esc_board", "mk2/esc_board", 2);
+}
+
+#[test]
+fn smart_battery_and_hbridge_pio_paths() {
+    same_pio_paths("smart_battery", "mk2/sbh_mcu", 21);
+    same_pio_paths("hbridge_board", "lilboat/hbridge_board", 2);
 }
