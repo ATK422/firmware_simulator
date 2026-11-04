@@ -1220,7 +1220,10 @@ mod tests {
         let t0 = Instant::now();
         let (last, slept) = wall_horizon(&mut pacing, &bounds(start + Time::from_ms(3)));
         assert!(slept >= Duration::from_micros(1900) && t0.elapsed() >= Duration::from_micros(1900), "{slept:?}");
-        assert!((9..=10).contains(&last), "{last}");
+        // A sleep that overshoots (a loaded machine) lets the wall clock, and with it the horizon, move on by the
+        // overshoot: allow one more slice per 100 µs of it
+        let overshoot = slept.saturating_sub(Duration::from_millis(2)).as_micros() / 100 + 1;
+        assert!(last >= 9 && (last as u128) <= 10 + overshoot, "{last} after {slept:?}");
         // Far behind: from where the wall clock is, 2 ms on (the window's other bounds cut that)
         std::thread::sleep(Duration::from_millis(30));
         let (last, slept) = wall_horizon(&mut pacing, &bounds(start + Time::from_ms(1)));

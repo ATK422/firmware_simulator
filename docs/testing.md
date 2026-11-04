@@ -34,6 +34,21 @@ way. `sim_test::titan_c("basic_template/template_project.elf")` looks under `bui
 `None`, and the test returns early, **passing**. Run with `--nocapture` (or check for `skipping:` lines) to be sure
 a green run actually ran the firmware.
 
+**Which compiler built them.** titan_firmware_rs pins its compiler in `rust-toolchain.toml` (rustc 1.99.0 at the
+pinned commit), and rustup uses it for the build in `external/titan_firmware_rs/firmware`. A different compiler gives
+slightly different code and timing: the bench fingerprints change (they are per firmware build), and so do
+timing-sensitive details such as which IVC packet in a reverberant pool loses a symbol. Tests must check behaviour
+that holds for any build of the same source, not one build's exact outcome: windows instead of exact times, every
+byte eventually delivered and acknowledged instead of "this packet gets through", statistics over several packets
+instead of one. To check a test against another compiler, build the images into a scratch directory and point the
+tests at it:
+
+```bash
+cd external/titan_firmware_rs/firmware
+CARGO_TARGET_DIR=/tmp/fw-other rustup run 1.97.0 cargo build --workspace --release && cd -
+TITAN_RS_RELEASE_DIR=/tmp/fw-other/thumbv6m-none-eabi/release cargo test --release -p sim_host --test ivc_link
+```
+
 ## A first test, step by step
 
 This walkthrough is `crates/sim_test/examples/walkthrough.rs`; `cargo run --release -p sim_test --example
@@ -256,7 +271,9 @@ When the firmware rather than the emulator looks wrong, write a test that assert
 
 `.github/workflows/ci.yml` has three jobs:
 
-* **test**: checks out the submodules, builds the titan_firmware_rs images (`cargo build --workspace --release`),
+* **test**: checks out the submodules, installs the firmware's pinned compiler (`rustup toolchain install` in
+  `external/titan_firmware_rs`, which reads its `rust-toolchain.toml`), builds the titan_firmware_rs images
+  (`cargo build --workspace --release`),
   runs `cargo fmt --all --check`, `cargo clippy --workspace --all-targets --release -- -D warnings` and
   `python3 scripts/gen_boards.py --check`, then `cargo test --release --workspace -- --nocapture`, and prints the
   smoke test and sweep tables from the log. It then runs the YAML scenarios with the command
@@ -265,7 +282,7 @@ When the firmware rather than the emulator looks wrong, write a test that assert
 * **c-firmware**: installs `gcc-arm-none-eabi`, builds the C programs with `scripts/build_c_firmware.sh` and runs
   the tests that boot them (`sim_host`'s `pico_sdk`, `flash`, `can`). It sets `CMAKE_POLICY_VERSION_MINIMUM=3.5`
   because the runners' CMake 4 refuses pico-sdk's bundled pioasm and elf2uf2 projects otherwise.
-* **macos**: builds the titan_firmware_rs images and runs clippy and the whole suite natively on macOS (Apple
+* **macos**: installs the firmware's pinned compiler, builds the titan_firmware_rs images and runs clippy and the whole suite natively on macOS (Apple
   silicon). SocketCAN is Linux only; on macOS `SocketCan::open` fails with a clear error and CAN reaches a Linux
   machine through `can-tunnel` instead.
 
@@ -290,7 +307,7 @@ cargo test --release -p sim_test --test robot -- --nocapture
 cargo test --release -p sim_host --test ivc_link -- --nocapture
 ```
 
-These take about 1.5 minutes on 4 cores once built (`ivc_link` about a minute, `faults` about 12 s, `robot` 5 s,
+These take about 2.5 minutes on 4 cores once built (`ivc_link` about two minutes, `faults` about 12 s, `robot` 5 s,
 `smoke` 3 s). There, a test that skips for want of an image fails. The workflow sets `SIM_REQUIRE_TITAN_RS=1`, which
 makes `sim_test::titan_rs`, `sim_host::titan_rs_image` and the tests built on them panic instead of skipping. It
 also fails the job on any `skipping: ...thumbv6m-none-eabi/release/...` line. Tests that need the C images still
