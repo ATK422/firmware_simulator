@@ -986,6 +986,7 @@ dependencies = [
  "sim_core",
  "sim_devices",
  "sim_host",
+ "sim_physics",
  "titan_link",
  "toml",
 ]

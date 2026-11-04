@@ -13,6 +13,7 @@ end to end, and a depth controller can be closed through the firmware's own dept
 - [The model](#the-model)
 - [Vehicle files](#vehicle-files)
 - [In a robot file](#in-a-robot-file)
+- [External vehicles](#external-vehicles)
 - [Running it and the CSV log](#running-it-and-the-csv-log)
 - [Tests](#tests)
 - [Limitations](#limitations)
@@ -36,8 +37,13 @@ Frames: world north-east-down (`z` is depth), body forward-starboard-down, both 
 
 ## Vehicle files
 
-`vehicles/talos.toml` and `vehicles/puddles.toml` (strict: unknown keys are errors). Each value is commented in
-the files with where it came from.
+`vehicles/talos.toml`, `vehicles/talos_nereus.toml` and `vehicles/puddles.toml` (strict: unknown keys are errors).
+Each value is commented in the files with where it came from. `talos_nereus.toml` is Talos as nereus's robot pack and
+riptide's `talos.yaml` describe it: the real thrusters (VUS, VUP, HUS, HUP, HLS, HLP, VLS, VLP, in the controller's
+order), nereus's pool-identified body (diagonal terms only), and a thrust curve through riptide's
+`force_to_rpm_coefficents` at its 24 N limit (24 N at 3171 RPM ahead, 2932 RPM astern), so the thrust for a speed
+is the force the controller chose that speed for; `robots/talos_c.toml`, `talos_c_nereus.toml` and
+`talos_nereus.toml` use it.
 
 | Key | Meaning |
 |---|---|
@@ -88,6 +94,7 @@ mount_m = [0.30, 0.0, 0.10]         # body frame: forward, starboard, down
 | `[[vehicle.sensor]]` | A board input that takes the absolute water pressure at `mount_m` (an MS5837's `<name>.pressure_pa`): `surface_pa + rho g depth` of the mount, the air pressure above the surface |
 | `[[vehicle.transducer]]` | A board whose hydrophone and projector follow the hull at `mount_m`; such a board takes no `position_m` or `trajectory` |
 | `log_ms` | Keep a state log every this many milliseconds |
+| `external` | Moved by another simulator instead of its thrusters ([below](#external-vehicles)) |
 
 After every slice the vehicle is stepped to the robot's time with each thruster's RPM read from its ESC's motor
 model, then the sensor inputs and transducer positions are updated. Wiring mistakes (an unknown thruster, board,
@@ -100,6 +107,26 @@ turns those four backwards). Positive vertical thrust dives. The camera cage's d
 10 cm below the centre of gravity. On Puddles, the backplane's `t1`-`t4` are horizontal and `t5`-`t8` vertical, none
 inverted, with the depth sensor on the aft end cap. Both start afloat; the depth sensors zero at boot, as on the
 dock.
+
+## External vehicles
+
+With `external = true` (or `robot --external-vehicle NAME`) the vehicle's own physics stop: another simulator owns
+its motion, and posts where the vehicle is to the dashboard, `POST /api/vehicle` ([tools.md](tools.md#api)). That is
+how [nereus](nereus.md) moves Talos while the emulated ESC boards push it. The vehicle stays where it was last put
+(the robot file's pose until the first post); its pressure sensors take the pressure at their mounts at once, and
+its transducers follow from the next slice, so IVC boards on it move too. Its thrusters still turn their ESC's
+propeller speed into thrust (the curve alone: the other simulator handles the surface), which `GET /api/thrusters`
+reports per ESC and per thruster, for the other simulator to apply. The posted pose is that of whatever point the
+other simulator reports (nereus: `base_link`), so in such a robot file the sensor mounts are measured from that
+point. An external vehicle needs `--dashboard`, since nothing else can move it.
+
+```bash
+firmware_simulator robot robots/talos_nereus.toml --dashboard 127.0.0.1:8080 --realtime --time 600s
+curl -s -X POST -d '{"position_m": [2.0, 1.0, 1.5], "rpy_deg": [0, 0, 90]}' http://127.0.0.1:8080/api/vehicle
+curl -s http://127.0.0.1:8080/api/thrusters
+```
+
+In code: `VehicleSim::external`, `VehicleSim::set_pose`.
 
 ## Running it and the CSV log
 
@@ -134,6 +161,7 @@ In code: `Robot::vehicle(name)` returns the `VehicleSim` (its `vehicle.state`, `
 | `crates/sim_host/tests/vehicle.rs` | Robot-file wiring and its errors, sensors and transducers following the vehicle, snapshots carrying their own vehicle, IVC boards linking from a drifting vehicle |
 | `crates/sim_test/tests/vehicle.rs` | Puddles dives on UDP thruster commands while its own depth sensor follows (within 3 cm), the kill switch stops the thrusters, a depth controller in the test closes the loop through the firmware and holds 1 m, runs reproduce exactly |
 | `crates/sim_test/tests/vehicle_talos.rs` | Talos's two ESC boards in RPM mode spin each motor to its target, the vehicle dives and turns as predicted, the camera cage reports the depth (about 40 s) |
+| `crates/sim_test/tests/vehicle_nereus.rs` | The controller's raw CAN thruster frames spin the Rust ESC boards; the thrust reported for nereus is what riptide's curve chose each speed for; an external vehicle stays where it is posted and the camera cage reports that depth |
 
 ## Limitations
 
