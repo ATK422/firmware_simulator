@@ -123,6 +123,8 @@ on top of that.
 `crates/sim_test/tests/scenarios.rs` runs every scenario in `scenarios/` as `the_shipped_scenarios_pass`, so
 `cargo test --release --workspace` covers them, printing each one's steps; a scenario whose images are not built is
 skipped (`skipping: ...`), or fails with `SIM_REQUIRE_TITAN_RS` set ([testing.md](testing.md#running-the-tests)).
+A scenario whose robot file takes its images from an unset variable (the C robots' `${TITAN_FIRMWARE_DIR}`, as
+`boot_mercury.yaml`) is skipped everywhere, by the command too, with the variable named.
 The CI test job also runs them with the command, which writes `scenarios.xml` (JUnit) as an artifact of the run:
 
 ```bash

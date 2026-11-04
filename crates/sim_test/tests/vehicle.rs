@@ -51,12 +51,12 @@ fn puddles_dives_on_thruster_commands_and_its_depth_sensor_sees_it() {
     }
     let v = r.robot.vehicle("puddles").unwrap().vehicle.clone();
     eprintln!("after 3 s diving: {:?}, thrust {:?}", v.state, v.thrust_n);
-    // Throttle 300 is DShot 348, 301/1000 of the ESC's 4000 RPM: 5.17 N from each T200
+    // Throttle 300 is DShot 348, 301/1000 of the ESC's 4000 RPM: 5.90 N from each T200 (50.82 N at 3533 RPM)
     let rpm = 301.0 / 1000.0 * 4000.0;
-    let thrust = 51.5 * (rpm / 3800.0f64).powi(2);
+    let thrust = 50.82 * (rpm / 3533.0f64).powi(2);
     assert!(v.thrust_n[4..].iter().all(|t| (*t - thrust).abs() < 0.01), "{:?}", v.thrust_n);
     assert!(v.thrust_n[..4].iter().all(|t| *t == 0.0));
-    // Sinking at the speed where the heave drag (33 w + 190 w^2) takes the 4 x 5.17 N less 1 N of buoyancy
+    // Sinking at the speed where the heave drag (33 w + 190 w^2) takes the 4 x 5.90 N less 1 N of buoyancy
     let force = 4.0 * thrust - 1.0;
     let terminal = (-33.0 + (33.0f64 * 33.0 + 4.0 * 190.0 * force).sqrt()) / (2.0 * 190.0);
     let w = v.state.world_velocity()[2];
@@ -95,8 +95,8 @@ fn a_depth_controller_through_the_firmware_reaches_and_holds_the_target() {
     // the error, plus the buoyancy to cancel, turned into throttle through the T200's square law
     let target = 1.0;
     let (kp, kd, buoyancy) = (40.0, 40.0, 1.0);
-    // Full throttle is 4000 RPM, where a T200 makes 51.5 * (4000/3800)^2 N forwards (40.2 * ... in reverse)
-    let full = |reverse: bool| if reverse { 40.2 } else { 51.5 } * (4000.0f64 / 3800.0).powi(2) * 4.0;
+    // Full throttle is 4000 RPM, where a T200 makes 50.82 * (4000/3533)^2 N forwards (40.53 * ... in reverse)
+    let full = |reverse: bool| if reverse { 40.53 } else { 50.82 } * (4000.0f64 / 3533.0).powi(2) * 4.0;
     let mut est = (0.0, 0.0, Time::ZERO);
     let mut trace = Vec::new();
     while r.now() < Time::from_secs(25) {

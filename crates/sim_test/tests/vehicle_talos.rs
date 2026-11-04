@@ -52,10 +52,10 @@ fn talos_dives_and_turns_on_esc_board_rpm_commands() {
     for (got, want) in rpm.iter().zip(want) {
         assert!((got - want).abs() < 10.0, "{rpm:?}");
     }
-    let t200 = |rpm: f64, k: f64| k * (rpm / 3800.0).powi(2);
-    let ahead = t200(800.0, 51.5);
-    let astern = -t200(800.0, 40.2);
-    let down = t200(1200.0, 51.5);
+    let t200 = |rpm: f64, k: f64| k * (rpm / 3533.0).powi(2);
+    let ahead = t200(800.0, 50.82);
+    let astern = -t200(800.0, 40.53);
+    let down = t200(1200.0, 50.82);
     let expected = [ahead, astern, ahead, astern, down, down, down, down];
     for (got, want) in v.thrust_n.iter().zip(expected) {
         assert!((got - want).abs() < 0.03 * want.abs(), "{:?} vs {expected:?}", v.thrust_n);

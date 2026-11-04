@@ -38,13 +38,18 @@ Frames: world north-east-down (`z` is depth), body forward-starboard-down, both 
 
 ## Vehicle files
 
-`vehicles/talos.toml`, `vehicles/talos_nereus.toml` and `vehicles/puddles.toml` (strict: unknown keys are errors).
+`vehicles/talos.toml`, `vehicles/talos_nereus.toml`, `vehicles/puddles.toml` and `vehicles/tempest.toml` (strict:
+unknown keys are errors).
 Each value is commented in the files with where it came from. `talos_nereus.toml` is Talos as nereus's robot pack and
 riptide's `talos.yaml` describe it: the real thrusters (VUS, VUP, HUS, HUP, HLS, HLP, VLS, VLP, in the controller's
 order), nereus's pool-identified body (diagonal terms only), and a thrust curve through riptide's
 `force_to_rpm_coefficents` at its 24 N limit (24 N at 3171 RPM ahead, 2932 RPM astern), so the thrust for a speed
 is the force the controller chose that speed for; `robots/talos_c.toml`, `talos_c_nereus.toml` and
 `talos_nereus.toml` use it.
+`tempest.toml` is Tempest, the AUV before Talos, from riptide's `tempest.yaml` (mass, inertia, volume, the
+controller's damping model, the eight thrusters' poses); its added mass, height and thrust curve are assumed, and
+the horizontal offset of its centre of buoyancy is dropped (it would float pitched up about 50 degrees).
+`robots/tempest.toml` leaves its thrusters unwired ([robots.md](robots.md#mercury-and-tempest)).
 
 | Key | Meaning |
 |---|---|
@@ -58,7 +63,7 @@ is the force the controller chose that speed for; `robots/talos_c.toml`, `talos_
 | `linear_drag` | N/(m/s) per axis, N m/(rad/s) for the rotations |
 | `quadratic_drag` | N/(m/s)², N m/(rad/s)² |
 | `munk_moment_scale` | Share of the potential-flow Munk moment that acts (1 by default; both shipped files use 0.25, because open frames shed the flow and the full value pitched them over at speed) |
-| `thruster_model` | Default thrust curve: `{ forward_n, reverse_n, at_rpm }` (T200 at 16 V: 51.5 N / 40.2 N at 3800 RPM) |
+| `thruster_model` | Default thrust curve: `{ forward_n, reverse_n, at_rpm }` (T200 at 16 V, fitted to Blue Robotics' data: 50.8 N / 40.5 N at 3533 RPM) |
 | `[[thruster]]` | `name`, `position_m`, `direction` (the way it pushes at positive RPM, normalised), `inverted` (false), `curve` (its own curve) |
 
 ## In a robot file
@@ -162,14 +167,23 @@ In code: `Robot::vehicle(name)` returns the `VehicleSim` (its `vehicle.state`, `
 | `crates/sim_host/tests/vehicle.rs` | Robot-file wiring and its errors, sensors and transducers following the vehicle, snapshots carrying their own vehicle, IVC boards linking from a drifting vehicle |
 | `crates/sim_test/tests/vehicle.rs` | Puddles dives on UDP thruster commands while its own depth sensor follows (within 3 cm), the kill switch stops the thrusters, a depth controller in the test closes the loop through the firmware and holds 1 m, runs reproduce exactly |
 | `crates/sim_test/tests/vehicle_talos.rs` | Talos's two ESC boards in RPM mode spin each motor to its target, the vehicle dives and turns as predicted, the camera cage reports the depth (about 40 s) |
-| `crates/sim_test/tests/vehicle_nereus.rs` | The controller's raw CAN thruster frames spin the Rust ESC boards; the thrust reported for nereus is what riptide's curve chose each speed for; an external vehicle stays where it is posted and the camera cage reports that depth |
+| `crates/sim_test/tests/vehicle_nereus.rs` | The controller's raw CAN thruster frames spin the Rust ESC boards to their targets ahead and astern (24 N ahead stops at the hard limit's 3068 RPM); the thrust reported for nereus is what riptide's curve chose each speed for; an external vehicle stays where it is posted and the camera cage reports that depth |
 
 ## Limitations
 
 Diagonal added mass and drag (no cross-coupling, lift or fins); added mass does not shrink out of the water; a
 flat surface (no waves); no walls (a vehicle can leave a tank sideways); no propeller reaction torque; thrust does
 not depend on inflow speed; the water density is a vehicle setting, not taken from the acoustic environment.
-The ESC model stops a motor 250 ms after its last DShot frame (`signal_loss_ms`), an assumed value.
+The ESC model stops a motor 250 ms after its last DShot frame (`signal_loss_ms`), an assumed value. The ESC boards'
+speed for a throttle is their bench fit ([boards.md](boards.md#the-esc-boards-speed-curve)); the Puddles backplane's
+ESCs keep the linear default (4000 RPM at full throttle), as nothing is known about them.
+
+**Two sources disagree on the T200's thrust.** Blue Robotics' data (`vehicles/talos.toml`, `puddles.toml`) gives
+40.7 N at 3153 RPM ahead; riptide's bench fit, which `talos_nereus.toml` follows, 24 N at 3171 RPM (59 % of it).
+The bench fit's full-throttle speed (3770 RPM, extrapolated) is also above the datasheet's top speed at 16 V (3533
+RPM, with Blue Robotics' ESC). Either the bench's force gauge or the RPM the APD ESCs report (7 pole pairs) is off,
+or the thrusters or the supply differ from the datasheet's; a check on a bench would settle which. The emulator follows the firmware's own data for
+the ESC and riptide's for the thrust in the files that run the riptide controller.
 
 Snapshots of a robot copy its vehicles and give the copy its own sensor inputs, so `sim_test::sweep` runs
 vehicle scenarios side by side (`vehicle_talos.rs` sweeps three depths, `vehicle.rs` three Puddles dive

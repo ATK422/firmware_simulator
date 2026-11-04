@@ -255,7 +255,10 @@ Every board also has its QSPI flash, debug UART and pins. The C programs (`basic
 and its OTA test app) run on these board files in `sim_host`'s `pico_sdk`, `flash` and `can` tests.
 
 The generator also writes files for boards that have no titan_firmware_rs image yet (`boards/mk1/*`,
-`boards/mercury/*`): their CAN controller and pins, without device overlays.
+`boards/mercury/*`): their CAN controller and pins, and for Mercury's boards, which titan_firmware's C apps run on,
+the devices too (four DShot ESCs; the MS5837-02BA depth sensor, SHT41 and MCP3426). The ESC boards' motors turn at
+the speed their APD ESCs and T200s reached for a throttle on the bench, the fit the firmware's feed-forward was made
+from ([boards.md](docs/boards.md#the-esc-boards-speed-curve)).
 [boards.md](docs/boards.md#which-board-file-for-which-image) has every table and field.
 
 | Robot file | What it is |
@@ -267,9 +270,11 @@ The generator also writes files for boards that have no titan_firmware_rs image 
 | [`robots/ivc2_interop.toml`](robots/ivc2_interop.toml) | The Rust IVCBoard2 and your build of the C one (micro-ROS over USB) in the pool, for acoustic interop |
 | [`robots/talos_c.toml`](robots/talos_c.toml) | Talos with your build of titan_firmware's C board apps (micro-ROS over CAN), as the robot runs them, in its real thruster layout |
 | [`robots/talos_c_nereus.toml`](robots/talos_c_nereus.toml), [`robots/talos_nereus.toml`](robots/talos_nereus.toml) | PoAC, the ESC boards and the camera cage (C or Rust) in a vehicle that nereus moves |
+| [`robots/mercury.toml`](robots/mercury.toml) | Mercury (the vehicle of UWRT's new Mercury stack, titan_firmware's "Triton" boards): your build of the C PoHalf and two ESC boards on the internal CAN FD bus; no vehicle file, as its geometry is not published |
+| [`robots/tempest.toml`](robots/tempest.toml) | Tempest, the AUV before Talos: its MK2 camera cage and actuator boards (with today's Talos images) in riptide's Tempest description; its coprocessor's firmware no longer exists |
 
 Environments: [`pool`, `open_water`, `harbour`](environments) ([acoustics.md](docs/acoustics.md#environment-files)).
-Vehicles: [`talos`, `talos_nereus`, `puddles`](vehicles) ([vehicles.md](docs/vehicles.md#vehicle-files)).
+Vehicles: [`talos`, `talos_nereus`, `puddles`, `tempest`](vehicles) ([vehicles.md](docs/vehicles.md#vehicle-files)).
 
 ## Architecture
 
