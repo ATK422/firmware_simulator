@@ -203,7 +203,16 @@ impl Timer {
         if self.paused {
             return self.base_value;
         }
-        self.base_value.wrapping_add(ticks.ticks(now).saturating_sub(self.base_ticks))
+        self.value_at(ticks.ticks(now))
+    }
+
+    /// The count when the tick generator has given `ticks` ([`Timer::value`] with `ticks` worked out).
+    #[inline]
+    pub fn value_at(&self, ticks: u64) -> u64 {
+        if self.paused {
+            return self.base_value;
+        }
+        self.base_value.wrapping_add(ticks.saturating_sub(self.base_ticks))
     }
 
     fn set_value(&mut self, ticks: &TickGen, now: Time, v: u64) {

@@ -2221,7 +2221,15 @@ impl<'a> BatchBus<'a> {
     #[inline(never)]
     fn timer_read(&mut self, addr: u32, size: Size) -> Result<u32, BusFault> {
         let now = self.now();
-        match self.sys.timer.read(&self.sys.watchdog.tick, now, addr & 0xFFC) {
+        let off = addr & 0xFFC;
+        let ticks = self.sys.watchdog.tick.ticks(now);
+        // The raw count (what `Timer::read` gives for these, without its other cases)
+        let raw = match off {
+            timer::TIMERAWL => Some(self.sys.timer.value_at(ticks) as u32),
+            timer::TIMERAWH => Some((self.sys.timer.value_at(ticks) >> 32) as u32),
+            _ => self.sys.timer.read(&self.sys.watchdog.tick, now, off),
+        };
+        match raw {
             Some(v) => {
                 // A fused batch ends here too: polling the timer is what busy-waits do, and the machine only finds
                 // those at quantum boundaries
@@ -2229,7 +2237,6 @@ impl<'a> BatchBus<'a> {
                 if self.end_on_slow {
                     self.after |= Self::ATTENTION;
                 }
-                let ticks = self.sys.watchdog.tick.ticks(now);
                 if self.timer_ticks.is_some_and(|t| t != ticks) {
                     self.ticked = true;
                 }
