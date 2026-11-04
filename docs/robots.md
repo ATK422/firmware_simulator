@@ -192,12 +192,12 @@ boards go back to taking turns for a while. Robots in an acoustic environment al
 hydrophone can hear another board within the slice. Emulator log lines from different boards can interleave
 differently with threads; what the boards do does not change. `Robot::threads` defaults to 1 in code (tests).
 
-**Speed.** On one core of the 4-core machine it was measured on, Talos (nine boards) runs at about 0.43x real
-time, and at about 0.72x on three or four threads (1.7x faster; 0.63x on two). That is as far as threads go: the
-slowest board sets the pace of every slice, and the two ESC boards each need about 0.95 s of host time per
-virtual second, in bursts that do not line up between them, so `--realtime` with all of Talos does not keep up.
-The template runs about 60x faster than real time, IVCBoard2 about 3.4x and the ESC board about 1.1x on its own.
-`cargo run --release -p sim_test --example bench` measures it ([internals.md](internals.md#performance)). Without
+**Speed.** On one core of the 4-core machine it was measured on, Talos (nine boards) runs at about 0.54x real
+time, and at about 0.8x on three threads (1.5x faster; 0.7x on two). That is as far as threads go: the slowest
+board sets the pace of every slice, and the two ESC boards each need about 0.7 s of host time per virtual second,
+in bursts (their DShot frames) that do not line up between them, so `--realtime` with all of Talos does not keep
+up. The template runs about 75x faster than real time, IVCBoard2 about 3.6x and the ESC board about 1.5x on its
+own. `cargo run --release -p sim_test --example bench` measures it ([internals.md](internals.md#performance)). Without
 `--realtime` a robot runs as fast as it can, so a host tool next to it (titan_bridge, a micro-ROS agent) needs
 timeouts with room for a robot slower than real time; with `--realtime` the robot warns
 (`real-time mode: emulation is 1.23s behind the wall clock`, at most every 5 s) when it cannot keep up.

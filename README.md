@@ -299,15 +299,15 @@ Measured with `cargo run --release -p sim_test --example bench -- --time 2s --re
 
 | Run | CPU time | Speed vs real time |
 |---|---|---|
-| `template` (power board) | 0.03 s | about 60x |
-| IVCBoard2 | 0.6 s | about 3.4x |
-| ESC board (four DShot ESCs on PIO) | 1.8 s | about 1.1x |
-| IVC2 pool (two boards in the water) | 2.2 s | about 0.9x |
-| Talos (nine boards) | 4.7 s | about 0.4x |
+| `template` (power board) | 0.03 s | about 75x |
+| IVCBoard2 | 0.55 s | about 3.6x |
+| ESC board (four DShot ESCs on PIO) | 1.35 s | about 1.5x |
+| IVC2 pool (two boards in the water) | 2.15 s | about 0.9x |
+| Talos (nine boards) | 3.7 s | about 0.54x |
 
 So single boards run at or above real time. All of Talos with `--realtime` does not keep up: its boards run on
-threads by default (`--threads`), which makes it about 1.7x faster (0.72x real time), but the two ESC boards set
-the pace. Details: [internals.md](docs/internals.md#performance),
+threads by default (`--threads`), which makes it about 1.5x faster (about 0.8x real time), but the two ESC boards
+set the pace. Details: [internals.md](docs/internals.md#performance),
 [robots.md](docs/robots.md#how-a-robot-runs).
 
 **Determinism.** The same image, board or robot file, inputs, faults and seeds give the same run, instruction for

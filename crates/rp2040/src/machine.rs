@@ -126,6 +126,13 @@ pub struct Machine {
     pub skip_spins: bool,
     /// Instructions skipped that way (counted in the cores' instruction counts too).
     pub spin_skipped: u64,
+    /// Skipping busy-waits on the timer across its ticks, up to their deadline (see [`Machine::skip_timer_wait`];
+    /// on by default, off to check that it changes nothing).
+    pub skip_timer_waits: bool,
+    /// Busy-waits skipped that way (statistics).
+    pub timer_waits_skipped: u64,
+    /// After such a skip, what is left of the quantum the core landed in (its next quantum is that long).
+    quantum_left: Option<(usize, u32)>,
     /// Quantum fusing (on by default; off to check that it changes nothing): while only one core can run, nothing
     /// is due before the quantum's limit and the core touches nothing but memory and the timer, one batch runs
     /// through several quanta (see [`Machine::run_until`]).
@@ -230,6 +237,9 @@ impl Machine {
             spin_window: None,
             skip_spins: true,
             spin_skipped: 0,
+            skip_timer_waits: true,
+            timer_waits_skipped: 0,
+            quantum_left: None,
             fuse_quanta: true,
             quanta_fused: 0,
             fuse_next: false,
@@ -927,6 +937,88 @@ impl Machine {
         self.budget_carry = None;
     }
 
+    /// After a quiet window of core `c` that polled the timer and came back to where it started (see
+    /// [`Machine::skip_spin`], whose conditions apply too): skips the loop across timer ticks, up to the last time
+    /// round before its reads could reach a value at which it would go another way (its deadline), when
+    /// `CortexM0Plus::timer_wait` finds one. The core is landed at the loop's start one time round before the next
+    /// event, the end of the run or `holds` at the latest, so that the time round it then runs gives the registers
+    /// that depend on the timer their values before anything can see them. Returns whether it skipped (else
+    /// [`Machine::skip_spin`] does what it can).
+    fn skip_timer_wait(&mut self, c: usize, cycles: u64, holds: Time, end: Time) -> bool {
+        let o = 1 - c;
+        let counts = |m: &Machine, k: usize| {
+            m.cores[k].systick.counts_core_clock()
+                || m.cores[k].systick.counts_reference_clock()
+                || m.systick_ref[k].is_some()
+        };
+        if !self.skip_timer_waits || !self.skip_spins || cycles == 0 || counts(self, c) {
+            return false;
+        }
+        let other_still = !self.core_enabled[o]
+            || self.cores[o].is_locked_up()
+            || (self.cores[o].is_sleeping() && !counts(self, o) && !self.cores[o].would_wake());
+        if !other_still {
+            return false;
+        }
+        let clock = self.clocks[c];
+        let (now, period) = (clock.now, self.clk_sys);
+        let tick = &self.sys.watchdog.tick;
+        let value = self.sys.timer.value(tick, now);
+        let sys = &self.sys;
+        let Some(w) = self.cores[c].timer_wait(
+            |addr| sys.timer_wait_code(now, addr),
+            |addr, size| sys.timer_wait_read(now, addr, size),
+            value,
+        ) else {
+            return false;
+        };
+        let Some(read) = w.read else { return false };
+        // The reads must see the timer below the deadline: up to the last time the tick count is short of it
+        let Some(deadline) = self.sys.timer.ticks_of_value((value & !0xFFFF_FFFF) + w.below) else { return false };
+        if deadline <= tick.ticks(now) {
+            return false;
+        }
+        let reads_until = clock.cycles_until(&period, tick.holds_until(deadline - 1) + Time(1));
+        let limit = self.sys.sched.next_time().min(end).min(holds);
+        let room = clock.cycles_until(&period, limit);
+        let (pre, cy) = (w.prefix_cycles, w.cycles);
+        if w.prefix_read.is_some_and(|r| r >= reads_until) || reads_until <= pre + read || cy == 0 {
+            return false;
+        }
+        // Times round whose last read comes before the deadline...
+        let by_reads = (reads_until - 1 - pre - read) / cy + 1;
+        // ...and that leave one more before the limit
+        let by_room = match room.checked_sub(1 + pre) {
+            Some(r) => (r / cy).saturating_sub(1),
+            None => 0,
+        };
+        let k = by_reads.min(by_room);
+        let skipped = pre + k * cy;
+        // Not worth it within the current tick, which the plain skip handles
+        let tick_end = clock.cycles_until(&period, tick.holds_until(tick.ticks(now)) + Time(1));
+        if k == 0 || skipped <= tick_end {
+            return false;
+        }
+        let steps = w.prefix_steps as u64 + k * w.steps as u64;
+        self.cores[c].land_timer_wait(&w);
+        self.clocks[c].advance(&self.clk_sys, skipped);
+        self.cores[c].account_skipped(skipped, steps);
+        self.spin_skipped += steps;
+        self.timer_waits_skipped += 1;
+        // The quanta go on as they would have: the next one ends where theirs would (events an access schedules
+        // within a quantum fire at its end), and the machine's time is that of the last boundary until then
+        let into = (steps % self.quantum.max(1) as u64) as u32;
+        if into == 0 {
+            self.now = self.now.max(self.clocks[c].now);
+        } else {
+            self.quantum_left = Some((c, self.quantum - into));
+        }
+        self.budget_carry = None;
+        self.spin_window = None;
+        self.spin_watch = None;
+        true
+    }
+
     fn trace_instruction(&mut self, c: usize, now: Time) {
         let cpu = &self.cores[c];
         let pc = cpu.last_pc;
@@ -944,6 +1036,8 @@ impl Machine {
         self.stop_requested = false;
         // The host may have changed something since the last quantum
         self.spin_window = None;
+        // (Quanta start afresh in each run, as a run's end cuts the last one short)
+        self.quantum_left = None;
         loop {
             if self.stop_requested {
                 self.stop_requested = false;
@@ -1022,7 +1116,10 @@ impl Machine {
             // Run core c for a quantum, stopping at the next event or the end
             self.last_ran = c;
             let limit = next_event.min(end);
-            let mut left = self.quantum;
+            let mut left = match self.quantum_left.take() {
+                Some((core, left)) if core == c => left,
+                _ => self.quantum,
+            };
             // Cycles until core c reaches `limit`, carried from one batch to the next (and one quantum to the next)
             // while nothing else moved its clock
             let mut budget = match &self.budget_carry {
@@ -1203,7 +1300,9 @@ impl Machine {
                 self.fire_events(horizon);
             } else {
                 self.now = self.now.max(horizon.min(next_event));
-                if let Some((quiet, steps, cycles, holds)) = closed {
+                if let Some((quiet, steps, cycles, holds)) = closed
+                    && !(matches!(quiet, Quiet::Timer(_)) && self.skip_timer_wait(ran, cycles, holds, end))
+                {
                     self.skip_spin(ran, steps, cycles, quiet, holds, end);
                 }
             }
@@ -1261,6 +1360,9 @@ impl Machine {
             spin_window: None,
             skip_spins: self.skip_spins,
             spin_skipped: self.spin_skipped,
+            skip_timer_waits: self.skip_timer_waits,
+            timer_waits_skipped: self.timer_waits_skipped,
+            quantum_left: None,
             fuse_quanta: self.fuse_quanta,
             quanta_fused: self.quanta_fused,
             fuse_next: false,
@@ -1305,6 +1407,7 @@ impl Machine {
         self.spin_watch = None;
         self.spin_window = None;
         self.fuse_next = false;
+        self.quantum_left = None;
     }
 
     /// Lets attached devices update their outputs (after the host delivered something to them).

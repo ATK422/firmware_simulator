@@ -17,6 +17,7 @@ mod block;
 pub mod disasm;
 mod exec;
 pub mod ppb;
+mod timer_wait;
 
 #[cfg(test)]
 mod tests;
@@ -26,6 +27,7 @@ use sim_core::cpu::{Cpu, StepOutcome};
 
 pub use block::BlockCache;
 pub use ppb::{Mpu, Nvic, Scb, SysTick};
+pub use timer_wait::{TimerWait, WaitRead};
 
 /// Exception numbers.
 pub mod exception {
