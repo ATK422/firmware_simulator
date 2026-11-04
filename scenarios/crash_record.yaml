@@ -1,0 +1,43 @@
+# What a board remembers across a reset. The safety code keeps a crash record in the watchdog's scratch registers:
+# after a watchdog timeout (a task that hangs and starves the watchdog) or a panic, the board boots again, logs the
+# record and raises FAULT_WATCHDOG_RESET; a brownout clears the registers with everything else, so the board comes
+# back with no record. Every case starts from the same boot, connected to ROS.
+#
+# The panic case accepts both spellings of the record: at titan_firmware_rs 342ee0d a panic while ROS is connected
+# is recorded as a watchdog timeout (faults.md, finding 3); later firmware records it as a panic.
+name: Crash records after a hang, a panic and a brownout
+board: {image: poac_board, file: talos/poac_board, name: poac}
+bridges: [1]
+time: 5s
+steps:
+  - expect: {log: ROS connected, within: 1s}
+  - expect: {status: {faults: 0}, at: 1.5s}
+cases:
+  - name: hang
+    steps:
+      - fault: hang:0
+      - expect: {resets: 1, within: 1s}
+      - expect: {log: {regex: "Watchdog timeout after \\d+ ms"}, level: error, within: 500ms}
+      - expect: {log: ROS connected, within: 1s}
+      - expect: {status: {raised: [FAULT_WATCHDOG_RESET]}, within: 1.5s}
+      - never: {log: Watchdog timeout with no crash record}
+  - name: panic
+    steps:
+      - fault: panic
+      - expect: {log: PANIC, within: 100ms}
+      - expect: {resets: 1, within: 1s}
+      - expect: {log: {regex: "Reset by panic after|Watchdog timeout after"}, level: error, within: 500ms}
+      - expect: {status: {raised: [FAULT_WATCHDOG_RESET]}, within: 2.5s}
+  - name: brownout
+    steps:
+      - fault: brownout:50ms
+      - expect: {resets: 1, within: 200ms}
+      - expect: {log: "Crash counts since power on: CrashCounts { watchdog_timeouts: 0, panics: 0 }", within: 500ms}
+      - expect: {log: ROS connected, within: 1s}
+      - expect: {status: {faults: 0}, within: 1.5s}
+      - never: {log: {regex: "Watchdog timeout|Reset by panic"}}
+  - name: no fault
+    steps:
+      - always: {resets: 0}
+      - expect: {status: {faults: 0}, at: 5s}
+      - expect: {log: Crash counts since power on, count: 1, at: 0s, until: 5s}

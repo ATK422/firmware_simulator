@@ -1,0 +1,41 @@
+# The camera cage's depth sensor (an MS5837 at I2C address 0x76) stops answering. Once it has been zeroed, the
+# firmware raises FAULT_DEPTH_ERROR after five failed conversions in a row and stops publishing depth; absent from
+# power-on, the sensor's initialisation fails and FAULT_DEPTH_INIT_ERROR is raised. The first scenario's cases start
+# from one boot (a snapshot taken when its common steps are done).
+name: Camera cage depth sensor fails after zeroing
+board: {image: camera_cage_bb, file: mk2/camera_cage_bb, name: camera_cage}
+bridges: [4]
+time: 5.5s
+steps:
+  - expect: {log: ROS connected, within: 1s}
+  - expect: {log: Depth zeroed, within: 3s}
+  # Depth readings every 50 ms, at the surface (the board file's 1 atm)
+  - expect: {message: CameraCage.Depth, value: [-0.05, 0.05], count: {min: 15}, within: 1s}
+  - expect: {status: {faults: 0}}
+cases:
+  - name: sensor unplugged
+    steps:
+      - fault: i2c-absent:0x76
+      - expect: {log: Depth conversion failed, level: warn, within: 100ms}
+      - expect: {log: Fault FAULT_DEPTH_ERROR raised, within: 500ms}
+      - expect: {status: {raised: [FAULT_DEPTH_ERROR]}, within: 1.5s}
+      - expect: {message: CameraCage.Depth, count: 0, within: 1s}
+  - name: sensor working
+    steps:
+      - never: {log: Depth conversion failed}
+      - always: {message: CameraCage.Depth, value: [-0.05, 0.05], at: 2.5s}
+      - expect: {status: {clear: [FAULT_DEPTH_ERROR, FAULT_DEPTH_INIT_ERROR]}, at: 5s}
+---
+name: Camera cage depth sensor absent from power-on
+board: {image: camera_cage_bb, file: mk2/camera_cage_bb, name: camera_cage}
+bridges: [4]
+time: 3s
+steps:
+  - at: 0s
+    fault: i2c-absent:0x76
+  - expect: {log: {regex: "Depth sensor failed: .*NoAcknowledge"}, level: error, within: 2.5s}
+  - expect: {log: Fault FAULT_DEPTH_INIT_ERROR raised, within: 100ms}
+  - expect: {status: {raised: [FAULT_DEPTH_INIT_ERROR]}, at: 3s}
+  - never: {message: CameraCage.Depth}
+  # The rest of the board carries on
+  - expect: {link: up, at: 3s}

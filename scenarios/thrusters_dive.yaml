@@ -1,0 +1,21 @@
+# Talos's heave thrusters on ESC board 1 (client 3), commanded the way titan_bridge forwards `command/thruster_rpm`:
+# the board holds neutral for its first 5 s, then its RPM controllers spin the motors to the targets (the
+# counter-rotating ones backwards), the vehicle dives and the camera cage reports the depth. The kill switch stops
+# them. Only the boards in the loop run.
+name: Talos dives on ESC board 1's heave thrusters, and the kill switch stops them
+robot: {file: robots/talos.toml, boards: [esc1, camera_cage]}
+bridges: all
+time: 9s
+steps:
+  - send: {board: esc1, message: {Esc: {ThrusterRpm: [0, 0, 0, 0, 1200, 1200, 1200, 1200]}}, every: 100ms, until: 9s}
+  - expect: {board: esc1, log: ROS connected, within: 1s}
+  # Neutral while the ESCs power up
+  - always: {board: esc1, esc: {name: esc1, rpm: [-1, 1]}, until: 4.9s}
+  - expect: {board: esc1, esc: {name: esc1, rpm: [-1260, -1140]}, at: 5s, within: 1.5s}
+  - expect: {board: esc1, esc: {name: esc2, rpm: [1140, 1260]}}
+  - expect: {vehicle: {depth: {min: 0.25}, roll: [-2, 2], pitch: [-2, 2]}, within: 1.5s}
+  - expect: {board: camera_cage, message: CameraCage.Depth, value: {max: -0.1}, within: 500ms}
+  - at: 7s
+    fault: esc1:kill:on
+  - expect: {board: esc1, esc: {name: esc1, rpm: [-50, 50]}, within: 500ms}
+  - expect: {board: esc1, status: {killed: true}, within: 1s}

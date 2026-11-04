@@ -36,6 +36,7 @@ sim_host.workspace = true
 sim_devices.workspace = true
 sim_acoustics.workspace = true
 sim_physics.workspace = true
+sim_test.workspace = true
 log.workspace = true
 anyhow.workspace = true
 clap = { version = "4", features = ["derive"] }

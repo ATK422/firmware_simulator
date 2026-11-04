@@ -1,0 +1,38 @@
+# Every board of Talos boots, brings its CAN controller up and connects to its (mock) titan_bridge, with a clean
+# firmware status and no panic. The robot computer's side is one mock bridge per CANmore client (`bridges: all`).
+name: Talos boots and every board connects
+robot: robots/talos.toml
+bridges: all
+time: 3s
+steps:
+  # Each check looks at what happened by its time (`at`), so the order of the boards does not matter
+  - expect: {board: poac, log: ROS connected, at: 1s}
+  - expect: {board: esc0, log: ROS connected, at: 1s}
+  - expect: {board: esc1, log: ROS connected, at: 1s}
+  - expect: {board: camera_cage, log: ROS connected, at: 1s}
+  - expect: {board: actuator, log: ROS connected, at: 1s}
+  - expect: {board: led, log: ROS connected, at: 1s}
+  - expect: {board: sbc, log: ROS connected, at: 1s}
+  - expect: {board: ivc, log: ROS connected, at: 1s}
+  - expect: {board: battery, log: ROS connected, at: 1s}
+  # The latest status of each, at the end: the identity it reports and no fault raised
+  - expect: {board: poac, status: {board_name: talos/poac_board, client_id: 1, faults: 0}, at: 3s}
+  - expect: {board: esc0, status: {board_name: mk2/esc_board, client_id: 2, faults: 0}, at: 3s}
+  - expect: {board: esc1, status: {board_name: mk2/esc_board, client_id: 3, faults: 0}, at: 3s}
+  - expect: {board: camera_cage, status: {board_name: mk2/camera_cage_bb, client_id: 4, faults: 0}, at: 3s}
+  - expect: {board: actuator, status: {board_name: mk2/actuator_board, client_id: 5, faults: 0}, at: 3s}
+  - expect: {board: led, status: {board_name: talos/led_board, client_id: 6, faults: 0}, at: 3s}
+  - expect: {board: sbc, status: {board_name: talos/sbc_board, client_id: 7, faults: 0}, at: 3s}
+  - expect: {board: ivc, status: {board_name: talos/ivc_board, client_id: 8, faults: 0}, at: 3s}
+  - expect: {board: battery, status: {board_name: mk2/sbh_mcu, client_id: 21, faults: 0}, at: 3s}
+  # Titan_link heartbeats keep coming, and the internal bus carries the CANmore heartbeats of its eight boards
+  # (standard frames ending in 0x2F, two a second each)
+  - expect: {board: esc0, link: up, at: 3s}
+  - expect: {board: battery, link: up, at: 3s}
+  - expect: {bus: internal, frame: {id: 0x02F, mask: 0x03F, extended: false}, rate: {min: 12}, at: 1s, within: 1s}
+  - never: {board: poac, log: PANIC}
+  - never: {board: esc0, log: PANIC}
+  - never: {board: esc1, log: PANIC}
+  - never: {board: camera_cage, log: PANIC}
+  - never: {board: ivc, log: PANIC}
+  - always: {board: esc0, resets: 0}

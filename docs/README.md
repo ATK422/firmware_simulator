@@ -14,6 +14,7 @@ their sensors, actuators, the water around them and the robot computer's side of
 | [vehicles.md](vehicles.md) | Vehicle physics: vehicle files, thruster wiring, sensors following the hull, external vehicles, CSV logs |
 | [nereus.md](nereus.md) | The firmware in nereus: the riptide stack's thruster commands through the emulated ESC boards move nereus's vehicle |
 | [testing.md](testing.md) | Writing firmware tests with `sim_test`, the test suites, CI |
+| [scenarios.md](scenarios.md) | Firmware tests in YAML without Rust (`scenario`: faults, inputs, checks on logs, statuses, frames and states; JUnit for CI), and firmware A/B comparisons (`compare`) |
 | [tools.md](tools.md) | Developer tools: the firmware profiler, VCD waveforms, the live dashboard and its API, the MCP server for coding agents, JSON logs, robot traces |
 | [faults.md](faults.md) | Every fault, its CLI spelling and what it models; firmware findings so far |
 | [internals.md](internals.md) | Architecture for contributors: crates, time, the run loop, peripherals, adding models, determinism, performance |

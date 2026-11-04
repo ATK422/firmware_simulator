@@ -31,6 +31,9 @@
 //! [`sweep`] runs one scenario from a snapshot over a set of parameters in parallel, e.g. the IVC range and noise
 //! sweeps in `tests/ivc_sweep.rs`.
 
+pub mod compare;
+pub mod scenario;
+
 use std::path::{Path, PathBuf};
 
 pub use rp2040::StopReason;
