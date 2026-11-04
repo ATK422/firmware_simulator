@@ -111,6 +111,44 @@ pub struct Esc {
     busy_until: Time,
 }
 
+/// The lag of a motor with time constant `tau` towards `target` over `dt` seconds from `rpm`.
+fn lag(tau: Time, rpm: f64, target: f64, dt: f64) -> f64 {
+    rpm + (target - rpm) * (1.0 - (-dt / tau.as_secs_f64()).exp())
+}
+
+/// An ESC's motor state at one moment ([`Esc::motor`]): enough to tell its speed at any later time, as long as no
+/// frame comes in.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Motor {
+    rpm: f64,
+    target_rpm: f64,
+    last_update: Time,
+    /// When the motor stops for lack of a signal, if it is turning.
+    loss_at: Option<Time>,
+    tau: Time,
+}
+
+impl Motor {
+    /// Signed mechanical RPM at `now` ([`Esc::rpm_at`]).
+    pub fn rpm_at(&self, now: Time) -> f64 {
+        if now <= self.last_update {
+            return self.rpm;
+        }
+        match self.loss_at {
+            Some(lost) if lost < now => {
+                let at_loss = lag(
+                    self.tau,
+                    self.rpm,
+                    self.target_rpm,
+                    (lost.max(self.last_update) - self.last_update).as_secs_f64(),
+                );
+                lag(self.tau, at_loss, 0.0, (now - lost.max(self.last_update)).as_secs_f64())
+            }
+            _ => lag(self.tau, self.rpm, self.target_rpm, (now - self.last_update).as_secs_f64()),
+        }
+    }
+}
+
 impl Esc {
     pub fn new(name: &str, signal_pin: u8, telemetry_pin: Option<u8>) -> Self {
         Esc {
@@ -159,7 +197,7 @@ impl Esc {
 
     /// The lag towards `target` over `dt` seconds from `rpm`.
     fn lag(&self, rpm: f64, target: f64, dt: f64) -> f64 {
-        rpm + (target - rpm) * (1.0 - (-dt / self.tau.as_secs_f64()).exp())
+        lag(self.tau, rpm, target, dt)
     }
 
     /// Brings the motor up to `now`, stopping it at the signal-loss time on the way.
@@ -188,16 +226,18 @@ impl Esc {
     /// last frame (`rpm` is only brought up to date when a frame arrives), and towards a stop once the signal has
     /// been lost for the timeout. For a vehicle simulation reading the propeller speed between frames.
     pub fn rpm_at(&self, now: Time) -> f64 {
-        if now <= self.last_update {
-            return self.rpm;
-        }
-        match self.loss_at() {
-            Some(lost) if lost < now => {
-                let at_loss =
-                    self.lag(self.rpm, self.target_rpm, (lost.max(self.last_update) - self.last_update).as_secs_f64());
-                self.lag(at_loss, 0.0, (now - lost.max(self.last_update)).as_secs_f64())
-            }
-            _ => self.lag(self.rpm, self.target_rpm, (now - self.last_update).as_secs_f64()),
+        self.motor().rpm_at(now)
+    }
+
+    /// The motor's state as it is now: what [`Esc::rpm_at`] works from, kept apart from the rest of the model (a
+    /// robot running its boards ahead of each other keeps it for each slice, for its vehicles).
+    pub fn motor(&self) -> Motor {
+        Motor {
+            rpm: self.rpm,
+            target_rpm: self.target_rpm,
+            last_update: self.last_update,
+            loss_at: self.loss_at(),
+            tau: self.tau,
         }
     }
 
@@ -587,6 +627,24 @@ mod signal_loss {
         ctx.now = lost + Time::from_ms(500);
         frame(&mut e, &mut ctx, 548);
         assert!(e.target_rpm > 1900.0 && !e.signal_lost(ctx.now));
+    }
+
+    /// A motor state taken at one moment goes on telling the speeds the ESC would have, signal loss included, until
+    /// a frame comes; the ESC itself moves on from then.
+    #[test]
+    fn a_motor_state_tells_the_speeds_until_the_next_frame() {
+        let (mut e, mut ctx) = spun_up();
+        let kept = e.motor();
+        let last = e.last_frame.unwrap();
+        for ms in [0, 1, 7, 100, 249, 250, 251, 260, 400, 2000] {
+            let t = last + Time::from_ms(ms);
+            assert_eq!(kept.rpm_at(t).to_bits(), e.rpm_at(t).to_bits(), "{ms} ms");
+        }
+        ctx.now = last + Time::from_ms(5);
+        frame(&mut e, &mut ctx, 100);
+        let later = last + Time::from_ms(80);
+        assert!(e.rpm_at(later) < kept.rpm_at(later) - 100.0, "the new frame slows the motor down");
+        assert_eq!(e.motor(), e.motor());
     }
 
     #[test]

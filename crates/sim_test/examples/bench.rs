@@ -6,8 +6,9 @@
 //! ```
 //!
 //! `talos_mt` is Talos with its boards on up to four threads (`robot --threads 4`), or as many as `--threads N` says
-//! (0: one per core); `talos_t2`, `talos_t3` and `talos_t6` on up to two, three and six. Their fingerprints match
-//! `talos`'s. `--threads` also prints how the boards were spread over the threads.
+//! (0: one per core); `talos_t2`, `talos_t3` and `talos_t6` on up to two, three and six, and `talos_t3_ls` on three in
+//! step slice by slice (without letting the boards run ahead of each other, `Robot::run_ahead`). Their fingerprints
+//! match `talos`'s. `--threads` also prints how the boards were spread over the threads.
 //!
 //! For each case: the virtual time run, the best wall time over the repeats, virtual/wall (above 1 keeps up with
 //! `--realtime`), the CPU time of that run (less disturbed than the wall clock by a busy machine), instructions
@@ -36,8 +37,9 @@ struct Case {
 enum Kind {
     /// An image on its board file with a mock bridge for a client.
     Board { elf: &'static str, board: &'static str, client: u8 },
-    /// A robot file with mock bridges `(bus, client)`, its boards run on `threads` threads (see `Robot::threads`).
-    Robot { file: &'static str, bridges: &'static [(&'static str, u8)], threads: usize },
+    /// A robot file with mock bridges `(bus, client)`, its boards run on `threads` threads (see `Robot::threads`;
+    /// negative: on that many, slice by slice, without `Robot::run_ahead`).
+    Robot { file: &'static str, bridges: &'static [(&'static str, u8)], threads: isize },
 }
 
 const CASES: &[Case] = &[
@@ -49,6 +51,8 @@ const CASES: &[Case] = &[
     Case { name: "talos_t2", kind: Kind::Robot { file: "talos.toml", bridges: &[("internal", 1)], threads: 2 } },
     Case { name: "talos_t3", kind: Kind::Robot { file: "talos.toml", bridges: &[("internal", 1)], threads: 3 } },
     Case { name: "talos_t6", kind: Kind::Robot { file: "talos.toml", bridges: &[("internal", 1)], threads: 6 } },
+    // On three threads in step slice by slice (`Robot::run_ahead` off), for comparison
+    Case { name: "talos_t3_ls", kind: Kind::Robot { file: "talos.toml", bridges: &[("internal", 1)], threads: -3 } },
     Case {
         name: "ivc2_pool",
         kind: Kind::Robot { file: "ivc2_pool.toml", bridges: &[("talos", 8), ("surface", 8)], threads: 1 },
@@ -87,7 +91,7 @@ fn hash_session(h: &mut Fnv, s: &Session) {
 
 fn threads_of(case: &Case) -> usize {
     match case.kind {
-        Kind::Robot { threads, .. } => threads,
+        Kind::Robot { threads, .. } => threads.unsigned_abs(),
         Kind::Board { .. } => 1,
     }
 }
@@ -129,6 +133,7 @@ fn run(case: &Case, time: Time, override_threads: Option<usize>) -> Result<Outco
                 Some(n) if case.name == "talos_mt" => n,
                 _ => threads_of(case),
             };
+            r.robot.run_ahead = !matches!(case.kind, Kind::Robot { threads, .. } if threads < 0);
             let (wall, cpu) = (Instant::now(), cpu_time());
             r.run_until(time);
             let (wall, cpu) = (wall.elapsed(), cpu_time().zip(cpu).map(|(b, a)| b - a));

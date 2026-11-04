@@ -147,6 +147,36 @@ the calling thread for 8 regroupings, twice as many each time in a row, up to 51
 calls. A board stopping for another reason than the slice's end is reported after the slice, lowest index first,
 with the others run to the end of the slice; a panic on a worker goes on on the calling thread.
 
+**Running ahead** (`sim_host::runahead`, on by default with threads; `Robot::run_ahead`, `robot --no-run-ahead`).
+Slice by slice, every slice waits for its slowest board, and the two ESC boards' heavy slices (their DShot frames)
+fall in different slices, so on threads Talos was bound by the sum of the slowest board of each slice. But boards
+see each other only through the end of a slice, and through it only in three ways: a bus step that carries a frame
+(a step that carries none changes no controller that counts no dominant bits and is not bus-off,
+`CanNode::idle_changes_nothing`), a vehicle (it reads the ESCs' motors and writes the pressure inputs of the boards
+it carries sensors for), and the order in which host hooks see lines. A frame finishes no earlier than when it
+became ready plus its time on the wire (`CanBus::earliest_end`), and endpoints say when they will next hand one in
+(`CanEndpoint::idle_until`: the mock bridge and `Monitor` can, SocketCAN and cannelloni cannot). So the boards run
+in windows: each runs on alone on its thread, doing the machine side of its end of each slice (devices, and taking
+out what RTT and the UARTs hold, `Session::collect`) and noting what its controllers show the bus and its ESCs'
+motors, up to the first boundary where any board's frame could finish (an atomic minimum it lowers as soon as it
+has a frame ready), an endpoint's next frame, or 64 slices. A board that went past the window's end before it was
+told is rolled back to a checkpoint (`Session::checkpoint`: the machine without its flash, which is versioned so
+that it is copied only when it changed, plus what the run loop carries, `Machine::run_carry`; one at the window's
+first boundary and one after every 1.5 ms of host time) and run again; runs are deterministic, so it gets there
+exactly as it would have. Meanwhile the calling thread commits every boundary all boards have gone past: each bus
+steps against stand-ins that answer as the controllers did there (one that the step would change panics: it would
+mean the bounds are wrong), the vehicles step with the noted motors, and boards whose inputs a vehicle drives (the
+camera cage) run there slice by slice rather than ahead; a frame of theirs cuts the window and rolls the others
+back. At the window's end the host sides take in what was collected, boundary by boundary in board order, and the
+end of the slice is done as usual. A board that stops ends the window at the end of that slice, as on threads.
+Boards with a pty, USB/IP, an Ethernet cable, a profiler or a trace sink (VCD, `--trace`), endpoints that cannot
+tell when they send, and acoustic media keep the slice-by-slice threads. `crates/sim_host/tests/runahead.rs`
+compares Talos frame by frame, line by line (the hooks' order across boards included) and state by state against
+taking turns: on 2, 3 and any threads, in uneven pieces, with a vehicle that moves the camera cage's input, with
+stops, and with a stress mode (`Robot::run_ahead_stress`) that makes every board ignore where its window ends
+until rolled back and cuts every window at a random boundary (thousands of rollbacks);
+`crates/sim_test/tests/run_ahead_thrusters.rs` does it with the thrusters spinning and the vehicle moving.
+
 Both run their machines through `Session::run_machine`, which goes through the session's sampling profiler when
 it has one (the profiler cuts the run at its sample times; a robot's worker thread takes the board's profiler with
 its machine). The waveform writer, the dashboard and the JSON log only observe: trace events (shared through
@@ -246,8 +276,11 @@ benchmark fingerprints rely on it.
 * Iterate in a defined order (`BTreeMap`, vectors), not over `HashMap`s, wherever the order can reach the
   machine.
 * Events at the same time fire in scheduling order; keep it that way when changing the scheduler.
-* Threads must not change results: robot boards only run in parallel within a slice where they cannot see each
-  other, and sweeps run independent snapshots.
+* Threads must not change results: robot boards only run in parallel where they cannot see each other (within a
+  slice, or ahead of each other up to where a frame could reach them, rolled back if they went too far), and
+  sweeps run independent snapshots. A `CanEndpoint::idle_until` or `CanNode::idle_changes_nothing` that promises
+  too much breaks this; the commit of a window panics when a bus step would change a node it was told would not
+  change.
 * Observers must not steer the machine: a trace sink only receives events, and only instruction and exception
   tracing turn batched execution off (GPIO and device traces, and so waveforms, leave it on). Cutting a run at
   any time, as the profiler does, must give the same single-core run (`crates/rp2040/tests/busy_wait.rs`).
@@ -273,7 +306,8 @@ cargo run --release -p sim_test --example bench -- --time 2s --repeat 3 --only e
 ```
 
 runs the template, ESC and IVCBoard2 images on their boards and the Talos (also on up to two, three, four and six
-threads: `talos_t2`, `talos_t3`, `talos_mt`, `talos_t6`; `--threads N` sets `talos_mt`'s and prints the grouping)
+threads: `talos_t2`, `talos_t3`, `talos_mt`, `talos_t6`, and on three slice by slice without running ahead:
+`talos_t3_ls`; `--threads N` sets `talos_mt`'s and prints the grouping)
 and IVC2 pool robots for 2 s of virtual time, and prints the best wall time, virtual/wall (above 1 keeps up with
 `--realtime`), CPU time, instructions executed, the share skipped in busy-waits, emulated MIPS, and a fingerprint
 of everything the run produced (log lines and their times, bridge messages, UART/RTT text, CPU registers, cycle
@@ -282,12 +316,17 @@ machine: compare the best of several repeats, or the instruction counts under `v
 `--repeat 1`.
 
 Measured on a shared 4-core machine (CPU time for 2 s of virtual time): template 0.03 s, ESC board 1.35 s,
-IVCBoard2 0.55 s, Talos 3.7 s, IVC2 pool 2.15 s. Talos on threads (wall time): 2.84 s on two, 2.47 s on three.
+IVCBoard2 0.55 s, Talos 3.7 s, IVC2 pool 2.15 s. Talos on threads (wall time): 1.6-1.7 s on three or four
+(1.2-1.25x real time), 2.4 s on two (both ESC boards share a thread with others there); slice by slice on three it
+was 2.5 s.
 The ESC board waits out each 400 µs DShot frame time on the timer (skipped across ticks up to its deadline, see
 the run loop), so what is left of its time is the frame itself: the control loop polling FSTAT while the PIO
 sends the frame and receives the replies. Per 100 µs slice an ESC board takes about 70 µs on average but its frames
-fall in different slices from the other ESC board's, so the slowest board of each slice adds up to about 2.4 s
-however many threads there are (2.5 s with three): about 0.8x real time is as far as threads take Talos. Under
+fall in different slices from the other ESC board's, so slice by slice the slowest board of each slice adds up to
+about 2.4 s however many threads there are: about 0.8x real time. Running ahead takes that floor away: Talos is
+then bound by its costliest board, an ESC board at about 1.4 s, plus about 0.2-0.3 s for the windows (430 per 2 s:
+the one that is ahead waits for the other at each window's end; reruns after 100-150 rollbacks per ESC board; about
+36 µs per checkpoint). Under
 callgrind (400 ms, `--repeat 1`) the ESC board executes 2,510 M host instructions, against 3,692 M before these
 skips: about 45 % in the interpreter and the run loop's per-quantum work, 20 % in advancing the PIO (half of it
 ticking the receivers between their counted loops) and 5 % resolving pins. IVCBoard2 is all interpretation
