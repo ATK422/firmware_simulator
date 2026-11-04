@@ -132,6 +132,19 @@ fn talos(how: &How) -> Option<(Run, sim_host::runahead::Stats)> {
     Some((Run { frames, hooks, state, bridge }, r.run_ahead_stats))
 }
 
+/// Asserts two runs are the same, showing where they first differ.
+#[track_caller]
+fn same(want: &Run, got: &Run, what: &str) {
+    for (name, a, b) in
+        [("frames", &want.frames, &got.frames), ("hooks", &want.hooks, &got.hooks), ("state", &want.state, &got.state)]
+    {
+        if let Some(i) = (0..a.len().max(b.len())).find(|&i| a.get(i) != b.get(i)) {
+            panic!("{what}: {name} differ at {i}:\n  want {:?}\n  got  {:?}", a.get(i), b.get(i));
+        }
+    }
+    assert_eq!(want.bridge, got.bridge, "{what}: what the bridge received");
+}
+
 fn turns() -> How {
     How { threads: 1, ..Default::default() }
 }
@@ -150,10 +163,10 @@ fn running_ahead_gives_the_same_run_as_turns() {
     // On threads slice by slice, as before
     let (lockstep, none) = talos(&How { threads: 3, fixed: Some(FIXED.to_vec()), ..Default::default() }).unwrap();
     assert_eq!(none, Default::default());
-    assert_eq!(want, lockstep);
+    same(&want, &lockstep, "slice by slice");
     for how in [ahead(3), ahead(2), ahead(0), How { fixed: Some(FIXED.to_vec()), ..ahead(3) }] {
         let (got, stats) = talos(&how).unwrap();
-        assert_eq!(want, got, "{} threads", how.threads);
+        same(&want, &got, &format!("{} threads", how.threads));
         // Most of the run was ahead: windows are many slices long
         assert!(stats.slices >= 6900 && stats.windows < stats.slices / 8, "{stats:?}");
     }
@@ -166,7 +179,7 @@ fn rolled_back_boards_rerun_the_same() {
     let Some((want, _)) = talos(&turns()) else { return };
     for seed in [1, 2] {
         let (got, stats) = talos(&How { stress: Some(seed), fixed: Some(FIXED.to_vec()), ..ahead(3) }).unwrap();
-        assert_eq!(want, got, "seed {seed}");
+        same(&want, &got, &format!("seed {seed}"));
         assert!(stats.rollbacks > 2000, "{stats:?}");
     }
 }
@@ -179,10 +192,10 @@ fn boards_on_a_moving_vehicle_see_it_move_as_in_turns() {
     let Some((want, _)) = talos(&How { threads: 1, ..sink.clone() }) else { return };
     let (got, stats) =
         talos(&How { threads: 3, run_ahead: true, fixed: Some(FIXED.to_vec()), ..sink.clone() }).unwrap();
-    assert_eq!(want, got);
+    same(&want, &got, "");
     assert!(stats.follower_cuts > 0, "{stats:?}");
     let (got, _) = talos(&How { threads: 3, run_ahead: true, stress: Some(7), ..sink }).unwrap();
-    assert_eq!(want, got);
+    same(&want, &got, "");
     // It did move
     let (still, _) = talos(&turns()).unwrap();
     assert_ne!(still.state.last(), want.state.last());
@@ -203,7 +216,7 @@ fn any_pieces_give_the_same_run() {
     let Some((want, _)) = talos(&How { ends: ends.clone(), ..turns() }) else { return };
     for stress in [None, Some(3)] {
         let (got, _) = talos(&How { ends: ends.clone(), stress, fixed: Some(FIXED.to_vec()), ..ahead(3) }).unwrap();
-        assert_eq!(want, got, "stress {stress:?}");
+        same(&want, &got, &format!("stress {stress:?}"));
     }
 }
 
