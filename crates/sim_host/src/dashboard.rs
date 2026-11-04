@@ -20,6 +20,7 @@
 //! | `POST /api/pause` `{"paused": true, "at_s": 2.0}` | pauses or resumes virtual time (`at_s`: pause when it gets there) |
 //! | `GET /api/thrusters` | every DShot ESC's propeller speed and each vehicle's thrust, built live (see [`thrusters_json`]) |
 //! | `POST /api/vehicle` `{"vehicle": "talos", "position_m": [n, e, d], "rpy_deg": [r, p, y]}` | puts a vehicle at a pose (an external one: its only motion), answered with `/api/thrusters` |
+//! | `POST /api/rewind` `{"time_s": 1.25}`, `{"checkpoint": "booted"}` or `{"save": "booted"}` | goes back (or forward, within what was run) to a time or a saved checkpoint (or saves one), the whole run at once ([`crate::timetravel`]; needs [`Dashboard::travel`]) |
 //!
 //! `POST /api/vehicle` takes the attitude as `rpy_deg` or `quat_wxyz` (body to world), and optionally
 //! `velocity_mps` (body frame) and `rate_dps`; `vehicle` may be left out when there is one. Frames are the
@@ -364,6 +365,49 @@ enum Command {
         pose: ExternalPose,
         reply: mpsc::Sender<Result<Value, String>>,
     },
+    /// `POST /api/rewind`.
+    Rewind {
+        to: RewindTo,
+        reply: mpsc::Sender<Result<String, String>>,
+    },
+}
+
+/// Where `POST /api/rewind` goes.
+#[derive(Clone, Debug, PartialEq)]
+pub enum RewindTo {
+    Time(Time),
+    Checkpoint(String),
+    /// Not a move: keeps a checkpoint here under this name.
+    Save(String),
+}
+
+/// Goes back (or forward) with `tt` on `target`: the message for the answer.
+pub fn rewind(
+    tt: Option<&mut crate::timetravel::TimeTravel>,
+    target: &mut dyn crate::timetravel::Rewindable,
+    to: &RewindTo,
+) -> Result<String, String> {
+    use crate::timetravel::Travelled;
+    let tt = tt.ok_or("time travel is off for this run (it records with --checkpoint-every above 0)")?;
+    let r = match to {
+        RewindTo::Time(t) => tt.rewind_to(target, *t),
+        RewindTo::Save(name) => {
+            tt.save(target, name)?;
+            return Ok(format!("checkpoint {name:?} saved at {}", target.now()));
+        }
+        RewindTo::Checkpoint(name) => tt.rewind_to_saved(target, name).ok_or_else(|| {
+            format!(
+                "no checkpoint {name:?}; saved: {:?}",
+                tt.checkpoints().iter().filter_map(|c| c.1).collect::<Vec<_>>()
+            )
+        })?,
+    };
+    let now = target.now();
+    Ok(match r {
+        Travelled::Beginning => format!("at {now}, the start of the recorded history"),
+        Travelled::Frontier => format!("at {now}, as far as the run has got"),
+        _ => format!("at {now}"),
+    })
 }
 
 struct Shared {
@@ -407,6 +451,9 @@ pub struct Dashboard {
     started: Instant,
     /// Shown on the page once the run is over.
     pub finished: Option<String>,
+    /// The run's recorder, for `POST /api/rewind` (see [`crate::timetravel`]); runs through
+    /// [`Dashboard::run_session`] and [`Dashboard::run_robot`] go through it.
+    pub travel: Option<crate::timetravel::TimeTravel>,
 }
 
 impl Dashboard {
@@ -463,7 +510,33 @@ impl Dashboard {
             speed: (started, Time::ZERO, 0.0),
             started,
             finished: None,
+            travel: None,
         })
+    }
+
+    /// Runs `s` to `end`, through [`Dashboard::travel`] when there is one.
+    pub fn run_session(&mut self, s: &mut Session, end: Time) -> rp2040::StopReason {
+        use crate::timetravel::Ran;
+        match &mut self.travel {
+            None => s.run_until(end),
+            Some(tt) => match tt.run_until(s, end) {
+                Ran::Reached => rp2040::StopReason::TimeLimit,
+                Ran::Interrupted => rp2040::StopReason::Requested,
+                Ran::Stopped { reason, .. } => reason,
+            },
+        }
+    }
+
+    /// Runs `r` to `end`, through [`Dashboard::travel`] when there is one (as [`Robot::run_until`]).
+    pub fn run_robot(&mut self, r: &mut Robot, end: Time) -> Option<(usize, rp2040::StopReason)> {
+        use crate::timetravel::Ran;
+        match &mut self.travel {
+            None => r.run_until(end),
+            Some(tt) => match tt.run_until(r, end) {
+                Ran::Reached | Ran::Interrupted => None,
+                Ran::Stopped { board, reason } => Some((board, reason)),
+            },
+        }
     }
 
     /// A mock bridge (or the Puddles one) attached to `board` or on bus `bus`.
@@ -584,7 +657,15 @@ impl Dashboard {
                         board.clone()
                     };
                     self.record_fault(s.machine.now, &name, &spec, &r);
+                    if let Some(tt) = &mut self.travel {
+                        tt.changed(s);
+                    }
                     replies.push((reply, r.map(|_| format!("{spec} applied to {name}"))));
+                }
+                Command::Rewind { to, reply } => {
+                    let r = rewind(self.travel.as_mut(), s, &to);
+                    s.reset_pacing();
+                    replies.push((reply, r));
                 }
                 Command::Input { board, name, value, reply } => {
                     let r = self.set_input(&board, &name, value);
@@ -639,7 +720,15 @@ impl Dashboard {
                         crate::fault::robot_target(r, i, ctl).apply(&fault)
                     });
                     self.record_fault(r.now, &board, &spec, &res);
+                    if let Some(tt) = &mut self.travel {
+                        tt.changed(r);
+                    }
                     replies.push((reply, res.map(|_| format!("{spec} applied to {board}"))));
+                }
+                Command::Rewind { to, reply } => {
+                    let res = rewind(self.travel.as_mut(), r, &to);
+                    r.reset_pacing();
+                    replies.push((reply, res));
                 }
                 Command::Input { board, name, value, reply } => {
                     replies.push((reply, self.set_input(&board, &name, value)));
@@ -656,7 +745,11 @@ impl Dashboard {
                     let _ = reply.send(Ok(self.robot_thrusters(r)));
                 }
                 Command::Vehicle { name, pose, reply } => {
-                    let res = set_vehicle_pose(r, &name, &pose).map(|msg| {
+                    let res = set_vehicle_pose(r, &name, &pose);
+                    if let (Ok(_), Some(tt)) = (&res, &mut self.travel) {
+                        tt.changed(r);
+                    }
+                    let res = res.map(|msg| {
                         let mut v = self.robot_thrusters(r);
                         v["message"] = msg.into();
                         v
@@ -748,6 +841,7 @@ impl Dashboard {
                 Ok(Command::Fault { reply, .. })
                 | Ok(Command::Input { reply, .. })
                 | Ok(Command::Pause { reply, .. })
+                | Ok(Command::Rewind { reply, .. })
                 | Ok(Command::Refresh { reply }) => {
                     let _ = reply.send(Err("the run is over".into()));
                 }
@@ -818,6 +912,17 @@ impl Dashboard {
             "realtime": realtime,
             "finished": self.finished,
             "faults": self.faults,
+            "travel": self.travel.as_ref().map(|tt| {
+                let st = tt.stats();
+                json!({
+                    "live": tt.at_frontier(),
+                    "oldest_s": st.oldest.as_secs_f64(),
+                    "frontier_s": st.frontier.as_secs_f64(),
+                    "checkpoints": st.checkpoints,
+                    "memory_mb": st.bytes as f64 / (1 << 20) as f64,
+                    "saved": tt.checkpoints().iter().filter_map(|c| c.1.map(|n| json!({"name": n, "time_s": c.0.as_secs_f64()}))).collect::<Vec<_>>(),
+                })
+            }),
             "fault_help": FAULT_HELP.iter().map(|(f, h)| json!({"fault": f, "help": h})).collect::<Vec<_>>(),
         })
     }
@@ -1442,6 +1547,32 @@ fn handle(mut stream: TcpStream, server: &Server) -> std::io::Result<()> {
             let (reply, answer) = mpsc::channel();
             live(&mut stream, server, Command::Vehicle { name, pose, reply }, answer)
         }
+        ("POST", "/api/rewind") => {
+            let body: Value = match serde_json::from_slice(&req.body) {
+                Ok(v) => v,
+                Err(e) => return json_reply(&mut stream, 400, json!({"ok": false, "error": format!("bad JSON: {e}")})),
+            };
+            let to = match (&body["time_s"], body["checkpoint"].as_str()) {
+                _ if body["save"].is_string() => RewindTo::Save(body["save"].as_str().unwrap_or("").to_string()),
+                (_, Some(name)) => RewindTo::Checkpoint(name.to_string()),
+                (v, None) => match v.as_f64() {
+                    Some(t) if t.is_finite() && t >= 0.0 => RewindTo::Time(Time::from_secs_f64(t)),
+                    _ => {
+                        let e = "give time_s (seconds, 0 or more), checkpoint (a name) or save (a name)";
+                        return json_reply(&mut stream, 400, json!({"ok": false, "error": e}));
+                    }
+                },
+            };
+            let (reply, answer) = mpsc::channel();
+            if server.tx.send(Command::Rewind { to, reply }).is_err() {
+                return json_reply(&mut stream, 503, json!({"ok": false, "error": "the run is over"}));
+            }
+            match answer.recv_timeout(REPLY_TIMEOUT) {
+                Ok(Ok(msg)) => json_reply(&mut stream, 200, json!({"ok": true, "message": msg})),
+                Ok(Err(e)) => json_reply(&mut stream, 422, json!({"ok": false, "error": e})),
+                Err(_) => json_reply(&mut stream, 503, json!({"ok": false, "error": "the run loop did not answer"})),
+            }
+        }
         ("POST", "/api/fault") | ("POST", "/api/input") | ("POST", "/api/pause") => {
             let body: Value = match serde_json::from_slice(&req.body) {
                 Ok(v) => v,
@@ -1496,6 +1627,7 @@ fn handle(mut stream: TcpStream, server: &Server) -> std::io::Result<()> {
         | (_, "/api/input")
         | (_, "/api/pause")
         | (_, "/api/thrusters")
+        | (_, "/api/rewind")
         | (_, "/api/vehicle") => json_reply(&mut stream, 405, json!({"ok": false, "error": "method not allowed"})),
         _ => json_reply(&mut stream, 404, json!({"ok": false, "error": "not found"})),
     }

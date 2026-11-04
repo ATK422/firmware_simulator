@@ -25,7 +25,7 @@
 //! first boundary where one of its frames could finish, and tells the others (an atomic minimum), who stop there
 //! too: the window ends at the first boundary where any frame could finish, or at an endpoint's next frame, at most
 //! `MAX_WINDOW` slices on. A board that ran past that boundary before it was told is rolled back to a checkpoint
-//! (`Session::checkpoint`: one at the window's first boundary, and another each time it has run for
+//! (`Session::rollback_point`: one at the window's first boundary, and another each time it has run for
 //! `CHECKPOINT_WORK` since) and run again to the window's end; runs are deterministic, so it gets there exactly
 //! as it would have, telling the others the same things.
 //!
@@ -75,7 +75,6 @@ use std::time::{Duration, Instant};
 use rp2040::StopReason;
 use sim_core::time::Time;
 use sim_core::trace::{Category, TraceSink, VecSink};
-use sim_core::versioned::Versioned;
 #[cfg(doc)]
 use sim_devices::can::CanBus;
 use sim_devices::can::{BitRates, BusError, CanFrame, CanNode, TxRequest};
@@ -84,7 +83,7 @@ use sim_devices::dshot::{Esc, Motor};
 use crate::parallel::{FIRST_REGROUP_SLICES, REGROUP_SLICES, lock, max_threads, wait_for};
 use crate::profile::{ProfileMark, Profiler};
 use crate::robot::{Robot, RobotBus, end_slice, power_on_by, step_bus};
-use crate::session::{Checkpoint, Collected, Pacing, Session};
+use crate::session::{Pacing, RollbackPoint, Session, SliceOutput};
 use crate::vehicle::VehicleSim;
 
 #[cfg(doc)]
@@ -168,7 +167,7 @@ impl HeldTrace {
 /// Where a board run ahead can be rolled back to: its boundary, the board there and what else running it changes.
 struct LaneCheckpoint {
     at: usize,
-    board: Checkpoint,
+    board: RollbackPoint,
     power: (Time, bool),
     /// Trace events held at the time.
     trace: usize,
@@ -270,7 +269,7 @@ impl CanNode for Proxy<'_> {
 struct Mark {
     nodes: Vec<NodeView>,
     motors: Vec<(usize, Motor)>,
-    collected: Collected,
+    collected: SliceOutput,
 }
 
 /// Where a window ends: its number in the run and its last boundary, in one word so that both are read together
@@ -318,8 +317,6 @@ impl Bounds {
 struct Lane<'a> {
     session: &'a mut Session,
     power: &'a mut (Time, bool),
-    /// The flash kept for its checkpoints (kept from one run to the next).
-    flash: &'a mut Versioned,
     /// The rates of its bus, to time its frames.
     rates: Option<BitRates>,
     /// The pin devices of its ESCs that a vehicle reads.
@@ -389,7 +386,7 @@ impl Lane<'_> {
             .expect("a board that went past boundary 1 has a checkpoint");
         self.checkpoints.truncate(k + 1);
         let c = &self.checkpoints[k];
-        self.session.rollback(&c.board, self.flash);
+        self.session.roll_back(&c.board);
         self.session.unread_from(self.bounds.time(c.at));
         *self.power = c.power;
         self.at = c.at;
@@ -487,14 +484,11 @@ impl Lane<'_> {
             if !self.blind && self.at >= boundary_of(shared.window.load(Ordering::Acquire)) {
                 return;
             }
-            // Later checkpoints share the flash kept for the first: they wait until it is the same again
-            let more = self.since_checkpoint >= CHECKPOINT_WORK
-                && self.flash.version() == self.session.machine.sys.flash.version();
-            if self.checkpoints.is_empty() || more {
+            if self.checkpoints.is_empty() || self.since_checkpoint >= CHECKPOINT_WORK {
                 let start = Instant::now();
                 self.checkpoints.push(LaneCheckpoint {
                     at: self.at,
-                    board: self.session.checkpoint(self.flash),
+                    board: self.session.rollback_point(),
                     power: *self.power,
                     trace: self.trace.as_ref().map_or(0, HeldTrace::len),
                     profile: self.session.profiler.as_ref().map(Profiler::mark),
@@ -655,13 +649,13 @@ fn horizon(buses: &[RobotBus], bounds: &Bounds) -> usize {
     bounds.at_or_after(first).max(1)
 }
 
-/// [`Robot::run_until`] for a robot that can run its boards ahead of each other ([`possible`]).
-pub(crate) fn run_until(robot: &mut Robot, end: Time) -> Option<(usize, StopReason)> {
+/// [`Robot::run_until`] for a robot that can run its boards ahead of each other ([`possible`]). With `soft`, it
+/// returns once a window ends at or after `soft` ([`Robot::run_until_after`]).
+pub(crate) fn run_until(robot: &mut Robot, end: Time, soft: Option<Time>) -> Option<(usize, StopReason)> {
     let max_threads = max_threads(robot);
     let n = robot.boards.len();
     let live = has_live_inputs(robot);
     robot.balance.fit(n, max_threads);
-    robot.kept_flash.resize_with(n, Versioned::default);
     let mut follower = vec![false; n];
     let mut escs = vec![Vec::new(); n];
     for v in &robot.vehicles {
@@ -685,7 +679,6 @@ pub(crate) fn run_until(robot: &mut Robot, end: Time) -> Option<(usize, StopReas
         pacing,
         balance,
         stop_flag,
-        kept_flash,
         run_ahead_stress,
         run_ahead_stats,
         ..
@@ -697,9 +690,8 @@ pub(crate) fn run_until(robot: &mut Robot, end: Time) -> Option<(usize, StopReas
     let lanes = boards
         .iter_mut()
         .zip(power_on.iter_mut())
-        .zip(kept_flash.iter_mut())
         .enumerate()
-        .map(|(i, ((session, power), flash))| {
+        .map(|(i, (session, power))| {
             let trace = HeldTrace::hold(&mut session.machine);
             if let Some(p) = &mut session.profiler {
                 p.hold();
@@ -707,7 +699,6 @@ pub(crate) fn run_until(robot: &mut Robot, end: Time) -> Option<(usize, StopReas
             Mutex::new(Lane {
                 session,
                 power,
-                flash,
                 rates: board_bus[i].map(|j| buses[j].bus.rates),
                 escs: std::mem::take(&mut escs[i]),
                 follower: follower[i],
@@ -879,6 +870,9 @@ pub(crate) fn run_until(robot: &mut Robot, end: Time) -> Option<(usize, StopReas
                     since_regroup = 0;
                     regroup_at = REGROUP_SLICES;
                 }
+                if soft.is_some_and(|s| *now >= s) {
+                    break;
+                }
             }
             None
         };
@@ -992,7 +986,7 @@ impl Committer {
                     shared.announce(self.window, f.max(j));
                 }
                 views[*i] = nodes.clone();
-                lock(l.marks).push(Mark { nodes, motors: Vec::new(), collected: Collected::default() });
+                lock(l.marks).push(Mark { nodes, motors: Vec::new(), collected: SliceOutput::default() });
             }
             if boundary_of(shared.window.load(Ordering::Acquire)) < w {
                 stats.follower_cuts += 1;
@@ -1200,10 +1194,9 @@ mod tests {
         b.profiler.as_mut().unwrap().commit();
         assert!(b.profiler.as_ref().unwrap().samples(0) > 0, "committed, counted");
         b.run_machine(Time::from_ms(25));
-        let mut flash = Versioned::default();
-        let (c, mark) = (b.checkpoint(&mut flash), b.profiler.as_ref().unwrap().mark());
+        let (c, mark) = (b.rollback_point(), b.profiler.as_ref().unwrap().mark());
         b.run_machine(Time::from_ms(37));
-        b.rollback(&c, &flash);
+        b.roll_back(&c);
         b.profiler.as_mut().unwrap().back_to(&mark);
         b.run_machine(Time::from_ms(40));
         b.profiler.as_mut().unwrap().release();
@@ -1240,10 +1233,8 @@ mod tests {
     fn a_rolled_back_session_reruns_the_same() {
         let Some(mut s) = boot("esc_board") else { return };
         s.run_machine(Time::from_ms(20));
-        let mut flash = Versioned::default();
         let at = s.machine.now;
-        let c = s.checkpoint(&mut flash);
-        assert_eq!(flash.version(), s.machine.sys.flash.version());
+        let c = s.rollback_point();
         let lines = hooked(&mut s);
         s.run_machine(Time::from_ms(140));
         s.poll_rtt();
@@ -1253,7 +1244,7 @@ mod tests {
             if written {
                 s.machine.sys.flash[0x1F_0000] ^= 0xFF;
             }
-            s.rollback(&c, &flash);
+            s.roll_back(&c);
             assert_eq!(s.machine.now, at);
             assert_eq!(s.machine.sys.flash.version(), first_flash, "the same contents as at the checkpoint");
             s.logs.clear();
@@ -1263,9 +1254,25 @@ mod tests {
             s.poll_rtt();
             assert_eq!(outcome(&s, &lines), first, "written: {written}");
         }
-        // Kept flash is only copied when it changed
-        let v = flash.version();
-        let _ = s.checkpoint(&mut flash);
-        assert_eq!(flash.version(), v);
+    }
+
+    /// What a board ran before it was rolled back does not count as covered: after a rollback and a rerun, the
+    /// coverage is what the rerun alone gives.
+    #[test]
+    fn rolled_back_execution_is_not_covered() {
+        let Some(mut s) = boot("esc_board") else { return };
+        s.machine.enable_coverage();
+        s.run_machine(Time::from_ms(5));
+        let mut fresh = s.snapshot();
+        let c = s.rollback_point();
+        // A run the rollback undoes, further than the rerun goes (so it runs code the rerun does not)
+        s.run_machine(Time::from_ms(300));
+        let undone = s.machine.coverage.clone().unwrap();
+        s.roll_back(&c);
+        s.run_machine(Time::from_ms(8));
+        fresh.run_machine(Time::from_ms(8));
+        assert_ne!(Some(&undone), s.machine.coverage.as_ref(), "the undone run covered other code");
+        assert_eq!(s.machine.coverage, fresh.machine.coverage);
+        assert_eq!(s.machine.cores[0].instructions(), fresh.machine.cores[0].instructions());
     }
 }

@@ -7,6 +7,10 @@
 // * Launch does not reset the chip: the emulator waits for GDB at the reset vector (a reset would be a watchdog
 //   reset, which titan firmware counts). Restart and Reset do `monitor reset halt`, then make GDB re-read the
 //   registers.
+// * Reverse debugging: the emulator advertises ReverseStep and ReverseContinue, but Cortex-Debug has no Step Back
+//   or Reverse Continue buttons (it does not ask the adapter for them); type `-exec reverse-continue`,
+//   `-exec reverse-stepi`, `-exec reverse-next`, `-exec monitor rewind 1.5s` in its Debug Console. The last
+//   configuration uses Native Debug (webfreak.debug) instead, which shows both buttons.
 {
   "version": "0.2.0",
   "configurations": [
@@ -81,6 +85,22 @@
         "maintenance flush register-cache"
       ],
       "preLaunchTask": "emulator: C pico-sdk ELF"
+    },
+    {
+      "name": "Emulator: titan_firmware_rs image, reverse debugging (Native Debug)",
+      "type": "gdb",
+      "request": "attach",
+      "remote": true,
+      "target": "localhost:3333",
+      "gdbpath": "gdb-multiarch",
+      "executable": "${workspaceFolder}/target/vscode/debug.elf",
+      "cwd": "${workspaceFolder}",
+      "stopAtConnect": true,
+      "autorun": [
+        "break main"
+      ],
+      "valuesFormatting": "parseText",
+      "preLaunchTask": "emulator: titan_firmware_rs image"
     }
   ]
 }

@@ -85,6 +85,43 @@ pub struct Options {
     /// A scenario whose firmware images are not built is skipped (tests) instead of failing, unless
     /// `SIM_REQUIRE_TITAN_RS` is set.
     pub skip_missing: bool,
+    /// Scenarios that reach the `pause` step of this name the same way (the same setup, inputs, bridges, images,
+    /// time and steps up to it) share one run up to there: the first to get there keeps a checkpoint of everything
+    /// (as `cases` do), the others go on from copies of it (`scenario --from-checkpoint NAME`).
+    pub from_checkpoint: Option<String>,
+    /// Collect firmware code coverage ([`Outcome::coverage`]; the boards run one instruction at a time).
+    pub coverage: bool,
+}
+
+/// Checkpoints kept by `pause` steps for [`Options::from_checkpoint`], by what led to them.
+type Checkpoints = std::collections::HashMap<String, Arc<Mutex<Option<Engine>>>>;
+
+fn checkpoints() -> &'static Mutex<Checkpoints> {
+    static CHECKPOINTS: std::sync::OnceLock<Mutex<Checkpoints>> = std::sync::OnceLock::new();
+    CHECKPOINTS.get_or_init(Default::default)
+}
+
+/// How many checkpoints `pause` steps keep for [`Options::from_checkpoint`] in this process.
+pub fn shared_checkpoints() -> usize {
+    checkpoints().lock().unwrap().values().filter(|s| s.lock().unwrap().is_some()).count()
+}
+
+/// Where the shared prefix ends: the index of the `pause` step named `name`, if the scenario can share the run up
+/// to it (no step after it is watched from the start of the run, which a copy taken later could not do).
+fn shared_prefix(s: &Scenario, name: &str) -> Option<usize> {
+    let p = s.steps.iter().position(|st| matches!(&st.kind, StepKind::Pause(n) if n == name))?;
+    let early = |st: &Step| {
+        matches!(st.kind, StepKind::Never(_) | StepKind::Always(_))
+            && matches!(
+                (st.start, st.end),
+                (Start::At(_), None | Some(End::Within(_)) | Some(End::Until(_))) | (Start::Cursor, None)
+            )
+    };
+    let later = s.steps[p + 1..].iter().chain(s.cases.iter().flat_map(|c| c.steps.iter()));
+    if later.clone().any(early) {
+        return None;
+    }
+    Some(p)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
@@ -135,6 +172,8 @@ pub struct Outcome {
     /// Each board and the image it ran.
     pub images: Vec<(String, PathBuf)>,
     pub record: Option<Record>,
+    /// What ran of each image, with [`Options::coverage`] (boards running the same image merged).
+    pub coverage: Option<sim_host::coverage::Coverage>,
 }
 
 impl Outcome {
@@ -163,6 +202,7 @@ impl Outcome {
             wall: Default::default(),
             images: Vec::new(),
             record: None,
+            coverage: None,
         }
     }
 }
@@ -1517,6 +1557,11 @@ fn build(s: &Scenario, opts: &Options, spec: &RobotSpec, dir: &Path) -> R<World>
             }
         }
     }
+    if opts.coverage {
+        for b in w.robot.boards.iter_mut() {
+            b.machine.enable_coverage();
+        }
+    }
     if let Some(interval) = opts.profile {
         for b in &mut w.robot.boards {
             b.start_profile(interval);
@@ -1567,6 +1612,56 @@ struct Engine {
 }
 
 impl Engine {
+    fn new(w: World, s: &Scenario, opts: &Options) -> Engine {
+        Engine {
+            w,
+            tl: Timeline {
+                results: Vec::new(),
+                pending: None,
+                watchers: Vec::new(),
+                sends: Vec::new(),
+                cursor: Time::ZERO,
+                end: s.time,
+                early: Vec::new(),
+            },
+            record: opts.record,
+        }
+    }
+
+    /// Runs `rest` of the steps, then the cases (each from a copy), as [`run`] does after the common steps.
+    fn run_rest(
+        &mut self,
+        s: &Scenario,
+        rest: &[Step],
+        images: &[(String, PathBuf)],
+        wall: std::time::Instant,
+    ) -> Vec<Outcome> {
+        let done = self.run_steps(rest);
+        if s.cases.is_empty() || !done {
+            self.finish();
+            if !done {
+                for c in &s.cases {
+                    for st in &c.steps {
+                        let k = self.result(st);
+                        self.tl.results[k].evidence.push("the common steps did not finish".into());
+                    }
+                }
+            }
+            return vec![self.outcome(s, None, images, wall)];
+        }
+        let mut out = Vec::new();
+        for c in &s.cases {
+            let started = std::time::Instant::now();
+            let mut f = self.fork();
+            f.run_steps(&c.steps);
+            f.finish();
+            let mut o = f.outcome(s, Some(&c.name), images, started);
+            o.wall += wall.elapsed() - started.elapsed();
+            out.push(o);
+        }
+        out
+    }
+
     fn fork(&self) -> Engine {
         Engine { w: self.w.snapshot(), tl: self.tl.clone(), record: self.record }
     }
@@ -2026,6 +2121,13 @@ impl Engine {
             wall: wall.elapsed(),
             images: images.to_vec(),
             record,
+            coverage: self.w.robot.boards.iter().any(|b| b.machine.coverage.is_some()).then(|| {
+                let mut c = sim_host::coverage::Coverage::new();
+                for (b, name) in self.w.robot.boards.iter().zip(&self.w.robot.images) {
+                    c.add_machine(name, &b.machine);
+                }
+                c
+            }),
             ..Outcome::empty(s)
         }
     }
@@ -2102,6 +2204,38 @@ pub fn run(s: &Scenario, opts: &Options) -> Vec<Outcome> {
         return fail(why);
     }
     let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| -> R<Vec<Outcome>> {
+        let shared = opts.from_checkpoint.as_deref().and_then(|name| shared_prefix(s, name).map(|p| (name, p)));
+        let slot = shared.map(|(name, p)| {
+            let key = format!(
+                "{name}|{:?}|{:?}|{:?}|{:?}|{}|{:?}|{images:?}|{:?}",
+                s.setup,
+                s.bridges,
+                s.inputs,
+                s.time,
+                s.threads,
+                &s.steps[..=p],
+                (opts.record, opts.profile, opts.coverage)
+            );
+            checkpoints().lock().unwrap().entry(key).or_default().clone()
+        });
+        if let (Some(slot), Some((_, p))) = (&slot, shared) {
+            let mut kept = slot.lock().unwrap();
+            if let Some(base) = &*kept {
+                let mut e = base.fork();
+                drop(kept);
+                return Ok(e.run_rest(s, &s.steps[p + 1..], &images, wall));
+            }
+            let w = build(s, opts, &spec, &dir)?;
+            let mut e = Engine::new(w, s, opts);
+            if e.run_steps(&s.steps[..=p]) {
+                *kept = Some(e.fork());
+                drop(kept);
+                return Ok(e.run_rest(s, &s.steps[p + 1..], &images, wall));
+            }
+            drop(kept);
+            e.finish();
+            return Ok(vec![e.outcome(s, None, &images, wall)]);
+        }
         let w = build(s, opts, &spec, &dir)?;
         let mut e = Engine {
             w,

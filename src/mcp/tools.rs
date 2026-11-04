@@ -221,6 +221,25 @@ pub fn definitions() -> Vec<Value> {
             false,
         ),
         tool(
+            "rewind",
+            "Go back in virtual time",
+            "Takes the whole run (every board, bus, vehicle and the water) back to virtual time `time_s` (the last \
+             100 µs slice boundary at or before it), or to a checkpoint saved by name (`save` keeps one), exactly \
+             as it was then: runs are deterministic, so the past is replayed from the nearest checkpoint. Going on \
+             (resume, wait_for) re-executes the recorded history (log lines already read are not repeated) and then \
+             runs live; setting an input or injecting a fault in the past starts a new future from there. A time \
+             past what has run stops where the run has got. Pausing first keeps the run from going on at once. \
+             Needs time travel, which runs started with a dashboard (as `start` does) have.",
+            json!({
+                "session": session,
+                "time_s": {"type": "number", "description": "Virtual time to go to, in seconds."},
+                "checkpoint": {"type": "string", "description": "A checkpoint saved by name (with `save`)."},
+                "save": {"type": "string", "description": "Instead of moving: keep a checkpoint here under this name, to come back to."},
+            }),
+            &[],
+            false,
+        ),
+        tool(
             "resume",
             "Resume virtual time",
             "Resumes a paused run, optionally only for `for_s` virtual seconds or until `until_s`, then pauses again \
@@ -556,6 +575,7 @@ impl Tools {
             "set_input" => self.set_input(&a),
             "pause" => self.pause(&a),
             "resume" => self.resume(&a),
+            "rewind" => self.rewind(&a),
             "wait_for" => self.wait_for(&a),
             "console" => self.console(&a),
             _ => unreachable!("{name} is defined but not handled"),
@@ -938,6 +958,17 @@ impl Tools {
         Ok(ToolOutput::json(self.post(&s, "/api/pause", &body)?))
     }
 
+    fn rewind(&self, a: &Args) -> Result<ToolOutput, String> {
+        let s = self.session(a)?;
+        let body = match (a.f64("time_s")?, a.str("checkpoint")?, a.str("save")?) {
+            (Some(t), None, None) => json!({"time_s": t}),
+            (None, Some(name), None) => json!({"checkpoint": name}),
+            (None, None, Some(name)) => json!({"save": name}),
+            _ => return Err("give one of `time_s`, `checkpoint` and `save`".into()),
+        };
+        Ok(ToolOutput::json(self.post(&s, "/api/rewind", &body)?))
+    }
+
     /// Where the run is now (not as of the last published state).
     fn live(&self, s: &Session) -> Result<Value, String> {
         self.get(s, &format!("/api/logs?since={}", u64::MAX))
@@ -1063,7 +1094,7 @@ mod tests {
     fn every_tool_is_defined_and_handled() {
         let t = Tools::new().unwrap();
         let defs = definitions();
-        assert_eq!(defs.len(), 14);
+        assert_eq!(defs.len(), 15);
         for d in &defs {
             let name = d["name"].as_str().unwrap();
             assert!(d["description"].as_str().unwrap().len() > 40, "{name} needs a description");

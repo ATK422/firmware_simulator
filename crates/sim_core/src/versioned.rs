@@ -31,6 +31,16 @@ impl Versioned {
         self.data.clone_from(&other.data);
         self.version = other.version;
     }
+
+    /// Takes `other`'s version if the contents are the same (compared): copies of `other` then count as copies of
+    /// this array again. Returns whether they are the same.
+    pub fn share_version(&mut self, other: &Versioned) -> bool {
+        let same = self.version == other.version || self.data == other.data;
+        if same {
+            self.version = other.version;
+        }
+        same
+    }
 }
 
 impl PartialEq for Versioned {
@@ -103,5 +113,10 @@ mod tests {
         let (c, d) = (Versioned::from(vec![1]), Versioned::from(vec![1]));
         assert_ne!(c.version(), d.version());
         assert_eq!(c, d, "equal contents compare equal");
+        // Equal contents can share a version; different ones cannot
+        let mut e = Versioned::from(vec![1]);
+        assert!(e.share_version(&c) && e.version() == c.version());
+        e[0] = 2;
+        assert!(!e.share_version(&c) && e.version() != c.version());
     }
 }
