@@ -226,6 +226,14 @@ fn tools_drive_a_run() {
     assert!((0.249..0.2501).contains(&st["time_s"].as_f64().unwrap()), "{st}");
     let r = c.call_result("rewind", json!({}));
     assert_eq!(r["isError"], true);
+    let r = c.call("rewind", json!({"save": "early"}));
+    assert!(r["message"].as_str().unwrap().contains("saved"), "{r}");
+    c.call("resume", json!({"until_s": 0.4}));
+    c.call("wait_for", json!({"time_s": 0.4, "timeout_s": 30}));
+    let r = c.call("rewind", json!({"checkpoint": "early"}));
+    assert!(r["message"].as_str().unwrap().starts_with("at 0.25"), "{r}");
+    let r = c.call_result("rewind", json!({"checkpoint": "nope"}));
+    assert_eq!(r["isError"], true);
     c.call("resume", json!({"until_s": 0.6}));
     let w = c.call("wait_for", json!({"time_s": 0.6, "timeout_s": 30}));
     assert_eq!(w["matched"], "time", "{w}");

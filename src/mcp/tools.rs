@@ -224,7 +224,7 @@ pub fn definitions() -> Vec<Value> {
             "rewind",
             "Go back in virtual time",
             "Takes the whole run (every board, bus, vehicle and the water) back to virtual time `time_s` (the last \
-             100 µs slice boundary at or before it), or to a checkpoint a scenario's `pause` saved by name, exactly \
+             100 µs slice boundary at or before it), or to a checkpoint saved by name (`save` keeps one), exactly \
              as it was then: runs are deterministic, so the past is replayed from the nearest checkpoint. Going on \
              (resume, wait_for) re-executes the recorded history (log lines already read are not repeated) and then \
              runs live; setting an input or injecting a fault in the past starts a new future from there. A time \
@@ -233,7 +233,8 @@ pub fn definitions() -> Vec<Value> {
             json!({
                 "session": session,
                 "time_s": {"type": "number", "description": "Virtual time to go to, in seconds."},
-                "checkpoint": {"type": "string", "description": "A checkpoint saved by name (a scenario's pause step)."},
+                "checkpoint": {"type": "string", "description": "A checkpoint saved by name (with `save`)."},
+                "save": {"type": "string", "description": "Instead of moving: keep a checkpoint here under this name, to come back to."},
             }),
             &[],
             false,
@@ -959,10 +960,11 @@ impl Tools {
 
     fn rewind(&self, a: &Args) -> Result<ToolOutput, String> {
         let s = self.session(a)?;
-        let body = match (a.f64("time_s")?, a.str("checkpoint")?) {
-            (Some(t), None) => json!({"time_s": t}),
-            (None, Some(name)) => json!({"checkpoint": name}),
-            _ => return Err("give `time_s` or `checkpoint`".into()),
+        let body = match (a.f64("time_s")?, a.str("checkpoint")?, a.str("save")?) {
+            (Some(t), None, None) => json!({"time_s": t}),
+            (None, Some(name), None) => json!({"checkpoint": name}),
+            (None, None, Some(name)) => json!({"save": name}),
+            _ => return Err("give one of `time_s`, `checkpoint` and `save`".into()),
         };
         Ok(ToolOutput::json(self.post(&s, "/api/rewind", &body)?))
     }

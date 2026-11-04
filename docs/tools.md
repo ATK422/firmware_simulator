@@ -1,8 +1,8 @@
-# Developer tools: profiler, waveforms, dashboard, MCP server, JSON logs
+# Developer tools: profiler, coverage, waveforms, dashboard, MCP server, JSON logs
 
-Tools for looking inside a run, on `run` and `robot` alike: a sampling profiler of the firmware, VCD waveforms of
-the pins, a live dashboard in the browser, an MCP server that gives coding agents the same as structured tools,
-and a JSON lines log for scripts. None of them changes what a
+Tools for looking inside a run, on `run` and `robot` alike: a sampling profiler of the firmware, code coverage,
+VCD waveforms of the pins, a live dashboard in the browser (with rewinding), an MCP server that gives coding agents
+the same as structured tools, and a JSON lines log for scripts. None of them changes what a
 single-core program does, and none costs anything per instruction: they cut runs at chosen times, or read trace
 events and state between slices. How to switch them on is in [running.md](running.md#profiles-waveforms-dashboard-and-json-logs)
 and [robots.md](robots.md#traces-profiles-waveforms-and-the-dashboard); this page covers what they produce and how
@@ -10,6 +10,7 @@ they work.
 
 - [At a glance](#at-a-glance)
 - [Profiler](#profiler)
+- [Code coverage](#code-coverage)
 - [Waveforms (VCD)](#waveforms-vcd)
 - [Dashboard](#dashboard)
 - [MCP server](#mcp-server)
@@ -22,9 +23,10 @@ they work.
 | Tool | `run` | `robot` | Output | Code |
 |---|---|---|---|---|
 | Profiler | `--profile FILE` | `--profile-dir DIR` | Functions by time per core, and folded stacks for flame graphs | `sim_host::profile`, `unwind`, `demangle` |
+| Coverage | `--coverage FILE` | `--coverage FILE` | lcov tracefile of the lines and functions that ran, a table per crate; `scenario --coverage DIR` | `rp2040::coverage`, `sim_host::coverage` |
 | Waveforms | `--vcd FILE` | `--vcd FILE` | VCD of the GPIOs, optionally with decoded traffic | `sim_host::vcd` |
-| Dashboard | `--dashboard ADDR` | `--dashboard ADDR` | A live page and JSON API, with fault, input and pause controls | `sim_host::dashboard`, `dashboard.html` |
-| MCP server | `firmware_simulator mcp` | | Tools for coding agents: run the emulator, read state, logs and CAN frames, inject faults, set inputs, pause | `src/mcp/` |
+| Dashboard | `--dashboard ADDR` | `--dashboard ADDR` | A live page and JSON API, with fault, input, pause and rewind controls | `sim_host::dashboard`, `dashboard.html`, `sim_host::timetravel` |
+| MCP server | `firmware_simulator mcp` | | Tools for coding agents: run the emulator, read state, logs and CAN frames, inject faults, set inputs, pause, rewind | `src/mcp/` |
 | JSON log | `--log-json FILE` | `--log-json FILE` | One JSON object per log line, UART line, CAN frame, fault | `sim_host::jsonlog` |
 | Traces | `--trace KINDS` | `--trace KINDS`, `--trace-board` | Text lines per event ([running.md](running.md#traces)) | `sim_core::trace` |
 
@@ -136,6 +138,59 @@ From `robot robots/talos.toml --mock-bridge internal:1 --time 3s --profile-dir p
   `delay_multiplier: 128` programs a 128 ms startup delay where pico-sdk waits about 1 ms. A boot-time and
   watchdog-recovery cost, not a bug.
 
+## Code coverage
+
+```bash
+firmware_simulator run $FW/power_board --board boards/mk2/power_board.toml --mock-bridge 1 --time 2s \
+    --coverage power.info
+firmware_simulator robot robots/talos.toml --mock-bridge internal:1 --time 2s --coverage talos.info
+firmware_simulator scenario scenarios/ --coverage coverage/      # lcov.info, IMAGE.info, summary.txt
+genhtml coverage/lcov.info -o coverage/html
+```
+
+```text
+crate                                   functions              lines
+core                                  13/39     33%     127/335    38%
+embassy_executor                      26/28     93%      37/45     82%
+embassy_rp                            12/14     86%     219/287    76%
+power_board                            4/6      67%      62/89     70%
+titan_link                             1/5      20%       5/104     5%
+titan_rp2040                          13/18     72%     352/449    78%
+...
+total                                118/188    63%    1164/1872   62%
+```
+
+(The power board for 2 s with a mock bridge: titan_link's encoders run, its decoders mostly do not, as the mock
+bridge sends little; the firmware's panic handler and fault paths do not run.)
+
+**What it counts.** While coverage is on, each core marks the halfword of every instruction it executes in a
+bitmap (one bit per halfword of ROM, flash through any XIP alias, and SRAM: `rp2040::coverage::CoverageMap`). An
+instruction counts once it has executed; a step that only takes an exception does not. The cores then run one
+instruction at a time, as with a breakpoint set, so busy-waits that a batched run skips over (and timer waits, and
+fused quanta) are executed and counted: they ran in the reference semantics. The run is otherwise the same: the
+bench's fingerprints do not change with `--coverage` (`cargo run --release -p sim_test --example bench --
+--coverage`), and `crates/sim_host/tests/coverage.rs` compares a two-core run with and without it. It costs about 3x
+to 5x the CPU time (ESC board 4.5 s for 2 s of virtual time against 1.4 s; Talos 12.8 s against 3.8 s).
+
+**From bits to lines.** `sim_host::coverage` reads the ELF's DWARF line table (`.debug_line`, with `gimli`): each
+row's address range belongs to a file and line, a line is instrumented when it has a range and covered when an
+instruction in one ran. A function is a `FUNC` symbol with a size, covered when any instruction in it ran, named
+(demangled) at the line of its first instruction. lcov hit counts are 1 or 0: the bitmap says whether an
+instruction ran, not how often. Boards running the same image (by file name) are merged, as are the scenarios of
+`scenario --coverage`; files shared by several images (embassy, core) are merged line by line. The summary groups
+functions by the crate their name starts with (the type's, for `<T as Trait>::f`) and lines by the crate their
+file is in (the directory above `src/`). Images without DWARF (stripped, UF2) give functions only, as "unplaced".
+
+**From Rust.** `machine.enable_coverage()`, run, then `sim_host::coverage::Coverage`: `add_machine(name,
+&machine)`, `report()` (files, lines, functions; `lcov(name)`, `summary()`, `function(name)`). The tests in
+`crates/sim_host/tests/coverage.rs` check exact lcov output for `test_programs/coverage.S` (a program with a
+branch taken and one not, a function called and one not) and that a titan_firmware_rs image's panic handler is
+unrun until a panic is injected.
+
+**Viewing it.** `genhtml FILE -o DIR` (from lcov) renders HTML; VS Code's Coverage Gutters extension shows the
+lines in the editor from an `lcov.info` (point its `coverage-gutters.coverageFileNames` at the file). The paths
+are those the ELF was built with.
+
 ## Waveforms (VCD)
 
 ```bash
@@ -218,6 +273,7 @@ theme.
 | `POST /api/input` `{"board": "camera_cage", "name": "depth.pressure_pa", "value": 120000}` | Sets a physical input |
 | `POST /api/pause` `{"paused": true}` | Pauses or resumes virtual time; with `"at_s": 2.5`, pausing waits for that virtual time, and resuming runs until it and pauses again |
 | `GET /api/thrusters` | Built live by the run loop: `escs` (every DShot ESC: `board`, `esc`, `rpm`, `throttle`, `signal_lost`, and the vehicle `thruster` it spins with its `thrust_n`) and `vehicles` (each one's pose, `external`, and its thrusters with `board`, `esc`, `rpm`, `thrust_n`) |
+| `POST /api/rewind` `{"time_s": 1.25}`, `{"checkpoint": "booted"}`, `{"save": "booted"}` | Takes the whole run (every board, bus, vehicle, the water) back to a virtual time (the last 100 µs slice boundary at or before it), or to a checkpoint saved by name, or forward within what has run; `save` keeps a checkpoint here under a name ([below](#rewinding)) |
 | `POST /api/vehicle` `{"vehicle": "talos", "position_m": [2, 1, 1.5], "rpy_deg": [0, 0, 90]}` | Puts a vehicle at a pose (world north-east-down, body forward-starboard-down; `quat_wxyz` instead of `rpy_deg`; optional `velocity_mps`, `rate_dps`; `vehicle` may be left out when there is one), answered like `/api/thrusters`; an [external vehicle](vehicles.md#external-vehicles)'s only motion |
 
 A POST is answered once the run loop has applied it and published the new state: 200 with `{"ok": true,
@@ -231,7 +287,26 @@ The state has `time_s`, `wall_s`, `speed` (virtual seconds per wall second), `pa
 `faults` (every fault applied, from the command line or the page, with its outcome) and `fault_help` at the top,
 then `boards` (each with `name`, `image`, `powered`, `resets`, `cores`, `gpio`, `leds`, `strips`, `escs`,
 `inputs`, `logs` (the last 120 lines), `link`, and its `bus` in a robot), `buses` (with the last 40 frames),
-`links` (the mock bridges and what they decoded) and `vehicles`.
+`links` (the mock bridges and what they decoded) and `vehicles`. With time travel, `travel` has `live` (false while
+the run re-executes its recorded history), `oldest_s` and `frontier_s` (the history it can go back to),
+`checkpoints`, `memory_mb` and `saved` (named checkpoints).
+
+### Rewinding
+
+A run with a dashboard is recorded for time travel (`--checkpoint-every`, 10 ms by default; `0` turns it off;
+[running.md](running.md#reverse-debugging-and-rewinding) explains it). `POST /api/rewind` puts every board, bus,
+vehicle and the water back exactly as they were at that time, by restoring the checkpoint before it and replaying
+the log to it. Pause first, or the run goes on at once: going on re-executes the recorded history (log lines and
+frames already shown are not shown again; the dashboard keeps its lines and frames as they were) and then runs
+live. An input set or a fault applied in the past starts a new future from there. A time past the end of what
+has run stops at that end. The page has no rewind control of its own: use the API, or the MCP server's `rewind`.
+
+```bash
+curl -s -X POST localhost:8080/api/pause -d '{"paused": true}'
+curl -s -X POST localhost:8080/api/rewind -d '{"time_s": 1.25}'      # {"ok": true, "message": "at 1.250000s"}
+curl -s -X POST localhost:8080/api/input -d '{"name": "stbd_battery", "value": 13.1}'   # another future
+curl -s -X POST localhost:8080/api/pause -d '{"paused": false}'
+```
 
 ### Incremental reads
 
@@ -318,6 +393,7 @@ and the repository as working directory. The server passes its environment on to
 | `can_frames` | Frames on a bus after a cursor, filtered by `id` and `mask` |
 | `inject_fault`, `set_input` | A fault in the `--fault` spelling ([faults.md](faults.md)), a physical input |
 | `pause`, `resume` | Pause now or at `at_s`; resume, optionally for `for_s` or until `until_s` |
+| `rewind` | Takes the whole run back to `time_s`, or to a `checkpoint` saved by name with `save` (or forward within what has run), as `POST /api/rewind` ([above](#rewinding)) |
 | `wait_for` | Blocks until a board logs a line matching `pattern` (substring, or `regex`), or virtual time reaches `time_s`, or `timeout_s` of wall time passes; returns early if the run is paused or over. `pause` pauses the run when it happens |
 | `console` | The console output of a started emulator: setup messages, `--candump` lines, and after the run its stop line and the unmodelled-register table |
 
@@ -414,4 +490,7 @@ Not available where this was built:
 * The MCP server from Claude Code itself (`.mcp.json` approval, `/mcp`, an agent using the tools). It is tested
   end to end with a scripted JSON-RPC client over its stdio (`tests/mcp.rs`).
 * Rendering the folded stacks with `inferno-flamegraph` or `flamegraph.pl`, and loading them in speedscope.
+* Rendering `--coverage` output with `genhtml` and showing it with VS Code's Coverage Gutters (lcov is not
+  installed here; the tracefile's records are checked line for line in `crates/sim_host/tests/coverage.rs`).
+* `POST /api/rewind` from a browser session; it is tested over loopback through the MCP server (`tests/mcp.rs`).
 * Rebuilding titan_firmware_rs with embassy-rp's `rom-func-cache` and profiling IVCBoard2 again.

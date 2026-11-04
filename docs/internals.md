@@ -107,6 +107,17 @@ scheduled. Counters (timer, PWM, watchdog) are computed lazily from virtual time
    that changes nothing (FSTAT, FLEVEL, IRQ, INTR...) advances the blocks once rather than twice
    (`System::pio_fast_reads`).
 
+7. **Debugger stops** (`StopReason::is_debug_stop`: a breakpoint, `BKPT`, a watchpoint, a position reached with
+   `Machine::stop_at`) return in the middle of a quantum with what is left of it noted (`Resume`: the core, the
+   instructions left, the quantum's time limit); the next `run_until` goes on with that quantum before anything
+   else, so a run that stopped is the same as one that did not (`crates/rp2040/tests/debug_stops.rs`, on both
+   cores). `Session::run_until` likewise finishes the slice a stop interrupted before doing the slice's end. A
+   **position** is a core and the time on its clock when one of its steps (an instruction or an exception entry)
+   starts; `stop_at[core]` stops before the first step at or after a time, with that core's batches cut there and
+   its busy-wait skipping and fusing off. Watchpoints (`Machine::watchpoints`) run the cores one instruction at a
+   time through a bus that checks every data access, and stop the core before its next step. Code coverage
+   (`Machine::coverage`) does too, marking each executed instruction.
+
 `Machine::skip_spins`, `Machine::skip_timer_waits`, `Machine::fuse_quanta`, `Pio::skip_loops`,
 `Pio::skip_counted`, `Pio::loop_inputs` and `Pio::fast_run` switch the skips and the fusing off;
 `crates/rp2040/tests/batching.rs`, `busy_wait.rs`, `timer_waits.rs`, `fused_quanta.rs`,
@@ -265,6 +276,18 @@ and a `Relink` map from old to new, and `sim_host::board::relink_inputs` walks e
 (`relink_inputs` on each device trait) to point it at them. `Bench`, `RobotBench` and `Robot` snapshots do this
 (`Session::snapshot_with_inputs`); a plain `Session::snapshot` keeps sharing. A robot snapshot also re-links the
 copy's hydrophones and projectors to the copy's acoustic medium and its vehicles' paths.
+
+**Checkpoints for time travel** (`sim_host::timetravel`) restore in place instead, so that whoever holds the live
+session, robot, inputs and bridges keeps holding them: `Session::checkpoint` and `Session::rewind_to` (the machine
+via `Machine::snapshot` and `restore`, the host side's RTT position, a defmt frame in progress, the CAN bus, the
+Ethernet cable; the logs and text collected are cut back, and given back from a kept copy when going forward), a
+robot's buses, vehicles (with their transducers' paths) and the medium's contents, and the inputs' values. The
+flash and ROM are shared between checkpoints while unchanged (`System::flash_writes` counts what could change the
+flash), the SRAM in 4 KB pieces. `TimeTravel` keeps them in a thinned ring within a memory budget, with a log of
+everything from outside (runs asked for and where they stopped, debugger writes, inputs, and per call what each host
+endpoint and pty gave, through `TappedCan`, `TappedEth` and the ptys' taps), and replays from the nearest one: the
+taps give the recorded frames again, hooks, trace sinks and the profiler are put aside. Host changes it does not
+log (faults, poses) are marked with `TimeTravel::changed`, a checkpoint replays never go through.
 
 ## Performance
 

@@ -151,11 +151,7 @@ fn a_robot_goes_back_whole() {
     rb.robot.boards[esc].machine.breakpoints.clear();
     let mut g = load();
     g.robot.boards[esc].machine.stop_at[core] = Some(time);
-    loop {
-        match g.robot.run_until(Time::from_ms(400)) {
-            Some((b, StopReason::Reached { core: c, .. })) if b == esc && c as usize == core => break,
-            other => panic!("{other:?}"),
-        }
-    }
+    let r = g.robot.run_until(Time::from_ms(400));
+    assert!(matches!(r, Some((b, StopReason::Reached { core: c, .. })) if b == esc && c as usize == core), "{r:?}");
     assert_eq!(robot_state(&mut rb.robot), robot_state(&mut g.robot));
 }

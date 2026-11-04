@@ -51,7 +51,7 @@ fn coverage_changes_nothing() {
         let m = &s.machine;
         let regs: Vec<Vec<u32>> =
             m.cores.iter().map(|c| (0..17).map(|r| sim_core::cpu::Cpu::read_reg(c, r)).collect()).collect();
-        let cycles: Vec<u64> = m.cores.iter().map(|c| sim_core::cpu::Cpu::cycles(c)).collect();
+        let cycles: Vec<u64> = m.cores.iter().map(sim_core::cpu::Cpu::cycles).collect();
         let hash = m.sys.sram.iter().fold(0u64, |h, &b| (h ^ b as u64).wrapping_mul(0x100_0000_01b3));
         (regs, cycles, hash, s.uart_text.clone(), m.coverage.as_ref().map(|c| c.count()))
     };

@@ -407,11 +407,15 @@ impl Rewindable for Session {
     }
 }
 
+/// The recorded points of a transducer's path.
+type PathPoints = VecDeque<(f64, sim_acoustics::geometry::Vec3)>;
+
 /// A robot's checkpoint: every board, bus, vehicle (with its transducers' paths) and the water.
 struct RobotCheckpoint {
     boards: Vec<SessionCheckpoint>,
     buses: Vec<(sim_devices::can::CanBus, Option<usize>)>,
-    vehicles: Vec<(crate::vehicle::VehicleSim, Vec<VecDeque<(f64, sim_acoustics::geometry::Vec3)>>)>,
+    /// Each vehicle, and the points of its transducers' paths.
+    vehicles: Vec<(crate::vehicle::VehicleSim, Vec<PathPoints>)>,
     medium: Option<sim_acoustics::medium::Medium>,
     now: Time,
     power_on: Vec<(Time, bool)>,
@@ -887,10 +891,34 @@ impl TimeTravel {
         }
     }
 
-    /// Keeps a checkpoint here under `name` (a scenario's `pause`), never thinned out.
-    pub fn save(&mut self, target: &mut dyn Rewindable, name: &str) {
-        self.diverge(target);
-        self.take_checkpoint(target, true, Some(name.to_string()));
+    /// Keeps a checkpoint here (a slice boundary) under `name`, never thinned out, to come back to with
+    /// [`TimeTravel::rewind_to_saved`]. In the past it goes among the others; nothing is dropped.
+    pub fn save(&mut self, target: &mut dyn Rewindable, name: &str) -> Result<(), String> {
+        if !target.at_boundary() || !matches!(self.here, Pos::Boundary(_)) {
+            return Err("checkpoints are kept at slice boundaries: not where a debugger stopped".into());
+        }
+        if self.at_frontier() {
+            self.take_checkpoint(target, false, Some(name.to_string()));
+            return Ok(());
+        }
+        let start = std::time::Instant::now();
+        let (state, bytes) = target.checkpoint(&mut self.flash);
+        let c = Checkpoint {
+            state,
+            bytes,
+            time: target.now(),
+            cursor: self.cursor,
+            taps: self.taps.list.iter().map(|t| t.calls()).collect(),
+            inputs: values(&self.inputs),
+            barrier: false,
+            name: Some(name.to_string()),
+        };
+        self.used += bytes;
+        self.checkpoints.insert(self.base + 1, c);
+        self.base += 1;
+        self.stats.taken += 1;
+        self.stats.taking_ns += start.elapsed().as_nanos() as u64;
+        Ok(())
     }
 
     /// The time of the checkpoint saved as `name`.
@@ -1021,7 +1049,7 @@ impl TimeTravel {
         let t0 = target.now();
         let r = self.replay_inner(target, goal, &mut probe);
         self.stats.replay_ns += start.elapsed().as_nanos() as u64;
-        self.stats.replayed = self.stats.replayed + target.now().saturating_sub(t0);
+        self.stats.replayed += target.now().saturating_sub(t0);
         for b in 0..target.boards() {
             target.session(b).machine.stop_at = [None; 2];
         }

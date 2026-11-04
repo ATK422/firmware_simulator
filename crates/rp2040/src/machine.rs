@@ -1233,11 +1233,11 @@ impl Machine {
             // Pick the runnable core furthest behind
             let mut pick: Option<usize> = None;
             let mut runnable = 0;
-            let mut can_run = [false; 2];
+            let mut can_run = 0u8;
             for c in 0..2 {
                 if self.runnable(c) {
                     runnable += 1;
-                    can_run[c] = true;
+                    can_run |= 1 << c;
                     self.catch_up(c);
                     // Ties go to the core that did not run last, so a core woken at the other core's current
                     // time is not starved by a busy-waiting partner
@@ -1251,7 +1251,7 @@ impl Machine {
                 }
             }
             // (The core stopped in the middle of its quantum, and can still run unless the host changed it)
-            let resumed = resume.take().filter(|r| can_run[r.core]);
+            let resumed = resume.take().filter(|r| can_run & (1 << r.core) != 0);
             if let Some(r) = resumed {
                 pick = Some(r.core);
             }

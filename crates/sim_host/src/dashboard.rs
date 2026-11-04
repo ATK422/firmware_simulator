@@ -20,7 +20,7 @@
 //! | `POST /api/pause` `{"paused": true, "at_s": 2.0}` | pauses or resumes virtual time (`at_s`: pause when it gets there) |
 //! | `GET /api/thrusters` | every DShot ESC's propeller speed and each vehicle's thrust, built live (see [`thrusters_json`]) |
 //! | `POST /api/vehicle` `{"vehicle": "talos", "position_m": [n, e, d], "rpy_deg": [r, p, y]}` | puts a vehicle at a pose (an external one: its only motion), answered with `/api/thrusters` |
-//! | `POST /api/rewind` `{"time_s": 1.25}` or `{"checkpoint": "booted"}` | goes back (or forward, within what was run) to a time or a saved checkpoint, the whole run at once ([`crate::timetravel`]; needs [`Dashboard::travel`]) |
+//! | `POST /api/rewind` `{"time_s": 1.25}`, `{"checkpoint": "booted"}` or `{"save": "booted"}` | goes back (or forward, within what was run) to a time or a saved checkpoint (or saves one), the whole run at once ([`crate::timetravel`]; needs [`Dashboard::travel`]) |
 //!
 //! `POST /api/vehicle` takes the attitude as `rpy_deg` or `quat_wxyz` (body to world), and optionally
 //! `velocity_mps` (body frame) and `rate_dps`; `vehicle` may be left out when there is one. Frames are the
@@ -377,6 +377,8 @@ enum Command {
 pub enum RewindTo {
     Time(Time),
     Checkpoint(String),
+    /// Not a move: keeps a checkpoint here under this name.
+    Save(String),
 }
 
 /// Goes back (or forward) with `tt` on `target`: the message for the answer.
@@ -389,6 +391,10 @@ pub fn rewind(
     let tt = tt.ok_or("time travel is off for this run (it records with --checkpoint-every above 0)")?;
     let r = match to {
         RewindTo::Time(t) => tt.rewind_to(target, *t),
+        RewindTo::Save(name) => {
+            tt.save(target, name)?;
+            return Ok(format!("checkpoint {name:?} saved at {}", target.now()));
+        }
         RewindTo::Checkpoint(name) => tt.rewind_to_saved(target, name).ok_or_else(|| {
             format!(
                 "no checkpoint {name:?}; saved: {:?}",
@@ -1547,11 +1553,12 @@ fn handle(mut stream: TcpStream, server: &Server) -> std::io::Result<()> {
                 Err(e) => return json_reply(&mut stream, 400, json!({"ok": false, "error": format!("bad JSON: {e}")})),
             };
             let to = match (&body["time_s"], body["checkpoint"].as_str()) {
+                _ if body["save"].is_string() => RewindTo::Save(body["save"].as_str().unwrap_or("").to_string()),
                 (_, Some(name)) => RewindTo::Checkpoint(name.to_string()),
                 (v, None) => match v.as_f64() {
                     Some(t) if t.is_finite() && t >= 0.0 => RewindTo::Time(Time::from_secs_f64(t)),
                     _ => {
-                        let e = "give time_s (seconds, 0 or more) or checkpoint (a name)";
+                        let e = "give time_s (seconds, 0 or more), checkpoint (a name) or save (a name)";
                         return json_reply(&mut stream, 400, json!({"ok": false, "error": e}));
                     }
                 },
