@@ -66,8 +66,25 @@ scheduled. Counters (timer, PWM, watchdog) are computed lazily from virtual time
    consecutive quiet quanta are compared with the state at the start of a window that doubles up to 16 quanta
    (`SpinWindow`, Brent's cycle detection), and whole windows are skipped. XOSC reads also keep a quantum quiet
    (`System::xosc_fast_reads`); the skip then ends before STATUS turns stable, so embassy's wait for the crystal
-   is skipped too. Skipped instructions still count as executed. The ESC board's control loop spends 62 % of its
-   instructions in such a loop.
+   is skipped too. Skipped instructions still count as executed.
+   **Timer waits** (`Machine::skip_timer_wait`, `Machine::skip_timer_waits`). A loop that polls the timer comes back
+   to the same state only within a tick (its registers hold what it read), so the skip above stops at every tick,
+   1 µs. When such a window closes, `CortexM0Plus::timer_wait` executes the loop abstractly from the core's state
+   (`crates/cpu_armv6m/src/timer_wait.rs`): registers are known, the low word of a timer read, or something that
+   depends on one; flags are known or predicates on the low word (`Lo >= k`, `Lo == k`); the high word reads as now
+   while the low word does not wrap. A conditional branch on a predicate keeps its way while every read stays below
+   the value at which it flips (the deadline), and once the abstract state at an address comes back the same, every
+   further time round takes the same path. The machine skips whole times round whose reads come before the
+   deadline, and lands the core at the loop's start at least one time round before the next event, the end of the
+   run or an XOSC change: registers and flags that depend on the timer there must be written before they are read
+   and before the first branch the timer decides, so that this time round gives them the values running every one
+   would have before anything can see them (the known ones are set). The next quantum is cut to end where the
+   quanta of a run without the skip would have (`Machine::quantum_left`): an event an access schedules within a
+   quantum fires at its end, and the core takes an interrupt it raises there. Only moves, additions and
+   subtractions (with carry), comparisons, a few logic operations and shifts, loads and branches are understood;
+   anything else, a store, or a timer value used any other way, and the loop is left to the plain skip. The ESC
+   board waits out each 400 µs DShot frame time in such a loop (`while Instant::now() < min_frame_time {}`), which
+   was 45 % of its quanta.
 4. **Quantum fusing** (`Machine::fuse_quanta`). While the other core cannot run, no SysTick counts and the last
    quantum wrote memory and touched nothing else (the core is computing), the next quantum's first batch may run on
    through up to 64 quanta: the boundaries in between would change nothing, since events are not due before the
@@ -80,15 +97,23 @@ scheduled. Counters (timer, PWM, watchdog) are computed lazily from virtual time
 6. **PIO** state machines are cycle exact (one instruction, delay or stall cycle per tick of their fractional
    divider) and advanced lazily, skipping delays and machines stalled on something that has not changed. A machine
    polling its own registers, FIFO levels or pins in a loop (the ESC's DShot reply wait) is not ticked through it:
-   whole iterations are skipped and the rest replayed when something reads or changes it. A CPU read of a PIO
-   register that changes nothing (FSTAT, FLEVEL, IRQ, INTR...) advances the blocks once rather than twice
+   whole iterations are skipped and the rest replayed when something reads or changes it. A counted loop, which
+   comes back with X or Y one less, decremented by its only `JMP X--`/`JMP Y--` and read by nothing else (the
+   DShot receivers' clock recovery, up to 12 times round a bit), is skipped up to the iteration that starts with
+   the counter at zero (`Pio::skip_counted`). Loops, and machines being watched for one (from 1, 2, 4... up to 64
+   ticks, Brent), go on through input changes on pins they do not read (`Pio::loop_inputs`). A block remembers
+   each machine's next tick between runs and works out again only those of machines that ticked and stalled ones;
+   a run with nothing to tick before its end only moves the cycle (`Pio::fast_run`). A CPU read of a PIO register
+   that changes nothing (FSTAT, FLEVEL, IRQ, INTR...) advances the blocks once rather than twice
    (`System::pio_fast_reads`).
 
-`Machine::skip_spins`, `Machine::fuse_quanta` and `Pio::skip_loops` switch the skips and the fusing off;
-`crates/rp2040/tests/batching.rs`, `busy_wait.rs`, `fused_quanta.rs`, `crates/sim_test/tests/fast_paths.rs` and
-the PIO tests compare runs with and without them (`fast_paths.rs` also for `System::pio_fast_reads` and
-`System::sio_fast_irqs`, which spares the interrupt-line recomputation after SIO accesses other than to the
-FIFOs, `System::xosc_fast_reads` and `Machine::skip_spins`).
+`Machine::skip_spins`, `Machine::skip_timer_waits`, `Machine::fuse_quanta`, `Pio::skip_loops`,
+`Pio::skip_counted`, `Pio::loop_inputs` and `Pio::fast_run` switch the skips and the fusing off;
+`crates/rp2040/tests/batching.rs`, `busy_wait.rs`, `timer_waits.rs`, `fused_quanta.rs`,
+`crates/sim_test/tests/fast_paths.rs` and the PIO tests (random programs, with each switch on and off) compare
+runs with and without them (`fast_paths.rs` also for `System::pio_fast_reads` and `System::sio_fast_irqs`, which
+spares the interrupt-line recomputation after SIO accesses other than to the FIFOs, `System::xosc_fast_reads` and
+`Machine::skip_spins`).
 
 Resets go through the same loop: a watchdog reset or `SYSRESETREQ` is a `ResetRequest` the machine carries out
 (`watchdog_reset`, `run_pin_reset`, `power_cycle`, `power_on_at`), with the reset kind reported in
@@ -256,13 +281,17 @@ counts, SRAM). The fingerprint must not change when the emulator is made faster.
 machine: compare the best of several repeats, or the instruction counts under `valgrind --tool=callgrind` with
 `--repeat 1`.
 
-Measured on a shared 4-core machine (CPU time for 2 s of virtual time): template 0.03 s, ESC board 1.8 s,
-IVCBoard2 0.6 s, Talos 4.7 s, IVC2 pool 2.2 s. Talos on threads (wall time, the machine otherwise idle): 4.65 s on
-one, 3.19 s on two, 2.76 s on three, 2.68 s on four. Per slice the ESC boards take about 95 µs each on average
-but 30 µs or 200-280 µs in turn (busy-wait skipped, or a DShot frame), out of step with each other, so the
-slowest board of each slice adds up to 2.73 s: that is the floor with any number of threads. The other seven
-boards take about 50 µs per slice together, the end of the slice 3.2 µs. Under callgrind, advancing the PIO blocks (on register reads and
-their 1 µs event) still takes about 22 % of the ESC board's time: the DShot state machines' clock recovery is
-ticked cycle by cycle. At boot, embassy's clock setup polls the XOSC status register for its 128 ms start-up
-delay (on the ring oscillator); that wait is skipped as a busy-wait (a three-instruction loop, so over three
-quanta), which takes the first 200 ms of a Talos run from 0.28 s to 0.25 s of CPU time.
+Measured on a shared 4-core machine (CPU time for 2 s of virtual time): template 0.03 s, ESC board 1.35 s,
+IVCBoard2 0.55 s, Talos 3.7 s, IVC2 pool 2.15 s. Talos on threads (wall time): 2.84 s on two, 2.47 s on three.
+The ESC board waits out each 400 µs DShot frame time on the timer (skipped across ticks up to its deadline, see
+the run loop), so what is left of its time is the frame itself: the control loop polling FSTAT while the PIO
+sends the frame and receives the replies. Per 100 µs slice an ESC board takes about 70 µs on average but its frames
+fall in different slices from the other ESC board's, so the slowest board of each slice adds up to about 2.4 s
+however many threads there are (2.5 s with three): about 0.8x real time is as far as threads take Talos. Under
+callgrind (400 ms, `--repeat 1`) the ESC board executes 2,510 M host instructions, against 3,692 M before these
+skips: about 45 % in the interpreter and the run loop's per-quantum work, 20 % in advancing the PIO (half of it
+ticking the receivers between their counted loops) and 5 % resolving pins. IVCBoard2 is all interpretation
+(1,660 M); there the dispatch's indirect branch, rather than the instructions executed, sets the pace (an
+interpreter with fewer instructions per op was slower on the wall clock). At boot, embassy's clock setup polls the
+XOSC status register for its 128 ms start-up delay (on the ring oscillator); that wait is skipped as a busy-wait
+(a three-instruction loop, so over three quanta).
