@@ -34,6 +34,9 @@ impl CanEndpoint for Near {
     fn live(&self) -> bool {
         true
     }
+    fn waiting(&mut self, _until: Time) -> bool {
+        !self.to_robot.lock().unwrap().is_empty()
+    }
 }
 
 /// The far side's end, on the far side's (wall) clock.
@@ -157,11 +160,12 @@ fn main() {
         worst_ahead.as_secs_f64() * 1e3,
     );
     println!(
-        "windows {} ({:.1} slices each), rollbacks {}, cut by host frames {}",
+        "windows {} ({:.1} slices each), rollbacks {}, cut by host frames {} (as soon as they were waiting {})",
         s.windows,
         s.slices as f64 / s.windows.max(1) as f64,
         s.rollbacks,
-        s.live_cuts
+        s.live_cuts + s.early_cuts,
+        s.early_cuts
     );
     for (b, name) in bridges.iter().zip(["poac", "esc0", "esc1", "camera_cage"]) {
         let st = b.state();

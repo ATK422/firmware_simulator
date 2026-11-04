@@ -108,6 +108,9 @@ pub struct Stats {
     pub follower_cuts: u64,
     /// Windows cut short by a frame a live endpoint handed in ([`CanEndpoint::live`]).
     pub live_cuts: u64,
+    /// Windows cut short as soon as a live endpoint had a frame waiting ([`CanEndpoint::waiting`]), before it was
+    /// handed in.
+    pub early_cuts: u64,
 }
 
 /// Whether `robot` can run its boards ahead of each other (see the module documentation).
@@ -905,6 +908,27 @@ struct Committer {
 }
 
 impl Committer {
+    /// A live endpoint with a frame waiting hands it in at the next boundary committed, so the window ends where it
+    /// can finish: cut it there now, before the boards run on past it (they would only be rolled back).
+    fn notice_waiting(&mut self, shared: &Shared, buses: &mut [RobotBus], stats: &mut Stats) {
+        let j = self.next;
+        let w = boundary_of(shared.window.load(Ordering::Acquire));
+        if j + 1 >= w {
+            return;
+        }
+        let t = self.bounds.time(j);
+        for rb in buses.iter_mut() {
+            let shortest = rb.bus.shortest_frame();
+            if rb.endpoints.iter_mut().any(|e| e.live() && e.waiting(t)) {
+                let end = self.bounds.at_or_after(t + shortest).max(j + 1);
+                if end < w {
+                    shared.announce(self.window, end);
+                    stats.early_cuts += 1;
+                }
+            }
+        }
+    }
+
     /// Commits every boundary it can now (with `only_see`, only tells whether it could commit one); returns
     /// whether it did (could).
     #[allow(clippy::too_many_arguments)]
@@ -919,6 +943,9 @@ impl Committer {
         only_see: bool,
     ) -> bool {
         let mut did = false;
+        if !only_see {
+            self.notice_waiting(shared, buses, stats);
+        }
         loop {
             let j = self.next;
             if j >= boundary_of(shared.window.load(Ordering::Acquire)) {

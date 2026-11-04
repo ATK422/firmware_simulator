@@ -217,7 +217,8 @@ fn run(case: &Case, time: Time, override_threads: Option<usize>) -> Result<Outco
                 r.robot.buses[0].endpoints.push(Box::new(Live(b.clone())));
                 bridges.push(b);
             }
-            r.robot.buses[0].endpoints.push(Box::new(Live(Controller { next: Time::from_ms(50) })));
+            // On its own (wall) clock: off the 10 ms grid of the runs
+            r.robot.buses[0].endpoints.push(Box::new(Live(Controller { next: Time::from_us(50_330) })));
             let (wall, cpu) = (Instant::now(), cpu_time());
             while r.now() < time {
                 let x = r.now().as_secs_f64();

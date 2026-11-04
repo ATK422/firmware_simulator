@@ -599,6 +599,10 @@ impl CanEndpoint for Arrivals {
     fn live(&self) -> bool {
         self.inner.live()
     }
+
+    fn waiting(&mut self, until: Time) -> bool {
+        self.inner.waiting(until)
+    }
 }
 
 /// The frames of `iface` in a log of arrivals ([`Arrivals`]), handed in at the times logged, as they were then.

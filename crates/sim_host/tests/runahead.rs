@@ -46,6 +46,22 @@ struct How {
     probe: Option<Reads>,
 }
 
+/// A live endpoint that cannot tell that a frame is waiting before it hands it in (`CanEndpoint::waiting`): its
+/// frames cut windows only where they are read, after the boards may have run past.
+struct Late<E>(E);
+
+impl<E: sim_devices::can::CanEndpoint> sim_devices::can::CanEndpoint for Late<E> {
+    fn take_tx(&mut self, until: Time) -> Vec<(Time, sim_devices::can::CanFrame)> {
+        self.0.take_tx(until)
+    }
+    fn receive(&mut self, frame: &sim_devices::can::CanFrame, at: Time) {
+        self.0.receive(frame, at);
+    }
+    fn live(&self) -> bool {
+        self.0.live()
+    }
+}
+
 /// Each read of a live endpoint: the step's virtual time and the wall clock then.
 type Reads = Arc<Mutex<Vec<(Time, std::time::Instant)>>>;
 
@@ -61,6 +77,9 @@ impl sim_devices::can::CanEndpoint for Queue {
     fn receive(&mut self, _frame: &sim_devices::can::CanFrame, _at: Time) {}
     fn live(&self) -> bool {
         true
+    }
+    fn waiting(&mut self, _until: Time) -> bool {
+        !self.0.lock().unwrap().is_empty()
     }
 }
 
@@ -159,7 +178,7 @@ fn talos(how: &How) -> Option<(Run, sim_host::runahead::Stats)> {
         eps.push(Box::new(bridge.clone()));
     }
     if how.arrivals {
-        eps.push(Box::new(Live(sim_devices::can::Monitor { outbox: arrivals(), ..Default::default() })));
+        eps.push(Box::new(Late(Live(sim_devices::can::Monitor { outbox: arrivals(), ..Default::default() }))));
     }
     if let Some(p) = &how.probe {
         eps.push(Box::new(Probe(p.clone())));
@@ -468,7 +487,8 @@ fn live_endpoints_give_the_same_run_as_turns() {
     for how in [How { threads: 3, run_ahead: true, ..live() }, How { threads: 0, run_ahead: true, ..live() }] {
         let (got, stats) = talos(&how).unwrap();
         same(&want, &got, &format!("{} threads", how.threads));
-        assert!(stats.live_cuts > 0, "{stats:?}");
+        // The scripted arrivals cut windows where they are read, the bridge's as soon as they are waiting
+        assert!(stats.live_cuts > 0 && stats.early_cuts > 0, "{stats:?}");
         assert!(stats.slices >= 6900 && stats.windows < stats.slices / 4, "{stats:?}");
     }
     // Different from the same bridge telling when it sends (its frames are ready when it made them)
@@ -514,7 +534,7 @@ fn in_real_time_live_windows_stay_close_to_the_wall_clock() {
     let wall = start.elapsed();
     same(&want, &got, "real time");
     assert!(wall >= std::time::Duration::from_millis(295), "{wall:?}: paced");
-    assert!(stats.windows > 0 && stats.live_cuts > 0, "{stats:?}");
+    assert!(stats.windows > 0 && stats.live_cuts + stats.early_cuts > 0, "{stats:?}");
     // Read at every boundary, in order, never more than the lead (and the slice being stepped) ahead of the wall
     // clock since the run started
     let reads = probe.lock().unwrap();
@@ -568,7 +588,8 @@ fn nereus(how: &How) -> Option<(Run, sim_host::runahead::Stats)> {
         r.buses[0].endpoints.push(Box::new(Live(b.clone())));
         bridges.push(b);
     }
-    r.buses[0].endpoints.push(Box::new(Live(Controller { next: Time::from_ms(50) })));
+    // (Off the 10 ms grid of the runs, so that its frames arrive inside windows)
+    r.buses[0].endpoints.push(Box::new(Live(Controller { next: Time::from_us(50_330) })));
     let hooks = Arc::new(Mutex::new(Vec::new()));
     for (i, s) in r.boards.iter_mut().enumerate() {
         let h = hooks.clone();
@@ -626,7 +647,7 @@ fn the_nereus_setup_runs_ahead_as_it_runs_in_turns() {
         let (got, stats) = nereus(&how).unwrap();
         same(&want, &got, &format!("{} threads, stress {:?}", how.threads, how.stress));
         assert_eq!(stats.follower_cuts, 0, "{stats:?}");
-        assert!(stats.live_cuts > 0 && stats.slices >= 6900, "{stats:?}");
+        assert!(stats.live_cuts + stats.early_cuts > 30 && stats.slices >= 6900, "{stats:?}");
     }
 }
 

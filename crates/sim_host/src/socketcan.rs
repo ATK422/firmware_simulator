@@ -75,6 +75,8 @@ pub struct SocketCan {
     /// Frames written and read, for statistics.
     pub tx_count: u64,
     pub rx_count: u64,
+    /// Frames read to answer [`CanEndpoint::waiting`], handed in by the next `take_tx`.
+    held: Vec<CanFrame>,
 }
 
 impl SocketCan {
@@ -126,7 +128,7 @@ impl SocketCan {
                 libc::close(fd);
                 return Err(e);
             }
-            Ok(SocketCan { fd, interface: interface.to_string(), tx_count: 0, rx_count: 0 })
+            Ok(SocketCan { fd, interface: interface.to_string(), tx_count: 0, rx_count: 0, held: Vec::new() })
         }
     }
 
@@ -171,7 +173,9 @@ impl Drop for SocketCan {
 
 impl CanEndpoint for SocketCan {
     fn take_tx(&mut self, until: Time) -> Vec<(Time, CanFrame)> {
-        self.read_all().into_iter().map(|f| (until, f)).collect()
+        let mut frames = std::mem::take(&mut self.held);
+        frames.extend(self.read_all());
+        frames.into_iter().map(|f| (until, f)).collect()
     }
 
     fn receive(&mut self, frame: &CanFrame, _at: Time) {
@@ -189,6 +193,12 @@ impl CanEndpoint for SocketCan {
     /// What host tools wrote is handed in at the step that reads it.
     fn live(&self) -> bool {
         true
+    }
+
+    fn waiting(&mut self, _until: Time) -> bool {
+        let more = self.read_all();
+        self.held.extend(more);
+        !self.held.is_empty()
     }
 }
 
@@ -214,6 +224,11 @@ impl<E: CanEndpoint> CanEndpoint for Live<E> {
 
     fn live(&self) -> bool {
         true
+    }
+
+    /// Whether `inner` will have sent something by `until`.
+    fn waiting(&mut self, until: Time) -> bool {
+        self.0.idle_until().is_some_and(|t| t <= until)
     }
 }
 
@@ -252,6 +267,7 @@ mod tests {
         assert!(!inner.live() && inner.idle_until() == Some(Time::from_us(30)));
         let mut live = Live(inner);
         assert!(live.live() && live.idle_until().is_none());
+        assert!(!live.waiting(Time::from_us(20)) && live.waiting(Time::from_us(30)));
         assert!(live.take_tx(Time::from_us(20)).is_empty());
         assert_eq!(live.take_tx(Time::from_us(100)), [(Time::from_us(100), f.clone())]);
         live.receive(&f, Time::from_us(200));

@@ -203,6 +203,14 @@ pub trait CanEndpoint {
     fn live(&self) -> bool {
         false
     }
+    /// For a [`CanEndpoint::live`] endpoint: whether `take_tx(until)`, called now, would hand in a frame (what has
+    /// reached it is then held for that call). A robot running ahead asks while it waits to commit the boundary at
+    /// `until`, and ends the window where that frame can finish at once, before the boards run past it. `false` (the
+    /// default): it cannot tell without handing it in.
+    fn waiting(&mut self, until: Time) -> bool {
+        let _ = until;
+        false
+    }
 }
 
 /// Who sent a frame on the bus.

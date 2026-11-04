@@ -129,6 +129,8 @@ pub struct Cannelloni {
     pub peer: SocketAddr,
     seq: u8,
     pending: Vec<CanFrame>,
+    /// Frames received to answer [`CanEndpoint::waiting`], handed in by the next `take_tx`.
+    held: Vec<CanFrame>,
     /// Frames sent to and received from the peer, and datagrams that could not be decoded.
     pub tx_frames: u64,
     pub rx_frames: u64,
@@ -148,6 +150,7 @@ impl Cannelloni {
             peer,
             seq: 0,
             pending: Vec::new(),
+            held: Vec::new(),
             tx_frames: 0,
             rx_frames: 0,
             rx_errors: 0,
@@ -230,7 +233,9 @@ impl Drop for Cannelloni {
 impl CanEndpoint for Cannelloni {
     fn take_tx(&mut self, until: Time) -> Vec<(Time, CanFrame)> {
         self.flush();
-        self.receive_all().into_iter().map(|f| (until, f)).collect()
+        let mut frames = std::mem::take(&mut self.held);
+        frames.extend(self.receive_all());
+        frames.into_iter().map(|f| (until, f)).collect()
     }
 
     fn receive(&mut self, frame: &CanFrame, _at: Time) {
@@ -246,6 +251,12 @@ impl CanEndpoint for Cannelloni {
     /// What the far side sent is handed in at the step that reads it.
     fn live(&self) -> bool {
         true
+    }
+
+    fn waiting(&mut self, _until: Time) -> bool {
+        let more = self.receive_all();
+        self.held.extend(more);
+        !self.held.is_empty()
     }
 }
 
@@ -346,6 +357,30 @@ mod tests {
             0, 0, 0, 0x6F, 1, 0xC0,
         ];
         assert_eq!(decode(&p).unwrap().1, vec![CanFrame::classic(0x6F, false, &[0xC0])]);
+    }
+
+    /// What the peer sent can be noticed before it is handed in: it is held, and handed in by the next `take_tx`,
+    /// stamped with that step, before anything that came later.
+    #[test]
+    fn a_waiting_frame_is_held_for_the_next_step() {
+        let peer = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let mut t = Cannelloni::bind("127.0.0.1:0".parse().unwrap(), peer.local_addr().unwrap()).unwrap();
+        let to = t.local_addr().unwrap();
+        assert!(t.live() && !t.waiting(Time::ZERO));
+        let mut seq = 0;
+        let send = |f: CanFrame, seq: &mut u8| {
+            for p in encode(&[f], seq) {
+                peer.send_to(&p, to).unwrap();
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        };
+        let (a, b) = (CanFrame::classic(1, false, &[1]), CanFrame::classic(2, false, &[2]));
+        send(a.clone(), &mut seq);
+        assert!(t.waiting(Time::from_us(100)) && t.waiting(Time::from_us(100)), "still waiting, held once");
+        send(b.clone(), &mut seq);
+        let at = Time::from_us(100);
+        assert_eq!(t.take_tx(at), [(at, a), (at, b)]);
+        assert!(!t.waiting(at) && t.take_tx(at).is_empty());
     }
 
     /// A peer that keeps sending while the bus is stuck: the tunnel's frames wait in a bounded queue, and the bus
