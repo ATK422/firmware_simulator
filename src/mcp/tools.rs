@@ -1122,7 +1122,7 @@ mod tests {
     fn every_tool_is_defined_and_handled() {
         let t = Tools::new().unwrap();
         let defs = definitions();
-        assert_eq!(defs.len(), 15);
+        assert_eq!(defs.len(), 16);
         for d in &defs {
             let name = d["name"].as_str().unwrap();
             assert!(d["description"].as_str().unwrap().len() > 40, "{name} needs a description");
