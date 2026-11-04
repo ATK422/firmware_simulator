@@ -70,6 +70,8 @@ pub struct Gpio {
     irq_levels: u32,
     /// CTRL and pad settings as bit masks over the pins, for [`Gpio::evaluate`].
     masks: Masks,
+    /// `external` as [`Gpio::evaluate`] last saw it, and what it drives and pulls as bit masks (high, low).
+    external_seen: Option<([External; NUM_GPIOS], [u32; 4])>,
 }
 
 /// What SIO and the two PIO blocks drive onto the pins whose function they are (bit per GPIO): most pins' functions,
@@ -129,6 +131,7 @@ impl Default for Gpio {
             input_levels: 0,
             irq_levels: 0,
             masks: Masks::default(),
+            external_seen: None,
         };
         g.refresh();
         g
@@ -253,16 +256,23 @@ impl Gpio {
         let otp = over_mask(ofp, &m.out_over) & ALL_PINS;
         let oetp = over_mask(oefp, &m.oe_over) & !m.od & ALL_PINS;
         // Undriven pins: an external driver, else the pad pulls and an external pull (see `resolve`)
-        let (mut dh, mut dl, mut ph, mut pl) = (0, 0, 0, 0);
-        for (pin, e) in self.external.iter().enumerate() {
-            match e {
-                External::Floating => {}
-                External::Driven(Level::High) => dh |= 1 << pin,
-                External::Driven(Level::Low) => dl |= 1 << pin,
-                External::Pull(Level::High) => ph |= 1 << pin,
-                External::Pull(Level::Low) => pl |= 1 << pin,
+        let [dh, dl, ph, pl] = match &self.external_seen {
+            Some((seen, masks)) if *seen == self.external => *masks,
+            _ => {
+                let (mut dh, mut dl, mut ph, mut pl) = (0, 0, 0, 0);
+                for (pin, e) in self.external.iter().enumerate() {
+                    match e {
+                        External::Floating => {}
+                        External::Driven(Level::High) => dh |= 1 << pin,
+                        External::Driven(Level::Low) => dl |= 1 << pin,
+                        External::Pull(Level::High) => ph |= 1 << pin,
+                        External::Pull(Level::Low) => pl |= 1 << pin,
+                    }
+                }
+                self.external_seen = Some((self.external, [dh, dl, ph, pl]));
+                [dh, dl, ph, pl]
             }
-        }
+        };
         let (pu, pd) = (m.pue, m.pde);
         let pulled = ph | pl;
         let floating = !(dh | dl | pulled);

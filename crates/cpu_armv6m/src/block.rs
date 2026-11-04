@@ -156,11 +156,11 @@ impl K {
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) struct Op {
     pub(crate) kind: K,
-    a: u8,
-    b: u8,
+    pub(crate) a: u8,
+    pub(crate) b: u8,
     /// Offset of the instruction from the start of the block, in bytes.
     pub(crate) off: u8,
-    imm: u32,
+    pub(crate) imm: u32,
 }
 
 impl Op {

@@ -559,11 +559,13 @@ function vehicleCard(v) {
     row("Position", c.pos.el), row("Attitude", c.rpy.el), row("Velocity", c.vel.el), row("Rates", c.rate.el),
     el("div", { class: "sep" }), row("Thrust", c.thrBox));
   c.title = el("h3");
-  c.root = el("article", { class: "card" }, el("div", { class: "card-head" }, c.title, el("span", { class: "sub", text: "vehicle" })), c.body);
+  c.sub = el("span", { class: "sub", text: "vehicle" });
+  c.root = el("article", { class: "card" }, el("div", { class: "card-head" }, c.title, c.sub), c.body);
   return c;
 }
 function updateVehicle(c, v) {
   setText(c.title, v.name);
+  setText(c.sub, v.external ? "vehicle, moved externally" : "vehicle");
   setText(c.depth.n[0], fmt(v.depth_m, 3)); setText(c.speed.n[0], fmt(v.speed_mps, 3));
   v.position_m.forEach((x, i) => setText(c.pos.n[i], fmt(x, 2)));
   v.rpy_deg.forEach((x, i) => setText(c.rpy.n[i], fmt(x, 1)));

@@ -31,7 +31,7 @@ use crate::periph::sio::{self, Sio};
 use crate::periph::spi::Spi;
 use crate::periph::ssi::{IoQspi, Ssi};
 use crate::periph::sysctl::{self, Psm, Resets, Vreg, bit, psm};
-use crate::periph::timer::{Timer, Watchdog, WatchdogReset};
+use crate::periph::timer::{self, Timer, Watchdog, WatchdogReset};
 use crate::periph::uart::Uart;
 use crate::periph::usb::{self, Usb};
 use crate::unmodelled::Unmodelled;
@@ -347,6 +347,50 @@ impl System {
     #[inline]
     fn xip_ready_from(&self, now: Time) -> bool {
         self.xip_config.is_ok() && now >= self.xip_busy_until
+    }
+
+    /// What a busy-wait's read of `addr` gives at `now`, for `CortexM0Plus::timer_wait`: the memory a batch reads
+    /// directly (SRAM, ROM, flash with XIP working), or the timer's raw low and high words.
+    pub fn timer_wait_read(&self, now: Time, addr: u32, size: Size) -> cpu_armv6m::WaitRead {
+        use cpu_armv6m::WaitRead;
+        let sram = addr.wrapping_sub(SRAM_BASE) as usize;
+        if sram < SRAM_SIZE {
+            return WaitRead::Value(mem::read(&self.sram, sram, size));
+        }
+        if addr >> 26 == XIP_BASE >> 26 {
+            let len = self.flash.len();
+            return match len.is_power_of_two() && self.xip_ready_from(now) {
+                true => WaitRead::Value(mem::read(&self.flash, addr as usize & (len - 1), size)),
+                false => WaitRead::Other,
+            };
+        }
+        if (addr as usize) < ROM_SIZE {
+            return WaitRead::Value(mem::read(&self.rom, addr as usize, size));
+        }
+        match addr {
+            a if a == TIMER_BASE + timer::TIMERAWL => WaitRead::TimerLow,
+            a if a == TIMER_BASE + timer::TIMERAWH => WaitRead::TimerHigh,
+            _ => WaitRead::Other,
+        }
+    }
+
+    /// The halfword of code at `addr` as a batch fetches it at `now` (see `BatchBus::code_at`).
+    pub fn timer_wait_code(&self, now: Time, addr: u32) -> Option<u16> {
+        let half = |buf: &[u8], off: usize| buf.get(off..off + 2).map(|b| u16::from_le_bytes([b[0], b[1]]));
+        if addr >> 26 == XIP_BASE >> 26 {
+            let len = self.flash.len();
+            return (len.is_power_of_two() && self.xip_ready_from(now))
+                .then(|| half(&self.flash, addr as usize & (len - 1)))
+                .flatten();
+        }
+        let sram = addr.wrapping_sub(SRAM_BASE) as usize;
+        if sram < SRAM_SIZE {
+            return half(&self.sram, sram);
+        }
+        if (addr as usize) < ROM_SIZE {
+            return half(&self.rom, addr as usize);
+        }
+        None
     }
 
     /// IRQ lines seen by `core`'s NVIC.
@@ -781,31 +825,42 @@ impl System {
         let target = self.pio_cycle(now);
         // When both blocks run, neither gets more than this many cycles ahead of the other
         const MAX_SKEW: u64 = 32;
-        loop {
-            let wire_t = self.wire.next_time().filter(|&t| t <= now);
-            let seg_end = wire_t.map_or(target, |t| self.pio_cycle(t).min(target));
-            let both = self.pio[0].busy() && self.pio[1].busy();
-            let b = (self.pio[1].cycle < self.pio[0].cycle) as usize;
-            if self.pio[b].cycle < seg_end {
-                let limit = if both { seg_end.min(self.pio[1 - b].cycle + MAX_SKEW) } else { seg_end };
-                let inputs = self.gpio.inputs();
-                if self.pio[b].run(limit, inputs) == pio::Stop::Outputs {
-                    let t = self.pio_time(self.pio[b].cycle);
-                    self.update_pins(trace, t);
-                }
-                continue;
+        let inputs = self.gpio.inputs();
+        let idle = self.wire.next_time().is_none_or(|t| t > now)
+            && self.pio[0].idle_through(target, inputs)
+            && self.pio[1].idle_through(target, inputs);
+        if idle {
+            // What the loop below would do: run both blocks there with nothing to tick
+            for p in &mut self.pio {
+                p.cycle = p.cycle.max(target);
             }
-            if self.pio[1 - b].cycle < seg_end {
-                let inputs = self.gpio.inputs();
-                if self.pio[1 - b].run(seg_end, inputs) == pio::Stop::Outputs {
-                    let t = self.pio_time(self.pio[1 - b].cycle);
-                    self.update_pins(trace, t);
+        } else {
+            loop {
+                let wire_t = self.wire.next_time().filter(|&t| t <= now);
+                let seg_end = wire_t.map_or(target, |t| self.pio_cycle(t).min(target));
+                let both = self.pio[0].busy() && self.pio[1].busy();
+                let b = (self.pio[1].cycle < self.pio[0].cycle) as usize;
+                if self.pio[b].cycle < seg_end {
+                    let limit = if both { seg_end.min(self.pio[1 - b].cycle + MAX_SKEW) } else { seg_end };
+                    let inputs = self.gpio.inputs();
+                    if self.pio[b].run(limit, inputs) == pio::Stop::Outputs {
+                        let t = self.pio_time(self.pio[b].cycle);
+                        self.update_pins(trace, t);
+                    }
+                    continue;
                 }
-                continue;
-            }
-            match wire_t {
-                Some(t) if self.pio_cycle(t) <= seg_end => self.apply_wire(trace, t),
-                _ => break,
+                if self.pio[1 - b].cycle < seg_end {
+                    let inputs = self.gpio.inputs();
+                    if self.pio[1 - b].run(seg_end, inputs) == pio::Stop::Outputs {
+                        let t = self.pio_time(self.pio[1 - b].cycle);
+                        self.update_pins(trace, t);
+                    }
+                    continue;
+                }
+                match wire_t {
+                    Some(t) if self.pio_cycle(t) <= seg_end => self.apply_wire(trace, t),
+                    _ => break,
+                }
             }
         }
         self.in_pio = false;
@@ -814,7 +869,7 @@ impl System {
             self.pio_lines = lines;
             self.irq_dirty = true;
         }
-        if self.pio.iter().any(|p| p.busy()) {
+        if self.pio[0].busy() || self.pio[1].busy() {
             self.sched.schedule(Event::Pio, now + Time::from_us(1));
         } else {
             self.sched.cancel(Event::Pio);
@@ -2166,7 +2221,15 @@ impl<'a> BatchBus<'a> {
     #[inline(never)]
     fn timer_read(&mut self, addr: u32, size: Size) -> Result<u32, BusFault> {
         let now = self.now();
-        match self.sys.timer.read(&self.sys.watchdog.tick, now, addr & 0xFFC) {
+        let off = addr & 0xFFC;
+        let ticks = self.sys.watchdog.tick.ticks(now);
+        // The raw count (what `Timer::read` gives for these, without its other cases)
+        let raw = match off {
+            timer::TIMERAWL => Some(self.sys.timer.value_at(ticks) as u32),
+            timer::TIMERAWH => Some((self.sys.timer.value_at(ticks) >> 32) as u32),
+            _ => self.sys.timer.read(&self.sys.watchdog.tick, now, off),
+        };
+        match raw {
             Some(v) => {
                 // A fused batch ends here too: polling the timer is what busy-waits do, and the machine only finds
                 // those at quantum boundaries
@@ -2174,7 +2237,6 @@ impl<'a> BatchBus<'a> {
                 if self.end_on_slow {
                     self.after |= Self::ATTENTION;
                 }
-                let ticks = self.sys.watchdog.tick.ticks(now);
                 if self.timer_ticks.is_some_and(|t| t != ticks) {
                     self.ticked = true;
                 }

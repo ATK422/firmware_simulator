@@ -217,6 +217,8 @@ theme.
 | `POST /api/fault` `{"board": "esc0", "fault": "can-stuck"}` | Applies a fault, in the `--fault` syntax ([faults.md](faults.md)); `run` takes its board's name or no `board` |
 | `POST /api/input` `{"board": "camera_cage", "name": "depth.pressure_pa", "value": 120000}` | Sets a physical input |
 | `POST /api/pause` `{"paused": true}` | Pauses or resumes virtual time; with `"at_s": 2.5`, pausing waits for that virtual time, and resuming runs until it and pauses again |
+| `GET /api/thrusters` | Built live by the run loop: `escs` (every DShot ESC: `board`, `esc`, `rpm`, `throttle`, `signal_lost`, and the vehicle `thruster` it spins with its `thrust_n`) and `vehicles` (each one's pose, `external`, and its thrusters with `board`, `esc`, `rpm`, `thrust_n`) |
+| `POST /api/vehicle` `{"vehicle": "talos", "position_m": [2, 1, 1.5], "rpy_deg": [0, 0, 90]}` | Puts a vehicle at a pose (world north-east-down, body forward-starboard-down; `quat_wxyz` instead of `rpy_deg`; optional `velocity_mps`, `rate_dps`; `vehicle` may be left out when there is one), answered like `/api/thrusters`; an [external vehicle](vehicles.md#external-vehicles)'s only motion |
 
 A POST is answered once the run loop has applied it and published the new state: 200 with `{"ok": true,
 "message": ...}`, 400 for a malformed request (bad JSON, an unknown fault spelling), 422 when it could not be

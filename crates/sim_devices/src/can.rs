@@ -243,6 +243,8 @@ pub struct BusFaults {
     /// Nodes (by index) unplugged from the bus, each alone on its own stub, with when that stub is free (its idle
     /// time is reported to the node up to there) and the idle time left over from that report.
     pub unplugged: Vec<(usize, Time, Time)>,
+    /// Nodes plugged back in, with when: a frame they had ready on their stub starts on the bus no earlier.
+    pub plugged_at: Vec<(usize, Time)>,
     pub floods: Vec<Flood>,
     /// Frames destroyed by injected errors, for tests.
     pub corrupted: u64,
@@ -256,6 +258,7 @@ impl BusFaults {
             corrupt_next: 0,
             stuck_dominant: None,
             unplugged: Vec::new(),
+            plugged_at: Vec::new(),
             floods: Vec::new(),
             corrupted: 0,
             rng: Rng::from_name(name),
@@ -366,9 +369,13 @@ impl CanBus {
     /// Unplugs node `node` (by its index in the node list [`CanBus::step`] gets) from the bus at `at`, or plugs it
     /// back in. Unplugged, it sends alone on its stub: nobody acknowledges, and it hears nothing.
     pub fn set_unplugged(&mut self, node: usize, unplugged: bool, at: Time) {
+        let was = self.faults.is_unplugged(node);
         self.faults.unplugged.retain(|(n, ..)| *n != node);
+        self.faults.plugged_at.retain(|(n, _)| *n != node);
         if unplugged {
             self.faults.unplugged.push((node, at, Time::ZERO));
+        } else if was {
+            self.faults.plugged_at.push((node, at));
         }
     }
 
@@ -491,10 +498,14 @@ impl CanBus {
                     continue;
                 }
                 if let Some(r) = node.tx_request() {
-                    let ready = match self.suspended {
+                    let mut ready = match self.suspended {
                         Some((n, until)) if n == i => r.ready_at.max(until),
                         _ => r.ready_at,
                     };
+                    // A frame that was waiting on the stub of a node just plugged back in starts once it is in
+                    if let Some((_, at)) = self.faults.plugged_at.iter().find(|(n, _)| *n == i) {
+                        ready = ready.max(*at);
+                    }
                     cands.push((ready, Sender::Node(i), r.token, r.frame));
                 }
             }
@@ -920,6 +931,9 @@ mod tests {
         bus.set_unplugged(0, false, Time::from_ms(1));
         bus.step(&mut [&mut a, &mut b, &mut c], &mut [&mut mon], Time::from_ms(2));
         assert_eq!(c.rx.len(), 3, "plugged back in");
+        // The frame it had been retrying on its stub goes out once it is back, not at the time it was queued
+        let rec = bus.record.as_ref().unwrap().iter().find(|r| r.sender == Sender::Node(0)).unwrap();
+        assert!(rec.start >= Time::from_ms(1) && rec.acked, "{rec:?}");
     }
 
     #[test]

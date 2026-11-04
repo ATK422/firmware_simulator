@@ -8,6 +8,13 @@
 //! vehicle is moved to its mounting point in the acoustic medium (a [`LivePath`] its hydrophone and projector
 //! follow). The vehicle steps at 1 ms on the robot's virtual clock, so it is as deterministic as the boards.
 //!
+//! An **external** vehicle (`external = true`, or `robot --external-vehicle NAME`) does not move by itself: another
+//! simulator (nereus, through `integrations/nereus/firmware_bridge.py`) owns its motion and posts its pose
+//! ([`VehicleSim::set_pose`], the dashboard's `POST /api/vehicle`). The sensors and transducers still follow that
+//! pose, and the thrusters still report the thrust their ESC's propeller speed makes ([`Vehicle::hold_to`]), which
+//! is what the other simulator applies. Its pose is the pose of whatever point the other simulator reports (nereus:
+//! `base_link`), so the mounts of its sensors are measured from that point rather than the centre of gravity.
+//!
 //! In a robot file:
 //!
 //! ```toml
@@ -19,6 +26,7 @@
 //! # floating = true                   # start at the depth where it floats (instead of position_m's depth)
 //! # water = { density_kg_m3 = 1025.0, current_mps = [0.1, 0.0, 0.0] }
 //! # log_ms = 10                        # keep a state log (CSV with `--vehicle-csv`)
+//! # external = true                   # moved by another simulator through the dashboard, not by its thrusters
 //! thrusters = [
 //!     { thruster = "heave_fl", board = "esc0", esc = "esc1" },   # a thruster of the vehicle file, the board
 //!     # ...                                                      # and the ESC (by name in the board file)
@@ -43,7 +51,7 @@ use sim_acoustics::medium::{LivePath, Trajectory};
 use sim_core::time::Time;
 use sim_devices::dshot::Esc;
 use sim_physics::log::StateLog;
-use sim_physics::{State, Vec3, Vehicle, VehicleFile, Water};
+use sim_physics::{Quat, State, Vec3, Vehicle, VehicleFile, Water};
 
 use crate::Session;
 use crate::board::Inputs;
@@ -75,6 +83,23 @@ pub struct VehicleSpec {
     pub transducer: Vec<TransducerMount>,
     /// Keep a log of the vehicle's state every this many milliseconds.
     pub log_ms: Option<f64>,
+    /// Moved by another simulator ([`VehicleSim::set_pose`]) instead of by its thrusters.
+    #[serde(default)]
+    pub external: bool,
+}
+
+/// A pose posted for a vehicle (`POST /api/vehicle`), in the emulator's frames: world north-east-down, body
+/// forward-starboard-down.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ExternalPose {
+    /// North, east, depth, m.
+    pub position: Vec3,
+    /// Body to world.
+    pub attitude: Quat,
+    /// Body-frame velocity, m/s (kept as it was when not given).
+    pub velocity: Option<Vec3>,
+    /// Body rates, rad/s (kept as they were when not given).
+    pub rate: Option<Vec3>,
 }
 
 /// Which ESC spins a thruster.
@@ -114,6 +139,10 @@ pub struct VehicleSim {
     pub vehicle: Vehicle,
     /// The state log (`log_ms`, or [`VehicleSim::keep_log`]).
     pub log: Option<StateLog>,
+    /// Moved by another simulator ([`VehicleSim::set_pose`]): the physics only report the thrust.
+    pub external: bool,
+    /// Poses posted so far ([`VehicleSim::set_pose`]).
+    pub poses_set: u64,
     /// Per thruster of the vehicle: the board index and the index of its ESC among the board's pin devices.
     thrusters: Vec<Option<(usize, usize)>>,
     /// Pressure inputs and where they are on the hull.
@@ -151,7 +180,15 @@ impl VehicleSim {
         }
         vehicle.name = spec.name.clone();
         let log = spec.log_ms.map(|ms| StateLog::new(ms / 1000.0, &vehicle));
-        let mut sim = VehicleSim { vehicle, log, thrusters: Vec::new(), sensors: Vec::new(), paths: Vec::new() };
+        let mut sim = VehicleSim {
+            vehicle,
+            log,
+            external: spec.external,
+            poses_set: 0,
+            thrusters: Vec::new(),
+            sensors: Vec::new(),
+            paths: Vec::new(),
+        };
         sim.record();
         Ok(sim)
     }
@@ -232,9 +269,44 @@ impl VehicleSim {
             .collect()
     }
 
-    /// Steps the vehicle up to `t` with the ESCs' current speeds, then updates its sensors and transducers.
+    /// Each thruster's ESC: the board's index in the robot and the ESC's index among the board's pin devices
+    /// (`None` for a thruster that isn't wired).
+    pub fn wiring(&self) -> &[Option<(usize, usize)>] {
+        &self.thrusters
+    }
+
+    /// Puts the vehicle at `pose` (an external simulator moved it; works on any vehicle, as a teleport for one
+    /// the thrusters move) and updates the sensor inputs at once. The transducers follow from the next slice.
+    pub fn set_pose(&mut self, pose: &ExternalPose) {
+        let s = &self.vehicle.state;
+        let state = State {
+            position: pose.position,
+            attitude: pose.attitude.normalized(),
+            velocity: pose.velocity.unwrap_or(s.velocity),
+            rate: pose.rate.unwrap_or(s.rate),
+        };
+        self.vehicle.place(state);
+        self.poses_set += 1;
+        self.update_outputs();
+    }
+
+    /// Steps the vehicle up to `t` with the ESCs' current speeds, then updates its sensors and transducers. An
+    /// external vehicle stays where it was put and only works out its thrust.
     pub fn advance<B: Borrow<Session>>(&mut self, t: Time, boards: &[B]) {
         let end = t.as_secs_f64();
+        if self.external {
+            let rpm = self.rpms(boards, t);
+            let before = self.vehicle.time;
+            self.vehicle.hold_to(end, &rpm);
+            if self.vehicle.time > before {
+                for (_, mount, path) in &self.paths {
+                    path.push(self.vehicle.time, self.vehicle.point(*mount));
+                }
+                self.record();
+            }
+            self.update_outputs();
+            return;
+        }
         while self.vehicle.time + self.vehicle.dt <= end + 1e-9 {
             let rpm = self.rpms(boards, Time::from_secs_f64(self.vehicle.time));
             self.vehicle.step(&rpm);

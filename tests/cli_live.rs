@@ -238,8 +238,7 @@ fn sigterm_ends_a_robot_run_cleanly() {
 
 #[test]
 fn a_robot_behind_real_time_says_so() {
-    if !sim_host::titan_rs_release_dir(&repo()).join("esc_board").exists() {
-        eprintln!("skipping: titan_firmware_rs images not built");
+    if sim_host::titan_rs_image(&repo(), "esc_board").is_none() {
         return;
     }
     // Talos's nine boards on one thread run at about half of real time

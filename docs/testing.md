@@ -12,6 +12,9 @@ values are stable, and a booted board can be snapshotted to run many scenarios f
 - [How the test suites are organised](#how-the-test-suites-are-organised)
 - [CI](#ci)
 
+Tests that need no Rust (a robot or board, faults, inputs and checks on logs, statuses and frames) can be written as
+YAML scenarios instead: [scenarios.md](scenarios.md).
+
 ## Running the tests
 
 ```bash
@@ -235,10 +238,12 @@ pass) without them.
 | `crates/sim_test/tests/harness.rs` | The harness itself (snapshots, board edits), the H-bridge board, the Dynamixel bench test |
 | `crates/sim_test/tests/faults.rs` | Fault injection against the safety system, and the `firmware_finding_*` tests |
 | `crates/sim_test/tests/can_log.rs` | Recording, replaying and comparing CAN traffic, a cannelloni tunnel |
-| `crates/sim_test/tests/vehicle.rs`, `vehicle_talos.rs` | Thrusters in the loop on Puddles and Talos |
+| `crates/sim_test/tests/vehicle.rs`, `vehicle_talos.rs`, `vehicle_nereus.rs` | Thrusters in the loop on Puddles and Talos, and the controller's raw CAN thruster frames with nereus as the physics |
 | `crates/sim_test/tests/ivc_sweep.rs` | IVC delivery against range and noise (prints tables with `--nocapture`; the slowest suite) |
 | `crates/sim_test/tests/guide.rs` | This page's walkthrough |
-| `tests/host_cli.rs` (root package) | The command line: robot record/replay/diff, `bridges` outputs, `scripts/vcan_up.sh` with stand-ins, the Docker files' consistency |
+| `crates/sim_test/tests/scenarios.rs` | Every YAML scenario in `scenarios/` ([scenarios.md](scenarios.md)), the runner's verdicts and evidence, determinism on any number of threads, and A/B comparisons of real runs |
+| `tests/host_cli.rs` (root package) | The command line: robot record/replay/diff, `bridges` outputs, `scripts/vcan_up.sh` with stand-ins, `robot_in_a_box.sh` and `nereus_firmware_sim.sh` in `--dry-run`, the nereus bridge's Python tests, the Docker files' consistency |
+| `tests/scenario_cli.rs` (root package) | `scenario` and `compare` on the command line: exit statuses, JUnit, JSON, Markdown |
 | `tests/docs.rs` (root package) | Every command line option the docs and the README mention exists |
 
 `test_programs/` holds the hand-written Thumb programs, a small embassy firmware, pico-sdk programs and small C
@@ -254,7 +259,9 @@ When the firmware rather than the emulator looks wrong, write a test that assert
 * **test**: checks out the submodules, builds the titan_firmware_rs images (`cargo build --workspace --release`),
   runs `cargo fmt --all --check`, `cargo clippy --workspace --all-targets --release -- -D warnings` and
   `python3 scripts/gen_boards.py --check`, then `cargo test --release --workspace -- --nocapture`, and prints the
-  smoke test and sweep tables from the log.
+  smoke test and sweep tables from the log. It then runs the YAML scenarios with the command
+  (`firmware_simulator scenario scenarios/ --junit scenarios.xml`) and keeps the JUnit XML as an artifact
+  ([scenarios.md](scenarios.md#in-cargo-test-and-ci)).
 * **c-firmware**: installs `gcc-arm-none-eabi`, builds the C programs with `scripts/build_c_firmware.sh` and runs
   the tests that boot them (`sim_host`'s `pico_sdk`, `flash`, `can`). It sets `CMAKE_POLICY_VERSION_MINIMUM=3.5`
   because the runners' CMake 4 refuses pico-sdk's bundled pioasm and elf2uf2 projects otherwise.
@@ -267,3 +274,31 @@ can read it as the repository secret **`TITAN_FIRMWARE_RS_TOKEN`** (a fine-grain
 "Contents: read" on that repository). Without it the submodule is not fetched, the "Firmware images" step fails
 loudly, and the firmware tests would otherwise skip. The c-firmware job needs it too: the emulator's workspace uses
 titan_firmware_rs's host crates (`canmore`, `titan_link`), so its tests can't build without the submodule.
+
+### In titan_firmware_rs
+
+titan_firmware_rs runs this repository's firmware tests on every push and pull request of its own, in
+`.github/workflows/emulator.yml` there ("Emulator CI" in its README). The workflow builds the images with the
+firmware's pinned compiler, checks out this repository at `master` (with the `FIRMWARE_SIMULATOR_TOKEN` secret,
+since this repository may be private), and puts its own checkout in place of `external/titan_firmware_rs`. This
+repository's host crates and images then both come from that commit, and no submodule is fetched. It then runs:
+
+```bash
+cargo test --release -p sim_test --test smoke -- --nocapture   # every board boots and connects; the table goes to the job summary
+cargo test --release -p sim_test --test faults -- --nocapture
+cargo test --release -p sim_test --test robot -- --nocapture
+cargo test --release -p sim_host --test ivc_link -- --nocapture
+```
+
+These take about 1.5 minutes on 4 cores once built (`ivc_link` about a minute, `faults` about 12 s, `robot` 5 s,
+`smoke` 3 s). There, a test that skips for want of an image fails. The workflow sets `SIM_REQUIRE_TITAN_RS=1`, which
+makes `sim_test::titan_rs`, `sim_host::titan_rs_image` and the tests built on them panic instead of skipping. It
+also fails the job on any `skipping: ...thumbv6m-none-eabi/release/...` line. Tests that need the C images still
+skip there.
+
+These tests encode what the firmware is expected to do, including the `firmware_finding_*` tests that pin down
+today's bugs. So when titan_firmware_rs changes behaviour on purpose (a finding fixed, a timing changed), its
+workflow fails against this repository's `master` until the tests here change to match. Make that change on a
+branch here, check it against the new images (`TITAN_RS_RELEASE_DIR=.../release cargo test ...`), and run the
+titan_firmware_rs workflow by hand with `emulator_ref` set to the branch. Bumping the `external/titan_firmware_rs`
+pin here goes with the same change.

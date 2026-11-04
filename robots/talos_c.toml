@@ -1,0 +1,113 @@
+# Talos with titan_firmware's C board apps (micro-ROS over CAN), as the deployed robot runs them: the boards the
+# Orin's `micro_ros_agent can -D can0` (internal CAN FD bus) and `can -D can1` (external bus) serve. The
+# "robot in a box" of docs/robots.md: scripts/robot_in_a_box.sh puts these buses on vcan interfaces named can0 and
+# can1, so riptide's launch files run unchanged.
+#
+#   scripts/robot_in_a_box.sh --robot robots/talos_c.toml          # or by hand:
+#   scripts/vcan_up.sh can0 can1
+#   firmware_simulator robot robots/talos_c.toml --can internal=can0 --can external=can1 --realtime --time 100000s
+#
+# The images come from your titan_firmware checkout (TITAN_FIRMWARE_DIR), each project built in its own build/
+# directory as titan_firmware's docs do it. The board apps need titan_firmware's micro-ROS library, which is
+# built in Docker once (lib/micro_ros_pico/build.sh); then, for each project:
+#
+#   cd $TITAN_FIRMWARE_DIR/talos/ESCBoard && mkdir -p build && cd build && cmake .. && make
+#
+# which writes esc_board_with_bl.uf2 (the CAN bootloader and the app). Each board boots through the bootrom and
+# its bootloader, like a powered-on board; scripts/build_c_boards.sh builds them all.
+#
+# PoAC and the two ESC boards are what the controller needs (kill switch, thrusters); the camera cage gives the
+# stack its depth (state/depth/raw, which riptide_hardware2's depth_converter turns into depth/pose). The C
+# IVCBoard is left out (it needs an acoustic environment and its micro-ROS runs over USB on the IVCBoard2 branch).
+# The vehicle is this emulator's own physics with Talos's real thruster layout (vehicles/talos_nereus.toml):
+# the controller's RPM commands spin it, the camera cage feels its depth. For nereus as the physics, see
+# robots/talos_c_nereus.toml.
+
+[[bus]]
+name = "internal"
+rates = "internal"
+
+[[bus]]
+name = "external"
+rates = "external"
+
+[[board]]
+name = "poac"
+board = "../boards/talos/poac_board.toml"
+elf = "${TITAN_FIRMWARE_DIR}/talos/PoacBoard/build/poac_board_with_bl.uf2"
+rom_boot = true
+bus = "internal"
+
+[[board]]
+name = "esc0"
+board = "../boards/mk2/esc_board.toml"
+elf = "${TITAN_FIRMWARE_DIR}/talos/ESCBoard/build/esc_board_with_bl.uf2"
+rom_boot = true
+bus = "internal"
+
+[[board]]
+name = "esc1"
+board = "../boards/mk2/esc_board.toml"
+elf = "${TITAN_FIRMWARE_DIR}/talos/ESCBoard/build/esc_board_with_bl.uf2"
+rom_boot = true
+bus = "internal"
+power_on_ms = 3
+gpio = [{ pin = 29, level = "high" }]
+
+[[board]]
+name = "camera_cage"
+board = "../boards/mk2/camera_cage_bb.toml"
+elf = "${TITAN_FIRMWARE_DIR}/talos/CameraCageBB/build/camera_cage_bb_with_bl.uf2"
+rom_boot = true
+bus = "internal"
+
+[[board]]
+name = "actuator"
+board = "../boards/mk2/actuator_board.toml"
+elf = "${TITAN_FIRMWARE_DIR}/talos/Actuator/build/actuator_mk2_with_bl.uf2"
+rom_boot = true
+bus = "internal"
+
+[[board]]
+name = "led"
+board = "../boards/talos/led_board.toml"
+elf = "${TITAN_FIRMWARE_DIR}/talos/LEDBoard/build/led_board_with_bl.uf2"
+rom_boot = true
+bus = "internal"
+
+[[board]]
+name = "sbc"
+board = "../boards/talos/sbc_board.toml"
+elf = "${TITAN_FIRMWARE_DIR}/SBCBoard/build/sbc_board_with_bl.uf2"
+rom_boot = true
+bus = "internal"
+
+[[board]]
+name = "battery"
+board = "../boards/mk2/sbh_mcu.toml"
+elf = "${TITAN_FIRMWARE_DIR}/talos/SmartBattery/build/smart_battery_with_bl.uf2"
+rom_boot = true
+bus = "external"
+
+# Thruster k of the controller is ESC board k / 4, ESC k % 4 + 1. Talos starts afloat; the depth sensor (talos.yaml's
+# depth pose, from the centre of mass) zeroes at the surface at boot, like on the dock.
+[[vehicle]]
+name = "talos"
+file = "../vehicles/talos_nereus.toml"
+position_m = [0.0, 0.0, 0.0]
+floating = true
+thrusters = [
+    { thruster = "VUS", board = "esc0", esc = "esc1" },
+    { thruster = "VUP", board = "esc0", esc = "esc2" },
+    { thruster = "HUS", board = "esc0", esc = "esc3" },
+    { thruster = "HUP", board = "esc0", esc = "esc4" },
+    { thruster = "HLS", board = "esc1", esc = "esc1" },
+    { thruster = "HLP", board = "esc1", esc = "esc2" },
+    { thruster = "VLS", board = "esc1", esc = "esc3" },
+    { thruster = "VLP", board = "esc1", esc = "esc4" },
+]
+
+[[vehicle.sensor]]
+board = "camera_cage"
+input = "depth.pressure_pa"
+mount_m = [-0.155, 0.166, -0.061]

@@ -203,7 +203,16 @@ impl Timer {
         if self.paused {
             return self.base_value;
         }
-        self.base_value.wrapping_add(ticks.ticks(now).saturating_sub(self.base_ticks))
+        self.value_at(ticks.ticks(now))
+    }
+
+    /// The count when the tick generator has given `ticks` ([`Timer::value`] with `ticks` worked out).
+    #[inline]
+    pub fn value_at(&self, ticks: u64) -> u64 {
+        if self.paused {
+            return self.base_value;
+        }
+        self.base_value.wrapping_add(ticks.saturating_sub(self.base_ticks))
     }
 
     fn set_value(&mut self, ticks: &TickGen, now: Time, v: u64) {
@@ -216,6 +225,11 @@ impl Timer {
     }
 
     /// When alarm `n` fires, given the current value; `None` if disarmed or the tick is stopped.
+    /// The tick count at which the counter reaches `value` (from the current base), unless it is paused.
+    pub fn ticks_of_value(&self, value: u64) -> Option<u64> {
+        (!self.paused).then(|| self.base_ticks.wrapping_add(value.wrapping_sub(self.base_value)))
+    }
+
     pub fn alarm_due(&self, ticks: &TickGen, now: Time, n: usize) -> Option<Time> {
         if self.armed & (1 << n) == 0 || self.paused {
             return None;

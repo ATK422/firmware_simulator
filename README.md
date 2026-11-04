@@ -21,7 +21,7 @@ Every run is repeatable: the same firmware and inputs give exactly the same resu
 **Full guide: [docs/](docs/README.md)** · Design and milestones: [PLAN.md](PLAN.md)
 
 - [Quick start](#quick-start)
-- [More ways to use it](#more-ways-to-use-it): coding agents (MCP), C firmware with micro-ROS, IVC in the water
+- [More ways to use it](#more-ways-to-use-it): tests in YAML and firmware A/B comparisons, coding agents (MCP), C firmware with micro-ROS, the robot computer on vcan, the firmware in nereus, IVC in the water
 - [What it can do](#what-it-can-do)
 - [Boards, firmware and robots](#boards-firmware-and-robots)
 - [Architecture](#architecture)
@@ -132,6 +132,19 @@ Always test in release mode. Tests whose firmware is not built print `skipping: 
 
 ## More ways to use it
 
+**Write tests in YAML and compare firmware builds.** A scenario file names a robot (or one board), the faults and
+inputs to apply when, and what must happen: log lines, firmware status fields and faults, CAN frames and rates,
+the link, GPIO levels, ESC speeds, the vehicle's depth, resets, IVC bytes. `firmware_simulator scenario` runs them
+(in parallel, deterministically) with a ✓ or ✗ per step and its evidence, JUnit XML for CI and JSON; the ones in
+`scenarios/` run in `cargo test`. `firmware_simulator compare` runs them with two firmware builds and writes a
+Markdown report of what changed (checks, log lines, CAN traffic per message, boot and connect times, faults, resets,
+ESC speeds, CPU load) for a pull request ([scenarios.md](docs/scenarios.md)):
+
+```bash
+firmware_simulator scenario scenarios/ --junit results.xml
+firmware_simulator compare --a $FW --b ~/other-build/thumbv6m-none-eabi/release scenarios/ -o ab.md
+```
+
 **Let a coding agent drive it (MCP).** `firmware_simulator mcp` is an MCP server: an agent can run a board or a
 robot, read logs, board state and CAN frames as JSON, inject faults, set inputs, pause, and wait for a log line,
 without screenshotting the dashboard. Claude Code started at the repository root picks it up from `.mcp.json`
@@ -155,6 +168,22 @@ Then `ros2 run micro_ros_agent micro_ros_agent serial --dev /tmp/ivc-ros`, and t
 ([running.md](docs/running.md#usb-bootsel-picoboot-uf2-and-cdc)). Building the C apps needs titan_firmware's
 micro-ROS library, which is built in Docker (`lib/micro_ros_pico/build.sh`). Several micro-ROS boards at once need
 one DDS discovery server per run, because the client, not the agent, picks the domain.
+
+**Put the robot computer's side on it (robot in a box).** `scripts/robot_in_a_box.sh` runs Talos's C board apps
+(`robots/talos_c.toml`, your titan_firmware build) on vcan interfaces named `can0` and `can1`, like the Orin's, and
+starts riptide's `copro_agent.launch.py` (`micro_ros_agent can -D can0`) when it finds a sourced riptide workspace;
+`--rust` runs the titan_firmware_rs images with one `titan_bridge` each instead
+([robots.md](docs/robots.md#robot-in-a-box-the-orins-side-on-vcan)).
+
+**Watch the firmware drive Talos in nereus.** `scripts/nereus_firmware_sim.sh` brings up vcan, the emulated
+PoAC, ESC boards and camera cage, [nereus](https://github.com/osu-uwrt/nereus) with the riptide stack and its viewer,
+and a bridge: the controller's RPM commands go over `can0` to the emulated ESC boards, the thrust their motors make
+moves nereus's vehicle, and the camera cage feels nereus's depth. nereus is slowed to the emulator's speed so both
+stay on one clock ([nereus.md](docs/nereus.md); to verify locally).
+
+```bash
+scripts/nereus_firmware_sim.sh --nereus ~/osu-uwrt/release/nereus      # ROS 2 and the riptide workspace sourced
+```
 
 **Test IVC in the water.** `robots/ivc2_pool.toml` puts two IVCBoard2s 5 m apart in a pool;
 `robots/ivc2_interop.toml` puts the Rust IVCBoard2 next to your build of the C one (set `TITAN_FIRMWARE_DIR`), and
@@ -180,7 +209,7 @@ The details, by area; each row links to the page that covers it.
 | **Robots and the water** | Robot files with several boards on CAN FD and classic buses, power-on offsets and ID straps; acoustic environments (pool, open water, harbour) with multipath, noise and Doppler between IVC boards (C and Rust IVCBoard2 checked against each other); a 6-DOF vehicle the firmware's DShot frames move, with depth sensors and transducers following it | [robots.md](docs/robots.md), [acoustics.md](docs/acoustics.md), [vehicles.md](docs/vehicles.md) |
 | **Host integration** | Mock `titan_bridge` built on the real `canmore`/`titan_link` crates; SocketCAN (vcan) for the real host tools; Puddles over Ethernet/UDP; CAN log recording, replay and `can-diff`; cannelloni tunnels; `titan_bridge` command lines; USB with BOOTSEL, PICOBOOT, UF2 drive, CDC (on robot boards too, for micro-ROS over USB) and USB/IP; GDB server | [robots.md](docs/robots.md#can-logs-recording-replaying-comparing), [running.md](docs/running.md#usb-bootsel-picoboot-uf2-and-cdc) |
 | **Testing and faults** | The `sim_test` harness (`Bench`, `RobotBench`, snapshots, parallel sweeps); a smoke test for every board image; fault injection that fails the hardware, not the firmware's state (CAN bit errors, stuck bus, absent I2C devices, ADC shorts, brownouts, hangs, bridge loss, kill switch) | [testing.md](docs/testing.md), [faults.md](docs/faults.md) |
-| **Developer tools** | Sampling firmware profiler with stack walks and flame-graph stacks; VCD waveforms with decoded traffic; a live web dashboard with fault, input and pause controls; an MCP server so coding agents can run, read and drive the emulator through tools; JSON logs; instruction, exception, GPIO and device traces | [tools.md](docs/tools.md) |
+| **Developer tools** | Sampling firmware profiler with stack walks and flame-graph stacks; VCD waveforms with decoded traffic; a live web dashboard with fault, input and pause controls; an MCP server so coding agents can run, read and drive the emulator through tools; JSON logs; instruction, exception, GPIO and device traces; a GDB server (both cores, any board of a robot) and VS Code launch configurations to step through firmware with Cortex-Debug, peripherals from the SVD | [tools.md](docs/tools.md), [running.md](docs/running.md#debugging-in-vs-code) |
 
 ## Boards, firmware and robots
 
@@ -216,9 +245,11 @@ The generator also writes files for boards that have no titan_firmware_rs image 
 | [`robots/ivc_pool.toml`](robots/ivc_pool.toml) | Two vehicles in `environments/pool.toml`, each with a first-generation IVCBoard on its own bus |
 | [`robots/ivc2_pool.toml`](robots/ivc2_pool.toml) | The same with IVCBoard2 |
 | [`robots/ivc2_interop.toml`](robots/ivc2_interop.toml) | The Rust IVCBoard2 and your build of the C one (micro-ROS over USB) in the pool, for acoustic interop |
+| [`robots/talos_c.toml`](robots/talos_c.toml) | Talos with your build of titan_firmware's C board apps (micro-ROS over CAN), as the robot runs them, in its real thruster layout |
+| [`robots/talos_c_nereus.toml`](robots/talos_c_nereus.toml), [`robots/talos_nereus.toml`](robots/talos_nereus.toml) | PoAC, the ESC boards and the camera cage (C or Rust) in a vehicle that nereus moves |
 
 Environments: [`pool`, `open_water`, `harbour`](environments) ([acoustics.md](docs/acoustics.md#environment-files)).
-Vehicles: [`talos`, `puddles`](vehicles) ([vehicles.md](docs/vehicles.md#vehicle-files)).
+Vehicles: [`talos`, `talos_nereus`, `puddles`](vehicles) ([vehicles.md](docs/vehicles.md#vehicle-files)).
 
 ## Architecture
 
@@ -268,15 +299,15 @@ Measured with `cargo run --release -p sim_test --example bench -- --time 2s --re
 
 | Run | CPU time | Speed vs real time |
 |---|---|---|
-| `template` (power board) | 0.03 s | about 60x |
-| IVCBoard2 | 0.6 s | about 3.4x |
-| ESC board (four DShot ESCs on PIO) | 1.8 s | about 1.1x |
-| IVC2 pool (two boards in the water) | 2.2 s | about 0.9x |
-| Talos (nine boards) | 4.7 s | about 0.4x |
+| `template` (power board) | 0.03 s | about 75x |
+| IVCBoard2 | 0.55 s | about 3.6x |
+| ESC board (four DShot ESCs on PIO) | 1.35 s | about 1.5x |
+| IVC2 pool (two boards in the water) | 2.15 s | about 0.9x |
+| Talos (nine boards) | 3.7 s | about 0.54x |
 
 So single boards run at or above real time. All of Talos with `--realtime` does not keep up: its boards run on
-threads by default (`--threads`), which makes it about 1.7x faster (0.72x real time), but the two ESC boards set
-the pace. Details: [internals.md](docs/internals.md#performance),
+threads by default (`--threads`), which makes it about 1.5x faster (about 0.8x real time), but the two ESC boards
+set the pace. Details: [internals.md](docs/internals.md#performance),
 [robots.md](docs/robots.md#how-a-robot-runs).
 
 **Determinism.** The same image, board or robot file, inputs, faults and seeds give the same run, instruction for
@@ -310,8 +341,10 @@ not modelled or not yet trusted:
 Docker daemon, vhci-hcd module or hardware. These are written and statically checked, but never run for real:
 
 * SocketCAN on vcan with the real `titan_bridge`, `canmore_cli` and `upload_tool`, and the `bridges` script and
-  launch file in `riptide-shell` ([robot in a box](docs/robots.md#robot-in-a-box-vcan-titan_bridge-docker)).
+  launch file in `riptide-shell` ([robot in a box](docs/robots.md#robot-in-a-box-the-orins-side-on-vcan)).
 * The `docker/robot_computer` image and compose file.
+* `scripts/robot_in_a_box.sh` with the C images and riptide's micro-ROS agents, and the firmware in nereus
+  (`scripts/nereus_firmware_sim.sh`, its bridge node and launch file; [the checklist](docs/nereus.md#to-verify-locally)).
 * `--usbip` against the kernel's vhci-hcd (tested only with an in-process USB/IP client).
 * VCD files in GTKWave/Surfer/PulseView; the MCP server from Claude Code itself (tested with scripted clients)
   ([tools.md](docs/tools.md#to-verify-locally)).

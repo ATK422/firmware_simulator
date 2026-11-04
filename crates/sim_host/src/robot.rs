@@ -390,6 +390,17 @@ impl Robot {
 
     /// Builds a robot from a parsed robot file; relative paths are taken from `dir`.
     pub fn from_spec(spec: &RobotSpec, dir: &Path) -> Result<Robot, String> {
+        Robot::from_spec_with_images(spec, dir, &|_, path| path)
+    }
+
+    /// [`Robot::from_spec`] with each board's firmware image chosen by `image`: it gets the board's name and the
+    /// image path the robot file gives (resolved as [`Robot::from_spec`] does, `$TITAN_RS_RELEASE_DIR` included)
+    /// and returns the image to load, used as it is (firmware A/B comparisons put another build in its place).
+    pub fn from_spec_with_images(
+        spec: &RobotSpec,
+        dir: &Path,
+        image: &dyn Fn(&str, PathBuf) -> PathBuf,
+    ) -> Result<Robot, String> {
         let mut robot = Robot::default();
         if let Some(e) = &spec.environment {
             let mut env = sim_acoustics::Environment::load(&dir.join(&e.file))?;
@@ -426,7 +437,7 @@ impl Robot {
             // Robot-level straps replace the board file's entries for the same pins
             board.gpio.retain(|g| !b.gpio.iter().any(|o| o.pin == g.pin));
             board.gpio.extend(b.gpio.iter().cloned());
-            let elf = crate::resolve_image(&dir.join(expand(&b.elf)?));
+            let elf = image(&b.name, crate::resolve_image(&dir.join(expand(&b.elf)?)));
             let image = Image::load(&elf).map_err(|e| format!("{}: {e}", elf.display()))?;
             let mut m = Machine::new(MachineConfig {
                 bootrom: Some(rp2040::BOOTROM_B1.to_vec()),

@@ -13,7 +13,7 @@ and replay, log comparison, UDP tunnels, and the real host tools.
 - [CAN logs: recording, replaying, comparing](#can-logs-recording-replaying-comparing)
 - [CAN over UDP (cannelloni)](#can-over-udp-cannelloni)
 - [titan_bridge command lines: `bridges`](#titan_bridge-command-lines-bridges)
-- [Robot in a box: vcan, titan_bridge, Docker](#robot-in-a-box-vcan-titan_bridge-docker)
+- [Robot in a box: the Orin's side on vcan](#robot-in-a-box-the-orins-side-on-vcan)
 
 ## Robot files
 
@@ -24,6 +24,8 @@ and replay, log comparison, UDP tunnels, and the real host tools.
 | `robots/ivc_pool.toml` | Two vehicles in `pool.toml`, each with a first-generation IVCBoard on its own bus |
 | `robots/ivc2_pool.toml` | The same with IVCBoard2 |
 | `robots/ivc2_interop.toml` | The Rust `ivc_board2` and the C titan_firmware IVCBoard2 (your build, micro-ROS over USB) in the pool ([acoustics.md](acoustics.md#c-and-rust-ivcboard2-interop)) |
+| `robots/talos_c.toml` | Talos with titan_firmware's C board apps (your build, micro-ROS over CAN), as the robot runs them, in Talos's real thruster layout ([robot in a box](#robot-in-a-box-the-orins-side-on-vcan)) |
+| `robots/talos_c_nereus.toml`, `robots/talos_nereus.toml` | The boards in the loop (PoAC, two ESC boards, camera cage), C or Rust, in a vehicle nereus moves ([nereus.md](nereus.md)) |
 
 ```toml
 [environment]                       # optional: the water the boards' transducers are in
@@ -102,6 +104,7 @@ as `[t] NAME uart0: ...`); the run ends with the stop time, the wall time and ea
 | `--fault TIME@BOARD:FAULT` | | A fault on one board, e.g. `1.5s@camera_cage:can-unplug` (repeatable; bridge faults act on the first mock bridge on the board's bus; [faults.md](faults.md)) |
 | `--noise-db L` | | Replaces every hydrophone's ambient noise with white noise at `L` dB re 1 µPa²/Hz |
 | `--vehicle-csv FILE` | | Writes each vehicle's state every 10 ms (`NAME` in the file name for several vehicles) |
+| `--external-vehicle NAME` | | Lets another simulator move the vehicle through the dashboard (`external = true`; needs `--dashboard`; [vehicles.md](vehicles.md#external-vehicles)) |
 | `--realtime` | off | Paces virtual time to the wall clock; warns when the robot falls behind it ([running.md](running.md#options)) |
 | `--threads N` | 0 | Runs the boards on up to `N` threads (0: up to one per core; 1: in turn on one) ([below](#how-a-robot-runs)) |
 | `--trace KINDS`, `--trace-board NAMES`, `--trace-file FILE` | | Traces the boards ([below](#traces-profiles-waveforms-and-the-dashboard)) |
@@ -109,6 +112,7 @@ as `[t] NAME uart0: ...`); the run ends with the stop time, the wall time and ea
 | `--vcd FILE`, `--vcd-pins SPEC`, `--vcd-events` | all pins | A VCD waveform with a scope per board (and per bus) |
 | `--dashboard ADDR`, `--dashboard-hold`, `--dashboard-pause-at T` | | A live dashboard of all boards, buses and vehicles |
 | `--log-json FILE` | | Every log line, UART line, CAN frame and fault as JSON lines |
+| `--gdb BOARD=ADDR` | | Waits for GDB on one board, e.g. `esc0=127.0.0.1:3333`; continuing runs the whole robot ([running.md](running.md#debugging-with-gdb)) |
 | `--unmodelled MODE` | `summary` | Registers the emulator does not model, as for `run` ([running.md](running.md#traces)): one note, then a line per board at the end listing them; `first`, `every` or `off` |
 
 A board whose core locks up runs on until its watchdog resets it, as on the chip (`--stop-on-lockup` stops the
@@ -188,12 +192,12 @@ boards go back to taking turns for a while. Robots in an acoustic environment al
 hydrophone can hear another board within the slice. Emulator log lines from different boards can interleave
 differently with threads; what the boards do does not change. `Robot::threads` defaults to 1 in code (tests).
 
-**Speed.** On one core of the 4-core machine it was measured on, Talos (nine boards) runs at about 0.43x real
-time, and at about 0.72x on three or four threads (1.7x faster; 0.63x on two). That is as far as threads go: the
-slowest board sets the pace of every slice, and the two ESC boards each need about 0.95 s of host time per
-virtual second, in bursts that do not line up between them, so `--realtime` with all of Talos does not keep up.
-The template runs about 60x faster than real time, IVCBoard2 about 3.4x and the ESC board about 1.1x on its own.
-`cargo run --release -p sim_test --example bench` measures it ([internals.md](internals.md#performance)). Without
+**Speed.** On one core of the 4-core machine it was measured on, Talos (nine boards) runs at about 0.54x real
+time, and at about 0.8x on three threads (1.5x faster; 0.7x on two). That is as far as threads go: the slowest
+board sets the pace of every slice, and the two ESC boards each need about 0.7 s of host time per virtual second,
+in bursts (their DShot frames) that do not line up between them, so `--realtime` with all of Talos does not keep
+up. The template runs about 75x faster than real time, IVCBoard2 about 3.6x and the ESC board about 1.5x on its
+own. `cargo run --release -p sim_test --example bench` measures it ([internals.md](internals.md#performance)). Without
 `--realtime` a robot runs as fast as it can, so a host tool next to it (titan_bridge, a micro-ROS agent) needs
 timeouts with room for a robot slower than real time; with `--realtime` the robot warns
 (`real-time mode: emulation is 1.23s behind the wall clock`, at most every 5 s) when it cannot keep up.
@@ -389,16 +393,77 @@ client ID from the serial number in its board file's `[[flash]]`. The Nth bus of
 | `--program PATH` | The titan_bridge program |
 | `--probe`, `--probe-time T` | Boot the robot for `T` (1.5 s) and take each board's client ID from its CANmore heartbeats |
 
-## Robot in a box: vcan, titan_bridge, Docker
+## Robot in a box: the Orin's side on vcan
 
 > **To verify locally.** None of this could run where this guide was written (no vcan module, no
 > `CAP_NET_ADMIN`, no ROS 2, no Docker daemon). The scripts and generated files are checked statically
-> (`tests/host_cli.rs`: the vcan script against stand-ins for `ip` and `modprobe`, the bridges script with
-> `bash -n`, the launch file with `py_compile`, the compose file's consistency).
+> (`tests/host_cli.rs`: the vcan script against stand-ins for `ip` and `modprobe`, `robot_in_a_box.sh` and
+> `nereus_firmware_sim.sh` in `--dry-run`, the bridges script with `bash -n`, the launch file with `py_compile`,
+> the compose file's consistency); the C robot files load with stand-in images (`tests/cli.rs`).
 
-`scripts/vcan_up.sh` loads the vcan module and creates `vcan0` and `vcan1` (or the interfaces named) with the CAN FD
-MTU (72) and a longer transmit queue; `--down` removes them. Then the emulated robot is on those interfaces and
-the real host tools run against it unchanged, with one `titan_bridge` per Rust board:
+**What the Orin does.** Talos's robot computer (an NVIDIA Jetson AGX Orin, JetPack with ROS 2 Humble, the
+`riptide_release` workspace) talks to the boards over plain Linux SocketCAN through the `mttcan` driver: `can0` is
+the internal bus (1 Mbit/s; titan_firmware runs it as CAN FD with a 5 Mbit/s data phase) and `can1` the external
+bus (250 kbit/s), set up by `riptide_release/scripts/config_target/configure_jetpack.bash`. The boards run
+**titan_firmware's C apps with micro-ROS over CAN**, and riptide_hardware2's `copro_agent.launch.py` (part of
+`hardware.launch.py`) serves them with `micro_ros_agent can -D can0` and, on Talos, `can -D can1` (osu-uwrt's
+Micro-XRCE-DDS-Agent fork with the `can` transport). The controller (`complete_controller`, riptide_control's
+Simulink model) does not go through ROS for the thrusters: `send_thruster_cmd_canbus.c` writes raw CANmore
+utility frames to `can0` (channel 0, four big-endian RPMs per ESC board, clients 2 and 3), which both the C and the
+Rust ESC firmware take. `titan_bridge` (titan_firmware_rs's host side) is not used by any riptide repository yet.
+
+**In a box.** `scripts/robot_in_a_box.sh` puts the emulated robot on vcan interfaces named `can0` and `can1`, so
+all of that runs unchanged:
+
+```bash
+export TITAN_FIRMWARE_DIR=~/osu-uwrt/titan_firmware    # the C images, built with scripts/build_c_boards.sh
+scripts/robot_in_a_box.sh                    # robots/talos_c.toml, plus the micro-ROS agents if ROS is sourced
+scripts/robot_in_a_box.sh --stack bringup    # also riptide's bringup (hardware:=none): controller, EKF, autonomy
+scripts/robot_in_a_box.sh --rust             # titan_firmware_rs images (robots/talos.toml) and one titan_bridge each
+scripts/robot_in_a_box.sh --dry-run          # what it would run
+```
+
+It refuses a `can0` that is not a vcan interface (a real adapter would get the emulator's frames), creates the
+interfaces with `scripts/vcan_up.sh can0 can1` (the CAN FD MTU of 72 bytes, which the internal bus needs), starts
+
+```bash
+firmware_simulator robot robots/talos_c.toml --can internal=can0 --can external=can1 --realtime --time 1000000s --dashboard 127.0.0.1:8080
+```
+
+in the background, and then, when it finds a sourced ROS 2 with the riptide workspace, the robot computer's side:
+`ros2 launch riptide_hardware2 copro_agent.launch.py robot:=talos` for the C images, or the launch file
+`firmware_simulator bridges ROBOT --format launch` writes for the Rust ones; without ROS it prints those commands.
+`ros2 topic list` then shows the boards' topics under `/talos` (`state/firmware`, `state/kill`,
+`state/thrusters/rpm`, `state/depth/raw`, ...), and `candump can0` the traffic.
+
+**The C images.** `robots/talos_c.toml` runs the PoAC, both ESC boards, the camera cage, the actuator, LED, SBC
+and smart battery apps from `${TITAN_FIRMWARE_DIR}`, each booted through the bootrom and its CAN bootloader as on a
+powered board, in Talos's real thruster layout (`vehicles/talos_nereus.toml`, the emulator's own physics). Each
+project builds in its own `build/` directory into `NAME_with_bl.uf2`; the apps need titan_firmware's micro-ROS
+library, which is built in Docker once:
+
+```bash
+git -C $TITAN_FIRMWARE_DIR submodule update --init --recursive
+(cd $TITAN_FIRMWARE_DIR/lib/micro_ros_pico && ./build.sh)                      # Docker
+scripts/build_c_boards.sh                                                      # all of them, or
+cd $TITAN_FIRMWARE_DIR/talos/ESCBoard && mkdir -p build && cd build && cmake .. && make   # one by hand
+```
+
+| Board | Project | Image |
+|---|---|---|
+| `poac` | `talos/PoacBoard` | `poac_board_with_bl.uf2` |
+| `esc0`, `esc1` | `talos/ESCBoard` | `esc_board_with_bl.uf2` (one image; GPIO 29 strapped high makes ESC board 1) |
+| `camera_cage` | `talos/CameraCageBB` | `camera_cage_bb_with_bl.uf2` |
+| `actuator` | `talos/Actuator` | `actuator_mk2_with_bl.uf2` |
+| `led` | `talos/LEDBoard` | `led_board_with_bl.uf2` |
+| `sbc` | `SBCBoard` | `sbc_board_with_bl.uf2` |
+| `battery` | `talos/SmartBattery` | `smart_battery_with_bl.uf2` (external bus) |
+
+The micro-ROS agent's sessions and timeouts are on the wall clock and the firmware's on virtual time; Talos as a
+whole runs slower than real time on one core (see [Speed](#how-a-robot-runs)), so watch the emulator's "behind the
+wall clock" warnings. With nereus as the physics instead of the emulator's own, see [nereus.md](nereus.md).
+
+**The Rust images and titan_bridge.** The same with `--rust`, or by hand:
 
 ```bash
 scripts/vcan_up.sh
@@ -410,9 +475,8 @@ canmore_cli                         # lists the boards on every can*/vcan* inter
 upload_tool -b talos/ivc_board path/to/ivc_board   # over CAN, to a board running the C Titan bootloader
 ```
 
-For a single board: `run IMAGE --board ... --can vcan0 --realtime`. Talos as a whole runs slower than real time
-on one core (see [Speed](#how-a-robot-runs)); `titan_bridge` drops the link after 700 ms without pings, so check
-the emulator's "behind the wall clock" warnings.
+For a single board: `run IMAGE --board ... --can vcan0 --realtime`. `titan_bridge` drops the link after 700 ms
+without pings, so check the emulator's "behind the wall clock" warnings.
 
 `docker/robot_computer/` has a ROS 2 Humble image with titan_bridge, upload_tool and canmore_cli and a compose
 file that runs it next to the emulator on the host's vcan interfaces (both with `network_mode: host`); see

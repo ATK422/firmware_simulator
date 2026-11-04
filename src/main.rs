@@ -16,6 +16,7 @@ use sim_host::Session;
 
 mod host_tools;
 mod mcp;
+mod scenario_cli;
 
 #[derive(Parser)]
 #[command(version, about = "RP2040 emulator for UWRT titan firmware")]
@@ -45,6 +46,12 @@ enum Command {
     /// Serves the Model Context Protocol on stdin/stdout, for coding agents: tools to run the emulator, read a run's
     /// state, logs and CAN frames, and inject faults, set inputs and pause.
     Mcp(mcp::McpArgs),
+    /// Runs YAML scenario files (a robot or board, faults, inputs and checks on logs, statuses, frames and states)
+    /// as tests: prints each step with its time and evidence, writes JUnit XML or JSON, exits with 1 on a failure.
+    Scenario(scenario_cli::ScenarioArgs),
+    /// Runs scenarios with two firmware builds and reports what changed: checks, log lines, CAN traffic, boot and
+    /// connect times, faults, resets, ESC speeds (Markdown and JSON).
+    Compare(scenario_cli::CompareArgs),
 }
 
 #[derive(Subcommand)]
@@ -107,6 +114,11 @@ struct RobotArgs {
     /// vehicle's name when there are several).
     #[arg(long)]
     vehicle_csv: Option<PathBuf>,
+    /// Let another simulator move this vehicle (repeatable; as `external = true` in the robot file): its own
+    /// physics stop, and the dashboard's `POST /api/vehicle` puts it where the other simulator has it, its sensors
+    /// and transducers following. `GET /api/thrusters` gives the thrust its ESCs make. Needs `--dashboard`.
+    #[arg(long = "external-vehicle")]
+    external_vehicles: Vec<String>,
     /// Inject a fault on a board at a virtual time: `TIME@BOARD:FAULT`, e.g. `1.5s@camera_cage:can-unplug`
     /// (repeatable; see `sim_host::fault::Fault`'s `from_str` for the faults). Bridge faults act on the first mock
     /// bridge on the board's bus.
@@ -178,6 +190,16 @@ struct RobotArgs {
     /// until its watchdog resets it.
     #[arg(long)]
     stop_on_lockup: bool,
+    /// Debug one board with GDB: `BOARD=ADDR`, e.g. `power=127.0.0.1:3333`. Waits for GDB before running; while it
+    /// is attached, continuing runs the whole robot (its boards in turn) and the board's breakpoints stop it all.
+    /// `--fault`s due meanwhile are applied once GDB detaches.
+    #[arg(long, value_parser = parse_board_addr)]
+    gdb: Option<(String, String)>,
+}
+
+fn parse_board_addr(s: &str) -> Result<(String, String), String> {
+    let (board, addr) = s.split_once('=').ok_or("expected BOARD=ADDR")?;
+    Ok((board.to_string(), addr.to_string()))
 }
 
 fn parse_board_udp(s: &str) -> Result<(String, String, String), String> {
@@ -343,6 +365,23 @@ fn robot(args: RobotArgs) -> Result<()> {
             v.keep_log(Time::from_ms(10));
         }
     }
+    for name in &args.external_vehicles {
+        let names: Vec<String> = r.vehicles.iter().map(|v| v.vehicle.name.clone()).collect();
+        let v = r.vehicle(name).with_context(|| {
+            format!("--external-vehicle: no vehicle {name:?} (the robot has: {})", names.join(", "))
+        })?;
+        v.external = true;
+    }
+    for v in &r.vehicles {
+        if v.external {
+            log::info!("vehicle {} is moved externally (POST /api/vehicle)", v.vehicle.name);
+            anyhow::ensure!(
+                args.dashboard.is_some(),
+                "vehicle {} is external: only the dashboard's POST /api/vehicle can move it, so add --dashboard ADDR",
+                v.vehicle.name
+            );
+        }
+    }
     let can_host = host_tools::attach_robot(&args.can_host, &mut r, &args.cans)?;
     r.realtime = args.realtime;
     r.threads = args.threads;
@@ -447,6 +486,16 @@ fn robot(args: RobotArgs) -> Result<()> {
     let mut faults = faults.into_iter().peekable();
     let mut pending: Option<(Time, usize, sim_host::fault::Fault)> = None;
     r.stop_flag = Some(&sim_host::signal::STOP);
+    if let Some((board, addr)) = &args.gdb {
+        let i = r.index(board).with_context(|| format!("--gdb: no board {board:?}"))?;
+        let listener = std::net::TcpListener::bind(addr).with_context(|| format!("binding {addr}"))?;
+        log::info!("waiting for GDB on {addr} (board {board})");
+        let mut target = sim_host::gdb::RobotBoard { robot: &mut r, board: i };
+        if sim_host::gdb::serve_target(&listener, &mut target)? == sim_host::gdb::Ended::Killed {
+            eprintln!("GDB ended the session at {}", r.now);
+            return Ok(());
+        }
+    }
     let stopped = loop {
         if pending.is_none() {
             pending = faults.next_if(|f| f.0 <= args.time);
@@ -1046,6 +1095,7 @@ fn run(args: RunArgs) -> Result<()> {
     if let Some(addr) = &args.gdb {
         let listener = std::net::TcpListener::bind(addr).with_context(|| format!("binding {addr}"))?;
         log::info!("waiting for GDB on {addr}");
+        // Stopped (SIGINT, SIGTERM while GDB was attached): the run below ends at once, with the usual summary
         if sim_host::gdb::serve(&listener, &mut session)? == sim_host::gdb::Ended::Killed {
             eprintln!("GDB ended the session at {}", session.machine.now);
             return Ok(());
@@ -1326,8 +1376,11 @@ fn picoboot_load(session: &mut Session, image: &Image, flash_size: u32, via: Loa
 }
 
 fn main() -> Result<()> {
-    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).format_timestamp(None).init();
     let cli = Cli::parse();
+    // Scenario runs print their own report; the emulator's notes (faults applied, ...) would only interleave with it
+    let quiet = matches!(cli.command, Command::Scenario(_) | Command::Compare(_));
+    let level = if quiet { "error" } else { "info" };
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or(level)).format_timestamp(None).init();
     if matches!(cli.command, Command::Run(_) | Command::Robot(_) | Command::Picoboot(_)) {
         // SIGINT and SIGTERM end a run the way reaching its time does (flash file saved, logs and trailers written)
         sim_host::signal::install().context("catching SIGINT and SIGTERM")?;
@@ -1367,6 +1420,8 @@ fn run_command(command: Command) -> Result<()> {
         Command::Bridges(args) => host_tools::bridges(args),
         Command::CanTunnel(args) => host_tools::can_tunnel(args),
         Command::Mcp(args) => mcp::serve(args),
+        Command::Scenario(args) => std::process::exit(scenario_cli::scenario(args)?),
+        Command::Compare(args) => std::process::exit(scenario_cli::compare(args)?),
     }
 }
 
