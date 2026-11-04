@@ -1,0 +1,21 @@
+[package]
+name = "sim_calib"
+description = "Calibration: fitting the emulator's acoustic, thruster and vehicle models to recordings, and replaying pool tests"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+sim_core.workspace = true
+sim_devices.workspace = true
+sim_acoustics.workspace = true
+sim_physics.workspace = true
+sim_host.workspace = true
+log.workspace = true
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
+canmore = { path = "../../external/titan_firmware_rs/crates/canmore" }
+
+[dev-dependencies]
+sim_test.workspace = true
+titan_link = { path = "../../external/titan_firmware_rs/crates/titan_link" }

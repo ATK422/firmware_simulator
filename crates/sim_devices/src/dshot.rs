@@ -264,6 +264,16 @@ impl Esc {
         if e < 60e6 / (0x1FF << 7) as f64 { 0x1FF << 7 } else { (60e6 / e) as u32 }
     }
 
+    /// What a valid frame carrying `throttle` does to the motor when it arrives at `now`: the motor is brought up
+    /// to `now` (stopping on the way if the signal had been lost) and follows the new throttle from there. Frames
+    /// decoded from the pin come here; so does whoever drives the motor model without a pin (calibration against
+    /// test-stand data).
+    pub fn command(&mut self, now: Time, throttle: u16) {
+        self.integrate(now);
+        self.apply_throttle(throttle);
+        self.last_frame = Some(now);
+    }
+
     fn apply_throttle(&mut self, v: u16) {
         self.target_rpm = match v {
             48..=1047 => (v - 47) as f64 / 1000.0 * self.max_rpm,
@@ -305,9 +315,7 @@ impl Esc {
             ctx.report(format!("{}: bad DShot checksum in {value:#06x}", self.name));
             return;
         }
-        self.integrate(now);
-        self.apply_throttle(frame.throttle);
-        self.last_frame = Some(now);
+        self.command(now, frame.throttle);
         // One wake-up per timeout at most, not one per frame: when it comes, it looks at the newest frame
         if let Some(timeout) = self.signal_loss_timeout
             && self.loss_check.is_none()
@@ -645,6 +653,21 @@ mod signal_loss {
         let later = last + Time::from_ms(80);
         assert!(e.rpm_at(later) < kept.rpm_at(later) - 100.0, "the new frame slows the motor down");
         assert_eq!(e.motor(), e.motor());
+    }
+
+    #[test]
+    fn commands_without_a_pin_drive_the_motor_like_frames() {
+        // A frame through the pin is a command at the time it was decoded
+        let (a, _) = spun_up();
+        assert_eq!(a.target_rpm, 2000.0);
+        // Half throttle forward, then the lag: 1 - 1/e of the way after one time constant
+        let mut c = Esc::new("c", 0, None);
+        c.signal_loss_timeout = None;
+        c.command(Time::ZERO, 547);
+        assert!((c.rpm_at(c.tau) - 2000.0 * (1.0 - (-1.0f64).exp())).abs() < 1e-6);
+        assert!((c.rpm_at(Time::from_secs(10)) - 2000.0).abs() < 1e-6);
+        c.command(Time::from_secs(10), 1048 + 999);
+        assert!((c.rpm_at(Time::from_secs(20)) + 4000.0).abs() < 1e-6);
     }
 
     #[test]

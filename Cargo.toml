@@ -17,6 +17,7 @@ sim_acoustics = { path = "crates/sim_acoustics" }
 sim_physics = { path = "crates/sim_physics" }
 sim_host = { path = "crates/sim_host" }
 sim_test = { path = "crates/sim_test" }
+sim_calib = { path = "crates/sim_calib" }
 log = "0.4"
 object = { version = "0.36", default-features = false, features = ["read_core", "elf", "std"] }
 anyhow = "1"
@@ -37,6 +38,7 @@ sim_devices.workspace = true
 sim_acoustics.workspace = true
 sim_physics.workspace = true
 sim_test.workspace = true
+sim_calib.workspace = true
 log.workspace = true
 anyhow.workspace = true
 clap = { version = "4", features = ["derive"] }
@@ -46,6 +48,10 @@ env_logger = "0.11"
 serde_json = "1"
 regex = "1"
 libc = "0.2"
+
+[dev-dependencies]
+# Already in the dependency tree (sim_host): reading the calibration outputs in tests
+toml = "0.8"
 
 [profile.release]
 debug = 1

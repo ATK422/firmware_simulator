@@ -14,6 +14,7 @@ use sim_core::time::Time;
 use sim_core::trace::{Category, WriterSink};
 use sim_host::Session;
 
+mod calib_cli;
 mod host_tools;
 mod mcp;
 mod scenario_cli;
@@ -52,6 +53,15 @@ enum Command {
     /// Runs scenarios with two firmware builds and reports what changed: checks, log lines, CAN traffic, boot and
     /// connect times, faults, resets, ESC speeds (Markdown and JSON).
     Compare(scenario_cli::CompareArgs),
+    /// Fits the emulator's models to data recorded on the robot: the acoustic receive chain and environment
+    /// (hydrophone WAVs), the thrust curve and ESC motor model (test-stand CSV), the vehicle's drag, added mass and
+    /// buoyancy (pool-test logs).
+    #[command(subcommand)]
+    Calibrate(calib_cli::CalibrateCommand),
+    /// Replays a pool test: what the robot computer sent in candump logs goes to the emulated boards at the times
+    /// it was recorded, and what they send is compared with what the real boards sent (timing, missing and extra
+    /// messages, payloads, faults). Exits with 1 if they differ.
+    ReplayPoolTest(calib_cli::ReplayArgs),
 }
 
 #[derive(Subcommand)]
@@ -120,6 +130,13 @@ struct RobotArgs {
     /// Attach a scripted titan_bridge to an Ethernet board (Puddles' UDP transport), by board name (repeatable).
     #[arg(long = "eth-mock-bridge")]
     eth_mock_bridges: Vec<String>,
+    /// Keep every ADC sample of each board's hydrophone and write them as WAV files at the end (`NAME` in the
+    /// file name is replaced by the board's name): -1..1 is the ADC's 0-3.3 V, as `calibrate acoustics` reads it.
+    #[arg(long, value_name = "FILE")]
+    hydrophone_wav: Option<PathBuf>,
+    /// The WAV files' sample rate.
+    #[arg(long, default_value_t = 500_000)]
+    hydrophone_wav_rate: u32,
     /// Write each vehicle's state every 10 ms to this CSV file (`NAME` in the file name is replaced by the
     /// vehicle's name when there are several).
     #[arg(long)]
@@ -605,6 +622,12 @@ fn robot(args: RobotArgs) -> Result<()> {
         }
         None => None,
     };
+    if args.hydrophone_wav.is_some() {
+        let n: usize = r.boards.iter_mut().map(|s| sim_host::acoustic::record_hydrophones(&mut s.machine)).sum();
+        if n == 0 {
+            bail!("--hydrophone-wav: no board of this robot has a hydrophone in an environment");
+        }
+    }
     let wall = std::time::Instant::now();
     let mut faults = faults.into_iter().peekable();
     let mut pending: Option<(Time, usize, sim_host::fault::Fault)> = None;
@@ -723,6 +746,34 @@ fn robot(args: RobotArgs) -> Result<()> {
         }
         for note in sim_host::acoustic::clipping_notes(&mut s.machine) {
             eprintln!("{name}: {note}");
+        }
+    }
+    if let Some(path) = &args.hydrophone_wav {
+        let several = r
+            .boards
+            .iter_mut()
+            .map(|s| sim_host::acoustic::hydrophones(&mut s.machine).next().is_some())
+            .filter(|h| *h)
+            .count()
+            > 1;
+        for (s, name) in r.boards.iter_mut().zip(&r.names) {
+            if sim_host::acoustic::hydrophones(&mut s.machine).next().is_none() {
+                continue;
+            }
+            let file = path.to_string_lossy();
+            let p = if file.contains("NAME") {
+                PathBuf::from(file.replace("NAME", name))
+            } else if several {
+                let stem = path.file_stem().map(|x| x.to_string_lossy().into_owned()).unwrap_or_default();
+                path.with_file_name(format!("{stem}_{name}.wav"))
+            } else {
+                path.clone()
+            };
+            let lines = sim_host::acoustic::write_hydrophone_wavs(&mut s.machine, &p, args.hydrophone_wav_rate)
+                .with_context(|| format!("writing {}", p.display()))?;
+            for l in lines {
+                eprintln!("{name}: {l}");
+            }
         }
     }
     if args.unmodelled != UnmodelledLog::Off {
@@ -964,6 +1015,13 @@ struct RunArgs {
     /// Position of the board's transducer in the environment, `x,y,z` metres (z is depth).
     #[arg(long, value_parser = parse_position, default_value = "0,0,1")]
     position: [f64; 3],
+    /// Keep every ADC sample of the board's hydrophone (with `--environment`) and write them to this WAV file at
+    /// the end: -1..1 is the ADC's 0-3.3 V, as `calibrate acoustics` reads a board recording.
+    #[arg(long, value_name = "FILE")]
+    hydrophone_wav: Option<PathBuf>,
+    /// The WAV file's sample rate (the IVC firmware samples at 500 kS/s).
+    #[arg(long, default_value_t = 500_000)]
+    hydrophone_wav_rate: u32,
     /// Write what the board's SSD1306 shows to this PNG file at the end.
     #[arg(long)]
     screenshot: Option<PathBuf>,
@@ -1138,6 +1196,9 @@ fn run(args: RunArgs) -> Result<()> {
             let env = sim_acoustics::Environment::load(path).map_err(anyhow::Error::msg)?;
             log::info!("{} source(s) in {}", env.sources.len(), path.display());
             b.place_in(&mut machine, std::sync::Arc::new(env), args.position).map_err(anyhow::Error::msg)?;
+        }
+        if args.hydrophone_wav.is_some() && sim_host::acoustic::record_hydrophones(&mut machine) == 0 {
+            bail!("--hydrophone-wav needs a board with a hydrophone in an --environment");
         }
     } else if !args.inputs.is_empty() || args.environment.is_some() {
         bail!("--input and --environment need a --board");
@@ -1485,6 +1546,13 @@ fn run(args: RunArgs) -> Result<()> {
             None => eprintln!("no SSD1306 on this board"),
         }
     }
+    if let Some(path) = &args.hydrophone_wav {
+        let lines = sim_host::acoustic::write_hydrophone_wavs(&mut session.machine, path, args.hydrophone_wav_rate)
+            .with_context(|| format!("writing {}", path.display()))?;
+        for l in lines {
+            eprintln!("{l}");
+        }
+    }
     let lockups = (session.lockups > 0).then(|| lockup_note(&session));
     let clipping = sim_host::acoustic::clipping_notes(&mut session.machine);
     let machine = &mut session.machine;
@@ -1664,6 +1732,15 @@ fn run_command(command: Command) -> Result<()> {
         Command::Mcp(args) => mcp::serve(args),
         Command::Scenario(args) => std::process::exit(scenario_cli::scenario(args)?),
         Command::Compare(args) => std::process::exit(scenario_cli::compare(args)?),
+        Command::Calibrate(cmd) => calib_cli::calibrate(cmd),
+        Command::ReplayPoolTest(args) => match calib_cli::replay_pool_test(args) {
+            Ok(true) => Ok(()),
+            Ok(false) => std::process::exit(1),
+            Err(e) => {
+                eprintln!("Error: {e:#}");
+                std::process::exit(2)
+            }
+        },
     }
 }
 

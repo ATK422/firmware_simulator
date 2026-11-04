@@ -430,11 +430,13 @@ dependencies = [
  "rp2040",
  "serde_json",
  "sim_acoustics",
+ "sim_calib",
  "sim_core",
  "sim_devices",
  "sim_host",
  "sim_physics",
  "sim_test",
+ "toml",
 ]
 
 [[package]]
@@ -938,6 +940,23 @@ dependencies = [
  "log",
  "serde",
  "sim_core",
+ "toml",
+]
+
+[[package]]
+name = "sim_calib"
+version = "0.1.0"
+dependencies = [
+ "canmore",
+ "log",
+ "serde",
+ "sim_acoustics",
+ "sim_core",
+ "sim_devices",
+ "sim_host",
+ "sim_physics",
+ "sim_test",
+ "titan_link",
  "toml",
 ]
 

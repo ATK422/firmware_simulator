@@ -21,7 +21,7 @@ Every run is repeatable: the same firmware and inputs give exactly the same resu
 **Full guide: [docs/](docs/README.md)** · Design and milestones: [PLAN.md](PLAN.md)
 
 - [Quick start](#quick-start)
-- [More ways to use it](#more-ways-to-use-it): tests in YAML and firmware A/B comparisons, coding agents (MCP), C firmware with micro-ROS, nano-ROS boards, the robot computer on vcan, the firmware in nereus, IVC in the water
+- [More ways to use it](#more-ways-to-use-it): tests in YAML and firmware A/B comparisons, coding agents (MCP), C firmware with micro-ROS, nano-ROS boards, the robot computer on vcan, the firmware in nereus, IVC in the water, calibration and pool-test replay
 - [What it can do](#what-it-can-do)
 - [Boards, firmware and robots](#boards-firmware-and-robots)
 - [Architecture](#architecture)
@@ -205,6 +205,18 @@ cargo test --release -p sim_test --test ivc_sweep -- --nocapture
 The acoustic front end and water are plausible models, not measurements: use them to compare firmware versions
 and settings, not to predict range in the real pool.
 
+**Calibrate the models and replay a pool test.** With recordings from the robot, `firmware_simulator calibrate`
+fits the acoustic receive chain and pool (hydrophone WAVs), the thrust curve and ESC model (test-stand CSV) and the
+vehicle's drag, added mass and buoyancy (pool-test logs; `scripts/bag_to_calib.py` converts a ROS 2 bag), and
+`firmware_simulator replay-pool-test` feeds the Orin's side of candump logs into the emulated boards and reports
+where they answer differently from the real ones: a bug seen in the water, reproduced at a desk
+([calibration.md](docs/calibration.md), which lists the data to collect):
+
+```bash
+firmware_simulator calibrate thrusters stand.csv --vehicle vehicles/talos.toml -o calibration/thrusters
+firmware_simulator replay-pool-test candump-can0.log --robot robots/talos.toml --report replay.md
+```
+
 ## What it can do
 
 The details, by area; each row links to the page that covers it.
@@ -271,7 +283,8 @@ Vehicles: [`talos`, `talos_nereus`, `puddles`](vehicles) ([vehicles.md](docs/veh
 | [`sim_physics`](crates/sim_physics) | The 6-DOF vehicle model |
 | [`sim_host`](crates/sim_host) | Sessions and robots, board and robot files, mock bridges, SocketCAN, UDP, GDB, USB tools, CAN logs, faults, profiler, VCD, dashboard |
 | [`sim_test`](crates/sim_test) | The firmware test harness: `Bench`, `RobotBench`, `sweep` |
-| `firmware_simulator` (root) | The command line: `run`, `robot`, `can-diff`, `bridges`, `can-tunnel`, `picoboot` |
+| [`sim_calib`](crates/sim_calib) | Calibration: fitting the acoustic, thruster and vehicle models to recordings; replaying pool tests |
+| `firmware_simulator` (root) | The command line: `run`, `robot`, `can-diff`, `bridges`, `can-tunnel`, `picoboot`, `calibrate`, `replay-pool-test` |
 
 Dependencies point one way: `sim_core` ← `cpu_armv6m`, `sim_devices`, `sim_acoustics`, `sim_physics` ← `rp2040`
 ← `sim_host` ← `sim_test` and the CLI. How a board's firmware reaches the buses, the water and the host:
@@ -340,7 +353,8 @@ not modelled or not yet trusted:
   SYSCFG (unmodelled registers are stored, and listed at the end of a run); the MPU is stored, not enforced
   ([the table](docs/internals.md#peripherals-and-their-modelling-status)).
 * **Physics are assumptions**: the acoustic numbers (transducers, filters) and every vehicle parameter are
-  plausible values, not calibrated against recordings, CAD or tank data. Use them to compare and catch
+  plausible values, not calibrated against recordings, CAD or tank data (the tools to fit them are ready:
+  [calibration.md](docs/calibration.md)). Use them to compare and catch
   regressions, not to prove range or dynamics ([acoustics.md](docs/acoustics.md),
   [vehicles.md](docs/vehicles.md#limitations)).
 * **C board applications in CI**: titan_firmware's C board apps need its prebuilt micro-ROS library (built in

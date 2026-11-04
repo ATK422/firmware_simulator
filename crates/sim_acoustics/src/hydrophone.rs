@@ -346,6 +346,32 @@ impl Hydrophone {
         (self.samples, self.clipped)
     }
 
+    /// The recording as the ADC converted it, as a WAV file at `rate`: -1..1 is the ADC input range `range_v` (the
+    /// pin voltage, offset included, as `calibrate acoustics` reads a board's own capture), quantised to `bits`
+    /// (0: not quantised). Samples are placed at their times; gaps (between the firmware's captures) are
+    /// mid-scale.
+    pub fn recording_pin_wav(&self, rate: u32, range_v: [f64; 2], bits: u32) -> Option<Wav> {
+        let r = self.recording.as_ref()?;
+        let start = r.first()?.0;
+        let end = r.last()?.0;
+        let n = ((end - start).as_secs_f64() * rate as f64) as usize + 1;
+        let mut samples = vec![0.0f32; n];
+        let (mid, half) = ((range_v[0] + range_v[1]) / 2.0, (range_v[1] - range_v[0]) / 2.0);
+        for (t, v) in r {
+            let i = ((*t - start).as_secs_f64() * rate as f64) as usize;
+            if let Some(s) = samples.get_mut(i) {
+                let mut x = *v as f64;
+                if bits > 0 {
+                    let levels = ((1u64 << bits) - 1) as f64;
+                    let code = ((x.clamp(range_v[0], range_v[1]) - range_v[0]) / (2.0 * half) * levels).round();
+                    x = range_v[0] + code / levels * 2.0 * half;
+                }
+                *s = ((x - mid) / half).clamp(-1.0, 1.0) as f32;
+            }
+        }
+        Some(Wav { rate, samples })
+    }
+
     /// The recording as a WAV file at `rate` (samples are placed at their times; gaps are silent).
     pub fn recording_wav(&self, rate: u32) -> Option<Wav> {
         let r = self.recording.as_ref()?;

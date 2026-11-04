@@ -425,6 +425,8 @@ both logs cover is compared. It exits with 0 when the logs agree, 1 when they di
 | `--max-skew T` | Also fail if paired events are further apart than this |
 | `--robot FILE` | Names each client's board in the report (`internal client 1 (poac) ...`) |
 
+`replay-pool-test` does all of this for a whole robot's pool test, lines a hardware log's clock up on the
+boards' uptimes, and reports faults and the emulated boards' errors too ([calibration.md](calibration.md#replaying-a-pool-test)).
 Holding a real board against the emulator (PLAN.md, "testing against hardware"; **to verify locally**, no
 hardware log was available here): record the board with `candump -l can0 > hw.log` while titan_bridge runs,
 replay the robot computer's side into the emulated board (`--replay hw.log --replay-filter sender=host

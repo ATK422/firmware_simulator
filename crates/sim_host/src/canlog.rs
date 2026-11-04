@@ -53,7 +53,46 @@ pub fn read_file(path: &Path) -> Result<Vec<LogFrame>, String> {
 /// Parses the text of a log. Blank lines and lines starting with `#` (comments in hand-written logs) are skipped,
 /// as are error frames and CAN XL frames. Frames come back in file order.
 pub fn parse(text: &str) -> Result<Vec<LogFrame>, ParseError> {
+    parse_with(text, false).map(|(frames, _)| frames)
+}
+
+/// What a lenient parse ([`parse_lenient`]) left out of a log, beyond comments and blank lines.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ParseStats {
+    /// Error frames (bus errors the interface reported: identifiers with the kernel's error flag), with the
+    /// timestamp of each.
+    pub error_frames: Vec<u64>,
+    /// CAN XL frames.
+    pub xl_frames: usize,
+    /// Lines that could not be read (a truncated last line, an editor's leftovers), with why.
+    pub bad_lines: Vec<ParseError>,
+}
+
+/// Parses a log as a real recording comes: lines that cannot be read are counted instead of failing the whole
+/// log, and the error frames and CAN XL frames skipped are counted too.
+pub fn parse_lenient(text: &str) -> (Vec<LogFrame>, ParseStats) {
+    parse_with(text, true).expect("a lenient parse does not fail")
+}
+
+/// Reads a log file leniently ([`parse_lenient`]).
+pub fn read_file_lenient(path: &Path) -> Result<(Vec<LogFrame>, ParseStats), String> {
+    let text = std::fs::read_to_string(path).map_err(|e| format!("{}: {e}", path.display()))?;
+    Ok(parse_lenient(&text))
+}
+
+/// Whether the identifier of a frame's tokens (compact `ID#...` or candump's text columns) has the error flag.
+fn is_error_frame(tokens: &[&str]) -> bool {
+    let mut t = tokens;
+    if matches!(t.first(), Some(&"RX") | Some(&"TX")) && t.len() >= 3 {
+        t = &t[3..];
+    }
+    let id = t.first().map(|f| f.split('#').next().unwrap_or("")).unwrap_or("");
+    id.len() > 3 && u32::from_str_radix(id, 16).is_ok_and(|v| v & 0x2000_0000 != 0)
+}
+
+fn parse_with(text: &str, lenient: bool) -> Result<(Vec<LogFrame>, ParseStats), ParseError> {
     let mut out = Vec::new();
+    let mut stats = ParseStats::default();
     // A log without timestamps (plain `candump can0`) gets increasing ones 1 µs apart, keeping the order
     let mut untimed = 0u64;
     for (i, raw) in text.lines().enumerate() {
@@ -62,29 +101,42 @@ pub fn parse(text: &str) -> Result<Vec<LogFrame>, ParseError> {
         if line.is_empty() || line.starts_with('#') {
             continue;
         }
-        let (time_ns, rest) = match line.strip_prefix('(') {
-            Some(r) => {
-                let (ts, rest) = r.split_once(')').ok_or_else(|| err("unterminated timestamp".into()))?;
-                (parse_timestamp(ts).map_err(err)?, rest.trim_start())
+        let parsed = (|| -> Result<Option<LogFrame>, ParseError> {
+            let (time_ns, rest) = match line.strip_prefix('(') {
+                Some(r) => {
+                    let (ts, rest) = r.split_once(')').ok_or_else(|| err("unterminated timestamp".into()))?;
+                    (parse_timestamp(ts).map_err(err)?, rest.trim_start())
+                }
+                None => {
+                    untimed += 1_000;
+                    (untimed, line)
+                }
+            };
+            let mut tokens = rest.split_whitespace();
+            let iface = tokens.next().ok_or_else(|| err("no interface".into()))?.to_string();
+            let tokens: Vec<&str> = tokens.collect();
+            let frame = match tokens.first() {
+                Some(t) if t.contains('#') => parse_compact(t).map_err(err)?,
+                Some(_) => parse_long(&tokens).map_err(err)?,
+                None => return Err(err("no frame".into())),
+            };
+            if frame.is_none() {
+                if is_error_frame(&tokens) {
+                    stats.error_frames.push(time_ns);
+                } else {
+                    stats.xl_frames += 1;
+                }
             }
-            None => {
-                untimed += 1_000;
-                (untimed, line)
-            }
-        };
-        let mut tokens = rest.split_whitespace();
-        let iface = tokens.next().ok_or_else(|| err("no interface".into()))?.to_string();
-        let tokens: Vec<&str> = tokens.collect();
-        let frame = match tokens.first() {
-            Some(t) if t.contains('#') => parse_compact(t).map_err(err)?,
-            Some(_) => parse_long(&tokens).map_err(err)?,
-            None => return Err(err("no frame".into())),
-        };
-        if let Some(frame) = frame {
-            out.push(LogFrame { time_ns, iface, frame });
+            Ok(frame.map(|frame| LogFrame { time_ns, iface, frame }))
+        })();
+        match parsed {
+            Ok(Some(f)) => out.push(f),
+            Ok(None) => {}
+            Err(e) if lenient => stats.bad_lines.push(e),
+            Err(e) => return Err(e),
         }
     }
-    Ok(out)
+    Ok((out, stats))
 }
 
 /// `1699999999.123456` (any number of fraction digits) or candump's `-t A` date form `2023-11-03 12:00:00.123456`
@@ -769,6 +821,25 @@ mod tests {
         assert!(parse("(18446744073.709551) can0 06F#C0").is_ok());
         assert!(parse("(2023-11-14 5124095576030432:00:00.0) can0 06F#C0").is_err(), "hours");
         assert!(parse("(9223372036854775807-01-01 00:00:00.0) can0 06F#C0").is_err(), "years");
+    }
+
+    #[test]
+    fn lenient_parses_count_what_they_leave_out() {
+        let text = "(1699999999.100000) can0 06F#C0\n\
+                    (1699999999.200000) can0 20000080#0000000000000000\n\
+                    (1699999999.250000) can0 XYZ#00\n\
+                    \x20 can0  20000004   [8]  00 04 00 00 00 00 00 00   ERRORFRAME\n\
+                    (1699999999.300000) can1 RX - -  20000040  [8]  00 00 00 00 00 00 00 00\n\
+                    (1699999999.400000) can0 123###1100\n\
+                    (1699999999.500000) can0 07F#\n\
+                    (1699999999.6";
+        let (log, st) = parse_lenient(text);
+        assert_eq!(log.len(), 2);
+        assert_eq!(st.error_frames, [1_699_999_999_200_000_000, 1_000, 1_699_999_999_300_000_000]);
+        assert_eq!(st.xl_frames, 1);
+        assert_eq!(st.bad_lines.iter().map(|e| e.line).collect::<Vec<_>>(), [3, 8], "{st:?}");
+        // The strict parse fails on the first bad line
+        assert_eq!(parse(text).unwrap_err().line, 3);
     }
 
     #[test]

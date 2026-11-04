@@ -7,7 +7,7 @@ a new transducer, another modem scheme or a different acoustic board is a config
 
 > The model is for comparing environments and catching regressions, not for proving range. Its numbers are
 > datasheet-style assumptions (the IVC transducer and filters are the plan's example numbers) until they are
-> calibrated against recordings.
+> calibrated against recordings: `firmware_simulator calibrate acoustics` fits them ([calibration.md](calibration.md#acoustics)).
 
 - [Environment files](#environment-files)
 - [Transducers](#transducers)
@@ -139,8 +139,11 @@ firmware_simulator run $FW/ivc_board2 --board boards/talos/ivc_board.toml --mock
 as the environment's transmission loss predicts. The ADC reads the hydrophone voltage at the exact time of each
 conversion.
 
-In code, `sim_acoustics::Hydrophone::record` keeps every ADC sample a hydrophone produced and
-`recording_wav(rate)` turns them into a WAV file (`sim_acoustics::wav`) for inspection; `Hydrophone::clipping`
+`run --hydrophone-wav FILE` (and `robot --hydrophone-wav FILE`) writes every sample the firmware's ADC took of the
+hydrophone as a WAV file, in the format `calibrate acoustics` reads a board recording in
+([calibration.md](calibration.md#acoustics)). In code, `sim_acoustics::Hydrophone::record` keeps every ADC sample a
+hydrophone produced and `recording_wav(rate)` (or `recording_pin_wav`) turns them into a WAV file
+(`sim_acoustics::wav`) for inspection; `Hydrophone::clipping`
 counts the samples the receive chain clipped at its rails. When a run's hydrophone clipped, `run` and `robot` say
 so at the end (`hydrophone: 0.7 % of the 9976152 samples the ADC took were clipped at the receive chain's rails`):
 what the firmware measures then no longer follows the sound.

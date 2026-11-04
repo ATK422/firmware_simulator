@@ -8,7 +8,8 @@ end to end, and a depth controller can be closed through the firmware's own dept
 > **Every vehicle parameter is assumed.** There is no CAD model, weighing or tank data behind `vehicles/*.toml`
 > yet: Talos is a plausible 32 kg open frame, Puddles uses BlueROV2 Heavy numbers from the literature, both with
 > T200 thrust curves at 16 V. The thruster layout and the wiring of thrusters to ESCs are assumed too. Replace them
-> when there is data; the tests check behaviour derived from whatever the files say.
+> when there is data (`firmware_simulator calibrate thrusters` and `calibrate vehicle` fit them from a test stand
+> and a pool test: [calibration.md](calibration.md)); the tests check behaviour derived from whatever the files say.
 
 - [The model](#the-model)
 - [Vehicle files](#vehicle-files)
