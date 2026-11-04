@@ -34,12 +34,49 @@ struct How {
     arrivals: bool,
     /// Paced to the wall clock.
     realtime: bool,
+    /// Traces GPIO and exceptions on the camera cage (which follows the vehicle), the actuator and the battery
+    /// board, and profiles esc0 and the camera cage.
+    watch: bool,
+    /// A host thread writes frames to a live endpoint as the run goes, on the wall clock, and their arrivals are
+    /// logged here (`Arrivals`).
+    fed: Option<sim_host::canlog::CandumpWriter>,
+    /// A log of arrivals replayed where the fed endpoint was.
+    replayed: Option<Arc<Vec<sim_host::canlog::LogFrame>>>,
     /// Notes the virtual time of every bus step that reads a live endpoint, and the wall clock then.
     probe: Option<Reads>,
 }
 
 /// Each read of a live endpoint: the step's virtual time and the wall clock then.
 type Reads = Arc<Mutex<Vec<(Time, std::time::Instant)>>>;
+
+/// A live endpoint handing in what a host thread put in its queue (as a SocketCAN interface does what host tools
+/// write).
+#[derive(Clone, Default)]
+struct Queue(Arc<Mutex<std::collections::VecDeque<sim_devices::can::CanFrame>>>);
+
+impl sim_devices::can::CanEndpoint for Queue {
+    fn take_tx(&mut self, until: Time) -> Vec<(Time, sim_devices::can::CanFrame)> {
+        self.0.lock().unwrap().drain(..).map(|f| (until, f)).collect()
+    }
+    fn receive(&mut self, _frame: &sim_devices::can::CanFrame, _at: Time) {}
+    fn live(&self) -> bool {
+        true
+    }
+}
+
+/// A shared buffer to write a log into.
+#[derive(Clone, Default)]
+struct Buffer(Arc<Mutex<Vec<u8>>>);
+
+impl std::io::Write for Buffer {
+    fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(b);
+        Ok(b.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
 
 /// A live endpoint that sends nothing and notes when it is read.
 struct Probe(Reads);
@@ -127,12 +164,47 @@ fn talos(how: &How) -> Option<(Run, sim_host::runahead::Stats)> {
     if let Some(p) = &how.probe {
         eps.push(Box::new(Probe(p.clone())));
     }
+    let mut feeder = None;
+    if let Some(log) = &how.fed {
+        let queue = Queue::default();
+        let inner = Box::new(queue.clone());
+        eps.push(Box::new(sim_host::canlog::Arrivals { inner, iface: "internal".into(), log: log.clone() }));
+        feeder = Some(std::thread::spawn(move || {
+            for k in 0..40u32 {
+                std::thread::sleep(std::time::Duration::from_micros(4_000 + 1_300 * (k % 5) as u64));
+                queue.0.lock().unwrap().push_back(sim_devices::can::CanFrame::fd(0x700 + k, false, &[k as u8; 8]));
+            }
+        }));
+    }
+    if let Some(log) = &how.replayed {
+        eps.push(Box::new(sim_host::canlog::arrivals_replay(log, "internal")));
+    }
     let hooks = Arc::new(Mutex::new(Vec::new()));
     for (i, s) in r.boards.iter_mut().enumerate() {
         let h = hooks.clone();
         s.on_log = Some(Box::new(move |t, line| h.lock().unwrap().push(format!("{i} [{t}] {line}"))));
         let h = hooks.clone();
         s.on_uart_line = Some(Box::new(move |t, n, line| h.lock().unwrap().push(format!("{i} [{t}] uart{n} {line}"))));
+    }
+    let traces: Vec<sim_core::trace::VecSink> = if how.watch {
+        [3, 4, 8]
+            .iter()
+            .map(|&i| {
+                let sink = sim_core::trace::VecSink::new(&[
+                    sim_core::trace::Category::Gpio,
+                    sim_core::trace::Category::Exception,
+                ]);
+                r.boards[i].machine.set_trace(Box::new(sink.clone()));
+                sink
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
+    if how.watch {
+        for i in [1, 3] {
+            r.boards[i].start_profile(Time::from_us(37));
+        }
     }
     let ends = if how.ends.is_empty() { vec![END] } else { how.ends.clone() };
     if let Some(p) = &how.probe {
@@ -145,6 +217,9 @@ fn talos(how: &How) -> Option<(Run, sim_host::runahead::Stats)> {
     }
     if let Some(fixed) = &how.fixed {
         assert_eq!(&r.thread_of_boards(), fixed);
+    }
+    if let Some(f) = feeder {
+        f.join().unwrap();
     }
     let mut frames = Vec::new();
     for rb in &r.buses {
@@ -187,6 +262,21 @@ fn talos(how: &How) -> Option<(Run, sim_host::runahead::Stats)> {
     }
     for v in &r.vehicles {
         state.push(format!("{} {:?} {:?}", v.vehicle.name, v.vehicle.state, v.rpms(&r.boards, r.now)));
+    }
+    for t in &traces {
+        let events = t.take();
+        assert!(
+            events.len() > 100
+                && r.boards.iter().all(|b| !b.machine.trace.wants(sim_core::trace::Category::Instruction))
+        );
+        state.extend(events.iter().map(|(t, e)| format!("trace [{t}] {e}")));
+    }
+    for (name, s) in r.names.iter().zip(&r.boards) {
+        if let Some(p) = &s.profiler {
+            let report = p.report();
+            assert!(p.samples(0) > 1000, "{name}: {} samples", p.samples(0));
+            state.push(format!("{name} profile {report:?}"));
+        }
     }
     let bridge = format!("{:?}", bridge.state().received);
     let hooks = std::mem::take(&mut *hooks.lock().unwrap());
@@ -323,8 +413,8 @@ impl sim_devices::can::CanEndpoint for Unknown {
     fn receive(&mut self, _frame: &sim_devices::can::CanFrame, _at: Time) {}
 }
 
-/// A board watched as it runs (a trace sink), or an endpoint that cannot tell when it sends, keeps the boards in
-/// step slice by slice on threads; the switch does too.
+/// A board traced to the instruction, or an endpoint that cannot tell when it sends, keeps the boards in step slice
+/// by slice on threads; the switch does too. Other trace sinks and live endpoints do not.
 #[test]
 fn what_cannot_be_run_ahead_runs_slice_by_slice() {
     if common::titan_elf("esc_board").is_none() {
@@ -342,11 +432,18 @@ fn what_cannot_be_run_ahead_runs_slice_by_slice() {
     assert_eq!(windows(&|r| r.threads = 1), 0);
     assert_eq!(
         windows(&|r| {
-            let sink = sim_core::trace::VecSink::new(&[sim_core::trace::Category::Gpio]);
+            let sink = sim_core::trace::VecSink::new(&[sim_core::trace::Category::Instruction]);
             r.boards[4].machine.set_trace(Box::new(sink));
         }),
         0
     );
+    assert!(
+        windows(&|r| {
+            let sink = sim_core::trace::VecSink::new(&[sim_core::trace::Category::Gpio]);
+            r.boards[4].machine.set_trace(Box::new(sink));
+        }) > 0
+    );
+    assert!(windows(&|r| r.buses[0].endpoints.push(Box::new(Live(Unknown)))) > 0);
     assert_eq!(windows(&|r| r.buses[0].endpoints.push(Box::new(Unknown))), 0);
     assert!(windows(&|r| r.buses[0].endpoints.push(Box::new(sim_devices::can::Monitor::default()))) > 0);
 }
@@ -530,5 +627,49 @@ fn the_nereus_setup_runs_ahead_as_it_runs_in_turns() {
         same(&want, &got, &format!("{} threads, stress {:?}", how.threads, how.stress));
         assert_eq!(stats.follower_cuts, 0, "{stats:?}");
         assert!(stats.live_cuts > 0 && stats.slices >= 6900, "{stats:?}");
+    }
+}
+
+/// Trace sinks and profilers see only what the boards finally did: the events and samples of a run that is rolled
+/// back are dropped, those of the rerun kept, so they get exactly what taking turns gives them.
+#[test]
+fn traces_and_profiles_of_boards_run_ahead_are_those_of_turns() {
+    let watched = How { watch: true, ..Default::default() };
+    let Some((want, _)) = talos(&How { threads: 1, ..watched.clone() }) else { return };
+    for how in [
+        How { threads: 3, run_ahead: true, fixed: Some(FIXED.to_vec()), ..watched.clone() },
+        How { threads: 3, run_ahead: true, stress: Some(21), ..watched.clone() },
+    ] {
+        let (got, stats) = talos(&how).unwrap();
+        same(&want, &got, &format!("stress {:?}", how.stress));
+        assert!(stats.slices >= 6900 && stats.windows < stats.slices / 4, "{stats:?}");
+    }
+}
+
+/// A run with frames from outside arriving whenever they arrive (a host thread on the wall clock, in real time)
+/// cannot be repeated by itself; with their arrivals logged (`canlog::Arrivals`) and replayed, it can, to the
+/// frame, taking turns or running ahead.
+#[test]
+fn a_live_run_replays_exactly_from_its_logged_arrivals() {
+    if common::titan_elf("esc_board").is_none() {
+        return;
+    }
+    let out = Buffer::default();
+    let log = sim_host::canlog::CandumpWriter::new(Box::new(out.clone()));
+    let ends = vec![Time::from_ms(300)];
+    let fed = How { threads: 3, run_ahead: true, realtime: true, ends: ends.clone(), fed: Some(log.clone()), ..live() };
+    let (want, stats) = talos(&fed).unwrap();
+    assert!(stats.live_cuts > 0, "{stats:?}");
+    log.flush().unwrap();
+    let text = String::from_utf8(out.0.lock().unwrap().clone()).unwrap();
+    let logged = sim_host::canlog::parse(&text).unwrap();
+    assert_eq!(logged.len(), 40, "{text}");
+    let replayed = Some(Arc::new(logged));
+    for how in [
+        How { threads: 1, ends: ends.clone(), replayed: replayed.clone(), ..live() },
+        How { threads: 3, run_ahead: true, ends: ends.clone(), stress: Some(2), replayed: replayed.clone(), ..live() },
+    ] {
+        let (got, _) = talos(&how).unwrap();
+        same(&want, &got, &format!("replayed, {} threads", how.threads));
     }
 }

@@ -243,4 +243,18 @@ mod tests {
     fn missing_interface_is_an_error() {
         assert!(SocketCan::open("nosuchcan0").is_err());
     }
+
+    /// A stand-in for an interface hands in what its inner endpoint sends at the step that reads it, and is live.
+    #[test]
+    fn live_stand_in_stamps_frames_with_the_step() {
+        let f = CanFrame::classic(0x6F, false, &[0xC0]);
+        let inner = sim_devices::can::Monitor { outbox: vec![(Time::from_us(30), f.clone())], ..Default::default() };
+        assert!(!inner.live() && inner.idle_until() == Some(Time::from_us(30)));
+        let mut live = Live(inner);
+        assert!(live.live() && live.idle_until().is_none());
+        assert!(live.take_tx(Time::from_us(20)).is_empty());
+        assert_eq!(live.take_tx(Time::from_us(100)), [(Time::from_us(100), f.clone())]);
+        live.receive(&f, Time::from_us(200));
+        assert_eq!(live.0.received, [(Time::from_us(200), f)]);
+    }
 }

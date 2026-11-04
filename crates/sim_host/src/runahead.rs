@@ -57,6 +57,7 @@ use std::time::{Duration, Instant};
 
 use rp2040::StopReason;
 use sim_core::time::Time;
+use sim_core::trace::{Category, TraceSink, VecSink};
 use sim_core::versioned::Versioned;
 #[cfg(doc)]
 use sim_devices::can::CanBus;
@@ -64,6 +65,7 @@ use sim_devices::can::{BitRates, BusError, CanFrame, CanNode, TxRequest};
 use sim_devices::dshot::{Esc, Motor};
 
 use crate::parallel::{FIRST_REGROUP_SLICES, REGROUP_SLICES, lock, max_threads, wait_for};
+use crate::profile::{ProfileMark, Profiler};
 use crate::robot::{Robot, RobotBus, end_slice, power_on_by, step_bus};
 use crate::session::{Checkpoint, Collected, Pacing, Session};
 use crate::vehicle::VehicleSim;
@@ -95,7 +97,7 @@ pub struct Stats {
 pub(crate) fn possible(robot: &Robot) -> bool {
     robot.run_ahead
         && robot.medium.is_none()
-        && robot.boards.iter().all(Session::can_run_ahead)
+        && robot.boards.iter().all(|b| b.can_run_ahead() && !b.machine.trace.wants(Category::Instruction))
         && robot.buses.iter().all(|rb| rb.endpoints.iter().all(|e| e.live() || e.idle_until().is_some()))
 }
 
@@ -103,6 +105,54 @@ pub(crate) fn possible(robot: &Robot) -> bool {
 /// endpoint): in real time its windows are kept close to the wall clock ([`LIVE_LEAD`]).
 fn has_live_inputs(robot: &Robot) -> bool {
     robot.buses.iter().any(|rb| rb.endpoints.iter().any(|e| e.live()))
+        || robot.boards.iter().any(Session::has_live_inputs)
+}
+
+/// Every category of trace event but instructions (too many to hold for a window: a board traced to the
+/// instruction runs slice by slice).
+const HELD_CATEGORIES: [Category; 5] =
+    [Category::Exception, Category::Gpio, Category::Peripheral, Category::Unmodelled, Category::Device];
+
+/// A board's trace sink while it runs ahead: the events go to a buffer that holds them until they are final (the
+/// end of the window), so that a rollback can drop those of the run it takes back; then they go on to the sink.
+struct HeldTrace {
+    sink: Box<dyn TraceSink>,
+    buffer: VecSink,
+}
+
+impl HeldTrace {
+    /// Puts a buffer wanting what its sink wants in place of the machine's sink, if it wants anything. (The
+    /// machine's own flags, set from what its sink wants, stay as they are.)
+    fn hold(m: &mut rp2040::Machine) -> Option<HeldTrace> {
+        let wanted: Vec<Category> = HELD_CATEGORIES.iter().copied().filter(|&c| m.trace.wants(c)).collect();
+        if wanted.is_empty() {
+            return None;
+        }
+        let buffer = VecSink::new(&wanted);
+        let sink = std::mem::replace(&mut m.trace, Box::new(buffer.clone()));
+        Some(HeldTrace { sink, buffer })
+    }
+
+    fn len(&self) -> usize {
+        lock(&self.buffer.events).len()
+    }
+
+    /// Passes everything held on to the sink.
+    fn flush(&mut self) {
+        for (t, e) in self.buffer.take() {
+            self.sink.event(t, e);
+        }
+    }
+}
+
+/// Where a board run ahead can be rolled back to: its boundary, the board there and what else running it changes.
+struct LaneCheckpoint {
+    at: usize,
+    board: Checkpoint,
+    power: (Time, bool),
+    /// Trace events held at the time.
+    trace: usize,
+    profile: Option<ProfileMark>,
 }
 
 /// In real time with live inputs, a window ends at most this far ahead of the wall clock (virtual time), as far
@@ -272,7 +322,9 @@ struct Lane<'a> {
     /// The board at some of the boundaries it went past, before its end of the slice there: the first one, then
     /// one each time it has run for [`CHECKPOINT_WORK`] of host time since the last (rolling back reruns no more
     /// than that).
-    checkpoints: Vec<(usize, Checkpoint, (Time, bool))>,
+    checkpoints: Vec<LaneCheckpoint>,
+    /// Its trace sink, while the events are held.
+    trace: Option<HeldTrace>,
     /// Host time spent running it since its last checkpoint (ns).
     since_checkpoint: u64,
     /// It stopped in the slice that ends at this boundary.
@@ -313,13 +365,20 @@ impl Lane<'_> {
         let k = self
             .checkpoints
             .iter()
-            .rposition(|c| c.0 <= w)
+            .rposition(|c| c.at <= w)
             .expect("a board that went past boundary 1 has a checkpoint");
         self.checkpoints.truncate(k + 1);
-        let (at, c, power) = &self.checkpoints[k];
-        self.session.rollback(c, self.flash);
-        *self.power = *power;
-        self.at = *at;
+        let c = &self.checkpoints[k];
+        self.session.rollback(&c.board, self.flash);
+        self.session.unread_from(self.bounds.time(c.at));
+        *self.power = c.power;
+        self.at = c.at;
+        if let Some(t) = &self.trace {
+            lock(&t.buffer.events).truncate(c.trace);
+        }
+        if let (Some(p), Some(mark)) = (&mut self.session.profiler, &c.profile) {
+            p.back_to(mark);
+        }
         self.done = false;
         lock(self.marks).truncate(self.at - 1);
         self.since_checkpoint = 0;
@@ -351,7 +410,7 @@ impl Lane<'_> {
     /// The machine side of its end of the slice at the boundary it is at.
     fn end_slice(&mut self, nodes: Vec<NodeView>) {
         self.session.machine.update_devices();
-        let collected = self.session.collect();
+        let collected = self.session.collect(self.bounds.time(self.at));
         let devices = &self.session.machine.sys.pin_devices;
         let motors = self
             .escs
@@ -413,7 +472,13 @@ impl Lane<'_> {
                 && self.flash.version() == self.session.machine.sys.flash.version();
             if self.checkpoints.is_empty() || more {
                 let start = Instant::now();
-                self.checkpoints.push((self.at, self.session.checkpoint(self.flash), *self.power));
+                self.checkpoints.push(LaneCheckpoint {
+                    at: self.at,
+                    board: self.session.checkpoint(self.flash),
+                    power: *self.power,
+                    trace: self.trace.as_ref().map_or(0, HeldTrace::len),
+                    profile: self.session.profiler.as_ref().map(Profiler::mark),
+                });
                 self.since_checkpoint = 0;
                 self.spent += start.elapsed().as_nanos() as u64;
             }
@@ -615,6 +680,10 @@ pub(crate) fn run_until(robot: &mut Robot, end: Time) -> Option<(usize, StopReas
         .zip(kept_flash.iter_mut())
         .enumerate()
         .map(|(i, ((session, power), flash))| {
+            let trace = HeldTrace::hold(&mut session.machine);
+            if let Some(p) = &mut session.profiler {
+                p.hold();
+            }
             Mutex::new(Lane {
                 session,
                 power,
@@ -629,6 +698,7 @@ pub(crate) fn run_until(robot: &mut Robot, end: Time) -> Option<(usize, StopReas
                 marks: &marks[i],
                 high: &highs[i],
                 checkpoints: Vec::new(),
+                trace,
                 since_checkpoint: 0,
                 stop: None,
                 spent: 0,
@@ -661,126 +731,149 @@ pub(crate) fn run_until(robot: &mut Robot, end: Time) -> Option<(usize, StopReas
         let mut busy = vec![false; max_threads];
         let mut wall = Instant::now();
         let mut paced = Duration::ZERO;
-        while *now < end && !crate::signal::is_set(*stop_flag) {
-            // A new window from here
-            window += 1;
-            let bounds = Bounds { start: *now, slice: *slice, end };
-            let mut last = horizon(buses, &bounds).min(MAX_WINDOW).min(bounds.count());
-            if *realtime && live {
-                let (wall, slept) = wall_horizon(pacing, &bounds);
-                last = last.min(wall);
-                paced += slept;
-            }
-            busy.fill(false);
-            for (i, lane) in shared.lanes.iter().enumerate() {
-                let mut l = lock(lane);
-                l.start_window(bounds, window);
-                l.blind = stress.is_some();
-                let t = if l.follower { FOLLOWER } else { balance.threads()[i] };
-                shared.owner[i].store(t, Ordering::Relaxed);
-                if t < max_threads {
-                    busy[t] = true;
+        let stopped = 'run: {
+            while *now < end && !crate::signal::is_set(*stop_flag) {
+                // A new window from here
+                window += 1;
+                let bounds = Bounds { start: *now, slice: *slice, end };
+                let mut last = horizon(buses, &bounds).min(MAX_WINDOW).min(bounds.count());
+                if *realtime && live {
+                    let (wall, slept) = wall_horizon(pacing, &bounds);
+                    last = last.min(wall);
+                    paced += slept;
                 }
-            }
-            while workers + 1 < max_threads && busy[workers + 1..].iter().any(|&b| b) {
-                workers += 1;
-                let me = workers;
-                let caller = caller.clone();
-                let h = std::thread::Builder::new()
-                    .name(format!("board-worker-{me}"))
-                    .spawn_scoped(scope, move || shared.work(me, &caller))
-                    .expect("starting a board worker thread");
-                lock(&shared.threads).push(h.thread().clone());
-            }
-            shared.first_end.store(last, Ordering::Relaxed);
-            shared.window.store(pack(window, last), Ordering::Release);
-            for (t, thread) in lock(&shared.threads).iter().enumerate().skip(1) {
-                if busy[t] {
-                    thread.unpark();
+                busy.fill(false);
+                for (i, lane) in shared.lanes.iter().enumerate() {
+                    let mut l = lock(lane);
+                    l.start_window(bounds, window);
+                    l.blind = stress.is_some();
+                    let t = if l.follower { FOLLOWER } else { balance.threads()[i] };
+                    shared.owner[i].store(t, Ordering::Relaxed);
+                    if t < max_threads {
+                        busy[t] = true;
+                    }
                 }
-            }
-            let mut committer = Committer { bounds, window, next: 1 };
-            if let Some(rng) = &mut stress {
-                shared.settle(&busy, &mut |_| false);
-                // Any boundary will do as the window's end: cutting it anywhere rolls back whoever went past
+                while workers + 1 < max_threads && busy[workers + 1..].iter().any(|&b| b) {
+                    workers += 1;
+                    let me = workers;
+                    let caller = caller.clone();
+                    let h = std::thread::Builder::new()
+                        .name(format!("board-worker-{me}"))
+                        .spawn_scoped(scope, move || shared.work(me, &caller))
+                        .expect("starting a board worker thread");
+                    lock(&shared.threads).push(h.thread().clone());
+                }
+                shared.first_end.store(last, Ordering::Relaxed);
+                shared.window.store(pack(window, last), Ordering::Release);
+                for (t, thread) in lock(&shared.threads).iter().enumerate().skip(1) {
+                    if busy[t] {
+                        thread.unpark();
+                    }
+                }
+                let mut committer = Committer { bounds, window, next: 1 };
+                if let Some(rng) = &mut stress {
+                    shared.settle(&busy, &mut |_| false);
+                    // Any boundary will do as the window's end: cutting it anywhere rolls back whoever went past
+                    let w = boundary_of(shared.window.load(Ordering::Acquire));
+                    shared.announce(window, 1 + (rng.next_u64() % w as u64) as usize);
+                    shared.settle(&busy, &mut |_| false);
+                } else {
+                    shared.settle(&busy, &mut |only_see| {
+                        committer.advance(shared, buses, board_bus, vehicles, now, run_ahead_stats, only_see)
+                    });
+                }
+                // Everything before the end is final now
+                loop {
+                    let settled = shared.window.load(Ordering::Acquire);
+                    committer.advance(shared, buses, board_bus, vehicles, now, run_ahead_stats, false);
+                    let packed = shared.window.load(Ordering::Acquire);
+                    if packed == settled && committer.next >= boundary_of(packed) {
+                        break;
+                    }
+                    // A follower cut the window short: the others go back to there
+                    shared.settle(&busy, &mut |_| false);
+                }
                 let w = boundary_of(shared.window.load(Ordering::Acquire));
-                shared.announce(window, 1 + (rng.next_u64() % w as u64) as usize);
-                shared.settle(&busy, &mut |_| false);
-            } else {
-                shared.settle(&busy, &mut |only_see| {
-                    committer.advance(shared, buses, board_bus, vehicles, now, run_ahead_stats, only_see)
-                });
-            }
-            // Everything before the end is final now
-            loop {
-                let settled = shared.window.load(Ordering::Acquire);
-                committer.advance(shared, buses, board_bus, vehicles, now, run_ahead_stats, false);
-                let packed = shared.window.load(Ordering::Acquire);
-                if packed == settled && committer.next >= boundary_of(packed) {
-                    break;
+                let mut held: Vec<MutexGuard<Lane>> = shared.lanes.iter().map(lock).collect();
+                // The followers' last slice
+                for l in held.iter_mut().filter(|l| l.follower && l.at < w && l.stop.is_none()) {
+                    l.run_slice(shared);
                 }
-                // A follower cut the window short: the others go back to there
-                shared.settle(&busy, &mut |_| false);
-            }
-            let w = boundary_of(shared.window.load(Ordering::Acquire));
-            let mut held: Vec<MutexGuard<Lane>> = shared.lanes.iter().map(lock).collect();
-            // The followers' last slice
-            for l in held.iter_mut().filter(|l| l.follower && l.at < w && l.stop.is_none()) {
-                l.run_slice(shared);
-            }
-            // The host sides take in what they collected, boundary by boundary, in board order
-            for (i, l) in held.iter().enumerate() {
-                let n = lock(l.marks).len();
-                assert!(
-                    n == w - 1 || l.follower && n == w,
-                    "lane {i} has {n} marks, window ends at {w}, at {} done {} stop {:?}",
-                    l.at,
-                    l.done,
-                    l.stop
-                );
-            }
-            let mut collected: Vec<std::vec::IntoIter<Mark>> =
-                held.iter().map(|l| std::mem::take(&mut *lock(l.marks)).into_iter()).collect();
-            for _ in 1..w {
-                for (l, m) in held.iter_mut().zip(&mut collected) {
-                    l.session.deliver(m.next().expect("a mark for every boundary").collected);
+                // The host sides take in what they collected, boundary by boundary, in board order
+                for (i, l) in held.iter().enumerate() {
+                    let n = lock(l.marks).len();
+                    assert!(
+                        n == w - 1 || l.follower && n == w,
+                        "lane {i} has {n} marks, window ends at {w}, at {} done {} stop {:?}",
+                        l.at,
+                        l.done,
+                        l.stop
+                    );
+                }
+                let mut collected: Vec<std::vec::IntoIter<Mark>> =
+                    held.iter().map(|l| std::mem::take(&mut *lock(l.marks)).into_iter()).collect();
+                for _ in 1..w {
+                    for (l, m) in held.iter_mut().zip(&mut collected) {
+                        l.session.deliver(m.next().expect("a mark for every boundary").collected);
+                    }
+                }
+                drop(collected);
+                // Trace events and profile samples up to here are final
+                for l in held.iter_mut() {
+                    if let Some(t) = &mut l.trace {
+                        t.flush();
+                    }
+                    if let Some(p) = &mut l.session.profiler {
+                        p.commit();
+                    }
+                }
+                run_ahead_stats.windows += 1;
+                run_ahead_stats.rollbacks = held.iter().map(|l| l.rollbacks).sum::<u64>() + rollbacks_before;
+                if let Some(panic) = lock(&shared.panic).take() {
+                    std::panic::resume_unwind(panic);
+                }
+                if let Some(stop) =
+                    held.iter().enumerate().find_map(|(i, l)| l.stop.filter(|(s, _)| *s == w).map(|(_, r)| (i, r)))
+                {
+                    break 'run Some(stop);
+                }
+                {
+                    let mut boards: Vec<&mut Session> = held.iter_mut().map(|l| &mut *l.session).collect();
+                    let t = bounds.time(w);
+                    end_slice(buses, board_bus, &mut boards, vehicles, t);
+                    *now = t;
+                }
+                drop(held);
+                since_regroup += w;
+                run_ahead_stats.slices += w as u64;
+                if *realtime {
+                    let start = Instant::now();
+                    pacing.pace(*now);
+                    paced += start.elapsed();
+                }
+                if since_regroup >= regroup_at {
+                    let spent: Vec<u64> = shared.lanes.iter().map(|l| std::mem::take(&mut lock(l).spent)).collect();
+                    let wall_ns = wall.elapsed().saturating_sub(paced).as_nanos() as u64;
+                    balance.regroup(&spent, since_regroup, max_threads, wall_ns);
+                    (wall, paced) = (Instant::now(), Duration::ZERO);
+                    since_regroup = 0;
+                    regroup_at = REGROUP_SLICES;
                 }
             }
-            drop(collected);
-            run_ahead_stats.windows += 1;
-            run_ahead_stats.rollbacks = held.iter().map(|l| l.rollbacks).sum::<u64>() + rollbacks_before;
-            if let Some(panic) = lock(&shared.panic).take() {
-                std::panic::resume_unwind(panic);
+            None
+        };
+        // The boards' trace sinks and profilers as they were, with everything that is final now
+        for lane in &shared.lanes {
+            let mut l = lock(lane);
+            if let Some(mut t) = l.trace.take() {
+                t.flush();
+                l.session.machine.trace = t.sink;
             }
-            if let Some(stop) =
-                held.iter().enumerate().find_map(|(i, l)| l.stop.filter(|(s, _)| *s == w).map(|(_, r)| (i, r)))
-            {
-                return Some(stop);
-            }
-            {
-                let mut boards: Vec<&mut Session> = held.iter_mut().map(|l| &mut *l.session).collect();
-                let t = bounds.time(w);
-                end_slice(buses, board_bus, &mut boards, vehicles, t);
-                *now = t;
-            }
-            drop(held);
-            since_regroup += w;
-            run_ahead_stats.slices += w as u64;
-            if *realtime {
-                let start = Instant::now();
-                pacing.pace(*now);
-                paced += start.elapsed();
-            }
-            if since_regroup >= regroup_at {
-                let spent: Vec<u64> = shared.lanes.iter().map(|l| std::mem::take(&mut lock(l).spent)).collect();
-                let wall_ns = wall.elapsed().saturating_sub(paced).as_nanos() as u64;
-                balance.regroup(&spent, since_regroup, max_threads, wall_ns);
-                (wall, paced) = (Instant::now(), Duration::ZERO);
-                since_regroup = 0;
-                regroup_at = REGROUP_SLICES;
+            if let Some(p) = &mut l.session.profiler {
+                p.release();
             }
         }
-        None
+        stopped
     })
 }
 
@@ -892,7 +985,7 @@ impl Committer {
             // The followers' end of the slice
             for (_, l) in followers.iter_mut() {
                 l.session.machine.update_devices();
-                let c = l.session.collect();
+                let c = l.session.collect(t);
                 lock(l.marks).last_mut().expect("its mark at j").collected = c;
             }
             // The vehicles, with the motors as they were at boundary j
@@ -1031,7 +1124,7 @@ mod tests {
             a.poll_uarts();
             b.run_machine(t);
             b.machine.update_devices();
-            kept.push(b.collect());
+            kept.push(b.collect(t));
             if k % 37 == 0 {
                 for c in kept.drain(..) {
                     b.deliver(c);
@@ -1043,6 +1136,58 @@ mod tests {
         }
         assert!(la.lock().unwrap().len() > 3, "{:?}", la.lock().unwrap());
         assert_eq!(outcome(&a, &la), outcome(&b, &lb));
+    }
+
+    /// A profiler holding its samples drops those of a run that is rolled back and takes the same ones again on the
+    /// rerun: the profile is that of the run without the rollback.
+    #[test]
+    fn a_held_profile_rolled_back_is_the_profile_of_one_run() {
+        let Some(mut a) = boot("esc_board") else { return };
+        let mut b = boot("esc_board").unwrap();
+        for s in [&mut a, &mut b] {
+            s.run_machine(Time::from_ms(5));
+            s.start_profile(Time::from_us(23));
+        }
+        a.run_machine(Time::from_ms(40));
+        let p = b.profiler.as_mut().unwrap();
+        p.hold();
+        b.run_machine(Time::from_ms(20));
+        assert_eq!(b.profiler.as_ref().unwrap().samples(0), 0, "held, not counted");
+        b.profiler.as_mut().unwrap().commit();
+        assert!(b.profiler.as_ref().unwrap().samples(0) > 0, "committed, counted");
+        b.run_machine(Time::from_ms(25));
+        let mut flash = Versioned::default();
+        let (c, mark) = (b.checkpoint(&mut flash), b.profiler.as_ref().unwrap().mark());
+        b.run_machine(Time::from_ms(37));
+        b.rollback(&c, &flash);
+        b.profiler.as_mut().unwrap().back_to(&mark);
+        b.run_machine(Time::from_ms(40));
+        b.profiler.as_mut().unwrap().release();
+        let (pa, pb) = (a.profiler.as_ref().unwrap(), b.profiler.as_ref().unwrap());
+        assert!(pa.samples(0) > 1000);
+        assert_eq!(format!("{:?}", pa.report()), format!("{:?}", pb.report()));
+    }
+
+    /// In real time with live inputs a window ends at most `LIVE_LEAD` ahead of the wall clock, after sleeping while
+    /// the robot is more than half of that ahead.
+    #[test]
+    fn live_windows_end_near_the_wall_clock() {
+        let mut pacing = Pacing::default();
+        let start = Time::from_ms(500);
+        let bounds = |start: Time| Bounds { start, slice: Time::from_us(100), end: Time::from_secs(9) };
+        // Pacing starts here: 2 ms ahead of it at most, 20 slices
+        let (last, slept) = wall_horizon(&mut pacing, &bounds(start));
+        assert!((19..=20).contains(&last), "{last}");
+        assert!(slept < Duration::from_millis(1));
+        // 3 ms ahead of the wall clock: it sleeps until it is 1 ms ahead, then runs to 2 ms ahead
+        let t0 = Instant::now();
+        let (last, slept) = wall_horizon(&mut pacing, &bounds(start + Time::from_ms(3)));
+        assert!(slept >= Duration::from_micros(1900) && t0.elapsed() >= Duration::from_micros(1900), "{slept:?}");
+        assert!((9..=10).contains(&last), "{last}");
+        // Far behind: from where the wall clock is, 2 ms on (the window's other bounds cut that)
+        std::thread::sleep(Duration::from_millis(30));
+        let (last, slept) = wall_horizon(&mut pacing, &bounds(start + Time::from_ms(1)));
+        assert!(last > 300 && slept == Duration::ZERO, "{last}");
     }
 
     /// A session rolled back to a checkpoint and run again gets to exactly where it got the first time, statistics

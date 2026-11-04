@@ -75,15 +75,39 @@ pub struct Session {
     pub lockups: u64,
     /// The current lockup was returned as final (it is returned once; running on, the board stays locked up).
     final_lockup_reported: bool,
+    /// What [`Session::collect`] read from the pseudo terminals and has not been delivered yet.
+    host_reads: HostReads,
 }
+
+/// What a board's host side read from its pseudo terminals while a robot ran it ahead ([`Session::collect`]),
+/// kept until the boundary it was read at is delivered. A board rolled back to before a read gives the bytes back
+/// ([`Session::unread_from`]): the next reads of that terminal take them first, so nothing typed is lost or taken
+/// in out of order.
+#[derive(Default)]
+struct HostReads {
+    /// (boundary, terminal, bytes), for the reads that got something.
+    log: std::collections::VecDeque<(Time, usize, Vec<u8>)>,
+    /// Per terminal (UART 0 and 1, CDC port 0 and 1): bytes given back, to be read first.
+    unread: [Vec<u8>; 4],
+}
+
+/// The terminals [`Session::read_terminal`] reads.
+const UART0: usize = 0;
+const UART1: usize = 1;
+const CDC0: usize = 2;
+const CDC1: usize = 3;
 
 /// What [`Session::collect`] took out of a board's machine at the end of a slice.
 #[derive(Default)]
 pub(crate) struct Collected {
+    /// The boundary.
+    at: Time,
     now: Time,
     /// The UARTs' output, taken twice (as the end of a slice polls them twice).
     uarts: [[Vec<(Time, u8)>; 2]; 2],
     usb_cdc: Vec<u8>,
+    /// The second CDC port's output (only taken with a pseudo terminal on it, as polling does).
+    usb_cdc2: Vec<u8>,
     rtt: Vec<(usize, Vec<u8>)>,
 }
 
@@ -145,6 +169,7 @@ impl Session {
             stop_on_lockup: true,
             lockups: 0,
             final_lockup_reported: false,
+            host_reads: HostReads::default(),
         }
     }
 
@@ -199,6 +224,7 @@ impl Session {
             stop_on_lockup: self.stop_on_lockup,
             lockups: self.lockups,
             final_lockup_reported: self.final_lockup_reported,
+            host_reads: HostReads::default(),
         }
     }
 
@@ -216,11 +242,27 @@ impl Session {
         self.defmt.is_some()
     }
 
+    /// Reads terminal `k` ([`UART0`], [`UART1`], [`CDC0`], [`CDC1`]): bytes given back by a rollback first, then
+    /// what the pseudo terminal holds now.
+    fn read_terminal(&mut self, k: usize) -> Vec<u8> {
+        let pty = match k {
+            UART0 => &self.uart_pty[0],
+            UART1 => &self.uart_pty[1],
+            CDC0 => &self.usb_cdc_pty,
+            _ => &self.usb_cdc2_pty,
+        };
+        let mut got = std::mem::take(&mut self.host_reads.unread[k]);
+        if let Some(p) = pty {
+            got.extend(p.read());
+        }
+        got
+    }
+
     /// Collects what the UARTs transmitted since the last poll.
     pub fn poll_uarts(&mut self) {
         for n in 0..2 {
-            if let Some(pty) = &self.uart_pty[n] {
-                let input = pty.read();
+            if self.uart_pty[n].is_some() {
+                let input = self.read_terminal(UART0 + n);
                 if !input.is_empty() {
                     let now = self.machine.now;
                     self.machine.sys.uart_inject(n, &input, now);
@@ -256,20 +298,20 @@ impl Session {
     /// the USB host has opened the port ([`sim_devices::usb::host::HostController::cdc_open`]).
     pub fn poll_usb_cdc(&mut self) {
         let now = self.machine.now;
-        if let Some(pty) = &self.usb_cdc2_pty {
-            let input = pty.read();
+        if self.usb_cdc2_pty.is_some() {
+            let input = self.read_terminal(CDC1);
             if !input.is_empty() {
                 self.machine.sys.with_usb_host(now, |h| h.cdc_write(1, &input));
             }
-            if let Some(host) = self.machine.sys.usb_host_mut() {
+            if let (Some(host), Some(pty)) = (self.machine.sys.usb_host_mut(), &self.usb_cdc2_pty) {
                 let rx = host.cdc_take_rx(1);
                 if !rx.is_empty() {
                     pty.write(&rx);
                 }
             }
         }
-        if let Some(pty) = &self.usb_cdc_pty {
-            let input = pty.read();
+        if self.usb_cdc_pty.is_some() {
+            let input = self.read_terminal(CDC0);
             if !input.is_empty() {
                 self.machine.sys.with_usb_host(now, |h| h.cdc_write(0, &input));
             }
@@ -344,48 +386,126 @@ impl Session {
         }
     }
 
-    /// Whether a robot may run this board ahead of the others ([`crate::runahead`]): nothing outside the
-    /// simulation feeds it or watches it as it runs (no pseudo terminal, USB/IP server, Ethernet cable, profiler or
-    /// trace sink), so its host side can take in what it produced later, and a copy rolled back reruns the same.
+    /// Whether a robot may run this board ahead of the others ([`crate::runahead`]): what feeds it from outside the
+    /// simulation as it runs comes in at the end of a slice (its pseudo terminals: [`Session::collect`] reads them
+    /// and keeps what it read for a rerun), and nothing watches it as it runs but what can take in afterwards what
+    /// it did (no USB/IP server or Ethernet cable, whose host sides answer the board at once; no profiler or trace
+    /// sink unless the robot runs them ahead, see [`crate::runahead`]), so its host side can take in what it
+    /// produced later, and a copy rolled back reruns the same.
     pub(crate) fn can_run_ahead(&self) -> bool {
-        use sim_core::trace::Category::*;
-        self.profiler.is_none()
-            && self.uart_pty.iter().all(Option::is_none)
-            && self.usb_cdc_pty.is_none()
-            && self.usb_cdc2_pty.is_none()
-            && self.usbip.is_none()
-            && self.machine.sys.ethernet.is_none()
-            && ![Instruction, Exception, Gpio, Peripheral, Unmodelled, Device]
-                .iter()
-                .any(|&c| self.machine.trace.wants(c))
+        self.usbip.is_none() && self.machine.sys.ethernet.is_none()
     }
 
-    /// The machine side of a robot's end of a slice for this board ([`Session::poll_rtt`] then
-    /// [`Session::poll_uarts`], for a board that [`Session::can_run_ahead`]): takes what the UARTs, the USB CDC port
-    /// and RTT hold out of the machine, for [`Session::deliver`] to take in later.
-    pub(crate) fn collect(&mut self) -> Collected {
-        fn uarts(m: &mut Machine) -> [Vec<(Time, u8)>; 2] {
-            [std::mem::take(&mut m.sys.uart[0].output), std::mem::take(&mut m.sys.uart[1].output)]
+    /// Whether something outside the simulation feeds the board (a pseudo terminal).
+    pub(crate) fn has_live_inputs(&self) -> bool {
+        self.uart_pty.iter().any(Option::is_some) || self.usb_cdc_pty.is_some() || self.usb_cdc2_pty.is_some()
+    }
+
+    /// A read of terminal `k` at the end of the slice at boundary `at`, run ahead: kept in case the board is rolled
+    /// back to before it.
+    fn host_read(&mut self, at: Time, k: usize) -> Vec<u8> {
+        let got = self.read_terminal(k);
+        if !got.is_empty() {
+            self.host_reads.log.push_back((at, k, got.clone()));
         }
+        got
+    }
+
+    /// Gives back what was read from the terminals at boundary `at` and after (the board was rolled back to before
+    /// its end of the slice there): the next reads take it first, in the order it was read.
+    pub(crate) fn unread_from(&mut self, at: Time) {
+        let r = &mut self.host_reads;
+        let keep = r.log.iter().position(|e| e.0 >= at).unwrap_or(r.log.len());
+        let mut back: [Vec<u8>; 4] = Default::default();
+        for (_, k, bytes) in r.log.drain(keep..) {
+            back[k].extend(bytes);
+        }
+        for (k, b) in back.iter_mut().enumerate() {
+            b.append(&mut r.unread[k]);
+            r.unread[k] = std::mem::take(b);
+        }
+    }
+
+    /// The UARTs' part of [`Session::collect`]: input from their terminals in, output out.
+    fn collect_uarts(&mut self, at: Time) -> [Vec<(Time, u8)>; 2] {
         let now = self.machine.now;
-        let first = uarts(&mut self.machine);
+        let mut out = [Vec::new(), Vec::new()];
+        for (n, o) in out.iter_mut().enumerate() {
+            if self.uart_pty[n].is_some() {
+                let input = self.host_read(at, UART0 + n);
+                if !input.is_empty() {
+                    self.machine.sys.uart_inject(n, &input, now);
+                }
+            }
+            *o = std::mem::take(&mut self.machine.sys.uart[n].output);
+        }
+        out
+    }
+
+    /// The machine side of a robot's end of a slice for this board at boundary `at` ([`Session::poll_rtt`] then
+    /// [`Session::poll_uarts`], for a board that [`Session::can_run_ahead`]): passes in what its terminals hold
+    /// (and what a rollback gave back) and takes what the UARTs, the USB CDC ports and RTT hold out of the machine,
+    /// for [`Session::deliver`] to take in later.
+    pub(crate) fn collect(&mut self, at: Time) -> Collected {
+        let now = self.machine.now;
+        let first = self.collect_uarts(at);
+        let mut usb_cdc2 = Vec::new();
+        if self.usb_cdc2_pty.is_some() {
+            let input = self.host_read(at, CDC1);
+            if !input.is_empty() {
+                self.machine.sys.with_usb_host(now, |h| h.cdc_write(1, &input));
+            }
+            if let Some(host) = self.machine.sys.usb_host_mut() {
+                usb_cdc2 = host.cdc_take_rx(1);
+            }
+        }
+        if self.usb_cdc_pty.is_some() {
+            let input = self.host_read(at, CDC0);
+            if !input.is_empty() {
+                self.machine.sys.with_usb_host(now, |h| h.cdc_write(0, &input));
+            }
+        }
         let usb_cdc = self.machine.sys.usb_host_mut().map(|h| h.cdc_take_rx(0)).unwrap_or_default();
         let rtt = self.rtt.as_ref().map(|r| r.poll(&mut self.machine)).unwrap_or_default();
-        let again = uarts(&mut self.machine);
-        Collected { now, uarts: [first, again], usb_cdc, rtt }
+        let again = self.collect_uarts(at);
+        Collected { at, now, uarts: [first, again], usb_cdc, usb_cdc2, rtt }
     }
 
-    /// The host side of [`Session::collect`]: text, logs and hooks, as [`Session::poll_rtt`] and
+    /// UART `n`'s output to its terminal and its host side.
+    fn uart_out(&mut self, n: usize, out: Vec<(Time, u8)>) {
+        if let Some(pty) = &self.uart_pty[n]
+            && !out.is_empty()
+        {
+            pty.write(&out.iter().map(|(_, b)| *b).collect::<Vec<u8>>());
+        }
+        self.uart_bytes(n, out);
+    }
+
+    /// The host side of [`Session::collect`]: terminals, text, logs and hooks, as [`Session::poll_rtt`] and
     /// [`Session::poll_uarts`] would have taken them in.
     pub(crate) fn deliver(&mut self, c: Collected) {
         let [[a0, a1], again] = c.uarts;
-        self.uart_bytes(0, a0);
-        self.uart_bytes(1, a1);
+        self.uart_out(0, a0);
+        self.uart_out(1, a1);
+        if let Some(pty) = &self.usb_cdc2_pty
+            && !c.usb_cdc2.is_empty()
+        {
+            pty.write(&c.usb_cdc2);
+        }
+        if let Some(pty) = &self.usb_cdc_pty
+            && !c.usb_cdc.is_empty()
+        {
+            pty.write(&c.usb_cdc);
+        }
         self.usb_cdc_bytes(c.now, c.usb_cdc);
         self.rtt_bytes(c.now, c.rtt);
         let [b0, b1] = again;
-        self.uart_bytes(0, b0);
-        self.uart_bytes(1, b1);
+        self.uart_out(0, b0);
+        self.uart_out(1, b1);
+        // Final now: no rerun reads there again
+        while self.host_reads.log.front().is_some_and(|e| e.0 <= c.at) {
+            self.host_reads.log.pop_front();
+        }
     }
 
     /// The state a robot running its boards ahead keeps to roll this board back to ([`Session::rollback`]): the
@@ -646,6 +766,39 @@ mod tests {
         assert_eq!(p.pace(Time::from_ms(110)), None, "not again so soon");
         p.warned = Instant::now().checked_sub(Duration::from_secs(6));
         assert!(p.pace(Time::from_ms(120)).is_some(), "again after five seconds");
+    }
+
+    /// What a board run ahead read from a terminal is given back when it is rolled back to before the read: the
+    /// next reads take it first, then what was typed since, in order; delivered boundaries are not given back.
+    #[test]
+    fn terminal_reads_are_given_back_on_a_rollback() {
+        use std::io::Write;
+        let Ok(pty) = crate::pty::Pty::open() else { return };
+        let mut term = std::fs::OpenOptions::new().write(true).open(&pty.path).unwrap();
+        let mut s = Session::new(Machine::new(Default::default()), &Image::default());
+        s.uart_pty[0] = Some(pty);
+        assert!(s.has_live_inputs());
+        let typed = |term: &mut std::fs::File, b: &[u8]| {
+            term.write_all(b).unwrap();
+            std::thread::sleep(Duration::from_millis(30));
+        };
+        let at = |k: u64| Time::from_us(100 * k);
+        typed(&mut term, b"ab");
+        assert_eq!(s.host_read(at(1), UART0), b"ab");
+        typed(&mut term, b"cd");
+        assert_eq!(s.host_read(at(2), UART0), b"cd");
+        typed(&mut term, b"ef");
+        assert_eq!(s.host_read(at(3), UART0), b"ef");
+        // Boundary 1 is final; the board goes back to boundary 2
+        s.deliver(Collected { at: at(1), ..Default::default() });
+        s.unread_from(at(2));
+        typed(&mut term, b"gh");
+        assert_eq!(s.host_read(at(2), UART0), b"cdefgh");
+        // Back again to 2, then to 1: nothing before 2 is given back, it was delivered
+        s.unread_from(at(2));
+        s.unread_from(at(1));
+        assert_eq!(s.read_terminal(UART0), b"cdefgh");
+        assert_eq!(s.read_terminal(UART0), b"");
     }
 
     #[test]

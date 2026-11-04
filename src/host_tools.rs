@@ -45,11 +45,23 @@ pub struct CanHostArgs {
     /// `internal=0.0.0.0:20000,192.168.1.50:20000`). Use with `--realtime`.
     #[arg(long, value_name = "[BUS=]LOCAL,PEER")]
     pub cannelloni: Vec<String>,
+    /// Log when each frame from the host (`--can`, `--cannelloni`) entered a bus, to the nanosecond, with the bus
+    /// name as the interface (`robot` only). `--replay-arrivals` repeats the run exactly from it.
+    #[arg(long, value_name = "FILE")]
+    pub arrivals_log: Option<PathBuf>,
+    /// Hand the frames of an `--arrivals-log` in again where they entered the buses, at exactly the same times
+    /// (`robot` only, in place of the `--can` and `--cannelloni` they came from; repeatable).
+    #[arg(long, value_name = "FILE")]
+    pub replay_arrivals: Vec<PathBuf>,
 }
 
 impl CanHostArgs {
     fn any(&self) -> bool {
-        self.candump_log.is_some() || !self.replay.is_empty() || !self.cannelloni.is_empty()
+        self.candump_log.is_some()
+            || !self.replay.is_empty()
+            || !self.cannelloni.is_empty()
+            || self.arrivals_log.is_some()
+            || !self.replay_arrivals.is_empty()
     }
 }
 
@@ -57,6 +69,7 @@ impl CanHostArgs {
 #[derive(Default)]
 pub struct Attached {
     writer: Option<(CandumpWriter, PathBuf)>,
+    arrivals: Option<(CandumpWriter, PathBuf)>,
     replays: Vec<(String, SharedReplay, usize)>,
 }
 
@@ -71,6 +84,13 @@ impl Attached {
             let (n, unacked) = w.counts();
             let skipped = if unacked > 0 { format!(" ({unacked} unacknowledged left out)") } else { String::new() };
             eprintln!("candump log: {n} frame(s) in {}{skipped}", path.display());
+        }
+        if let Some((w, path)) = &self.arrivals {
+            w.flush().with_context(|| format!("writing {}", path.display()))?;
+            if let Some(e) = w.error() {
+                bail!("writing {}: {e}", path.display());
+            }
+            eprintln!("arrivals log: {} frame(s) from the host in {}", w.counts().0, path.display());
         }
         for (what, r, total) in &self.replays {
             let r = r.0.lock().unwrap();
@@ -99,6 +119,9 @@ pub fn attach_run(args: &CanHostArgs, session: &mut Session) -> Result<Attached>
     let mut out = Attached::default();
     if !args.any() {
         return Ok(out);
+    }
+    if args.arrivals_log.is_some() || !args.replay_arrivals.is_empty() {
+        bail!("--arrivals-log and --replay-arrivals are robot options");
     }
     let Some(bus) = session.can_bus.as_mut() else {
         bail!("--candump-log, --replay and --cannelloni need a --board with a CAN bus");
@@ -215,6 +238,35 @@ pub fn attach_robot(args: &CanHostArgs, r: &mut Robot, cans: &[(String, String)]
         let t = Cannelloni::bind(local, peer).with_context(|| format!("binding {local}"))?;
         r.buses[j].endpoints.push(Box::new(t));
         log::info!("bus {bus} tunnelled (cannelloni over UDP): {local} <-> {peer}");
+    }
+    for (path, log) in read_logs(&args.replay_arrivals)? {
+        for iface in canlog::interfaces(&log) {
+            let j = bus_index(r, &iface).with_context(|| format!("{}: frames on {iface:?}", path.display()))?;
+            let replay = canlog::arrivals_replay(&log, &iface);
+            let total = replay.remaining();
+            let shared = SharedReplay::new(replay);
+            r.buses[j].endpoints.push(Box::new(shared.clone()));
+            let what = format!("{} ({iface})", path.display());
+            log::info!("replaying the {total} arrival(s) of {what}");
+            out.replays.push((what, shared, total));
+        }
+    }
+    if let Some(path) = &args.arrivals_log {
+        let w = CandumpWriter::create(path).with_context(|| format!("creating {}", path.display()))?;
+        for (rb, name) in r.buses.iter_mut().zip(&r.bus_names) {
+            let eps = std::mem::take(&mut rb.endpoints);
+            rb.endpoints = eps
+                .into_iter()
+                .map(|e| -> Box<dyn sim_devices::can::CanEndpoint + Send> {
+                    if e.live() {
+                        Box::new(canlog::Arrivals { inner: e, iface: name.clone(), log: w.clone() })
+                    } else {
+                        e
+                    }
+                })
+                .collect();
+        }
+        out.arrivals = Some((w, path.clone()));
     }
     Ok(out)
 }
