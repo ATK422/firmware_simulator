@@ -316,6 +316,38 @@ fn a_rust_board_with_a_mock_bridge() {
     assert!(c.close().success());
 }
 
+/// A nano-ROS board with its mock agent: the agent's state, and sending on a topic through it.
+#[test]
+fn a_nanoros_agent_through_the_tools() {
+    let mut c = Client::start();
+    c.initialize();
+    let args = json!(["robot", "robots/nanoros_led.toml", "--mock-agent", "nanoros:led"]);
+    let s = c.call("start", json!({"args": args, "time": "600s", "realtime": true}));
+    let pid = s["pid"].as_u64().unwrap();
+    let w = c.call("wait_for", json!({"pattern": "done reg", "timeout_s": 30}));
+    assert_eq!(w["matched"], "log", "{w}");
+    let r = c.call("agent_send", json!({"board": "led", "topic": "bit_sub", "msg": {"data": 7}}));
+    assert_eq!(r["ok"], true, "{r}");
+    let w = c.call("wait_for", json!({"pattern": "bit_sub 7", "timeout_s": 30}));
+    assert_eq!(w["matched"], "log", "{w}");
+    let r = c.call_result("agent_send", json!({"topic": "imu_data"}));
+    assert_eq!(r["isError"], true);
+    assert!(r["content"][0]["text"].as_str().unwrap().contains("publishers"), "{r}");
+    let w = c.call("wait_for", json!({"time_s": 1.5, "timeout_s": 30, "pause": true}));
+    assert_eq!(w["paused"], true, "{w}");
+    let st = c.call("state", json!({"sections": ["agent"]}));
+    let a = &st["boards"][0]["agent"];
+    assert_eq!((&a["protocol"], &a["connected"]), (&json!("nanoros"), &json!(true)), "{st}");
+    let topics = a["topics"].as_array().unwrap();
+    let echo = topics.iter().find(|t| t["name"] == "bit_echo").unwrap();
+    assert_eq!(echo["last"]["data"], 8, "{st}");
+    let fw = topics.iter().find(|t| t["name"] == "firmware_status").unwrap();
+    assert_eq!(fw["last"]["board_name"], "nanoros_led", "{st}");
+    c.call("stop", json!({}));
+    assert!(wait_gone(pid));
+    assert!(c.close().success());
+}
+
 #[test]
 fn the_project_mcp_config_runs_this_server() {
     let cfg: Value = serde_json::from_str(&std::fs::read_to_string(repo().join(".mcp.json")).unwrap()).unwrap();

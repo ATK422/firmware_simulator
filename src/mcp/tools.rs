@@ -46,10 +46,10 @@ const ONCE_SUBCOMMANDS: [&str; 6] = ["run", "robot", "picoboot", "can-diff", "br
 const START_SUBCOMMANDS: [&str; 3] = ["run", "robot", "picoboot"];
 
 /// State sections, and those `state` shows by default.
-const SECTIONS: [&str; 11] =
-    ["cores", "leds", "gpio", "inputs", "bridge", "logs", "strips", "escs", "buses", "vehicles", "faults"];
-const DEFAULT_SECTIONS: [&str; 10] =
-    ["cores", "leds", "inputs", "bridge", "logs", "strips", "escs", "buses", "vehicles", "faults"];
+const SECTIONS: [&str; 12] =
+    ["cores", "leds", "gpio", "inputs", "bridge", "agent", "logs", "strips", "escs", "buses", "vehicles", "faults"];
+const DEFAULT_SECTIONS: [&str; 11] =
+    ["cores", "leds", "inputs", "bridge", "agent", "logs", "strips", "escs", "buses", "vehicles", "faults"];
 
 /// The tools as `tools/list` describes them: name, title, description, input schema, read only.
 pub fn definitions() -> Vec<Value> {
@@ -139,7 +139,8 @@ pub fn definitions() -> Vec<Value> {
             "Read the run's state",
             "The run's state as JSON: virtual time, paused or finished, applied faults; per board its cores (state \
              and function), LEDs, physical inputs, the mock bridge's decoded firmware status (fault bits by name, \
-             kill switch, heartbeats), WS2812 strips, ESC RPMs and its last log lines; per bus frame count, rate, \
+             kill switch, heartbeats), a mock agent's topics and last messages (`agent`), WS2812 strips, ESC RPMs \
+             and its last log lines; per bus frame count, rate, \
              load and errors; vehicles. Compact by default: pick `board` and `sections` to narrow it, add \
              \"gpio\" for pin levels, directions and functions, or `full` for the dashboard's raw JSON.",
             json!({
@@ -200,6 +201,22 @@ pub fn definitions() -> Vec<Value> {
             ),
             json!({"session": session, "board": board, "fault": {"type": "string", "description": "The fault, e.g. \"can-unplug\" or \"i2c-absent:0x76\"."}}),
             &["fault"],
+            false,
+        ),
+        tool(
+            "agent_send",
+            "Send a message through a mock agent",
+            "Makes a board's mock agent (`--mock-agent`, e.g. `nanoros:led`: early, nano-ROS is still changing) send \
+             a message on one of the board's subscribed topics at once, its fields as JSON (missing ones are zero), \
+             e.g. topic `bit_sub` with msg `{\"data\": 5}`. The state's `agent` lists the topics, their types and \
+             the last message on each; messages sent before the board has registered wait for it.",
+            json!({
+                "session": session,
+                "board": board,
+                "topic": {"type": "string", "description": "The topic, as in the board's ros.toml."},
+                "msg": {"type": "object", "description": "The message's fields (nested messages as objects, arrays as lists)."},
+            }),
+            &["topic"],
             false,
         ),
         tool(
@@ -501,6 +518,9 @@ pub fn compact_state(st: &Value, board: Option<&str>, sections: &[String], log_l
         if has("bridge") && !b["link"].is_null() {
             o.insert("bridge".into(), b["link"].clone());
         }
+        if has("agent") && !b["agent"].is_null() {
+            o.insert("agent".into(), b["agent"].clone());
+        }
         if has("logs") && log_lines > 0 {
             let logs = b["logs"].as_array().cloned().unwrap_or_default();
             let tail: Vec<Value> = logs[logs.len().saturating_sub(log_lines)..]
@@ -572,6 +592,7 @@ impl Tools {
             "logs" => self.logs(&a),
             "can_frames" => self.can_frames(&a),
             "inject_fault" => self.inject_fault(&a),
+            "agent_send" => self.agent_send(&a),
             "set_input" => self.set_input(&a),
             "pause" => self.pause(&a),
             "resume" => self.resume(&a),
@@ -942,6 +963,13 @@ impl Tools {
         Ok(ToolOutput::json(self.post(&s, "/api/fault", &body)?))
     }
 
+    fn agent_send(&self, a: &Args) -> Result<ToolOutput, String> {
+        let s = self.session(a)?;
+        let msg = a.0.get("msg").cloned().unwrap_or(Value::Null);
+        let body = json!({"board": a.str("board")?.unwrap_or(""), "topic": a.req_str("topic")?, "msg": msg});
+        Ok(ToolOutput::json(self.post(&s, "/api/agent", &body)?))
+    }
+
     fn set_input(&self, a: &Args) -> Result<ToolOutput, String> {
         let s = self.session(a)?;
         let value = a.f64("value")?.ok_or("`value` is required")?;
@@ -1094,7 +1122,7 @@ mod tests {
     fn every_tool_is_defined_and_handled() {
         let t = Tools::new().unwrap();
         let defs = definitions();
-        assert_eq!(defs.len(), 15);
+        assert_eq!(defs.len(), 16);
         for d in &defs {
             let name = d["name"].as_str().unwrap();
             assert!(d["description"].as_str().unwrap().len() > 40, "{name} needs a description");

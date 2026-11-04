@@ -158,6 +158,7 @@ robot: robots/talos.toml                                 # a robot file, or
 robot: {file: robots/talos.toml, boards: [esc0, poac]}   #   only some of its boards, or
 board: {image: esc_board, file: mk2/esc_board}           # one board (give robot or board)
 bridges: [internal:1, internal:2]                        # mock titan_bridges; or `all`
+agents: [nanoros:led]                                    # mock agents in the board's protocol (nano-ROS)
 inputs: {camera_cage.depth.pressure_pa: 101325}          # physical inputs at time 0
 time: 15s                                                # virtual time to run (required)
 threads: 1                                               # threads the boards may use (results are the same)
@@ -171,6 +172,7 @@ cases: [...]                                             # branches from a snaps
 | `robot` | A robot file ([robots.md](robots.md#robot-files)), by path, or by name (`talos` is `robots/talos.toml`). With `{file, boards}` only the boards listed run, and vehicle thrusters, sensors and transducers wired to the others are left out: a two-board scenario of Talos runs several times faster than all nine boards |
 | `board` | One board: `image` (a path, or a titan_firmware_rs image name such as `esc_board`), `file` (a board file: `mk2/esc_board` is `boards/mk2/esc_board.toml`, or a path), and optionally `name` (the board's name in checks; default the image's) and `rom_boot: true`. It is on a bus called `can` if its board file has a CAN controller |
 | `bridges` | Mock bridges ([robots.md](robots.md#mock-bridges)), as on the command line: `BUS:CLIENT` for a CANmore client on a bus (`CLIENT` alone when there is one bus), `eth:BOARD` on an Ethernet board's cable (Puddles). `all` puts one on every board's client on its bus and on every Ethernet board. The ESC board's client comes from its ID strap and the smart battery's from its serial number, as `bridges` works them out ([robots.md](robots.md#titan_bridge-command-lines-bridges)). Each bridge pings every 100 ms with the kill switch released |
+| `agents` | Mock agents ([robots.md](robots.md#mock-agents-nano-ros-and-other-protocols)), as `--mock-agent`: `nanoros:BOARD` for a nano-ROS board (its `ros_toml` from the robot file), `nanoros:BOARD=PATH` with its `ros.toml` (looked for from the scenario's directory up), `titan_link:BOARD` the same as a bridge for the board. Early: nano-ROS is still changing ([nanoros.md](nanoros.md)) |
 | `inputs` | `BOARD.INPUT: VALUE` (or `INPUT` with one board), as in the board files ([boards.md](boards.md#inputs)); set before the boards start. A vehicle drives its sensors' inputs itself ([vehicles.md](vehicles.md)) |
 | `time` | How long to run: `15s`, `1500ms`, or a number of seconds |
 | `threads` | As `robot --threads` ([robots.md](robots.md#how-a-robot-runs)); 1 by default. Robots in water always take turns |
@@ -230,6 +232,7 @@ Every step may have a `name:`, shown instead of the generated description.
 | `fault` | `fault: esc0:can-unplug`, `fault: {board: esc0, fault: can-unplug}`, `fault: brownout:50ms` (one board) | A fault in the `--fault` spelling ([faults.md](faults.md#every-fault)). Bus faults (`can-stuck`, `can-error-rate:P`, `can-flood:...`) may leave out the board when there is one bus. Bridge and kill switch faults act on the board's own mock bridge |
 | `input` | `input: {camera_cage.depth.pressure_pa: 120000, port_battery: 13}` | Sets physical inputs |
 | `send` | `send: {board: esc1, message: {Esc: {ThrusterRpm: [0, 0, 0, 0, 1200, 1200, 1200, 1200]}}}` | The board's bridge (or `bridge: internal:3`) sends a titan_link `HostToDevice` message, written as its variant names and fields (`{KillSwitch: {asserting_kill: true}}`, `{Power: {ElectricalCommand: 6}}`). With `every: 100ms` and `within`/`until`, again and again until then, the way titan_bridge forwards a topic |
+| `send` (a topic) | `send: {board: led, topic: bit_sub, msg: {data: 5}}`, `send: {board: led, topic: imu_cmd, msg: {orientation: {z: 0.6, w: 0.8}}, every: 100ms, until: 3s}` | The board's mock agent (`agents`) sends a message on one of the board's subscribed topics, its fields as the `.msg` names them (missing ones are zero); before the board has registered it waits for it. On a board with only a bridge, the topic is a titan_link `HostToDevice` variant and `msg` its contents (`topic: KillSwitch, msg: {asserting_kill: true}`). `every` as above |
 | `ivc_send` | `ivc_send: talos_ivc:0x5a`, `ivc_send: {board: surface_ivc, byte: 195}` | Makes an IVC board transmit a byte through its bridge, as `robot --ivc-send` ([robots.md](robots.md#mock-bridges)) |
 | `pause` | `pause: after the replug` | A checkpoint, named by its text: its evidence is the state of every board (resets, what each core is doing, the last status, the last line) and the frames so far on each bus; with `--from-checkpoint` scenarios share the run up to it ([below](#checkpoints-one-boot-many-scenarios)) |
 
@@ -247,6 +250,7 @@ Every step may have a `name:`, shown instead of the generated description.
 - expect: {vehicle: {depth: {min: 0.25}, roll: [-2, 2]}, within: 1.5s}
 - expect: {board: surface_ivc, ivc: 0x5a, within: 10s}
 - expect: {board: camera_cage, message: CameraCage.Depth, value: [-0.05, 0.05], count: {min: 15}, within: 1s}
+- expect: {board: led, topic: imu_data, msg: {header: {frame_id: imu_link}, linear_acceleration: {z: {min: 9.7}}}, within: 1s}
 - never: {board: esc0, log: PANIC}
 - always: {board: poac, resets: 0}
 ```
@@ -267,12 +271,13 @@ board, or one bridge, these may be left out.
 | `resets: RANGE` | state | Chip resets of the board since the start: watchdog resets and the power-on reset after a brownout |
 | `lockups: RANGE` | state | Core lockups since the start ([faults.md](faults.md#what-the-models-do)) |
 | `ivc: BYTE` (or `any`) | occurrence | A byte the board's IVC modem received acoustically, as its bridge decodes it |
+| `topic: NAME`, `msg: {...}` | value stream | Each message on the topic the board's mock agent decodes (`agents`; on a board with only a bridge, its titan_link messages of that variant, `topic: FirmwareStatus`), whose fields match `msg`: each field given must be there and match (others are not looked at), nested messages as maps, lists item by item, `{min, max}` (either) a number in a range, numbers equal to within a millionth (a float32's rounding), anything else exactly; without `msg`, any message on the topic. A topic the board's `ros.toml` does not have is an error |
 | `message: PATH`, `value: ...` | value stream | Each titan_link message from the board whose JSON form has `PATH` (`CameraCage.Depth`, `Power.Electrical.port_voltage`, `Heartbeat`), with the value there in a range (`value: [15, 17]`) or equal to a value (`value: true`, `value: "text"`); without `value`, any such message |
 
 **`count` and `rate`** go with `expect` on occurrences and value streams: how many matching ones the window
 holds (`count: 0` is "none", `count: {min: 3}`), or how many per second; they are judged when the window closes.
 
-| | occurrence (log, frame, ivc) | value stream (status, message) | state |
+| | occurrence (log, frame, ivc) | value stream (status, message, topic) | state |
 |---|---|---|---|
 | `expect` | one matches | one matches (at an instant: the latest) | it holds at a sample |
 | `never` | none matches | none matches | it holds at no sample |

@@ -10,6 +10,7 @@ and replay, log comparison, UDP tunnels, and the real host tools.
 - [Traces, profiles, waveforms and the dashboard](#traces-profiles-waveforms-and-the-dashboard)
 - [How a robot runs](#how-a-robot-runs)
 - [Mock bridges](#mock-bridges)
+- [Mock agents: nano-ROS and other protocols](#mock-agents-nano-ros-and-other-protocols)
 - [CAN logs: recording, replaying, comparing](#can-logs-recording-replaying-comparing)
 - [CAN over UDP (cannelloni)](#can-over-udp-cannelloni)
 - [titan_bridge command lines: `bridges`](#titan_bridge-command-lines-bridges)
@@ -25,6 +26,7 @@ and replay, log comparison, UDP tunnels, and the real host tools.
 | `robots/ivc2_pool.toml` | The same with IVCBoard2 |
 | `robots/ivc2_interop.toml` | The Rust `ivc_board2` and the C titan_firmware IVCBoard2 (your build, micro-ROS over USB) in the pool ([acoustics.md](acoustics.md#c-and-rust-ivcboard2-interop)) |
 | `robots/talos_c.toml` | Talos with titan_firmware's C board apps (your build, micro-ROS over CAN), as the robot runs them, in Talos's real thruster layout ([robot in a box](#robot-in-a-box-the-orins-side-on-vcan)) |
+| `robots/nanoros_led.toml` | The nano-ROS test board (`test_programs/nanoros_led`: osu-uwrt/nano_ros's libnanoros on the Talos LED board) with its `ros_toml`, for `--mock-agent nanoros:led` ([below](#mock-agents-nano-ros-and-other-protocols); early) |
 | `robots/talos_c_nereus.toml`, `robots/talos_nereus.toml` | The boards in the loop (PoAC, two ESC boards, camera cage), C or Rust, in a vehicle nereus moves ([nereus.md](nereus.md)) |
 
 ```toml
@@ -48,6 +50,7 @@ gpio = [{ pin = 29, level = "high" }]   # straps, replacing the board file's for
 # rom_boot = true                   # boot through the bootrom and boot2
 # usb_cdc = "pty:/tmp/esc1-log"     # USB plugged into a host that opens CDC port 0: stdout, pty or pty:PATH
 # usb_cdc2 = "pty:/tmp/esc1-ros"    # and CDC port 1 (micro-ROS over titan_dual_stdio_usb); usb = true only plugs in
+# ros_toml = "../path/ros.toml"     # a nano-ROS board's topics, for --mock-agent nanoros:BOARD (docs/nanoros.md)
 # position_m = [5.0, 6.0, 1.5]      # in an environment: where its transducer is,
 # trajectory = { start_m = [...], velocity_mps = [...] }   # or how it moves
 # [board.transducer]                # replaces the board file's transducer
@@ -94,6 +97,7 @@ as `[t] NAME uart0: ...`); the run ends with the stop time, the wall time and ea
 | `-t, --time T` | `5s` | Virtual time to run |
 | `--mock-bridge BUS:CLIENT` | | A mock bridge for one client on one bus (repeatable, one per client) |
 | `--eth-mock-bridge BOARD` | | A mock bridge on an Ethernet board's cable (Puddles) |
+| `--mock-agent PROTOCOL[:BUS][:BOARD][=CONFIG]` | | A scripted host side in the board's protocol: `nanoros:led` (a nano-ROS agent with the board's `ros_toml`), `nanoros:led=ros.toml`, `titan_link:poac` (`--mock-bridge` for the board's client); repeatable ([below](#mock-agents-nano-ros-and-other-protocols)) |
 | `--udp BOARD:LOCAL=PEER` | | Relays an Ethernet board's UDP through a host socket, e.g. `backplane:127.0.0.1:2203=127.0.0.1:2204` |
 | `--can BUS=IFACE` | | Bridges a bus to a SocketCAN interface, e.g. `internal=vcan0` (repeatable) |
 | `--candump` | | Prints every frame with its bus |
@@ -269,6 +273,36 @@ In code it is `sim_host::mock_bridge::MockBridge` (`PuddlesBridge` for Ethernet)
 `send_at` a virtual time, read `state().received` (or get each message as it arrives with `on_message`),
 `stop`/`start` it, `set_kill`, `fork` it for a snapshot. `IvcModem::from_image(name).transmit(byte)` and
 `ivc_received(msg)` are the IVC messages above.
+
+## Mock agents: nano-ROS and other protocols
+
+**Early and experimental: nano-ROS is still changing ([nanoros.md](nanoros.md)).** A mock agent is the scripted
+host side of one board's CAN link in whatever protocol its firmware speaks, behind one interface
+(`sim_host::host_protocol::HostAgent`) that the command line, [scenarios](scenarios.md#actions), the
+[dashboard](tools.md#dashboard) and the [MCP server](tools.md#mcp-server) use: messages from the board by
+topic, sending one by topic, a status. Two protocols speak it: `nanoros`, a stand-in for osu-uwrt/nano_ros's
+`nano_ros_agent` for titan_firmware C boards built with libnanoros, and `titan_link`, the mock bridge above (its
+messages' variants are its topics).
+
+`--mock-agent nanoros:BOARD` puts a nano-ROS agent on the board's bus for its CANmore client (from its board file),
+reading the topic table from the robot file's `ros_toml` for the board, or `nanoros:BOARD=ros.toml` from that file
+(`nanoros:BUS:CLIENT=ros.toml` for a client no board file names). It discovers the board, takes its topic
+registrations, checks them against the `ros.toml`, and prints each message the board publishes, decoded:
+
+```bash
+firmware_simulator robot robots/nanoros_led.toml --mock-agent nanoros:led --time 2s
+#   [INFO  sim_host::nanoros] [0.249318s] nano-ROS: client 6 registered 5 topic(s)
+#   [0.314943s] led <- imu_data {"angular_velocity":{"x":0.0,...},"header":{"frame_id":"imu_link",...},...}
+#   [1.055491s] led <- firmware_status {"board_name":"nanoros_led","bus_id":1,"client_id":6,...,"uptime_ms":1040,...}
+#   led: nanoros agent connected, 19 message(s) from the board, 0 sent, 0 error(s)
+firmware_simulator run test_programs/nanoros_led/nanoros_led.elf --board boards/talos/led_board.toml \
+    --mock-agent nanoros=test_programs/nanoros_led/ros.toml --time 2s
+```
+
+Sending to the board's subscribers goes through a scenario's `send: {board, topic, msg}`, the dashboard's
+`POST /api/agent` or the MCP `agent_send` tool. In code: `host_protocol::attach(&mut robot, &spec, dir)` (or
+`sim_host::nanoros::NanoRosAgent::new`), then `send(topic, &json, at)`, `messages(from)`, `on_message`, `status`,
+`stop`/`start` (the agent restarting), `fork`.
 
 ## CAN logs: recording, replaying, comparing
 

@@ -1,0 +1,6 @@
+<?xml version="1.0"?>
+<!-- Only the message definitions the emulator's nano-ROS mock agent (and nano_ros_codegen, as --ros-prefix) need.
+     From ROS 2 common_interfaces (Apache-2.0). -->
+<package format="3">
+  <name>geometry_msgs</name>
+</package>
