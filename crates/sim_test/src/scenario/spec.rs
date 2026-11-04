@@ -117,9 +117,22 @@ pub enum StepKind {
         message: Box<HostToDevice>,
         every: Option<Time>,
     },
+    /// An encoded titan_link message, any bytes (valid or not), from a board's bridge: `send: {bytes: "..."}`.
+    SendBytes {
+        target: Target,
+        bytes: Vec<u8>,
+    },
     IvcSend {
         board: String,
         byte: u8,
+    },
+    /// Raw CAN frames from a board's bridge (its SocketCAN interface, as `cansend` would), the `k`-th of
+    /// `repeat` rounds through the list going out `k * spacing` after the first.
+    CanSend {
+        target: Target,
+        frames: Vec<sim_devices::can::CanFrame>,
+        spacing: Time,
+        repeat: u32,
     },
     /// A point to stop at: the dashboard pauses there (`scenario --dashboard`); otherwise nothing happens.
     Pause(String),
@@ -133,8 +146,9 @@ impl StepKind {
         match self {
             StepKind::Fault { .. } => "fault",
             StepKind::Input(_) => "input",
-            StepKind::Send { .. } => "send",
+            StepKind::Send { .. } | StepKind::SendBytes { .. } => "send",
             StepKind::IvcSend { .. } => "ivc_send",
+            StepKind::CanSend { .. } => "can_send",
             StepKind::Pause(_) => "pause",
             StepKind::Expect(_) => "expect",
             StepKind::Never(_) => "never",
@@ -770,13 +784,25 @@ fn parse_bridge(s: &str) -> R<BridgeSpec> {
     Ok(BridgeSpec::Can { bus, client: client as u8 })
 }
 
+/// Hex bytes, spaces and underscores allowed: `"01 0A ff"`.
+fn hex_bytes(v: &Value, what: &str) -> R<Vec<u8>> {
+    let s = string(v, what)?.replace([' ', '_'], "");
+    if s.len() % 2 != 0 {
+        return Err(format!("{what}: {s:?}: an even number of hex digits"));
+    }
+    (0..s.len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(&s[i..i + 2], 16).map_err(|_| format!("{what}: {s:?}: not hex")))
+        .collect()
+}
+
 fn parse_inputs(v: &Value, what: &str) -> R<Vec<(String, f64)>> {
     let m = map(v, what)?;
     m.iter().map(|(k, v)| Ok((key_str(k)?.to_string(), number(v, &format!("{what}.{}", key_str(k)?))?))).collect()
 }
 
 const TIMING: [&str; 4] = ["at", "after", "within", "until"];
-const KINDS: [&str; 8] = ["fault", "input", "send", "ivc_send", "pause", "expect", "never", "always"];
+const KINDS: [&str; 9] = ["fault", "input", "send", "ivc_send", "can_send", "pause", "expect", "never", "always"];
 
 fn parse_steps(v: &Value, first: usize) -> R<Vec<Step>> {
     let list = v.as_sequence().ok_or("steps: expected a list")?;
@@ -903,10 +929,16 @@ fn parse_kind(kind: &str, body: &Value) -> R<StepKind> {
         }
         "send" => {
             let m = without_timing(map(body, "send")?);
-            check_keys(&m, &["board", "bridge", "message", "every"], "send")?;
+            check_keys(&m, &["board", "bridge", "message", "bytes", "every"], "send")?;
             let target = parse_target(&m)?;
             if target.board.is_none() && target.bridge.is_none() {
                 return Err("needs `board` or `bridge`: whose bridge sends it".into());
+            }
+            if let Some(b) = get(&m, "bytes") {
+                if get(&m, "message").is_some() || get(&m, "every").is_some() {
+                    return Err("`bytes` goes alone: no `message` or `every` with it".into());
+                }
+                return Ok(StepKind::SendBytes { target, bytes: hex_bytes(b, "bytes")? });
             }
             let msg =
                 get(&m, "message").ok_or("needs a `message`, e.g. {Esc: {ThrusterRpm: [0, 0, 0, 0, 0, 0, 0, 0]}}")?;
@@ -936,6 +968,33 @@ fn parse_kind(kind: &str, body: &Value) -> R<StepKind> {
                 _ => return Err(format!("expected BOARD:BYTE or {{board, byte}}, found {}", show(body))),
             };
             StepKind::IvcSend { board, byte: integer(&byte, "byte")? }
+        }
+        "can_send" => {
+            let m = without_timing(map(body, "can_send")?);
+            check_keys(&m, &["board", "bridge", "frames", "spacing", "repeat"], "can_send")?;
+            let target = parse_target(&m)?;
+            if target.board.is_none() && target.bridge.is_none() {
+                return Err("needs `board` or `bridge`: whose bridge's interface sends them".into());
+            }
+            let list = match get(&m, "frames") {
+                Some(Value::Sequence(l)) => l.clone(),
+                Some(v @ Value::String(_)) => vec![v.clone()],
+                Some(v) => return Err(format!("frames: expected a list of ID#DATA frames, found {}", show(v))),
+                None => return Err("needs `frames`, e.g. [\"123#DEADBEEF\", \"01234567##1AABB\"]".into()),
+            };
+            let frames = list
+                .iter()
+                .map(|f| sim_host::canlog::parse_frame(&string(f, "frames")?).map_err(|e| format!("frames: {e}")))
+                .collect::<R<Vec<_>>>()?;
+            if frames.is_empty() {
+                return Err("frames: the list is empty".into());
+            }
+            let spacing = get(&m, "spacing").map(|v| time(v, "spacing")).transpose()?.unwrap_or(Time::ZERO);
+            let repeat = get(&m, "repeat").map(|v| integer(v, "repeat")).transpose()?.unwrap_or(1);
+            if repeat == 0 {
+                return Err("repeat: at least 1".into());
+            }
+            StepKind::CanSend { target, frames, spacing, repeat }
         }
         "pause" => StepKind::Pause(match body {
             Value::Null => String::new(),

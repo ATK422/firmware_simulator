@@ -193,6 +193,8 @@ pub struct PuddlesState {
     pub heartbeats: Vec<(Time, Heartbeat)>,
     pub errors: Vec<String>,
     pub pending: Vec<HostToDevice>,
+    /// Encoded titan_link messages (any bytes) to send once as `"TL"` datagrams ([`PuddlesBridge::send_encoded`]).
+    pub pending_encoded: Vec<Vec<u8>>,
     pub pings: u64,
     pub last_ping: Option<Time>,
     next_ping: Time,
@@ -223,6 +225,11 @@ impl PuddlesBridge {
 
     pub fn send(&self, msg: HostToDevice) {
         self.state().pending.push(msg);
+    }
+
+    /// Sends `bytes` as an encoded titan_link message (a `"TL"` datagram around whatever they are).
+    pub fn send_encoded(&self, bytes: &[u8]) {
+        self.state().pending_encoded.push(bytes.to_vec());
     }
 
     pub fn stop(&self) {
@@ -300,6 +307,15 @@ impl EthEndpoint for PuddlesBridge {
                 }
             }
             s.pending = kept;
+            let mut kept = Vec::new();
+            for bytes in std::mem::take(&mut s.pending_encoded) {
+                let mut d = b"TL".to_vec();
+                d.extend_from_slice(&bytes);
+                if !s.host.send(&d, until) {
+                    kept.push(bytes);
+                }
+            }
+            s.pending_encoded = kept;
             while s.next_ping <= until {
                 let at = s.next_ping;
                 let ping = HostToDevice::Ping { protocol_version: titan_link::PROTOCOL_VERSION };

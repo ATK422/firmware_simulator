@@ -1378,6 +1378,17 @@ pub fn describe(st: &Step) -> String {
                 None => format!("{target} {m}"),
             }
         }
+        StepKind::SendBytes { target, bytes } => {
+            let hex: String = bytes.iter().take(24).map(|b| format!("{b:02x}")).collect();
+            format!("{target} bytes {hex}{}", if bytes.len() > 24 { "..." } else { "" })
+        }
+        StepKind::CanSend { target, frames, spacing, repeat } => {
+            let first = sim_host::canlog::compact(&frames[0]);
+            let more = if frames.len() > 1 { format!(" and {} more", frames.len() - 1) } else { String::new() };
+            let rounds = if *repeat > 1 { format!(" x{repeat}") } else { String::new() };
+            let gap = if *spacing > Time::ZERO { format!(" {} apart", short_time(*spacing)) } else { String::new() };
+            format!("{target} {first}{more}{rounds}{gap}")
+        }
         StepKind::IvcSend { board, byte } => format!("{board} {byte:#04x}"),
         StepKind::Pause(t) if t.is_empty() => String::new(),
         StepKind::Pause(t) => format!("{t:?}"),
@@ -1830,6 +1841,28 @@ impl Engine {
                 }
                 self.tl.sends.sort_by_key(|s| s.0);
                 Ok(Vec::new())
+            }
+            StepKind::SendBytes { target, bytes } => {
+                match self.w.target_bridge(target)? {
+                    BridgeRef::Can(k) => self.w.can[k].2.send_encoded(bytes),
+                    BridgeRef::Eth(k) => self.w.eth[k].1.send_encoded(bytes),
+                }
+                Ok(Vec::new())
+            }
+            StepKind::CanSend { target, frames, spacing, repeat } => {
+                let BridgeRef::Can(k) = self.w.target_bridge(target)? else {
+                    return Err("can_send: the bridge is on an Ethernet cable, not a CAN bus".into());
+                };
+                let bridge = &self.w.can[k].2;
+                let mut t = now;
+                for _ in 0..*repeat {
+                    for f in frames {
+                        bridge.send_frame_at(t, f.clone());
+                        t += *spacing;
+                    }
+                }
+                let n = frames.len() * *repeat as usize;
+                Ok(vec![format!("{n} frame(s) from {now} to {}", t - *spacing)])
             }
             StepKind::IvcSend { board, byte } => {
                 let i = self.w.board(board)?;

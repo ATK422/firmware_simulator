@@ -156,6 +156,20 @@ fn parse_hex_bytes(s: &str) -> Result<Vec<u8>, String> {
         .collect()
 }
 
+/// One frame in `candump -l` notation ([`compact`]; `cansend`'s): `123#DEADBEEF`, `12345678##1DEADBEEF` (FD, flags
+/// nibble: BRS 1, ESI 2), `123#R`. A CAN FD payload is padded with zeros to the next length a frame can carry, as
+/// SocketCAN does.
+pub fn parse_frame(tok: &str) -> Result<CanFrame, String> {
+    if !tok.contains('#') {
+        return Err(format!("{tok:?}: expected ID#DATA, ID##FLAGSDATA or ID#R"));
+    }
+    let mut f = parse_compact(tok)?.ok_or_else(|| format!("{tok:?}: an error or CAN XL frame"))?;
+    if f.fd {
+        f.data.resize(sim_devices::can::fd_dlc_to_len(sim_devices::can::fd_len_to_dlc(f.data.len())), 0);
+    }
+    Ok(f)
+}
+
 /// `123#11223344`, `123#R`, `123#R4`, `12345678##1AABB` (FD), `123#1122334455667788_9` (classic DLC suffix).
 fn parse_compact(tok: &str) -> Result<Option<CanFrame>, String> {
     if tok.contains("###") {
@@ -665,6 +679,23 @@ pub fn interfaces(log: &[LogFrame]) -> Vec<String> {
 mod tests {
     use super::*;
     use sim_devices::can::{CanBus, Monitor};
+
+    #[test]
+    fn single_frames_parse_and_pad_like_cansend() {
+        assert_eq!(parse_frame("123#DEADBEEF").unwrap(), CanFrame::classic(0x123, false, &[0xDE, 0xAD, 0xBE, 0xEF]));
+        let fd = parse_frame("01234567##3").unwrap();
+        assert!(fd.fd && fd.brs && fd.esi && fd.extended && fd.data.is_empty());
+        // 9 bytes are carried in a 12 byte frame
+        let fd = parse_frame("123##0000102030405060708").unwrap();
+        assert_eq!(fd.data.len(), 12);
+        assert!(!fd.brs && !fd.extended);
+        assert_eq!(&fd.data[..9], &[0, 1, 2, 3, 4, 5, 6, 7, 8]);
+        assert!(parse_frame("7FF#R").unwrap().rtr);
+        assert_eq!(compact(&parse_frame("1FFFFFFF#00").unwrap()), "1FFFFFFF#00");
+        for bad in ["123", "123#0", "123#000102030405060708", "2000007F#00", "XYZ#00"] {
+            assert!(parse_frame(bad).is_err(), "{bad}");
+        }
+    }
 
     /// Arrivals are logged to the nanosecond and replayed at exactly those times; a replay tells when it sends.
     #[test]
