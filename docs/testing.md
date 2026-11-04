@@ -235,10 +235,10 @@ pass) without them.
 | `crates/sim_test/tests/harness.rs` | The harness itself (snapshots, board edits), the H-bridge board, the Dynamixel bench test |
 | `crates/sim_test/tests/faults.rs` | Fault injection against the safety system, and the `firmware_finding_*` tests |
 | `crates/sim_test/tests/can_log.rs` | Recording, replaying and comparing CAN traffic, a cannelloni tunnel |
-| `crates/sim_test/tests/vehicle.rs`, `vehicle_talos.rs` | Thrusters in the loop on Puddles and Talos |
+| `crates/sim_test/tests/vehicle.rs`, `vehicle_talos.rs`, `vehicle_nereus.rs` | Thrusters in the loop on Puddles and Talos, and the controller's raw CAN thruster frames with nereus as the physics |
 | `crates/sim_test/tests/ivc_sweep.rs` | IVC delivery against range and noise (prints tables with `--nocapture`; the slowest suite) |
 | `crates/sim_test/tests/guide.rs` | This page's walkthrough |
-| `tests/host_cli.rs` (root package) | The command line: robot record/replay/diff, `bridges` outputs, `scripts/vcan_up.sh` with stand-ins, the Docker files' consistency |
+| `tests/host_cli.rs` (root package) | The command line: robot record/replay/diff, `bridges` outputs, `scripts/vcan_up.sh` with stand-ins, `robot_in_a_box.sh` and `nereus_firmware_sim.sh` in `--dry-run`, the nereus bridge's Python tests, the Docker files' consistency |
 | `tests/docs.rs` (root package) | Every command line option the docs and the README mention exists |
 
 `test_programs/` holds the hand-written Thumb programs, a small embassy firmware, pico-sdk programs and small C

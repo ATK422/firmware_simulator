@@ -18,6 +18,12 @@
 //! | `POST /api/fault` `{"board": "esc0", "fault": "can-stuck"}` | applies a fault (`sim_host::fault::Fault` syntax) |
 //! | `POST /api/input` `{"board": "esc0", "name": "esc_vcc", "value": 12.0}` | sets a physical input |
 //! | `POST /api/pause` `{"paused": true, "at_s": 2.0}` | pauses or resumes virtual time (`at_s`: pause when it gets there) |
+//! | `GET /api/thrusters` | every DShot ESC's propeller speed and each vehicle's thrust, built live (see [`thrusters_json`]) |
+//! | `POST /api/vehicle` `{"vehicle": "talos", "position_m": [n, e, d], "rpy_deg": [r, p, y]}` | puts a vehicle at a pose (an external one: its only motion), answered with `/api/thrusters` |
+//!
+//! `POST /api/vehicle` takes the attitude as `rpy_deg` or `quat_wxyz` (body to world), and optionally
+//! `velocity_mps` (body frame) and `rate_dps`; `vehicle` may be left out when there is one. Frames are the
+//! emulator's: world north-east-down, body forward-starboard-down ([`crate::vehicle::ExternalPose`]).
 
 use std::collections::{BTreeMap, VecDeque};
 use std::io::{Read, Write};
@@ -37,6 +43,7 @@ use crate::ethernet::PuddlesBridge;
 use crate::fault::{BridgeControl, Fault};
 use crate::mock_bridge::MockBridge;
 use crate::robot::{Robot, RobotBus};
+use crate::vehicle::ExternalPose;
 
 const PAGE: &str = include_str!("dashboard.html");
 /// Log lines kept per board (for `GET /api/logs`).
@@ -347,6 +354,16 @@ enum Command {
     Refresh {
         reply: mpsc::Sender<Result<String, String>>,
     },
+    /// `GET /api/thrusters`, built by the run loop.
+    Thrusters {
+        reply: mpsc::Sender<Result<Value, String>>,
+    },
+    /// `POST /api/vehicle`.
+    Vehicle {
+        name: String,
+        pose: ExternalPose,
+        reply: mpsc::Sender<Result<Value, String>>,
+    },
 }
 
 struct Shared {
@@ -581,6 +598,13 @@ impl Dashboard {
                     replies.push((reply, r));
                 }
                 Command::Refresh { reply } => replies.push((reply, Ok(String::new()))),
+                Command::Thrusters { reply } => {
+                    let v = thrusters_json(&self.board_names(), &[&*s], &[], s.machine.now);
+                    let _ = reply.send(Ok(self.with_status(v, s.machine.now)));
+                }
+                Command::Vehicle { reply, .. } => {
+                    let _ = reply.send(Err("a single board's run has no vehicle".into()));
+                }
             }
         }
         let paused_now = self.pause_if_due(s.machine.now);
@@ -628,6 +652,17 @@ impl Dashboard {
                     replies.push((reply, res));
                 }
                 Command::Refresh { reply } => replies.push((reply, Ok(String::new()))),
+                Command::Thrusters { reply } => {
+                    let _ = reply.send(Ok(self.robot_thrusters(r)));
+                }
+                Command::Vehicle { name, pose, reply } => {
+                    let res = set_vehicle_pose(r, &name, &pose).map(|msg| {
+                        let mut v = self.robot_thrusters(r);
+                        v["message"] = msg.into();
+                        v
+                    });
+                    let _ = reply.send(res);
+                }
             }
         }
         let paused_now = self.pause_if_due(r.now);
@@ -716,9 +751,31 @@ impl Dashboard {
                 | Ok(Command::Refresh { reply }) => {
                     let _ = reply.send(Err("the run is over".into()));
                 }
+                Ok(Command::Thrusters { reply }) | Ok(Command::Vehicle { reply, .. }) => {
+                    let _ = reply.send(Err("the run is over".into()));
+                }
                 Err(_) => std::thread::sleep(Duration::from_secs(3600)),
             }
         }
+    }
+
+    fn board_names(&self) -> Vec<String> {
+        self.boards.iter().map(|b| b.name.clone()).collect()
+    }
+
+    /// `/api/thrusters` of a robot, with where the run is.
+    fn robot_thrusters(&self, r: &Robot) -> Value {
+        let boards: Vec<&Session> = r.boards.iter().collect();
+        let v = thrusters_json(&self.board_names(), &boards, &r.vehicles, r.now);
+        self.with_status(v, r.now)
+    }
+
+    /// Adds the run's time and state to a live answer.
+    fn with_status(&self, mut v: Value, now: Time) -> Value {
+        v["time_s"] = now.as_secs_f64().into();
+        v["paused"] = self.paused.into();
+        v["finished"] = json!(self.finished);
+        v
     }
 
     fn record_fault(&mut self, t: Time, board: &str, spec: &str, r: &Result<(), String>) {
@@ -824,7 +881,8 @@ impl Dashboard {
                         "velocity_mps": s.velocity,
                         "speed_mps": sim_physics::math::norm(s.velocity),
                         "rate_dps": s.rate.map(f64::to_degrees),
-                        "thrusters": vs.vehicle.thrusters.iter().zip(rpms).map(|(t, rpm)| json!({"name": t.name, "rpm": rpm})).collect::<Vec<_>>(),
+                        "external": vs.external,
+                        "thrusters": vs.vehicle.thrusters.iter().zip(rpms).map(|(t, rpm)| json!({"name": t.name, "rpm": rpm, "thrust_n": t.thrust(rpm)})).collect::<Vec<_>>(),
                     })
                 })
                 .collect::<Vec<_>>()
@@ -930,6 +988,134 @@ impl Dashboard {
     pub fn published(&self) -> String {
         self.shared.lock().unwrap().state.clone()
     }
+}
+
+/// `GET /api/thrusters`: every DShot ESC of every board (`escs`: board, ESC name, propeller speed in signed
+/// mechanical RPM, the last throttle value it got, whether its signal is lost, and the vehicle thruster it spins
+/// with that thruster's thrust in newtons along its direction), and each vehicle's thrusters in the vehicle file's
+/// order with its pose. `board_names` are the robot's board names, in order; the speeds are those at `now`.
+pub fn thrusters_json(
+    board_names: &[String],
+    boards: &[&Session],
+    vehicles: &[crate::vehicle::VehicleSim],
+    now: Time,
+) -> Value {
+    use sim_devices::dshot::Esc;
+    let mut escs = Vec::new();
+    for (i, s) in boards.iter().enumerate() {
+        for (k, d) in s.machine.sys.pin_devices.iter().enumerate() {
+            let Some(e) = d.as_any().downcast_ref::<Esc>() else { continue };
+            let mut x = json!({
+                "board": board_names.get(i).cloned().unwrap_or_default(),
+                "esc": e.name,
+                "rpm": e.rpm_at(now),
+                "throttle": e.last_throttle(),
+                "signal_lost": e.signal_lost(now),
+                "thruster": Value::Null,
+                "thrust_n": Value::Null,
+            });
+            for v in vehicles {
+                if let Some(t) = v.wiring().iter().position(|w| *w == Some((i, k))) {
+                    x["vehicle"] = v.vehicle.name.clone().into();
+                    x["thruster"] = v.vehicle.thrusters[t].name.clone().into();
+                    x["thrust_n"] = v.vehicle.thrusters[t].thrust(e.rpm_at(now)).into();
+                }
+            }
+            escs.push(x);
+        }
+    }
+    let vehicles: Vec<Value> = vehicles
+        .iter()
+        .map(|v| {
+            let s = &v.vehicle.state;
+            let rpms = v.rpms(boards, now);
+            let thrusters: Vec<Value> = v
+                .vehicle
+                .thrusters
+                .iter()
+                .zip(v.wiring())
+                .zip(rpms)
+                .map(|((t, w), rpm)| {
+                    let (board, esc) = match w {
+                        Some((b, k)) => (
+                            board_names.get(*b).cloned(),
+                            boards[*b].machine.sys.pin_devices[*k]
+                                .as_any()
+                                .downcast_ref::<Esc>()
+                                .map(|e| e.name.clone()),
+                        ),
+                        None => (None, None),
+                    };
+                    json!({"name": t.name, "board": board, "esc": esc, "rpm": rpm, "thrust_n": t.thrust(rpm)})
+                })
+                .collect();
+            json!({
+                "name": v.vehicle.name,
+                "external": v.external,
+                "poses_set": v.poses_set,
+                "position_m": s.position,
+                "rpy_deg": s.attitude.euler().map(f64::to_degrees),
+                "thrusters": thrusters,
+            })
+        })
+        .collect();
+    json!({"escs": escs, "vehicles": vehicles})
+}
+
+/// Puts the vehicle called `name` (or the only one, for an empty name) at `pose`.
+fn set_vehicle_pose(r: &mut Robot, name: &str, pose: &ExternalPose) -> Result<String, String> {
+    let names: Vec<String> = r.vehicles.iter().map(|v| v.vehicle.name.clone()).collect();
+    let v = match name {
+        "" if r.vehicles.len() == 1 => &mut r.vehicles[0],
+        "" if r.vehicles.is_empty() => return Err("the robot has no vehicle".into()),
+        "" => return Err(format!("which vehicle? there are: {}", names.join(", "))),
+        n => r
+            .vehicles
+            .iter_mut()
+            .find(|v| v.vehicle.name == n)
+            .ok_or_else(|| format!("no vehicle {n:?}; there are: {}", names.join(", ")))?,
+    };
+    v.set_pose(pose);
+    let p = pose.position;
+    Ok(format!("{} at [{:.3}, {:.3}, {:.3}] m", v.vehicle.name, p[0], p[1], p[2]))
+}
+
+/// The pose of a `POST /api/vehicle` body: `position_m`, `rpy_deg` or `quat_wxyz`, optional `velocity_mps` and
+/// `rate_dps`; also returns its `vehicle`.
+pub fn parse_pose(body: &Value) -> Result<(String, ExternalPose), String> {
+    fn vec<const N: usize>(body: &Value, key: &str) -> Result<Option<[f64; N]>, String> {
+        let v = &body[key];
+        if v.is_null() {
+            return Ok(None);
+        }
+        let a = v.as_array().filter(|a| a.len() == N).ok_or_else(|| format!("{key}: expected {N} numbers"))?;
+        let mut out = [0.0; N];
+        for (o, x) in out.iter_mut().zip(a) {
+            *o = x.as_f64().filter(|x| x.is_finite()).ok_or_else(|| format!("{key}: expected {N} numbers"))?;
+        }
+        Ok(Some(out))
+    }
+    let name = match &body["vehicle"] {
+        Value::Null => String::new(),
+        Value::String(s) => s.clone(),
+        _ => return Err("vehicle: expected a name".into()),
+    };
+    let position = vec::<3>(body, "position_m")?.ok_or("position_m: missing")?;
+    let attitude = match (vec::<3>(body, "rpy_deg")?, vec::<4>(body, "quat_wxyz")?) {
+        (Some(_), Some(_)) => return Err("give rpy_deg or quat_wxyz, not both".into()),
+        (Some([r, p, y]), None) => sim_physics::Quat::from_euler(r.to_radians(), p.to_radians(), y.to_radians()),
+        (None, Some([w, x, y, z])) => {
+            let n = (w * w + x * x + y * y + z * z).sqrt();
+            if n <= 1e-6 {
+                return Err("quat_wxyz: not a rotation".into());
+            }
+            sim_physics::Quat { w, x, y, z }.normalized()
+        }
+        (None, None) => return Err("rpy_deg or quat_wxyz: missing".into()),
+    };
+    let velocity = vec::<3>(body, "velocity_mps")?;
+    let rate = vec::<3>(body, "rate_dps")?.map(|r| r.map(f64::to_radians));
+    Ok((name, ExternalPose { position, attitude, velocity, rate }))
 }
 
 impl Drop for Dashboard {
@@ -1196,6 +1382,26 @@ impl Server {
     }
 }
 
+/// Sends `cmd` to the run loop and answers with what it built (`{"ok": true, ...}`), or the error.
+fn live(
+    stream: &mut TcpStream,
+    server: &Server,
+    cmd: Command,
+    answer: mpsc::Receiver<Result<Value, String>>,
+) -> std::io::Result<()> {
+    if server.tx.send(cmd).is_err() {
+        return json_reply(stream, 503, json!({"ok": false, "error": "the run is over"}));
+    }
+    match answer.recv_timeout(REPLY_TIMEOUT) {
+        Ok(Ok(mut v)) => {
+            v["ok"] = true.into();
+            json_reply(stream, 200, v)
+        }
+        Ok(Err(e)) => json_reply(stream, 422, json!({"ok": false, "error": e})),
+        Err(_) => json_reply(stream, 503, json!({"ok": false, "error": "the run loop did not answer"})),
+    }
+}
+
 fn handle(mut stream: TcpStream, server: &Server) -> std::io::Result<()> {
     stream.set_read_timeout(Some(Duration::from_secs(5)))?;
     let Some(req) = read_request(&mut stream)? else { return Ok(()) };
@@ -1220,6 +1426,21 @@ fn handle(mut stream: TcpStream, server: &Server) -> std::io::Result<()> {
                 Ok(v) => json_reply(&mut stream, 200, v),
                 Err(e) => json_reply(&mut stream, 400, json!({"ok": false, "error": e})),
             }
+        }
+        ("GET", "/api/thrusters") => {
+            let (reply, answer) = mpsc::channel();
+            live(&mut stream, server, Command::Thrusters { reply }, answer)
+        }
+        ("POST", "/api/vehicle") => {
+            let parsed = serde_json::from_slice::<Value>(&req.body)
+                .map_err(|e| format!("bad JSON: {e}"))
+                .and_then(|b| parse_pose(&b));
+            let (name, pose) = match parsed {
+                Ok(p) => p,
+                Err(e) => return json_reply(&mut stream, 400, json!({"ok": false, "error": e})),
+            };
+            let (reply, answer) = mpsc::channel();
+            live(&mut stream, server, Command::Vehicle { name, pose, reply }, answer)
         }
         ("POST", "/api/fault") | ("POST", "/api/input") | ("POST", "/api/pause") => {
             let body: Value = match serde_json::from_slice(&req.body) {
@@ -1273,7 +1494,9 @@ fn handle(mut stream: TcpStream, server: &Server) -> std::io::Result<()> {
         | (_, "/api/frames")
         | (_, "/api/fault")
         | (_, "/api/input")
-        | (_, "/api/pause") => json_reply(&mut stream, 405, json!({"ok": false, "error": "method not allowed"})),
+        | (_, "/api/pause")
+        | (_, "/api/thrusters")
+        | (_, "/api/vehicle") => json_reply(&mut stream, 405, json!({"ok": false, "error": "method not allowed"})),
         _ => json_reply(&mut stream, 404, json!({"ok": false, "error": "not found"})),
     }
 }

@@ -78,6 +78,25 @@ const OUTSIDE: &[(&str, &str)] = &[
     ("--scope", "claude mcp add"),
 ];
 
+/// The options of this repository's scripts and the nereus bridge, from their `--help`.
+fn script_options() -> BTreeSet<String> {
+    let mut out = BTreeSet::new();
+    for s in ["robot_in_a_box.sh", "nereus_firmware_sim.sh"] {
+        let o = Command::new("bash").arg(repo().join("scripts").join(s)).arg("--help").output().unwrap();
+        assert!(o.status.success(), "{s} --help");
+        out.extend(options(&String::from_utf8_lossy(&o.stdout)));
+    }
+    for py in ["firmware_bridge.py", "make_packs.py"] {
+        let path = repo().join("integrations/nereus").join(py);
+        let o = match Command::new("python3").args(["-I", "-B"]).arg(path).arg("--help").output() {
+            Ok(o) if o.status.success() => o,
+            _ => panic!("{py} --help"),
+        };
+        out.extend(options(&String::from_utf8_lossy(&o.stdout)));
+    }
+    out
+}
+
 /// A `firmware_simulator` command shown on a page: its subcommand and the text of its arguments (continuation
 /// lines included).
 fn commands(text: &str) -> Vec<(String, String)> {
@@ -146,6 +165,7 @@ fn every_option_mentioned_exists() {
         known.extend(help_options(sub));
     }
     known.extend(OUTSIDE.iter().map(|(o, _)| o.to_string()));
+    known.extend(script_options());
     let mut unknown = Vec::new();
     for (path, text) in pages() {
         for opt in options(&text) {

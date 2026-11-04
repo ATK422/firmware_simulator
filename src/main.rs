@@ -107,6 +107,11 @@ struct RobotArgs {
     /// vehicle's name when there are several).
     #[arg(long)]
     vehicle_csv: Option<PathBuf>,
+    /// Let another simulator move this vehicle (repeatable; as `external = true` in the robot file): its own
+    /// physics stop, and the dashboard's `POST /api/vehicle` puts it where the other simulator has it, its sensors
+    /// and transducers following. `GET /api/thrusters` gives the thrust its ESCs make. Needs `--dashboard`.
+    #[arg(long = "external-vehicle")]
+    external_vehicles: Vec<String>,
     /// Inject a fault on a board at a virtual time: `TIME@BOARD:FAULT`, e.g. `1.5s@camera_cage:can-unplug`
     /// (repeatable; see `sim_host::fault::Fault`'s `from_str` for the faults). Bridge faults act on the first mock
     /// bridge on the board's bus.
@@ -341,6 +346,23 @@ fn robot(args: RobotArgs) -> Result<()> {
     if args.vehicle_csv.is_some() {
         for v in &mut r.vehicles {
             v.keep_log(Time::from_ms(10));
+        }
+    }
+    for name in &args.external_vehicles {
+        let names: Vec<String> = r.vehicles.iter().map(|v| v.vehicle.name.clone()).collect();
+        let v = r.vehicle(name).with_context(|| {
+            format!("--external-vehicle: no vehicle {name:?} (the robot has: {})", names.join(", "))
+        })?;
+        v.external = true;
+    }
+    for v in &r.vehicles {
+        if v.external {
+            log::info!("vehicle {} is moved externally (POST /api/vehicle)", v.vehicle.name);
+            anyhow::ensure!(
+                args.dashboard.is_some(),
+                "vehicle {} is external: only the dashboard's POST /api/vehicle can move it, so add --dashboard ADDR",
+                v.vehicle.name
+            );
         }
     }
     let can_host = host_tools::attach_robot(&args.can_host, &mut r, &args.cans)?;
