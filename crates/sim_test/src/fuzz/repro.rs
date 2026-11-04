@@ -117,10 +117,7 @@ pub fn scenario_yaml(
         Kind::ErrorLog => mapping(vec![(
             "expect",
             mapping(vec![
-                (
-                    "log",
-                    mapping(vec![("regex", Value::String(super::oracle::gist(&finding.detail).replace('#', ".")))]),
-                ),
+                ("log", mapping(vec![("regex", Value::String(super::oracle::gist_regex(&finding.detail)))])),
                 ("level", Value::String("error".into())),
                 ("within", within),
             ]),

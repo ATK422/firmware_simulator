@@ -142,12 +142,14 @@ pub fn check(base: &Baseline, o: &Outcome) -> Vec<Finding> {
     }
 
     // A fault bit raised that the baseline did not have and that is still set at the end
+    // One finding per bit, so a case that latches two faults is not a third, combined finding
     let new_faults = o.faults & !base.faults;
-    if new_faults != 0 {
+    for b in (0..32).filter(|b| new_faults & (1 << b) != 0) {
+        let name = fault_list(&base.fault_names, 1 << b);
         push(Finding {
             kind: Kind::FaultLatched,
-            key: format!("fault:{}", fault_list(&base.fault_names, new_faults)),
-            detail: format!("faults {new_faults:#x} ({})", fault_list(&base.fault_names, new_faults)),
+            key: format!("fault:{name}"),
+            detail: format!("{name} raised and still set at the end (faults {:#x})", o.faults),
             at: None,
         });
     }
@@ -173,7 +175,8 @@ pub fn check(base: &Baseline, o: &Outcome) -> Vec<Finding> {
     }
 
     for (t, level, msg) in o.logs {
-        if level.as_deref() == Some("ERROR") {
+        // defmt levels come as `error`, `warn`, ... (defmt_decoder's `Level::as_str`)
+        if level.as_deref().is_some_and(|l| l.eq_ignore_ascii_case("error")) {
             // Collapse the numbers out of the key so the same message with different arguments is one finding
             push(Finding {
                 kind: Kind::ErrorLog,
@@ -188,23 +191,27 @@ pub fn check(base: &Baseline, o: &Outcome) -> Vec<Finding> {
     out
 }
 
-/// The gist of a log line: its text with runs of digits and hex replaced, so the same message with other
-/// arguments collapses to one key.
+/// The gist of a log line: its text with every number (a run starting with a digit: `172`, `0x3a981`) replaced
+/// by `#`, so the same message with other arguments collapses to one key. Words stay as they are.
 pub fn gist(msg: &str) -> String {
     let mut out = String::new();
-    let mut in_num = false;
-    for c in msg.chars() {
-        let num = c.is_ascii_hexdigit() || c == 'x';
-        if num {
-            if !in_num {
-                out.push('#');
+    let mut chars = msg.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c.is_ascii_digit() {
+            while chars.peek().is_some_and(|n| n.is_ascii_hexdigit() || *n == 'x' || *n == 'X') {
+                chars.next();
             }
+            out.push('#');
         } else {
             out.push(c);
         }
-        in_num = num;
     }
     out
+}
+
+/// A regex (Rust syntax) matching a log line with `msg`'s gist: the text escaped, each number any number.
+pub fn gist_regex(msg: &str) -> String {
+    gist(msg).split('#').map(regex::escape).collect::<Vec<_>>().join("[0-9A-Fa-fxX]+")
 }
 
 #[cfg(test)]
@@ -246,11 +253,11 @@ mod tests {
             ["UART0.UARTIBRD".to_string(), "SPI0.SSPCR0".to_string()].into_iter().collect();
         let o = Outcome {
             logs: &[
-                (Time::from_ms(1), Some("ERROR".into()), "PANIC: wild".into()),
-                (Time::from_ms(2), Some("ERROR".into()), "Fault raised arg 0x12".into()),
-                (Time::from_ms(3), Some("ERROR".into()), "Fault raised arg 0x34".into()),
+                (Time::from_ms(1), Some("error".into()), "PANIC: wild".into()),
+                (Time::from_ms(2), Some("error".into()), "Fault raised arg 0x12".into()),
+                (Time::from_ms(3), Some("error".into()), "Fault raised arg 0x34".into()),
             ],
-            faults: 0b100,
+            faults: 0b1100,
             unmodelled: &unmodelled,
             resets: 1,
             lockups: 0,
@@ -261,7 +268,8 @@ mod tests {
         let kinds: Vec<Kind> = fs.iter().map(|f| f.kind).collect();
         assert!(kinds.contains(&Kind::Panic));
         assert!(kinds.contains(&Kind::WatchdogReset));
-        assert!(kinds.contains(&Kind::FaultLatched));
+        // Two latched bits are two findings, not one combined key
+        assert_eq!(fs.iter().filter(|f| f.kind == Kind::FaultLatched).count(), 2);
         assert!(kinds.contains(&Kind::UnmodelledAccess));
         // The two "Fault raised arg 0x.." ERROR lines collapse to one key (plus the PANIC one)
         assert_eq!(fs.iter().filter(|f| f.kind == Kind::ErrorLog).count(), 2);
@@ -289,5 +297,13 @@ mod tests {
     fn gist_collapses_numbers() {
         assert_eq!(gist("Fault raised arg 0x12"), gist("Fault raised arg 0x9ab"));
         assert_ne!(gist("Depth error"), gist("Comm error"));
+        // Words with hex letters stay words; only numbers are masked
+        assert_eq!(
+            gist("Bridge speaks titan_link v172, firmware speaks v2"),
+            "Bridge speaks titan_link v#, firmware speaks v#"
+        );
+        let re = regex::Regex::new(&gist_regex("Bridge speaks v172 (arg 0x3a981)")).unwrap();
+        assert!(re.is_match("Bridge speaks v9 (arg 0xff)"));
+        assert!(!re.is_match("Bridge speaks v (arg 0xff)"));
     }
 }

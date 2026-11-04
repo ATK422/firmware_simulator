@@ -17,7 +17,8 @@ pub struct FuzzArgs {
     /// `docs/fuzzing.md`).
     #[arg(value_name = "BOARD")]
     boards: Vec<String>,
-    /// Stop each board after this much wall time (shared out over `--jobs`). Give this or `--cases`.
+    /// Wall-time budget shared out over the boards that boot: `25m`, `90s`, `1h`, `1500ms` (a bare number is
+    /// seconds). Give this or `--cases`.
     #[arg(long, value_name = "DURATION")]
     time: Option<String>,
     /// Run this many cases per board instead of a time budget.
@@ -50,7 +51,7 @@ pub fn run(args: FuzzArgs) -> Result<()> {
     if args.time.is_some() && args.cases.is_some() {
         bail!("give --time or --cases, not both");
     }
-    let budget = args.time.as_deref().map(parse_time).transpose().map_err(anyhow::Error::msg)?;
+    let budget = args.time.as_deref().map(parse_wall).transpose().map_err(anyhow::Error::msg)?;
     let targets: Vec<fuzz::Target> = if args.boards.is_empty() {
         fuzz::default_targets()
     } else {
@@ -170,4 +171,42 @@ fn campaign_window(c: &Campaign) -> Time {
 }
 fn campaign_settle(c: &Campaign) -> Time {
     c.shared().settle()
+}
+
+/// A wall-clock duration: `1h`, `25m`, `90s`, `1500ms`, or a bare number of seconds.
+fn parse_wall(s: &str) -> Result<Time, String> {
+    let s = s.trim();
+    let (num, scale) = if let Some(n) = s.strip_suffix("ms") {
+        (n, 1e-3)
+    } else if let Some(n) = s.strip_suffix('h') {
+        (n, 3600.0)
+    } else if let Some(n) = s.strip_suffix('m') {
+        (n, 60.0)
+    } else if let Some(n) = s.strip_suffix('s') {
+        (n, 1.0)
+    } else {
+        (s, 1.0)
+    };
+    let v: f64 = num.trim().parse().map_err(|_| format!("bad duration {s:?} (write e.g. 25m, 90s, 1h)"))?;
+    if !v.is_finite() || v < 0.0 {
+        return Err(format!("bad duration {s:?}"));
+    }
+    Ok(Time::from_secs_f64(v * scale))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn wall_durations() {
+        assert_eq!(parse_wall("25m").unwrap(), Time::from_secs(1500));
+        assert_eq!(parse_wall("1h").unwrap(), Time::from_secs(3600));
+        assert_eq!(parse_wall("90s").unwrap(), Time::from_secs(90));
+        assert_eq!(parse_wall("1500ms").unwrap(), Time::from_ms(1500));
+        assert_eq!(parse_wall("2").unwrap(), Time::from_secs(2));
+        for bad in ["", "m", "x5s", "-1s"] {
+            assert!(parse_wall(bad).is_err(), "{bad}");
+        }
+    }
 }
