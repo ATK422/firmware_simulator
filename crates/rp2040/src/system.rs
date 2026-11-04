@@ -31,7 +31,7 @@ use crate::periph::sio::{self, Sio};
 use crate::periph::spi::Spi;
 use crate::periph::ssi::{IoQspi, Ssi};
 use crate::periph::sysctl::{self, Psm, Resets, Vreg, bit, psm};
-use crate::periph::timer::{Timer, Watchdog, WatchdogReset};
+use crate::periph::timer::{self, Timer, Watchdog, WatchdogReset};
 use crate::periph::uart::Uart;
 use crate::periph::usb::{self, Usb};
 use crate::unmodelled::Unmodelled;
@@ -347,6 +347,50 @@ impl System {
     #[inline]
     fn xip_ready_from(&self, now: Time) -> bool {
         self.xip_config.is_ok() && now >= self.xip_busy_until
+    }
+
+    /// What a busy-wait's read of `addr` gives at `now`, for `CortexM0Plus::timer_wait`: the memory a batch reads
+    /// directly (SRAM, ROM, flash with XIP working), or the timer's raw low and high words.
+    pub fn timer_wait_read(&self, now: Time, addr: u32, size: Size) -> cpu_armv6m::WaitRead {
+        use cpu_armv6m::WaitRead;
+        let sram = addr.wrapping_sub(SRAM_BASE) as usize;
+        if sram < SRAM_SIZE {
+            return WaitRead::Value(mem::read(&self.sram, sram, size));
+        }
+        if addr >> 26 == XIP_BASE >> 26 {
+            let len = self.flash.len();
+            return match len.is_power_of_two() && self.xip_ready_from(now) {
+                true => WaitRead::Value(mem::read(&self.flash, addr as usize & (len - 1), size)),
+                false => WaitRead::Other,
+            };
+        }
+        if (addr as usize) < ROM_SIZE {
+            return WaitRead::Value(mem::read(&self.rom, addr as usize, size));
+        }
+        match addr {
+            a if a == TIMER_BASE + timer::TIMERAWL => WaitRead::TimerLow,
+            a if a == TIMER_BASE + timer::TIMERAWH => WaitRead::TimerHigh,
+            _ => WaitRead::Other,
+        }
+    }
+
+    /// The halfword of code at `addr` as a batch fetches it at `now` (see `BatchBus::code_at`).
+    pub fn timer_wait_code(&self, now: Time, addr: u32) -> Option<u16> {
+        let half = |buf: &[u8], off: usize| buf.get(off..off + 2).map(|b| u16::from_le_bytes([b[0], b[1]]));
+        if addr >> 26 == XIP_BASE >> 26 {
+            let len = self.flash.len();
+            return (len.is_power_of_two() && self.xip_ready_from(now))
+                .then(|| half(&self.flash, addr as usize & (len - 1)))
+                .flatten();
+        }
+        let sram = addr.wrapping_sub(SRAM_BASE) as usize;
+        if sram < SRAM_SIZE {
+            return half(&self.sram, sram);
+        }
+        if (addr as usize) < ROM_SIZE {
+            return half(&self.rom, addr as usize);
+        }
+        None
     }
 
     /// IRQ lines seen by `core`'s NVIC.

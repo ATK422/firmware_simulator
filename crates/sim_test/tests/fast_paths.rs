@@ -8,6 +8,7 @@
 //! * SIO accesses other than to the FIFOs leave the interrupt lines alone (`System::sio_fast_irqs`).
 //! * XOSC reads skip the general path and leave quanta quiet (`System::xosc_fast_reads`), so that embassy-rp's
 //!   wait for the crystal is skipped as a busy-wait; and busy-wait skipping itself (`Machine::skip_spins`).
+//! * Busy-waits on the timer are skipped across its ticks up to their deadline (`Machine::skip_timer_waits`).
 //! * PIO state machines skip counted loops (`Pio::skip_counted`), keep looping through changes of pins they do not
 //!   read (`Pio::loop_inputs`), and blocks remember their next ticks between runs (`Pio::fast_run`).
 
@@ -176,4 +177,17 @@ fn esc_board_pio_paths() {
 fn smart_battery_and_hbridge_pio_paths() {
     same_pio_paths("smart_battery", "mk2/sbh_mcu", 21);
     same_pio_paths("hbridge_board", "lilboat/hbridge_board", 2);
+}
+
+fn same_timer_waits(elf: &str, board: &str, client: u8) {
+    let Some((a, _, skipped)) = run_skipped(elf, board, client, |_| {}) else { return };
+    let (b, _, ticked) = run_skipped(elf, board, client, |m| m.skip_timer_waits = false).unwrap();
+    compare(elf, &a, &b);
+    assert!(skipped > ticked, "{elf}: {skipped} instructions skipped, {ticked} without");
+}
+
+#[test]
+fn timer_waits_skipped_as_ticked() {
+    // The control loop waits out the DShot frame time on core 1 (`while Instant::now() < min_frame_time {}`)
+    same_timer_waits("esc_board", "mk2/esc_board", 2);
 }

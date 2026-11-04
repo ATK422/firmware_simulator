@@ -216,6 +216,11 @@ impl Timer {
     }
 
     /// When alarm `n` fires, given the current value; `None` if disarmed or the tick is stopped.
+    /// The tick count at which the counter reaches `value` (from the current base), unless it is paused.
+    pub fn ticks_of_value(&self, value: u64) -> Option<u64> {
+        (!self.paused).then(|| self.base_ticks.wrapping_add(value.wrapping_sub(self.base_value)))
+    }
+
     pub fn alarm_due(&self, ticks: &TickGen, now: Time, n: usize) -> Option<Time> {
         if self.armed & (1 << n) == 0 || self.paused {
             return None;
