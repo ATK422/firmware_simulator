@@ -178,6 +178,10 @@ fn sub(x: V, y: V) -> (V, Flags) {
 /// `x + y + carry` (`ADCS`; `SBCS` with `y` inverted) with the carry in a predicate: known operands only.
 fn add_carry(x: V, y: V, carry: P) -> (V, Flags) {
     let (V::Known(a), V::Known(b)) = (x, y) else { return (V::Dead, [P::Unknown; 4]) };
+    if let P::Known(c) = carry {
+        let (r, c, v) = adc(a, b, c);
+        return (V::Known(r), [P::Known(r >> 31 != 0), P::Known(r == 0), P::Known(c), P::Known(v)]);
+    }
     let flags = |r: u32, c: bool, v: bool| [r >> 31 != 0, r == 0, c, v];
     let (r1, c1, v1) = adc(a, b, true);
     let (r0, c0, v0) = adc(a, b, false);
@@ -408,6 +412,23 @@ fn step(
             }
             let f = nz(r);
             set_flags(s, &mut acc, [f[0], f[1], P::Unknown, P::Unknown], 0b0011);
+        }
+        K::Mvn => {
+            let r = logic(get(s, &mut acc, b), V::Known(0), |x, _| !x);
+            set(s, &mut acc, a, r);
+            let f = nz(r);
+            set_flags(s, &mut acc, [f[0], f[1], P::Unknown, P::Unknown], 0b0011);
+        }
+        K::LslI | K::LsrI => {
+            let x = get(s, &mut acc, b);
+            let (r, c) = match x {
+                V::Known(v) if op.kind == K::LslI => (V::Known(v << imm), P::Known((v >> (32 - imm)) & 1 != 0)),
+                V::Known(v) => (V::Known(v >> imm), P::Known((v >> (imm - 1)) & 1 != 0)),
+                _ => (V::Dead, P::Unknown),
+            };
+            set(s, &mut acc, a, r);
+            let f = nz(r);
+            set_flags(s, &mut acc, [f[0], f[1], c, P::Unknown], 0b0111);
         }
         K::Uxtb | K::Uxth => {
             let x = get(s, &mut acc, b);

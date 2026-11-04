@@ -59,6 +59,9 @@ fn waits() -> Vec<(&'static str, Vec<u16>, bool)> {
             true,
         ),
         ("lo_below", vec![0x6870, 0x42A0, bcond(CC, w + 4, w)], true), // ldr r0, [r6, #4]; cmp r0, r4; bcc
+        // The deadline worked out again each time round: lsls r1, r4, #1; lsrs r1, r1, #1; mvns r2, r3;
+        // adds r1, r1, r2 (r1 = r4 - 1); cmp r0, r1; bcc
+        ("known_work", vec![0x6870, 0x0061, 0x0849, 0x43DA, 0x1889, 0x4288, bcond(CC, w + 12, w)], true),
         ("lo_not_equal", vec![0x6870, 0x42A0, bcond(NE, w + 4, w)], true), // ...; bne
         ("deadline_above", vec![0x6871, 0x428C, bcond(HI, w + 4, w)], true), // ldr r1, [r6, #4]; cmp r4, r1; bhi
         // (int32_t)(now - deadline) < 0: the sign of a difference is not understood
