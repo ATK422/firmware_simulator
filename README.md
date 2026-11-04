@@ -307,8 +307,8 @@ Measured with `cargo run --release -p sim_test --example bench -- --time 2s --re
 | IVC2 pool (two boards in the water) | 2.15 s | about 0.9x |
 | Talos (nine boards), one thread | 3.7 s | about 0.54x |
 | Talos on three or four threads | 5-6 s (1.6-1.7 s wall) | about 1.2x |
-| Talos on three threads, its bridge on a live endpoint (as on vcan) | 5.1 s (1.8 s wall) | about 1.1x (0.55-0.75x before) |
-| nereus setup (`robots/talos_nereus.toml`, live host sides, external vehicle), three threads | 4.5 s (1.75 s wall) | about 1.1x (0.75x before) |
+| Talos on three threads, its bridge on a live endpoint (as on vcan) | 5.2 s (1.8 s wall) | about 1.1x (0.7x before) |
+| nereus setup (`robots/talos_nereus.toml`, live host sides, external vehicle), three threads | 4.8 s (1.8-2.1 s wall) | about 1.0x (0.7x before) |
 
 So single boards run at or above real time. All of Talos keeps up with `--realtime` on three or more free cores:
 its boards run on threads by default (`--threads`) and ahead of each other between the slices where a CAN frame

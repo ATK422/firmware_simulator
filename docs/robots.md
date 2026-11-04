@@ -509,8 +509,8 @@ cd $TITAN_FIRMWARE_DIR/talos/ESCBoard && mkdir -p build && cd build && cmake .. 
 The micro-ROS agent's sessions and timeouts are on the wall clock and the firmware's on virtual time; Talos as a
 whole runs slower than real time on one core (see [Speed](#how-a-robot-runs)), so watch the emulator's "behind the
 wall clock" warnings. On threads (the scripts' default `--threads 0`) the boards run ahead of each other with the
-vcan interfaces too: Talos keeps up with three free cores (about 1.1-1.2x before pacing; slice by slice, as before
-this, it was about 0.55-0.75x with a live endpoint), and the emulator stays within 2 ms of the wall clock. Add
+vcan interfaces too: Talos keeps up with three free cores (about 1.1x before pacing; slice by slice, as before
+this, it was about 0.7x with a live endpoint), and the emulator stays within 2 ms of the wall clock. Add
 `--arrivals-log FILE` to keep a session's host traffic: `--replay-arrivals FILE` in place of `--can` repeats it,
 without vcan or ROS. With nereus as the physics instead of the emulator's own, see [nereus.md](nereus.md).
 

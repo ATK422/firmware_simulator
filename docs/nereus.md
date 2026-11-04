@@ -195,10 +195,10 @@ The emulator runs the firmware as fast as it can, never faster than the wall clo
 (the script's default) its boards run ahead of each other between the moments they can see each other, with can0
 as well: what titan_bridge, the micro-ROS agent and the controller write to can0 is read at the slice boundary
 where taking turns would read it, and a board that already ran past where such a frame can reach it is rolled
-back to before it. For these four boards that is about 1.1x real time before pacing on a shared 4-core machine
-with three cores free (`nereus_t3` in the benchmark; slice by slice, as before, it was about 0.6-0.75x: the ESC
-boards' DShot PIO is the cost, the other boards and the Orin's tools are cheap), so the emulator keeps up and runs
-at 1x; it stays within 2 ms of the wall clock, so host frames are not held back. On fewer free cores, or a slower
+back to before it. For these four boards that is about 0.9-1.1x real time before pacing on a shared 4-core
+machine with three cores free (`nereus_t3` in the benchmark; slice by slice, as before, it was about 0.6-0.75x: the ESC
+boards' DShot PIO is the cost, the other boards and the Orin's tools are cheap), so the emulator about keeps up,
+and more on a laptop with more cores; it stays within 2 ms of the wall clock, so host frames are not held back. On fewer free cores, or a slower
 machine, it may still fall behind. If nereus ran at 1x anyway, the vehicle would move on thrust the firmware has
 not made yet, and the lag would grow without bound.
 
