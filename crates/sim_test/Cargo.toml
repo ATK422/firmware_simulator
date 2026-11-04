@@ -8,6 +8,7 @@ license.workspace = true
 [dependencies]
 sim_core.workspace = true
 rp2040.workspace = true
+cpu_armv6m.workspace = true
 sim_host.workspace = true
 sim_devices.workspace = true
 sim_acoustics.workspace = true
