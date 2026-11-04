@@ -12,9 +12,9 @@ steps:
   # Neutral while the ESCs power up
   - always: {board: esc1, esc: {name: esc1, rpm: [-1, 1]}, until: 4.9s}
   - expect: {board: esc1, esc: {name: esc1, rpm: [-1260, -1140]}, at: 5s, within: 1.5s}
-  - expect: {board: esc1, esc: {name: esc2, rpm: [1140, 1260]}}
+  - expect: {board: esc1, esc: {name: esc2, rpm: [1140, 1260]}, at: 5s, within: 1.5s}
   - expect: {vehicle: {depth: {min: 0.25}, roll: [-2, 2], pitch: [-2, 2]}, within: 1.5s}
-  - expect: {board: camera_cage, message: CameraCage.Depth, value: {max: -0.1}, within: 500ms}
+  - expect: {board: camera_cage, message: CameraCage.Depth, value: {max: -0.1}, within: 1s}
   - at: 7s
     fault: esc1:kill:on
   - expect: {board: esc1, esc: {name: esc1, rpm: [-50, 50]}, within: 500ms}

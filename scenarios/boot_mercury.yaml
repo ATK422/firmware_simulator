@@ -1,0 +1,24 @@
+# Mercury's three C titan_firmware boards (robots/mercury.toml) boot through their CAN bootloader into the app and
+# come online on the internal bus: each prints its build tag on its debug UART and sends its CANmore heartbeat
+# (standard frame client << 6 | 0x2F, every 500 ms) whether or not a micro-ROS agent answers, with no panic and no
+# watchdog reset. The images come from TITAN_FIRMWARE_DIR (each project's build/NAME_with_bl.uf2); without it this
+# scenario is skipped. Not checked here: anything past "waiting for the agent" (no micro-ROS agent in a scenario).
+name: Mercury boots and every board comes online on CAN
+robot: robots/mercury.toml
+time: 5s
+steps:
+  # titan_firmware's build tag names the robot and the board: "... 1.0-mercury/mercury/esc_board ..."
+  - expect: {board: pohalf, log: mercury/po_half, at: 2s}
+  - expect: {board: esc0, log: mercury/esc_board, at: 2s}
+  - expect: {board: esc1, log: mercury/esc_board, at: 2s}
+  # Each client's heartbeat from 1 s to 4 s (six expected): PoHalf 1, ESC board 0 (strap low) 2, ESC board 1 (strap
+  # high) 3
+  - expect: {bus: internal, frame: {id: 0x06F, extended: false}, count: {min: 4}, at: 1s, within: 3s}
+  - expect: {bus: internal, frame: {id: 0x0AF, extended: false}, count: {min: 4}, at: 1s, within: 3s}
+  - expect: {bus: internal, frame: {id: 0x0EF, extended: false}, count: {min: 4}, at: 1s, within: 3s}
+  - never: {board: pohalf, log: PANIC}
+  - never: {board: esc0, log: PANIC}
+  - never: {board: esc1, log: PANIC}
+  - always: {board: pohalf, resets: 0}
+  - always: {board: esc0, resets: 0}
+  - always: {board: esc1, resets: 0}

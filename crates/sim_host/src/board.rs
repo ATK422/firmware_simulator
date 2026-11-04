@@ -98,12 +98,22 @@ pub struct EscEntry {
     pub name: Option<String>,
     pub signal_pin: u8,
     pub telemetry_pin: Option<u8>,
-    /// Mechanical RPM at full throttle.
+    /// Mechanical RPM at full throttle (a speed proportional to the throttle; 4000 by default).
     pub max_rpm: Option<f64>,
+    /// A measured throttle-to-speed curve instead (`sim_devices::dshot::SpeedCurve::Fit`).
+    pub throttle_fit: Option<ThrottleFit>,
     pub pole_pairs: Option<u32>,
     /// How long after the last DShot frame the ESC stops the motor (250 ms by default, an assumption; see
     /// `sim_devices::dshot`); 0 keeps the last throttle forever.
     pub signal_loss_ms: Option<f64>,
+}
+
+/// Steady-state throttle step for a speed, per direction: `c0 + c1 rpm + c2 rpm^2` ([`EscEntry::throttle_fit`]).
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ThrottleFit {
+    pub forward: [f64; 3],
+    pub reverse: [f64; 3],
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -424,7 +434,19 @@ impl Board {
         for (i, e) in self.dshot_esc.iter().enumerate() {
             let name = e.name.clone().unwrap_or_else(|| format!("esc{}", i + 1));
             let mut esc = sim_devices::dshot::Esc::new(&name, e.signal_pin, e.telemetry_pin);
-            esc.max_rpm = e.max_rpm.unwrap_or(esc.max_rpm);
+            esc.curve = match (&e.throttle_fit, e.max_rpm) {
+                (Some(_), Some(_)) => return Err(format!("{name}: max_rpm and throttle_fit both given")),
+                (Some(f), None) => {
+                    if f.forward.iter().chain(&f.reverse).any(|c| !c.is_finite())
+                        || [f.forward, f.reverse].iter().any(|c| c[1] < 0.0 || c[2] < 0.0 || c[1] + c[2] <= 0.0)
+                    {
+                        return Err(format!("{name}: throttle_fit needs rising curves (c1, c2 >= 0, not both 0)"));
+                    }
+                    sim_devices::dshot::SpeedCurve::Fit { forward: f.forward, reverse: f.reverse }
+                }
+                (None, Some(max_rpm)) => sim_devices::dshot::SpeedCurve::Linear { max_rpm },
+                (None, None) => esc.curve,
+            };
             esc.pole_pairs = e.pole_pairs.unwrap_or(esc.pole_pairs);
             if let Some(ms) = e.signal_loss_ms {
                 esc.signal_loss_timeout = (ms > 0.0).then(|| sim_core::Time::from_secs_f64(ms / 1000.0));
@@ -731,6 +753,43 @@ mux = { select_pins = [3, 4, 5], inputs = [{ volts = 1.0 }, { volts = 2.0 }] }
             t,
             [Some(sim_devices::dshot::Esc::DEFAULT_SIGNAL_LOSS_TIMEOUT), Some(sim_core::Time::from_ms(100)), None]
         );
+    }
+
+    #[test]
+    fn esc_speed_curves() {
+        use sim_devices::dshot::{Esc, SpeedCurve};
+        let b = Board::parse(
+            "name = \"x\"\n[[dshot_esc]]\nsignal_pin = 1\n[[dshot_esc]]\nsignal_pin = 2\nmax_rpm = 3000\n\
+             [[dshot_esc]]\nsignal_pin = 3\nthrottle_fit = { forward = [1.0, 0.1, 0.0], reverse = [2.0, 0.2, 0.0] }\n",
+        )
+        .unwrap();
+        let mut m = Machine::new(Default::default());
+        b.apply(&mut m).unwrap();
+        let c: Vec<_> = m.sys.pin_devices.iter().map(|d| d.as_any().downcast_ref::<Esc>().unwrap().curve).collect();
+        assert_eq!(
+            c,
+            [
+                SpeedCurve::Linear { max_rpm: 4000.0 },
+                SpeedCurve::Linear { max_rpm: 3000.0 },
+                SpeedCurve::Fit { forward: [1.0, 0.1, 0.0], reverse: [2.0, 0.2, 0.0] }
+            ]
+        );
+        // Both, a falling curve, or a key of its own are mistakes
+        for (extra, want) in [
+            ("max_rpm = 3000\nthrottle_fit = { forward = [0, 1, 0], reverse = [0, 1, 0] }", "both given"),
+            ("throttle_fit = { forward = [0, -1, 0], reverse = [0, 1, 0] }", "rising"),
+            ("throttle_fit = { forward = [0, 0, 0], reverse = [0, 1, 0] }", "rising"),
+        ] {
+            let b = Board::parse(&format!("name = \"x\"\n[[dshot_esc]]\nsignal_pin = 1\n{extra}\n")).unwrap();
+            let e = b.apply(&mut Machine::new(Default::default())).err().unwrap();
+            assert!(e.contains(want), "{extra}: {e}");
+        }
+        let e = Board::parse(
+            "name = \"x\"\n[[dshot_esc]]\nsignal_pin = 1\nthrottle_fit = { forward = [0, 1, 0], reverse = [0, 1, 0], up = 1 }\n",
+        )
+        .err()
+        .unwrap();
+        assert!(e.contains("unknown field"), "{e}");
     }
 
     #[test]
