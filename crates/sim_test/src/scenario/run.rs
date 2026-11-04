@@ -14,6 +14,7 @@ use sim_core::time::Time;
 use sim_devices::can::{BusRecord, Sender};
 use sim_host::ethernet::PuddlesBridge;
 use sim_host::fault::{BridgeControl, Fault};
+use sim_host::host_protocol::{HostAgent, Placement};
 use sim_host::mock_bridge::{IvcModem, MockBridge};
 use sim_host::robot::{Robot, RobotSpec};
 use titan_link::{DeviceToHost, FirmwareStatus, HostToDevice};
@@ -266,6 +267,13 @@ enum BridgeRef {
     Eth(usize),
 }
 
+/// A protocol-neutral host side: a mock agent (`agents`), or a CAN mock bridge seen as one.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AgentRef {
+    Agent(usize),
+    Can(usize),
+}
+
 /// The robot and everything around it.
 struct World {
     robot: Robot,
@@ -273,6 +281,8 @@ struct World {
     can: Vec<(usize, u8, MockBridge)>,
     /// Bridges on Ethernet cables: board, bridge.
     eth: Vec<(usize, PuddlesBridge)>,
+    /// Mock agents in the boards' own protocols (`agents`): where each is, and the agent.
+    agents: Vec<(Placement, Box<dyn HostAgent>)>,
     store: Arc<Mutex<Store>>,
     /// Per bus, the board each CAN node belongs to.
     nodes: Vec<Vec<usize>>,
@@ -350,11 +360,16 @@ impl World {
         for (i, b) in &eth {
             robot.boards[*i].eth_endpoints.push(Box::new(b.clone()));
         }
+        let agents: Vec<(Placement, Box<dyn HostAgent>)> = self.agents.iter().map(|(p, a)| (*p, a.fork())).collect();
+        for (p, a) in &agents {
+            robot.buses[p.bus].endpoints.push(a.endpoint());
+        }
         let store = self.store.lock().unwrap().clone();
         let mut w = World {
             robot,
             can,
             eth,
+            agents,
             store: Arc::new(Mutex::new(store)),
             nodes: self.nodes.clone(),
             fault_names: self.fault_names.clone(),
@@ -494,6 +509,52 @@ impl World {
         }
     }
 
+    /// The agent a topic step uses: `bridge` (a mock bridge), or the board's agent (`agents`), else its mock bridge.
+    fn target_agent(&self, t: &Target) -> R<AgentRef> {
+        if let Some(b) = &t.bridge {
+            return match self.bridge_spec(b)? {
+                BridgeRef::Can(k) => Ok(AgentRef::Can(k)),
+                BridgeRef::Eth(_) => Err(format!("{b}: topics go through a CAN agent or bridge")),
+            };
+        }
+        if let Some(b) = &t.board {
+            let i = self.board(b)?;
+            if let Some(k) = self.agents.iter().position(|(p, _)| p.board == Some(i)) {
+                return Ok(AgentRef::Agent(k));
+            }
+            return match self.board_bridge(i) {
+                Some(BridgeRef::Can(k)) => Ok(AgentRef::Can(k)),
+                _ => Err(format!("{b} has no mock agent (add `agents: [nanoros:{b}]`) or CAN mock bridge")),
+            };
+        }
+        match (self.agents.len(), self.can.len()) {
+            (1, _) => Ok(AgentRef::Agent(0)),
+            (0, 1) => Ok(AgentRef::Can(0)),
+            (0, 0) => Err("there is no mock agent (add `agents`)".into()),
+            _ => Err("which agent? (give `board`)".into()),
+        }
+    }
+
+    fn host(&self, a: AgentRef) -> &dyn HostAgent {
+        match a {
+            AgentRef::Agent(k) => &*self.agents[k].1,
+            AgentRef::Can(k) => &self.can[k].2,
+        }
+    }
+
+    fn agent_name(&self, a: AgentRef) -> String {
+        match a {
+            AgentRef::Agent(k) => {
+                let p = self.agents[k].0;
+                p.board.map_or_else(
+                    || format!("{}:{}", self.robot.bus_names[p.bus], p.client),
+                    |i| self.robot.names[i].clone(),
+                )
+            }
+            AgentRef::Can(k) => self.bridge_name(BridgeRef::Can(k)),
+        }
+    }
+
     fn with_received<T>(&self, b: BridgeRef, f: impl FnOnce(&[(Time, DeviceToHost)]) -> T) -> T {
         match b {
             BridgeRef::Can(k) => f(&self.can[k].2.state().received),
@@ -575,6 +636,7 @@ enum RWhat {
     Lockups { board: usize, r: Range },
     Ivc { bridge: BridgeRef, byte: Option<u8> },
     Message { bridge: BridgeRef, path: Vec<String>, value: Option<ValueCheck> },
+    Topic { agent: AgentRef, topic: String, msg: Option<serde_json::Value> },
 }
 
 impl RWhat {
@@ -591,7 +653,7 @@ impl RWhat {
     }
 
     fn is_stream(&self) -> bool {
-        matches!(self, RWhat::Status { .. } | RWhat::Message { .. })
+        matches!(self, RWhat::Status { .. } | RWhat::Message { .. } | RWhat::Topic { .. })
     }
 }
 
@@ -702,6 +764,16 @@ fn resolve(w: &World, c: &Condition) -> R<RWhat> {
         What::Ivc(b) => RWhat::Ivc { bridge: w.target_bridge(&c.target)?, byte: *b },
         What::Message { path, value } => {
             RWhat::Message { bridge: w.target_bridge(&c.target)?, path: path.clone(), value: value.clone() }
+        }
+        What::Topic { topic, msg } => {
+            let agent = w.target_agent(&c.target)?;
+            let known = w.host(agent).topics();
+            // A topic the agent knows the board does not have (from its ros.toml) is a typo
+            if w.host(agent).protocol() == "nanoros" && !known.is_empty() && !known.iter().any(|(t, _)| t == topic) {
+                let names: Vec<&str> = known.iter().map(|(t, _)| t.as_str()).collect();
+                return Err(format!("no topic {topic:?} (the board's topics: {})", names.join(", ")));
+            }
+            RWhat::Topic { agent, topic: topic.clone(), msg: msg.clone() }
         }
     })
 }
@@ -892,12 +964,37 @@ impl Active {
                 });
                 self.next = next;
             }
+            RWhat::Topic { agent, .. } => {
+                let host = w.host(*agent);
+                let name = w.agent_name(*agent);
+                let k = *self.next.get_or_insert_with(|| {
+                    let all = host.messages(0);
+                    all.partition_point(|m| m.t < from)
+                });
+                let fresh = host.messages(k);
+                let mut n = k;
+                for m in fresh.iter().take_while(|m| m.t <= upto) {
+                    f(judge_topic(&self.what, &name, m));
+                    n += 1;
+                }
+                self.next = Some(n);
+            }
             _ => unreachable!("not an occurrence"),
         }
     }
 
     /// The latest occurrence of a value stream at or before `t`.
     fn latest(&self, w: &World, t: Time) -> Option<Item> {
+        if let RWhat::Topic { agent, .. } = &self.what {
+            let name = w.agent_name(*agent);
+            let all = w.host(*agent).messages(0);
+            return all
+                .iter()
+                .rev()
+                .filter(|m| m.t <= t)
+                .map(|m| judge_topic(&self.what, &name, m))
+                .find(|i| i.relevant);
+        }
         let (RWhat::Status { bridge, .. } | RWhat::Message { bridge, .. }) = &self.what else { unreachable!() };
         let name = w.bridge_name(*bridge);
         w.with_received(*bridge, |rx| {
@@ -1024,6 +1121,19 @@ fn judge(what: &RWhat, bridge: &str, t: Time, msg: &DeviceToHost) -> Item {
     }
 }
 
+fn judge_topic(what: &RWhat, agent: &str, m: &sim_host::host_protocol::HostMessage) -> Item {
+    let RWhat::Topic { topic, msg, .. } = what else { unreachable!() };
+    if m.topic != *topic {
+        return Item { t: m.t, relevant: false, ok: false, evidence: String::new() };
+    }
+    let bad = msg.as_ref().and_then(|p| msg_mismatch(p, &m.msg));
+    let evidence = match &bad {
+        None => format!("[{}] {agent} {topic}: {}", m.t, compact(&m.msg)),
+        Some(b) => format!("[{}] {agent} {topic}: {b}: {}", m.t, compact(&m.msg)),
+    };
+    Item { t: m.t, relevant: true, ok: bad.is_none(), evidence }
+}
+
 /// The last lines of a board up to `t`, for a failure.
 fn tail(w: &World, board: usize, t: Time, n: usize) -> Vec<String> {
     let st = w.store.lock().unwrap();
@@ -1060,6 +1170,25 @@ fn nothing_found(w: &World, a: &Active, to: Time) -> Vec<String> {
                 _ => format!("no such message at {name} from {window}"),
             }];
             if let Some(i) = w.bridge_board(*bridge) {
+                v.extend(tail(w, i, to, 5));
+            }
+            v
+        }
+        RWhat::Topic { agent, topic, .. } => {
+            let name = w.agent_name(*agent);
+            let host = w.host(*agent);
+            let mut v = vec![match &a.last_bad {
+                Some(b) => format!("none matched from {window}; the last: {b}"),
+                None => {
+                    format!("no {topic} message at {name} from {window} ({} message(s) in all)", host.message_count())
+                }
+            }];
+            v.extend(host.errors().into_iter().take(3).map(|e| format!("agent: {e}")));
+            let board = match agent {
+                AgentRef::Agent(k) => w.agents[*k].0.board,
+                AgentRef::Can(k) => w.bridge_board(BridgeRef::Can(*k)),
+            };
+            if let Some(i) = board {
                 v.extend(tail(w, i, to, 5));
             }
             v
@@ -1350,6 +1479,8 @@ fn what_text(c: &Condition) -> String {
             Some(ValueCheck::Range(r)) => format!("message {} in {r}", path.join(".")),
             Some(ValueCheck::Equals(v)) => format!("message {} = {v}", path.join(".")),
         },
+        What::Topic { topic, msg: None } => format!("topic {topic}"),
+        What::Topic { topic, msg: Some(m) } => format!("topic {topic} {}", compact(m)),
     };
     let mut w = w;
     if let Some(c) = c.count {
@@ -1376,6 +1507,15 @@ pub fn describe(st: &Step) -> String {
             match every {
                 Some(e) => format!("{target} {m} every {}", short_time(*e)),
                 None => format!("{target} {m}"),
+            }
+        }
+        StepKind::SendTopic { target, topic, msg, every } => {
+            let m = if msg.is_null() { String::new() } else { format!(" {}", compact(msg)) };
+            let who =
+                if target.board.is_none() && target.bridge.is_none() { String::new() } else { format!("{target} ") };
+            match every {
+                Some(e) => format!("{who}{topic}{m} every {}", short_time(*e)),
+                None => format!("{who}{topic}{m}"),
             }
         }
         StepKind::IvcSend { board, byte } => format!("{board} {byte:#04x}"),
@@ -1486,6 +1626,7 @@ fn build(s: &Scenario, opts: &Options, spec: &RobotSpec, dir: &Path) -> R<World>
         robot,
         can: Vec::new(),
         eth: Vec::new(),
+        agents: Vec::new(),
         store: Default::default(),
         nodes,
         fault_names,
@@ -1544,6 +1685,16 @@ fn build(s: &Scenario, opts: &Options, spec: &RobotSpec, dir: &Path) -> R<World>
                 }
             }
         }
+    }
+    for spec in &s.agents {
+        if spec.protocol == sim_host::host_protocol::Protocol::TitanLink {
+            let p = sim_host::host_protocol::place(&w.robot, spec).map_err(|e| format!("agents: {e}"))?;
+            add_can(&mut w, p.bus, p.client);
+            continue;
+        }
+        let (p, agent) =
+            sim_host::host_protocol::attach(&mut w.robot, spec, dir).map_err(|e| format!("agents: {e}"))?;
+        w.agents.push((p, agent));
     }
     for (k, v) in &s.inputs {
         set_input(&w, k, *v).map_err(|e| format!("inputs: {e}"))?;
@@ -1830,6 +1981,31 @@ impl Engine {
                 }
                 self.tl.sends.sort_by_key(|s| s.0);
                 Ok(Vec::new())
+            }
+            StepKind::SendTopic { target, topic, msg, every } => {
+                let a = self.w.target_agent(target)?;
+                let host = self.w.host(a);
+                let times = match every {
+                    None => vec![now],
+                    Some(e) => {
+                        let start = self.start_of(st);
+                        let until = self.end_of(st, start).unwrap_or(start);
+                        let mut t = start.max(now);
+                        let mut v = Vec::new();
+                        while t <= until {
+                            v.push(self.w.grid(t));
+                            t += *e;
+                        }
+                        v
+                    }
+                };
+                for t in &times {
+                    host.send(topic, msg, Some(*t))?;
+                }
+                Ok(match every {
+                    Some(_) => vec![format!("{} message(s) from {}", times.len(), self.w.agent_name(a))],
+                    None => Vec::new(),
+                })
             }
             StepKind::IvcSend { board, byte } => {
                 let i = self.w.board(board)?;

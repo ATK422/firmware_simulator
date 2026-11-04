@@ -251,7 +251,10 @@ curl -s -X POST -d '{"board": "camera_cage", "fault": "i2c-absent:0x76"}' http:/
 The page (self-contained, no external scripts or fonts) shows, per board: the cores' states and the functions they
 are in, log and UART lines, the titan_link `FirmwareStatus` a mock bridge decoded (CAN or Puddles Ethernet, fault
 bits named from the board's own `FAULT_NAMES` table in flash, e.g. `FAULT_DEPTH_INIT_ERROR`), GPIO levels,
-functions and directions, LEDs, WS2812 strip colours, ESC RPMs and the physical inputs. Per bus: frame count, rate,
+functions and directions, LEDs, WS2812 strip colours, ESC RPMs and the physical inputs; with a mock agent
+(`--mock-agent nanoros:BOARD`, [robots.md](robots.md#mock-agents-nano-ros-and-other-protocols)) its registration
+and a line per topic (direction, ID, type, count, the last message, and whether ROS 2 would lay the board's
+messages out differently, [nanoros.md](nanoros.md#findings-in-nano_ros)). Per bus: frame count, rate,
 load, errors, missing ACKs and recent frames. Per vehicle: position, depth, roll/pitch/yaw, velocity and thruster
 RPMs. The header has virtual time, wall time and the emulation speed. Its controls inject a fault, set an input
 and pause virtual time.
@@ -277,6 +280,7 @@ theme.
 | `GET /api/frames?bus=NAME&since=SEQ&max=N&id=ID&mask=MASK&tail=1` | CAN frames after a cursor, read live |
 | `POST /api/fault` `{"board": "esc0", "fault": "can-stuck"}` | Applies a fault, in the `--fault` syntax ([faults.md](faults.md)); `run` takes its board's name or no `board` |
 | `POST /api/input` `{"board": "camera_cage", "name": "depth.pressure_pa", "value": 120000}` | Sets a physical input |
+| `POST /api/agent` `{"board": "led", "topic": "bit_sub", "msg": {"data": 5}}` | The board's mock agent sends a message on one of its subscribed topics (`board` may be left out with one agent); the state's board `agent` has its topics and last messages |
 | `POST /api/pause` `{"paused": true}` | Pauses or resumes virtual time; with `"at_s": 2.5`, pausing waits for that virtual time, and resuming runs until it and pauses again |
 | `GET /api/thrusters` | Built live by the run loop: `escs` (every DShot ESC: `board`, `esc`, `rpm`, `throttle`, `signal_lost`, and the vehicle `thruster` it spins with its `thrust_n`) and `vehicles` (each one's pose, `external`, and its thrusters with `board`, `esc`, `rpm`, `thrust_n`) |
 | `POST /api/rewind` `{"time_s": 1.25}`, `{"checkpoint": "booted"}`, `{"save": "booted"}` | Takes the whole run (every board, bus, vehicle, the water) back to a virtual time (the last 100 µs slice boundary at or before it), or to a checkpoint saved by name, or forward within what has run; `save` keeps a checkpoint here under a name ([below](#rewinding)) |
@@ -394,10 +398,11 @@ and the repository as working directory. The server passes its environment on to
 | `start` | Starts `run`, `robot` or `picoboot load` in the background with its dashboard on a free port, optionally `realtime` and set to pause at `pause_at_s`; returns a session id, the boards and buses |
 | `attach` | Attaches to an emulator someone started with `--dashboard ADDR`, by its URL |
 | `list`, `stop` | Lists the sessions; stops one (kills the emulator, or detaches) and returns the end of its console |
-| `state` | The state, compact: per board cores, LEDs, inputs, the bridge's decoded firmware status, strips, ESCs and the last log lines; buses; vehicles; faults applied. `board` and `sections` narrow it, `gpio` adds pins, `full` gives the dashboard's JSON |
+| `state` | The state, compact: per board cores, LEDs, inputs, the bridge's decoded firmware status, a mock agent's topics and last messages (`agent`), strips, ESCs and the last log lines; buses; vehicles; faults applied. `board` and `sections` narrow it, `gpio` adds pins, `full` gives the dashboard's JSON |
 | `logs` | Log and UART lines after a cursor (`since`, pass back `next`), of one board or all, filtered by `kinds` (`warn`, `error`, `uart0`, ...) and `grep` |
 | `can_frames` | Frames on a bus after a cursor, filtered by `id` and `mask` |
 | `inject_fault`, `set_input` | A fault in the `--fault` spelling ([faults.md](faults.md)), a physical input |
+| `agent_send` | A board's mock agent (`--mock-agent nanoros:BOARD`) sends `msg` (JSON fields) on `topic`, as `POST /api/agent` (early: [nanoros.md](nanoros.md)) |
 | `pause`, `resume` | Pause now or at `at_s`; resume, optionally for `for_s` or until `until_s` |
 | `rewind` | Takes the whole run back to `time_s`, or to a `checkpoint` saved by name with `save` (or forward within what has run), as `POST /api/rewind` ([above](#rewinding)) |
 | `wait_for` | Blocks until a board logs a line matching `pattern` (substring, or `regex`), or virtual time reaches `time_s`, or `timeout_s` of wall time passes; returns early if the run is paused or over. `pause` pauses the run when it happens |

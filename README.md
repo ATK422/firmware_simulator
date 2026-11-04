@@ -21,7 +21,7 @@ Every run is repeatable: the same firmware and inputs give exactly the same resu
 **Full guide: [docs/](docs/README.md)** · Design and milestones: [PLAN.md](PLAN.md)
 
 - [Quick start](#quick-start)
-- [More ways to use it](#more-ways-to-use-it): tests in YAML and firmware A/B comparisons, coding agents (MCP), C firmware with micro-ROS, the robot computer on vcan, the firmware in nereus, IVC in the water
+- [More ways to use it](#more-ways-to-use-it): tests in YAML and firmware A/B comparisons, coding agents (MCP), C firmware with micro-ROS, nano-ROS boards, the robot computer on vcan, the firmware in nereus, IVC in the water
 - [What it can do](#what-it-can-do)
 - [Boards, firmware and robots](#boards-firmware-and-robots)
 - [Architecture](#architecture)
@@ -172,6 +172,9 @@ Then `ros2 run micro_ros_agent micro_ros_agent serial --dev /tmp/ivc-ros`, and t
 ([running.md](docs/running.md#usb-bootsel-picoboot-uf2-and-cdc)). Building the C apps needs titan_firmware's
 micro-ROS library, which is built in Docker (`lib/micro_ros_pico/build.sh`). Several micro-ROS boards at once need
 one DDS discovery server per run, because the client, not the agent, picks the domain.
+
+**Try nano-ROS boards (early, experimental).** `--mock-agent nanoros:BOARD` stands in for osu-uwrt/nano_ros's
+host agent on a libnanoros C board, in scenarios too ([nanoros.md](docs/nanoros.md)).
 
 **Put the robot computer's side on it (robot in a box).** `scripts/robot_in_a_box.sh` runs Talos's C board apps
 (`robots/talos_c.toml`, your titan_firmware build) on vcan interfaces named `can0` and `can1`, like the Orin's, and

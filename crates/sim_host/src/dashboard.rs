@@ -370,6 +370,13 @@ enum Command {
         to: RewindTo,
         reply: mpsc::Sender<Result<String, String>>,
     },
+    /// `POST /api/agent`: a board's mock agent sends a message on a topic.
+    AgentSend {
+        board: String,
+        topic: String,
+        msg: Value,
+        reply: mpsc::Sender<Result<String, String>>,
+    },
 }
 
 /// Where `POST /api/rewind` goes.
@@ -437,6 +444,8 @@ pub struct Dashboard {
     pub addr: SocketAddr,
     boards: Vec<BoardInfo>,
     links: Vec<(Option<usize>, Option<usize>, Link)>,
+    /// Protocol-neutral mock agents ([`crate::host_protocol`]), with the board each serves.
+    agents: Vec<(Option<usize>, Box<dyn crate::host_protocol::HostAgent>)>,
     logs: Arc<Mutex<Logs>>,
     bus_feeds: Vec<Arc<Mutex<BusFeed>>>,
     bus_names: Vec<String>,
@@ -499,6 +508,7 @@ impl Dashboard {
             addr,
             boards,
             links: Vec::new(),
+            agents: Vec::new(),
             logs,
             bus_feeds,
             bus_names,
@@ -542,6 +552,28 @@ impl Dashboard {
     /// A mock bridge (or the Puddles one) attached to `board` or on bus `bus`.
     pub fn add_link(&mut self, board: Option<usize>, bus: Option<usize>, link: Link) {
         self.links.push((board, bus, link));
+    }
+
+    /// A mock agent ([`crate::host_protocol::HostAgent`]: a nano-ROS agent) serving `board`: its status goes in the
+    /// board's `agent` and `POST /api/agent` sends through it.
+    pub fn add_agent(&mut self, board: Option<usize>, agent: Box<dyn crate::host_protocol::HostAgent>) {
+        self.agents.push((board, agent));
+    }
+
+    /// Sends `msg` on `topic` through `board`'s agent (the only agent when `board` is empty).
+    fn agent_send(&self, board: &str, topic: &str, msg: &Value) -> Result<String, String> {
+        let agent = if board.is_empty() {
+            match &self.agents[..] {
+                [(_, a)] => a,
+                [] => return Err("no mock agent (--mock-agent)".into()),
+                _ => return Err("which board's agent? (give board)".into()),
+            }
+        } else {
+            let i = self.board_index(board)?;
+            &self.agents.iter().find(|a| a.0 == Some(i)).ok_or_else(|| format!("{board} has no mock agent"))?.1
+        };
+        agent.send(topic, msg, None)?;
+        Ok(format!("{} agent sends {topic}", agent.protocol()))
     }
 
     /// Pauses virtual time when it reaches `at` (at once for zero: the run then stops after its first piece).
@@ -686,6 +718,9 @@ impl Dashboard {
                 Command::Vehicle { reply, .. } => {
                     let _ = reply.send(Err("a single board's run has no vehicle".into()));
                 }
+                Command::AgentSend { board, topic, msg, reply } => {
+                    replies.push((reply, self.agent_send(&board, &topic, &msg)));
+                }
             }
         }
         let paused_now = self.pause_if_due(s.machine.now);
@@ -755,6 +790,9 @@ impl Dashboard {
                         v
                     });
                     let _ = reply.send(res);
+                }
+                Command::AgentSend { board, topic, msg, reply } => {
+                    replies.push((reply, self.agent_send(&board, &topic, &msg)));
                 }
             }
         }
@@ -842,6 +880,7 @@ impl Dashboard {
                 | Ok(Command::Input { reply, .. })
                 | Ok(Command::Pause { reply, .. })
                 | Ok(Command::Rewind { reply, .. })
+                | Ok(Command::AgentSend { reply, .. })
                 | Ok(Command::Refresh { reply }) => {
                     let _ = reply.send(Err("the run is over".into()));
                 }
@@ -1066,6 +1105,7 @@ impl Dashboard {
             .collect();
         drop(all);
         let link = self.links.iter().find(|l| l.0 == Some(i)).map(|l| l.2.json(now, &info.fault_names));
+        let agent = self.agents.iter().find(|a| a.0 == Some(i)).map(|a| a.1.status(now));
         json!({
             "name": info.name,
             "image": info.image,
@@ -1086,6 +1126,7 @@ impl Dashboard {
             "inputs": inputs,
             "logs": logs,
             "link": link,
+            "agent": agent,
         })
     }
 
@@ -1573,7 +1614,7 @@ fn handle(mut stream: TcpStream, server: &Server) -> std::io::Result<()> {
                 Err(_) => json_reply(&mut stream, 503, json!({"ok": false, "error": "the run loop did not answer"})),
             }
         }
-        ("POST", "/api/fault") | ("POST", "/api/input") | ("POST", "/api/pause") => {
+        ("POST", "/api/fault") | ("POST", "/api/input") | ("POST", "/api/pause") | ("POST", "/api/agent") => {
             let body: Value = match serde_json::from_slice(&req.body) {
                 Ok(v) => v,
                 Err(e) => return json_reply(&mut stream, 400, json!({"ok": false, "error": format!("bad JSON: {e}")})),
@@ -1595,6 +1636,12 @@ fn handle(mut stream: TcpStream, server: &Server) -> std::io::Result<()> {
                         return json_reply(&mut stream, 400, json!({"ok": false, "error": "value must be a number"}));
                     };
                     Command::Input { board, name, value, reply }
+                }
+                "/api/agent" => {
+                    let Some(topic) = body["topic"].as_str().map(str::to_string) else {
+                        return json_reply(&mut stream, 400, json!({"ok": false, "error": "needs a topic"}));
+                    };
+                    Command::AgentSend { board, topic, msg: body["msg"].clone(), reply }
                 }
                 _ => {
                     let at = match &body["at_s"] {
@@ -1625,6 +1672,7 @@ fn handle(mut stream: TcpStream, server: &Server) -> std::io::Result<()> {
         | (_, "/api/frames")
         | (_, "/api/fault")
         | (_, "/api/input")
+        | (_, "/api/agent")
         | (_, "/api/pause")
         | (_, "/api/thrusters")
         | (_, "/api/rewind")

@@ -74,6 +74,9 @@ pub struct Robot {
     pub pins: Vec<std::collections::BTreeMap<String, u8>>,
     /// Each board's CANmore client ID (its board file's `[can] client_id`).
     pub client_ids: Vec<Option<u8>>,
+    /// Each board's nano-ROS topic table (the robot file's `ros_toml`: its firmware's `ros.toml`), for a nano-ROS
+    /// mock agent ([`crate::nanoros`]).
+    pub ros_tomls: Vec<Option<PathBuf>>,
     /// Each board's firmware image file name.
     pub images: Vec<String>,
     /// The bus each board is on.
@@ -123,6 +126,7 @@ impl Default for Robot {
             inputs: Vec::new(),
             pins: Vec::new(),
             client_ids: Vec::new(),
+            ros_tomls: Vec::new(),
             images: Vec::new(),
             board_bus: Vec::new(),
             usb: Vec::new(),
@@ -161,6 +165,7 @@ impl Robot {
         self.inputs.push(Inputs::default());
         self.pins.push(Default::default());
         self.client_ids.push(None);
+        self.ros_tomls.push(None);
         self.images.push(String::new());
         self.board_bus.push(bus);
         self.usb.push(UsbPorts::default());
@@ -389,6 +394,7 @@ impl Robot {
             inputs,
             pins: self.pins.clone(),
             client_ids: self.client_ids.clone(),
+            ros_tomls: self.ros_tomls.clone(),
             images: self.images.clone(),
             board_bus: self.board_bus.clone(),
             usb: self.usb.clone(),
@@ -529,6 +535,7 @@ impl Robot {
             robot.inputs[owner] = inputs;
             robot.pins[owner] = board.pins.clone();
             robot.client_ids[owner] = board.can.as_ref().and_then(|c| c.client_id);
+            robot.ros_tomls[owner] = b.ros_toml.as_ref().map(|p| expand(p).map(|p| dir.join(p))).transpose()?;
             robot.images[owner] = elf.file_name().map(|f| f.to_string_lossy().into_owned()).unwrap_or_default();
             if let Some(ms) = b.power_on_ms
                 && ms > 0.0
@@ -689,4 +696,7 @@ pub struct BoardSpec {
     pub usb_cdc: Option<CdcSink>,
     /// Open its second CDC port (titan_dual_stdio_usb's micro-ROS port): `pty` or `pty:PATH`.
     pub usb_cdc2: Option<CdcSink>,
+    /// The board's nano-ROS topics: its firmware's `ros.toml`, which a nano-ROS mock agent for the board
+    /// (`--mock-agent nanoros:BOARD`, a scenario's `agents`) reads.
+    pub ros_toml: Option<PathBuf>,
 }

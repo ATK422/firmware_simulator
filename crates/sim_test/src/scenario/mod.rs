@@ -30,8 +30,8 @@ pub use run::{
 };
 pub use spec::{
     BridgeSpec, Bridges, Case, Condition, End, FaultRef, FrameMatch, PinRef, Range, Scenario, Setup, Start,
-    StatusCheck, Step, StepKind, Target, TextMatch, ValueCheck, VehicleQty, What, find_upward, load_file, parse_str,
-    parse_time,
+    StatusCheck, Step, StepKind, Target, TextMatch, ValueCheck, VehicleQty, What, find_upward, load_file, msg_mismatch,
+    parse_str, parse_time,
 };
 
 /// The scenario files under `paths`: files as given, directories searched for `*.yaml` and `*.yml` (recursively,

@@ -8,6 +8,7 @@ use std::path::{Path, PathBuf};
 use serde_yaml::{Mapping, Value};
 use sim_core::time::Time;
 use sim_host::fault::Fault;
+use sim_host::host_protocol::AgentSpec;
 use titan_link::HostToDevice;
 
 /// One scenario: what to run, for how long, and the steps.
@@ -20,6 +21,8 @@ pub struct Scenario {
     pub document: usize,
     pub setup: Setup,
     pub bridges: Bridges,
+    /// Mock agents in a board's own protocol (`nanoros:BOARD`), as `--mock-agent`; their `=CONFIG` paths found.
+    pub agents: Vec<AgentSpec>,
     /// Physical inputs set before the boards start: `BOARD.INPUT` (or `INPUT` with one board) and the value.
     pub inputs: Vec<(String, f64)>,
     /// Virtual time to run.
@@ -117,6 +120,14 @@ pub enum StepKind {
         message: Box<HostToDevice>,
         every: Option<Time>,
     },
+    /// A message on a topic from the board's mock agent (or its bridge's titan_link message, by variant), once or
+    /// `every` so often until the window ends.
+    SendTopic {
+        target: Target,
+        topic: String,
+        msg: serde_json::Value,
+        every: Option<Time>,
+    },
     IvcSend {
         board: String,
         byte: u8,
@@ -133,7 +144,7 @@ impl StepKind {
         match self {
             StepKind::Fault { .. } => "fault",
             StepKind::Input(_) => "input",
-            StepKind::Send { .. } => "send",
+            StepKind::Send { .. } | StepKind::SendTopic { .. } => "send",
             StepKind::IvcSend { .. } => "ivc_send",
             StepKind::Pause(_) => "pause",
             StepKind::Expect(_) => "expect",
@@ -144,6 +155,14 @@ impl StepKind {
 
     pub fn is_action(&self) -> bool {
         !matches!(self, StepKind::Expect(_) | StepKind::Never(_) | StepKind::Always(_))
+    }
+
+    /// For a `send`: its `every`.
+    pub fn send_every(&self) -> Option<Option<Time>> {
+        match self {
+            StepKind::Send { every, .. } | StepKind::SendTopic { every, .. } => Some(*every),
+            _ => None,
+        }
     }
 }
 
@@ -237,18 +256,69 @@ pub enum What {
         path: Vec<String>,
         value: Option<ValueCheck>,
     },
+    /// Each message on `topic` the board's mock agent gets (or its bridge's titan_link messages of that variant),
+    /// with the fields `msg` gives matching ([`msg_mismatch`]).
+    Topic {
+        topic: String,
+        msg: Option<serde_json::Value>,
+    },
 }
 
 impl What {
     /// Occurrences with a time (lines, frames, messages) rather than a state sampled every millisecond.
     pub fn is_occurrence(&self) -> bool {
-        matches!(self, What::Log { .. } | What::Status(_) | What::Frame(_) | What::Ivc(_) | What::Message { .. })
+        matches!(
+            self,
+            What::Log { .. }
+                | What::Status(_)
+                | What::Frame(_)
+                | What::Ivc(_)
+                | What::Message { .. }
+                | What::Topic { .. }
+        )
     }
 
     /// Value streams: at an instant, the latest one counts.
     pub fn is_stream(&self) -> bool {
-        matches!(self, What::Status(_) | What::Message { .. })
+        matches!(self, What::Status(_) | What::Message { .. } | What::Topic { .. })
     }
+}
+
+/// Whether message `v` has what `pattern` asks for, or the first thing it does not: an object's fields each match
+/// (others are not looked at); a list item by item, the same length; `{min, max}` (either) a number in that range;
+/// a number equal to within a millionth (a float32 decoded keeps its rounding); anything else equal.
+pub fn msg_mismatch(pattern: &serde_json::Value, v: &serde_json::Value) -> Option<String> {
+    use serde_json::Value as J;
+    fn at(path: &str) -> String {
+        if path.is_empty() { "the message".into() } else { path.to_string() }
+    }
+    fn walk(p: &J, v: &J, path: &str) -> Option<String> {
+        match (p, v) {
+            (J::Object(pm), _) if !pm.is_empty() && pm.keys().all(|k| k == "min" || k == "max") => {
+                let Some(x) = v.as_f64() else { return Some(format!("{} is {v}, not a number", at(path))) };
+                let lo = pm.get("min").and_then(J::as_f64).unwrap_or(f64::NEG_INFINITY);
+                let hi = pm.get("max").and_then(J::as_f64).unwrap_or(f64::INFINITY);
+                (x < lo || x > hi).then(|| format!("{} is {x}, not in [{lo}, {hi}]", at(path)))
+            }
+            (J::Object(pm), J::Object(vm)) => pm.iter().find_map(|(k, pv)| {
+                let sub = if path.is_empty() { k.clone() } else { format!("{path}.{k}") };
+                match vm.get(k) {
+                    Some(x) => walk(pv, x, &sub),
+                    None => Some(format!("no field {sub}")),
+                }
+            }),
+            (J::Array(pa), J::Array(va)) if pa.len() == va.len() => {
+                pa.iter().zip(va).enumerate().find_map(|(i, (a, b))| walk(a, b, &format!("{path}[{i}]")))
+            }
+            (J::Number(a), J::Number(b)) => {
+                let (a, b) = (a.as_f64().unwrap_or(f64::NAN), b.as_f64().unwrap_or(f64::NAN));
+                ((a - b).abs() > 1e-6 * a.abs().max(b.abs()).max(1.0)).then(|| format!("{} is {b}, not {a}", at(path)))
+            }
+            (p, v) if p == v => None,
+            (p, v) => Some(format!("{} is {v}, not {p}", at(path))),
+        }
+    }
+    walk(pattern, v, "")
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -558,7 +628,7 @@ fn parse_scenario(v: &Value, path: &Path, document: usize) -> R<Scenario> {
     let m = map(v, "the scenario")?;
     check_keys(
         m,
-        &["name", "description", "robot", "board", "bridges", "inputs", "time", "threads", "steps", "cases"],
+        &["name", "description", "robot", "board", "bridges", "agents", "inputs", "time", "threads", "steps", "cases"],
         "the scenario",
     )?;
     let name = string(get(m, "name").ok_or("a scenario needs a `name`")?, "name")?;
@@ -587,6 +657,13 @@ fn parse_scenario(v: &Value, path: &Path, document: usize) -> R<Scenario> {
                 show(other)
             ));
         }
+    };
+    let agents = match get(m, "agents") {
+        None => Vec::new(),
+        Some(Value::Sequence(list)) => {
+            list.iter().map(|a| parse_agent(&string(a, "agents")?, dir)).collect::<R<_>>()?
+        }
+        Some(other) => return Err(format!("agents: expected a list like [nanoros:led], found {}", show(other))),
     };
     let inputs = match get(m, "inputs") {
         Some(v) => parse_inputs(v, "inputs")?,
@@ -625,6 +702,7 @@ fn parse_scenario(v: &Value, path: &Path, document: usize) -> R<Scenario> {
         document,
         setup,
         bridges,
+        agents,
         inputs,
         time,
         threads,
@@ -770,6 +848,16 @@ fn parse_bridge(s: &str) -> R<BridgeSpec> {
     Ok(BridgeSpec::Can { bus, client: client as u8 })
 }
 
+/// An agent as `--mock-agent` takes it; its `=CONFIG` path is looked for from the scenario's directory up.
+fn parse_agent(s: &str, dir: &Path) -> R<AgentSpec> {
+    let mut a: AgentSpec = s.parse().map_err(|e| format!("agents: {e}"))?;
+    if let Some(c) = &a.config {
+        let p = sim_host::expand_path(&c.to_string_lossy())?;
+        a.config = Some(find_upward(dir, &p).ok_or_else(|| format!("agents: {s}: no file {}", p.display()))?);
+    }
+    Ok(a)
+}
+
 fn parse_inputs(v: &Value, what: &str) -> R<Vec<(String, f64)>> {
     let m = map(v, what)?;
     m.iter().map(|(k, v)| Ok((key_str(k)?.to_string(), number(v, &format!("{what}.{}", key_str(k)?))?))).collect()
@@ -830,13 +918,13 @@ fn parse_step(v: &Value, number: usize) -> R<Step> {
     let label = get(m, "name").map(|v| string(v, "name")).transpose().map_err(ctx)?;
     let kind = parse_kind(kind, body).map_err(|e| ctx(format!("{kind}: {e}")))?;
     match &kind {
-        StepKind::Send { every: Some(_), .. } if end.is_none() => {
-            return Err(ctx("send: `every` needs `within` or `until` to say when to stop".into()));
-        }
-        StepKind::Send { every: None, .. } if end.is_some() => {
+        k if k.send_every() == Some(None) && end.is_some() => {
             return Err(ctx("send: `within`/`until` only go with `every`".into()));
         }
-        k if k.is_action() && !matches!(k, StepKind::Send { .. }) && end.is_some() => {
+        k if k.send_every().is_some_and(|e| e.is_some()) && end.is_none() => {
+            return Err(ctx("send: `every` needs `within` or `until` to say when to stop".into()));
+        }
+        k if k.is_action() && k.send_every().is_none() && end.is_some() => {
             return Err(ctx(format!("{}: actions take `at` or `after`, not `within` or `until`", k.word())));
         }
         StepKind::Always(c) | StepKind::Never(c) if c.count.is_some() || c.rate.is_some() => {
@@ -901,6 +989,22 @@ fn parse_kind(kind: &str, body: &Value) -> R<StepKind> {
             let m = without_timing(map(body, "input")?);
             StepKind::Input(parse_inputs(&Value::Mapping(m), "input")?)
         }
+        "send" if map(body, "send")?.contains_key("topic") => {
+            let m = without_timing(map(body, "send")?);
+            check_keys(&m, &["board", "bridge", "topic", "msg", "every"], "send")?;
+            let target = parse_target(&m)?;
+            let topic = string(get(&m, "topic").unwrap(), "topic")?;
+            // Through JSON: a message is its fields as the agent's protocol has them
+            let msg = match get(&m, "msg") {
+                Some(v) => serde_json::to_value(v).map_err(|e| format!("msg: {e}"))?,
+                None => serde_json::Value::Null,
+            };
+            let every = get(&m, "every").map(|v| time(v, "every")).transpose()?;
+            if every == Some(Time::ZERO) {
+                return Err("every: must be more than 0".into());
+            }
+            StepKind::SendTopic { target, topic, msg, every }
+        }
         "send" => {
             let m = without_timing(map(body, "send")?);
             check_keys(&m, &["board", "bridge", "message", "every"], "send")?;
@@ -949,13 +1053,13 @@ fn parse_kind(kind: &str, body: &Value) -> R<StepKind> {
     })
 }
 
-const WHATS: [&str; 11] =
-    ["log", "status", "link", "frame", "gpio", "esc", "vehicle", "resets", "lockups", "ivc", "message"];
+const WHATS: [&str; 12] =
+    ["log", "status", "link", "frame", "gpio", "esc", "vehicle", "resets", "lockups", "ivc", "message", "topic"];
 
 fn parse_condition(body: &Value) -> R<Condition> {
     let m = without_timing(map(body, "the condition")?);
     let mut allowed: Vec<&str> = WHATS.to_vec();
-    allowed.extend(["board", "bridge", "bus", "level", "count", "rate", "value"]);
+    allowed.extend(["board", "bridge", "bus", "level", "count", "rate", "value", "msg"]);
     check_keys(&m, &allowed, "the condition")?;
     let whats: Vec<&str> = WHATS.iter().copied().filter(|k| get(&m, k).is_some()).collect();
     let w = match whats[..] {
@@ -972,6 +1076,7 @@ fn parse_condition(body: &Value) -> R<Condition> {
     };
     only_with("level", "log")?;
     only_with("value", "message")?;
+    only_with("msg", "topic")?;
     let what = match w {
         "log" => {
             let text = match v {
@@ -1077,6 +1182,10 @@ fn parse_condition(body: &Value) -> R<Condition> {
             };
             What::Message { path, value }
         }
+        "topic" => What::Topic {
+            topic: string(v, "topic")?,
+            msg: get(&m, "msg").map(|x| serde_json::to_value(x).map_err(|e| format!("msg: {e}"))).transpose()?,
+        },
         _ => unreachable!(),
     };
     let target = parse_target(&m)?;

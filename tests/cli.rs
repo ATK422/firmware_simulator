@@ -529,3 +529,32 @@ fn mercury_robot_file_and_its_smoke_scenario() {
     let (ok, text) = run(&["scenario", "scenarios/boot_mercury.yaml"], Some(&tf));
     assert!(!ok && text.contains("0 passed, 1 failed"), "{text}");
 }
+
+/// `--mock-agent nanoros`: on a robot (the robot file's `ros_toml`) and on one board (a `ros.toml` given), the
+/// board's messages printed by topic and a summary at the end; specs that cannot work are refused.
+#[test]
+fn mock_agents_print_what_a_nanoros_board_publishes() {
+    let robot = repo().join("robots/nanoros_led.toml");
+    let out = sim(&["robot", path(&robot), "--mock-agent", "nanoros:internal:led", "--time", "1.2s"]);
+    assert!(out.contains("led <- firmware_status {\"board_name\":\"nanoros_led\""), "{out}");
+    assert!(out.contains("led <- imu_data {"), "{out}");
+    assert!(out.contains("led: nanoros agent connected"), "{out}");
+    assert!(out.contains(", 0 error(s)"), "{out}");
+    let elf = repo().join("test_programs/nanoros_led/nanoros_led.elf");
+    let ros = repo().join("test_programs/nanoros_led/ros.toml");
+    let agent = format!("nanoros={}", path(&ros));
+    let board = repo().join("boards/talos/led_board.toml");
+    let out = sim(&["run", path(&elf), "--board", path(&board), "--mock-agent", &agent, "--time", "1.2s"]);
+    assert!(out.contains("client 6 <- firmware_status {"), "{out}");
+    assert!(out.contains("client 6: nanoros agent connected"), "{out}");
+    let fail = |args: &[&str]| {
+        let out = Command::new(env!("CARGO_BIN_EXE_firmware_simulator")).args(args).output().unwrap();
+        assert!(!out.status.success(), "{args:?}");
+        String::from_utf8_lossy(&out.stderr).into_owned()
+    };
+    let r = path(&robot);
+    assert!(fail(&["robot", r, "--mock-agent", "nanoros:nope", "--time", "1ms"]).contains("no board \"nope\""));
+    assert!(fail(&["robot", r, "--mock-agent", "nanoros:external:led", "--time", "1ms"]).contains("no bus"));
+    assert!(fail(&["robot", r, "--mock-agent", "nanoros:led=nope.toml", "--time", "1ms"]).contains("nope.toml"));
+    assert!(fail(&["robot", r, "--mock-agent", "mqtt:led", "--time", "1ms"]).contains("unknown protocol"));
+}

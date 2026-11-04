@@ -1,0 +1,18 @@
+# The nano-ROS test board (test_programs/nanoros_led: osu-uwrt/nano_ros's libnanoros on a Talos LED board, CANmore
+# client 6) alone on the internal bus, with its topic table for a nano-ROS mock agent. Early: nano-ROS is still
+# changing (docs/nanoros.md).
+#
+#   firmware_simulator robot robots/nanoros_led.toml --mock-agent nanoros:led --time 3s
+#
+# prints every message the board publishes (firmware_status, imu_data, bit_echo) as the agent decodes it.
+
+[[bus]]
+name = "internal"
+rates = "internal"
+
+[[board]]
+name = "led"
+board = "../boards/talos/led_board.toml"
+elf = "../test_programs/nanoros_led/nanoros_led.elf"
+bus = "internal"
+ros_toml = "../test_programs/nanoros_led/ros.toml"
