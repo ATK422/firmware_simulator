@@ -90,36 +90,38 @@ pub fn scenario_yaml(
         steps.push(mapping(vec![("fault", Value::String(spec.to_string())), ("at", clear_at.clone())]));
     }
     // The oracle check for this finding
-    let within = secs(window + settle);
+    // Every check looks from the snapshot to the end of the run: what it looks for can happen during the fuzz
+    // window, before the cursor reaches the steps that clear the bus conditions
+    let from = || ("at", secs(snap_at));
+    let to = || ("until", secs(end));
+    let at_least_one = || mapping(vec![("min", Value::Number(1.into()))]);
     let check = match finding.kind {
         Kind::Panic => mapping(vec![(
             "expect",
             mapping(vec![
                 ("log", mapping(vec![("regex", Value::String("PANIC|Reset by panic|HardFault".into()))])),
-                ("within", within),
+                from(),
+                to(),
             ]),
         )]),
-        Kind::WatchdogReset => mapping(vec![(
-            "expect",
-            mapping(vec![("resets", mapping(vec![("min", Value::Number(1.into()))])), ("within", within)]),
-        )]),
-        Kind::Lockup => mapping(vec![(
-            "expect",
-            mapping(vec![("lockups", mapping(vec![("min", Value::Number(1.into()))])), ("within", within)]),
-        )]),
+        Kind::WatchdogReset => mapping(vec![("expect", mapping(vec![("resets", at_least_one()), from(), to()]))]),
+        Kind::Lockup => mapping(vec![("expect", mapping(vec![("lockups", at_least_one()), from(), to()]))]),
         Kind::Hang => {
             mapping(vec![("expect", mapping(vec![("link", Value::String("down".into())), ("at", secs(end))]))])
         }
         Kind::FaultLatched => {
-            // Replay and check a status is still received; the exact fault bits are in the JSON record
-            mapping(vec![("expect", mapping(vec![("status", Value::String("any".into())), ("within", within)]))])
+            // The latest status at the end still has the fault raised (the key is `fault:NAME`)
+            let name = finding.key.strip_prefix("fault:").unwrap_or(&finding.key).to_string();
+            let status = mapping(vec![("raised", Value::Sequence(vec![Value::String(name)]))]);
+            mapping(vec![("expect", mapping(vec![("status", status), ("at", secs(end))]))])
         }
         Kind::ErrorLog => mapping(vec![(
             "expect",
             mapping(vec![
                 ("log", mapping(vec![("regex", Value::String(super::oracle::gist_regex(&finding.detail)))])),
                 ("level", Value::String("error".into())),
-                ("within", within),
+                from(),
+                to(),
             ]),
         )]),
         Kind::UnmodelledAccess => {

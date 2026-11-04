@@ -252,6 +252,7 @@ impl Shared {
 pub struct Campaign {
     base: Bench,
     shared: Shared,
+    noise: Vec<Finding>,
 }
 
 impl Campaign {
@@ -273,6 +274,7 @@ impl Campaign {
             lockups: base.session.lockups,
             was_connected: !base.bridge.as_ref().unwrap().state().heartbeats.is_empty(),
             fault_names: fault_names(&base),
+            noise: Default::default(),
         };
         let snap_at = grid(base.now());
         let seen = base.session.machine.edges().unwrap_or_default();
@@ -290,7 +292,17 @@ impl Campaign {
             seen: Arc::new(Mutex::new(seen)),
             target: target.clone(),
         };
-        Ok(Campaign { base, shared })
+        let mut campaign = Campaign { base, shared, noise: Vec::new() };
+        // A control case with no traffic: whatever it trips is the clean board's own behaviour, not the input's
+        let (control, _) = campaign.run_once(&FuzzInput { ops: Vec::new() });
+        campaign.shared.baseline.noise = control.iter().map(|f| f.key.clone()).collect();
+        campaign.noise = control;
+        Ok(campaign)
+    }
+
+    /// What the control case (no fuzz traffic) tripped: the clean board's own behaviour, left out of the findings.
+    pub fn noise(&self) -> &[Finding] {
+        &self.noise
     }
 
     pub fn params(&self) -> Params {

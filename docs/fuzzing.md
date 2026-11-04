@@ -55,10 +55,23 @@ finding with its kind, detail and the size of its minimised case:
 
 ```
 board               cases     corpus   edges   findings  wall
-esc_board              5000      214   18233         0  61.2s
-power_board            5000      191    2291         1   54.8s
-    [fault_latched] faults 0x8 (FAULT_ROS_ERROR)  (1 op(s))
+power_board            6157      149    2567         3  109.1s
+    [fault_latched] FAULT_ROS_ERROR raised and still set at the end (faults 0x8)  (1 op(s))
+    [error_log] Bridge speaks titan_link v10, firmware speaks v2  (1 op(s))
+    [error_log] Fault FAULT_ROS_ERROR raised (arg 0xa) at titan_rp2040/src/link.rs:139  (1 op(s))
+esc_board                85       21    2404         3  110.0s
+...
+hbridge_board          4292      129    2535         4  109.1s
+    (clean board, not counted) [error_log] Async UART reported RX error: Timeout
+...
 ```
+
+(`--time 20m --jobs 2 --seed 2026` on titan_firmware_rs 94a107e. The ESC and IVC boards run near real time, so
+they get far fewer cases in the same wall time than the idle boards.)
+
+Before fuzzing, each board runs one **control case** with no fuzz traffic at all; whatever that trips (here the
+H-bridge board's own UART timeout line) is the clean board's behaviour, not the input's, so it is printed as
+`(clean board, not counted)` and left out of every case's findings.
 
 Runs are deterministic: the same seed, board images and options give the same cases, coverage and findings on any
 number of threads (only the wall time differs). Ctrl-C ends the campaign at the next case boundary.

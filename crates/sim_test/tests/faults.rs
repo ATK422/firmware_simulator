@@ -868,3 +868,28 @@ fn firmware_finding_fuzz_rx_overflow_latches_can_internal_error() {
     // Today: still raised seconds after the flood stopped
     assert!(later.iter().all(|f| f & FAULT_CAN_INTERNAL_ERROR != 0), "FAULT_CAN_INTERNAL_ERROR latched: {later:x?}");
 }
+
+/// Found by `firmware_simulator fuzz`: two `CYCLE_COMPUTER` electrical commands to the camera cage in a row (a ROS
+/// command delivered twice, say) raise `FAULT_ROS_BAD_COMMAND` on the second, from the repeat guard in
+/// `camera_cage_bb/src/cage.rs`, and nothing lowers it. The guard itself rearms once the cycle is done
+/// (`CYCLE_ACTIVE` is cleared), so later requests work again, but the board reports the fault for the rest of the
+/// run. Minimised reproducer: the two commands (`send: {bytes: "060200"}` twice, 7 ms apart).
+#[test]
+fn firmware_finding_fuzz_repeated_cycle_command_latches_bad_command() {
+    use sim_test::titan_link::camera_cage::HostToDevice as Cage;
+    const FAULT_ROS_BAD_COMMAND: u32 = 1 << 5;
+    let Some(elf) = sim_test::titan_rs("camera_cage_bb") else { return };
+    let mut b = Bench::builder(&elf).board("mk2/camera_cage_bb").bridge(4).boot().unwrap();
+    b.run_until(ms(1500)).unwrap();
+    assert_eq!(b.faults().unwrap() & FAULT_ROS_BAD_COMMAND, 0, "clear before");
+    b.send(HostToDevice::CameraCage(Cage::ElectricalCommand(0)));
+    b.run_for(ms(10));
+    b.send(HostToDevice::CameraCage(Cage::ElectricalCommand(0)));
+    let sent = b.now();
+    b.run_for(ms(6000));
+    assert!(b.logged("Attempting to request multiple cycles in a row"));
+    let later: Vec<u32> = b.statuses().iter().filter(|s| s.0 > sent + ms(3000)).map(|s| s.1.faults).collect();
+    assert!(later.len() >= 2, "statuses kept coming");
+    // Today: still raised long after the cycle finished and the guard rearmed
+    assert!(later.iter().all(|f| f & FAULT_ROS_BAD_COMMAND != 0), "FAULT_ROS_BAD_COMMAND latched: {later:x?}");
+}

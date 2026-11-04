@@ -106,6 +106,9 @@ pub fn run(args: FuzzArgs) -> Result<()> {
             report.hits.len(),
             started.elapsed().as_secs_f64(),
         );
+        for f in campaign.noise() {
+            println!("    (clean board, not counted) [{}] {}", f.kind.word(), f.detail);
+        }
         for hit in &report.hits {
             let f = &hit.findings[0];
             println!("    [{}] {}  ({} op(s))", f.kind.word(), f.detail, hit.input.ops.len());

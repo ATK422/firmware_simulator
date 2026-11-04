@@ -22,6 +22,9 @@ pub struct Baseline {
     pub was_connected: bool,
     /// The board's fault bit names (`FAULT_*`), for reporting.
     pub fault_names: Vec<String>,
+    /// Finding keys a case with no fuzz traffic at all produces (a clean board's own ERROR lines, say): not
+    /// caused by the input, so left out of every case's findings and reported separately.
+    pub noise: BTreeSet<String>,
 }
 
 /// A kind of finding. Ordered by how serious it is, worst first.
@@ -187,6 +190,7 @@ pub fn check(base: &Baseline, o: &Outcome) -> Vec<Finding> {
         }
     }
 
+    out.retain(|f| !base.noise.contains(&f.key));
     out.sort_by_key(|f| f.kind);
     out
 }
@@ -230,6 +234,7 @@ mod tests {
                 "FAULT_WATCHDOG_WARNING".into(),
                 "FAULT_CAN_INTERNAL_ERROR".into(),
             ],
+            noise: BTreeSet::new(),
         }
     }
 
@@ -291,6 +296,22 @@ mod tests {
             locked_up_now: false,
         };
         assert_eq!(check(&base(), &o).iter().filter(|f| f.kind == Kind::Hang).count(), 1);
+    }
+
+    #[test]
+    fn noise_from_the_control_run_is_left_out() {
+        let mut b = base();
+        b.noise.insert(format!("error:{}", gist("Async UART reported RX error: Timeout")));
+        let o = Outcome {
+            logs: &[(Time::from_ms(1), Some("error".into()), "Async UART reported RX error: Timeout".into())],
+            faults: 0,
+            unmodelled: &b.unmodelled,
+            resets: 0,
+            lockups: 0,
+            answered_after: true,
+            locked_up_now: false,
+        };
+        assert!(check(&b, &o).is_empty(), "a clean board's own ERROR line is not a finding");
     }
 
     #[test]
