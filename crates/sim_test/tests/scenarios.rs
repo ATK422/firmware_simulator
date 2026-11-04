@@ -177,3 +177,34 @@ fn two_firmware_builds_compared() {
     let j = c.json();
     assert_eq!(j["differs"], true);
 }
+
+/// `--from-checkpoint`: scenarios that reach the same `pause` the same way share one run up to it, and come out as
+/// they do on their own.
+#[test]
+fn scenarios_share_a_run_up_to_a_named_checkpoint() {
+    if sim_test::titan_rs("power_board").is_none() {
+        return;
+    }
+    let boot = "steps:\n  - expect: {log: ROS connected, within: 1s}\n  - pause: booted\n";
+    let text = format!(
+        "name: unplugged\n{POWER}time: 2s\n{boot}  - fault: can-unplug\n  - expect: {{link: down, within: 1s}}\n\
+         ---\nname: battery\n{POWER}time: 2s\n{boot}  - input: {{stbd_battery: 13.5}}\n  - expect: {{log: ROS connected, at: 1.5s}}\n\
+         ---\nname: other boot\n{POWER}time: 2s\nsteps:\n  - expect: {{log: ROS connected, within: 900ms}}\n  - pause: booted\n"
+    );
+    let s = scenario::parse_str(&text, &scenarios_dir().join("inline.yaml")).unwrap();
+    let alone = scenario::run_all(&s, &Options::default(), 1);
+    let before = scenario::shared_checkpoints();
+    let opts = Options { from_checkpoint: Some("booted".into()), ..Default::default() };
+    let shared = scenario::run_all(&s, &opts, 1);
+    // The first two share one; the third gets there another way, so it has one of its own
+    assert_eq!(scenario::shared_checkpoints() - before, 2);
+    let strip = |o: &[Outcome]| {
+        let mut j = scenario::json(o);
+        for s in j["scenarios"].as_array_mut().unwrap() {
+            s["wall_s"] = serde_json::Value::Null;
+        }
+        j
+    };
+    assert_eq!(strip(&alone), strip(&shared));
+    assert!(shared.iter().all(|o| o.passed()), "{}", shared.iter().map(scenario::human).collect::<String>());
+}

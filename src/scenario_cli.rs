@@ -32,6 +32,10 @@ pub struct ScenarioArgs {
     /// Checks the files and lists each scenario's steps, without running them.
     #[arg(long)]
     check: bool,
+    /// Scenarios that reach the `pause` step of this name the same way (same setup, bridges, inputs, images, time
+    /// and steps up to it) share one run up to there and go on from copies of its state.
+    #[arg(long, value_name = "NAME")]
+    from_checkpoint: Option<String>,
 }
 
 fn parse_override(s: &str) -> Result<ImageOverride, String> {
@@ -73,7 +77,8 @@ pub fn scenario(args: ScenarioArgs) -> Result<i32> {
         );
         return Ok(0);
     }
-    let opts = Options { images: args.image.clone(), ..Default::default() };
+    let opts =
+        Options { images: args.image.clone(), from_checkpoint: args.from_checkpoint.clone(), ..Default::default() };
     let to_stdout = args.json.as_deref() == Some(std::path::Path::new("-"));
     let print = !to_stdout;
     let quiet = args.quiet;
@@ -245,6 +250,7 @@ pub fn compare(args: CompareArgs) -> Result<i32> {
         record: true,
         profile: args.profile.then_some(args.profile_interval),
         skip_missing: false,
+        from_checkpoint: None,
     };
     let (oa, ob) = (side(&args.a), side(&args.b));
     // Each scenario twice, A and B side by side
