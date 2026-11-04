@@ -166,7 +166,9 @@ see each other only through the end of a slice, and through it only in three way
 `CanNode::idle_changes_nothing`), a vehicle (it reads the ESCs' motors and writes the pressure inputs of the boards
 it carries sensors for), and the order in which host hooks see lines. A frame finishes no earlier than when it
 became ready plus its time on the wire (`CanBus::earliest_end`), and endpoints say when they will next hand one in
-(`CanEndpoint::idle_until`: the mock bridge and `Monitor` can, SocketCAN and cannelloni cannot). So the boards run
+(`CanEndpoint::idle_until`: the mock bridge, `Monitor` and replays can), or are *live* (`CanEndpoint::live`:
+SocketCAN, cannelloni, the upload link: they cannot tell, but every frame they hand in is ready at the step that
+reads it, as it arrived from outside since the last one). So the boards run
 in windows: each runs on alone on its thread, doing the machine side of its end of each slice (devices, and taking
 out what RTT and the UARTs hold, `Session::collect`) and noting what its controllers show the bus and its ESCs'
 motors, up to the first boundary where any board's frame could finish (an atomic minimum it lowers as soon as it
@@ -180,13 +182,41 @@ mean the bounds are wrong), the vehicles step with the noted motors, and boards 
 camera cage) run there slice by slice rather than ahead; a frame of theirs cuts the window and rolls the others
 back. At the window's end the host sides take in what was collected, boundary by boundary in board order, and the
 end of the slice is done as usual. A board that stops ends the window at the end of that slice, as on threads.
-Boards with a pty, USB/IP, an Ethernet cable, a profiler or a trace sink (VCD, `--trace`), endpoints that cannot
-tell when they send, and acoustic media keep the slice-by-slice threads. `crates/sim_host/tests/runahead.rs`
+
+*Live inputs.* A live endpoint is read where taking turns reads it, at every boundary's bus step, which running
+ahead does where it commits the boundary; after the step, the window is cut at the first boundary where what it
+handed in could finish (`CanBus::earliest_queued_end`, at least the next one), and the boards that ran past it are
+rolled back, so they see the frame where taking turns would have. A host frame therefore enters the bus at a
+well-defined virtual time, the boundary whose step read it, and never in the past of a board that keeps what it
+did. What makes a run differ from another is only when frames arrive (which step reads them); given the same
+arrivals, taking turns, slice by slice on threads and running ahead give the same run. `canlog::Arrivals`
+(`robot --arrivals-log`) logs the arrivals to the nanosecond and `canlog::arrivals_replay` (`--replay-arrivals`)
+hands them in again at the same steps, so a run with real host tools can be repeated exactly. Pseudo terminals
+(UART, USB CDC ports 0 and 1) are read the same way, by the board itself: `Session::collect` reads them at each
+boundary where polling would, injects what it got, and keeps it until it is delivered; a rollback gives it back
+(`Session::unread_from`) to be read first, so nothing is lost or reordered, and output reaches the terminal once
+final. In real time with a live input (`runahead::LIVE_LEAD`), a window ends at most 2 ms of virtual time ahead
+of the wall clock (where taking turns lets virtual time get before it sleeps), sleeping first while the robot is
+more than 1 ms ahead, so frames are read, and the boards' frames go out, about when they are due; behind the wall
+clock the windows are as long as without. Real-time pacing and its lag warnings run at each window's end. The
+sensor boards of an external vehicle (moved only by `POST /api/vehicle`, between runs) need not follow it and run
+ahead too.
+
+*Observers.* Trace sinks (VCD, `--trace`, except instruction tracing, which runs slice by slice) get a board's
+events through a buffer (`HeldTrace`) that a rollback truncates and each window's end passes on; profilers hold
+their samples (`Profiler::hold`, `mark`, `back_to`, `commit`) the same way: both see exactly the committed run.
+Boards with USB/IP or an Ethernet cable (their host sides answer the board at once: ARP, the mock bridge; rolling
+them back would need snapshots of the endpoints, and Puddles is a single board anyway), endpoints that are
+neither live nor can tell when they send, and acoustic media keep the slice-by-slice threads. `crates/sim_host/tests/runahead.rs`
 compares Talos frame by frame, line by line (the hooks' order across boards included) and state by state against
 taking turns: on 2, 3 and any threads, in uneven pieces, with a vehicle that moves the camera cage's input, with
 stops, and with a stress mode (`Robot::run_ahead_stress`) that makes every board ignore where its window ends
-until rolled back and cuts every window at a random boundary (thousands of rollbacks);
-`crates/sim_test/tests/run_ahead_thrusters.rs` does it with the thrusters spinning and the vehicle moving.
+until rolled back and cuts every window at a random boundary (thousands of rollbacks); with live endpoints (a
+mock bridge behind `socketcan::Live`, frames at chosen times, frames from a host thread on the wall clock logged
+and replayed), a host frame landing in boards' windows, in real time (no read more than the lead ahead of the
+wall clock), the nereus setup (`robots/talos_nereus.toml`: live host sides, an external vehicle posted between
+runs), and with traces and profiles; `crates/sim_host/tests/robot_usb.rs` with a board fed from a terminal;
+`crates/sim_test/tests/run_ahead_thrusters.rs` with the thrusters spinning and the vehicle moving.
 
 Both run their machines through `Session::run_machine`, which goes through the session's sampling profiler when
 it has one (the profiler cuts the run at its sample times; a robot's worker thread takes the board's profiler with
@@ -355,7 +385,12 @@ would have done it, whatever ran ahead and was rolled back. So:
   call an endpoint, so the calls and what they gave are the same either way. A tapped endpoint can tell when it
   will next send (`CanEndpoint::idle_until`) if the endpoint itself can: live, the endpoint's own answer; in a
   replay, the time its next recorded frames were asked for (or, once the replay reaches the frontier, the
-  endpoint's own answer, whichever is first). So replays run ahead too.
+  endpoint's own answer, whichever is first). So replays run ahead too. A tapped live endpoint (SocketCAN,
+  cannelloni) is live as its endpoint is (`CanEndpoint::live`): what it gave was ready at the step that read it,
+  and so it is replayed; it tells that a frame is waiting (`CanEndpoint::waiting`) as the endpoint does, and in a
+  replay from the recording. The nereus setup (`--can`, `--dashboard`, which records by default) thus runs ahead
+  while recorded and in replays (`the_nereus_setup_runs_ahead_as_it_runs_in_turns`,
+  `recorded_live_endpoints_run_ahead_and_replay_the_same`).
 * *Debugger stops run in turns.* While GDB is attached to one of its boards (it stops at a `BKPT`), or a
   breakpoint, watchpoint or position is armed on any board, a recorded robot runs its boards in turns on the
   calling thread, as GDB without time travel always did, so stops are reported exactly as before (on threads the
@@ -377,7 +412,8 @@ cargo run --release -p sim_test --example bench -- --time 2s --repeat 3 --only e
 
 runs the template, ESC and IVCBoard2 images on their boards and the Talos (also on up to two, three, four and six
 threads: `talos_t2`, `talos_t3`, `talos_mt`, `talos_t6`, and on three slice by slice without running ahead:
-`talos_t3_ls`; `--threads N` sets `talos_mt`'s and prints the grouping)
+`talos_t3_ls`; `--threads N` sets `talos_mt`'s and prints the grouping; `talos_live_t3` and `talos_live_t3_ls`
+with the bridge behind a live endpoint, as on vcan; `nereus`, `nereus_t3` and `nereus_t3_ls`: the nereus setup)
 and IVC2 pool robots for 2 s of virtual time, and prints the best wall time, virtual/wall (above 1 keeps up with
 `--realtime`), CPU time, instructions executed, the share skipped in busy-waits, emulated MIPS, and a fingerprint
 of everything the run produced (log lines and their times, bridge messages, UART/RTT text, CPU registers, cycle

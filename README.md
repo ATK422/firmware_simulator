@@ -307,16 +307,21 @@ Measured with `cargo run --release -p sim_test --example bench -- --time 2s --re
 | IVC2 pool (two boards in the water) | 2.15 s | about 0.9x |
 | Talos (nine boards), one thread | 3.7 s | about 0.54x |
 | Talos on three or four threads | 5-6 s (1.6-1.7 s wall) | about 1.2x |
+| Talos on three threads, its bridge on a live endpoint (as on vcan) | 5.2 s (1.8 s wall) | about 1.1x (0.7x before) |
+| nereus setup (`robots/talos_nereus.toml`, live host sides, external vehicle), three threads | 4.8 s (1.8-2.1 s wall) | about 1.0x (0.7x before) |
 
 So single boards run at or above real time. All of Talos keeps up with `--realtime` on three or more free cores:
 its boards run on threads by default (`--threads`) and ahead of each other between the slices where a CAN frame
 could reach them, which makes it about 2.2x faster than on one core (1.6-1.7 s for 2 s of virtual time, about
-1.2x real time); the costlier ESC board sets the pace. Details: [internals.md](docs/internals.md#performance),
+1.2x real time); the costlier ESC board sets the pace. That holds with the real host tools too: frames from
+`--can` (SocketCAN) or `--cannelloni` enter the bus at the slice boundary that reads them, boards that already ran
+past it are rolled back, and with `--realtime` the emulator stays within 2 ms of the wall clock, so the robot in a
+box and the firmware in nereus keep up. Details: [internals.md](docs/internals.md#performance),
 [robots.md](docs/robots.md#how-a-robot-runs).
 
 **Determinism.** The same image, board or robot file, inputs, faults and seeds give the same run, instruction for
 instruction and frame for frame: models never read the wall clock (only `--realtime` pacing does, to sleep), all
-randomness is seeded, iteration orders are fixed, `--threads` (with the boards running ahead of each other) gives the same results as taking turns, and observers
+randomness is seeded, iteration orders are fixed, `--threads` (with the boards running ahead of each other) gives the same results as taking turns, frames from host tools differ only in when they arrive (`--arrivals-log` and `--replay-arrivals` repeat such a run exactly), and observers
 (traces, waveforms, the profiler) do not change what the machine does. Tests, replay, `can-diff` of two runs and
 the benchmark's fingerprints rely on it ([internals.md](docs/internals.md#determinism-rules)).
 
