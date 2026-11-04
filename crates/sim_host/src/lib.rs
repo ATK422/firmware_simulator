@@ -201,6 +201,7 @@ pub mod session;
 pub mod signal;
 pub mod socketcan;
 pub mod target;
+pub mod timetravel;
 pub mod unwind;
 pub mod upload;
 pub mod usb;

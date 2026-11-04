@@ -74,6 +74,55 @@ pub struct Session {
     pub lockups: u64,
     /// The current lockup was returned as final (it is returned once; running on, the board stays locked up).
     final_lockup_reported: bool,
+    /// The end of the slice a debugger stop interrupted ([`StopReason::is_debug_stop`]): the next run finishes that
+    /// slice first, so stopping never changes where slices end (or anything else about the run).
+    slice_end: Option<Time>,
+    /// Where the last slice [`Session::run_until`] ran ended (the time it ran to; the machine's own time may be a
+    /// little past it, as its last instruction may end later).
+    boundary: Time,
+}
+
+/// What a session collected (see [`Session::keep_collected`]).
+#[derive(Clone, Default)]
+pub struct Collected {
+    logs: Vec<(Time, LogLine)>,
+    rtt_text: Vec<(usize, Vec<u8>)>,
+    uart_text: [String; 2],
+    usb_cdc_text: String,
+}
+
+/// A [`Session::checkpoint`].
+pub struct SessionCheckpoint {
+    machine: rp2040::machine::Snapshot,
+    flash: std::sync::Arc<Vec<u8>>,
+    rtt: Option<RttReader>,
+    defmt_partial: Vec<u8>,
+    logs: usize,
+    rtt_text: usize,
+    uart_text: [usize; 2],
+    uart_line: [String; 2],
+    usb_cdc_text: usize,
+    usb_cdc_line: String,
+    can_bus: Option<(CanBus, Option<usize>)>,
+    #[allow(clippy::type_complexity)]
+    eth: Option<(std::collections::VecDeque<Vec<u8>>, Vec<(Time, Vec<u8>)>, bool, u64)>,
+    eth_loss: Option<crate::fault::PacketLoss>,
+    lockups: u64,
+    final_lockup_reported: bool,
+    slice_end: Option<Time>,
+    boundary: Time,
+}
+
+impl SessionCheckpoint {
+    /// The flash contents (shared between checkpoints while it does not change).
+    pub fn flash(&self) -> &std::sync::Arc<Vec<u8>> {
+        &self.flash
+    }
+
+    /// About how much memory the checkpoint holds besides the flash: SRAM, the other memories, devices.
+    pub fn bytes(&self) -> usize {
+        self.machine.bytes() + self.defmt_partial.len() + 4096
+    }
 }
 
 /// Callback for complete lines of text: `(virtual time, line)`.
@@ -124,6 +173,8 @@ impl Session {
             stop_on_lockup: true,
             lockups: 0,
             final_lockup_reported: false,
+            slice_end: None,
+            boundary: Time::ZERO,
         }
     }
 
@@ -178,6 +229,8 @@ impl Session {
             stop_on_lockup: self.stop_on_lockup,
             lockups: self.lockups,
             final_lockup_reported: self.final_lockup_reported,
+            slice_end: self.slice_end,
+            boundary: self.boundary,
         }
     }
 
@@ -359,14 +412,24 @@ impl Session {
     }
 
     /// Runs until virtual time `end`, polling RTT every [`Session::slice`]. Returns [`StopReason::Requested`] at
-    /// a slice boundary once [`Session::stop_flag`] is set.
+    /// a slice boundary once [`Session::stop_flag`] is set. A debugger stop ([`StopReason::is_debug_stop`]) returns
+    /// in the middle of a slice, before the slice's end (RTT, CAN, ...) is done: the next run goes on to the same
+    /// slice end and does it there, as a run that never stopped would.
     pub fn run_until(&mut self, end: Time) -> StopReason {
         loop {
             if crate::signal::is_set(self.stop_flag) {
                 return StopReason::Requested;
             }
-            let target = (self.machine.now + self.slice).min(end);
+            let target = self.next_boundary(end);
+            self.slice_end = None;
             let reason = self.run_machine_through_lockups(target);
+            if reason.is_debug_stop() {
+                self.slice_end = Some(target);
+                return reason;
+            }
+            if reason == StopReason::TimeLimit {
+                self.boundary = target;
+            }
             self.step_can();
             self.poll_rtt();
             if let Some(u) = &mut self.usbip {
@@ -381,6 +444,169 @@ impl Session {
                 other => return other,
             }
         }
+    }
+
+    /// Where the slice the next [`Session::run_until`]`(end)` runs first ends: the end of a slice a debugger stop
+    /// interrupted, else a [`Session::slice`] from now (and never past `end`).
+    pub fn next_boundary(&self, end: Time) -> Time {
+        self.slice_end.unwrap_or(self.machine.now + self.slice).min(end)
+    }
+
+    /// Where the last slice run ended (see [`Session::run_until`]): the session's slice boundary.
+    pub fn boundary(&self) -> Time {
+        let now = self.machine.now;
+        // The machine was run (or moved) outside `run_until` since: where it is now is the boundary
+        if self.slice_end.is_none() && (now < self.boundary || now >= self.boundary + self.slice) {
+            now
+        } else {
+            self.boundary
+        }
+    }
+
+    /// Whether the session is between slices (no slice was interrupted by a debugger stop).
+    pub fn at_boundary(&self) -> bool {
+        self.slice_end.is_none()
+    }
+
+    /// A checkpoint of the session for time travel (see [`crate::timetravel`]): the machine without its trace sink
+    /// and debugger settings, and the host side's state (RTT position, a defmt frame in progress, how much log,
+    /// RTT, UART and USB text there was, the CAN bus without its record, the Ethernet cable). The flash is shared
+    /// with `prev` when it has not changed since. Hooks, endpoints and ptys are not part of it.
+    pub fn checkpoint(&mut self, prev: Option<&std::sync::Arc<Vec<u8>>>) -> SessionCheckpoint {
+        let flash = std::mem::take(&mut self.machine.sys.flash);
+        let machine = self.machine.snapshot();
+        let shared = match prev {
+            Some(p) if **p == flash => p.clone(),
+            _ => std::sync::Arc::new(flash.clone()),
+        };
+        self.machine.sys.flash = flash;
+        let can_bus = self.can_bus.as_mut().map(|bus| {
+            let record = bus.record.take();
+            let len = record.as_ref().map(|r| r.len());
+            let copy = bus.clone();
+            bus.record = record;
+            (copy, len)
+        });
+        let eth = self.machine.sys.ethernet.as_ref().map(|w| {
+            let w = w.lock().unwrap();
+            (w.to_device.clone(), w.from_device.clone(), w.link_up, w.dropped)
+        });
+        SessionCheckpoint {
+            machine,
+            flash: shared,
+            rtt: self.rtt.clone(),
+            defmt_partial: self.defmt.as_ref().map(|d| d.partial().to_vec()).unwrap_or_default(),
+            logs: self.logs.len(),
+            rtt_text: self.rtt_text.len(),
+            uart_text: [self.uart_text[0].len(), self.uart_text[1].len()],
+            uart_line: self.uart_line.clone(),
+            usb_cdc_text: self.usb_cdc_text.len(),
+            usb_cdc_line: self.usb_cdc_line.clone(),
+            can_bus,
+            eth,
+            eth_loss: self.eth_loss.clone(),
+            lockups: self.lockups,
+            final_lockup_reported: self.final_lockup_reported,
+            slice_end: self.slice_end,
+            boundary: self.boundary,
+        }
+    }
+
+    /// Puts the session back where `c` was taken: the machine (keeping its trace sink, breakpoints and
+    /// watchpoints), the host side, and the collected logs and text cut back to what there was then. Inputs the
+    /// devices read are not part of it (see [`crate::timetravel`]).
+    pub fn rewind_to(&mut self, c: &SessionCheckpoint) {
+        self.rewind_to_with(c, &Collected::default());
+    }
+
+    /// Keeps in `c` what the session collected (logs, RTT, UART and USB text) if it has more than `c` has: going
+    /// back cuts them, going forward again to a later checkpoint ([`Session::rewind_to_with`]) gives them back.
+    pub fn keep_collected(&self, c: &mut Collected) {
+        if self.logs.len() > c.logs.len() {
+            c.logs.clone_from(&self.logs);
+        }
+        if self.rtt_text.len() > c.rtt_text.len() {
+            c.rtt_text.clone_from(&self.rtt_text);
+        }
+        for n in 0..2 {
+            if self.uart_text[n].len() > c.uart_text[n].len() {
+                c.uart_text[n].clone_from(&self.uart_text[n]);
+            }
+        }
+        if self.usb_cdc_text.len() > c.usb_cdc_text.len() {
+            c.usb_cdc_text.clone_from(&self.usb_cdc_text);
+        }
+    }
+
+    /// Cuts `c` to what the session has now (the future changed).
+    pub fn cut_collected(&self, c: &mut Collected) {
+        c.logs.truncate(self.logs.len());
+        c.rtt_text.truncate(self.rtt_text.len());
+        for n in 0..2 {
+            if c.uart_text[n].is_char_boundary(self.uart_text[n].len().min(c.uart_text[n].len())) {
+                c.uart_text[n].truncate(self.uart_text[n].len());
+            }
+        }
+        if c.usb_cdc_text.is_char_boundary(self.usb_cdc_text.len().min(c.usb_cdc_text.len())) {
+            c.usb_cdc_text.truncate(self.usb_cdc_text.len());
+        }
+    }
+
+    /// [`Session::rewind_to`], taking what was collected by then from `collected` when the session has less now
+    /// (it was taken back before the checkpoint).
+    pub fn rewind_to_with(&mut self, c: &SessionCheckpoint, collected: &Collected) {
+        fn cut<T: Clone>(v: &mut Vec<T>, len: usize, longer: &[T]) {
+            if v.len() >= len {
+                v.truncate(len);
+            } else if longer.len() >= len {
+                v.clear();
+                v.extend_from_slice(&longer[..len]);
+            }
+        }
+        fn cut_text(v: &mut String, len: usize, longer: &str) {
+            if v.len() >= len {
+                if v.is_char_boundary(len) {
+                    v.truncate(len);
+                }
+            } else if longer.len() >= len && longer.is_char_boundary(len) {
+                v.clear();
+                v.push_str(&longer[..len]);
+            }
+        }
+        cut(&mut self.logs, c.logs, &collected.logs);
+        cut(&mut self.rtt_text, c.rtt_text, &collected.rtt_text);
+        for n in 0..2 {
+            cut_text(&mut self.uart_text[n], c.uart_text[n], &collected.uart_text[n]);
+        }
+        cut_text(&mut self.usb_cdc_text, c.usb_cdc_text, &collected.usb_cdc_text);
+        self.machine.restore(&c.machine);
+        self.machine.sys.flash.clone_from(&*c.flash);
+        self.rtt = c.rtt.clone();
+        if let Some(d) = &self.defmt {
+            self.defmt = Some(d.with_partial(&c.defmt_partial));
+        }
+        self.uart_line = c.uart_line.clone();
+        self.usb_cdc_line = c.usb_cdc_line.clone();
+        if let (Some(bus), Some((copy, len))) = (&mut self.can_bus, &c.can_bus) {
+            let mut record = bus.record.take();
+            if let (Some(r), Some(len)) = (&mut record, len) {
+                r.truncate(*len);
+            }
+            *bus = copy.clone();
+            bus.record = record;
+        }
+        if let (Some(w), Some((to, from, link, dropped))) = (&self.machine.sys.ethernet, &c.eth) {
+            let mut w = w.lock().unwrap();
+            w.to_device = to.clone();
+            w.from_device = from.clone();
+            w.link_up = *link;
+            w.dropped = *dropped;
+        }
+        self.eth_loss = c.eth_loss.clone();
+        self.lockups = c.lockups;
+        self.final_lockup_reported = c.final_lockup_reported;
+        self.slice_end = c.slice_end;
+        self.boundary = c.boundary;
     }
 
     /// Runs just the machine until `end` (through the profiler, if there is one), without polling anything.
