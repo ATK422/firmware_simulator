@@ -32,6 +32,15 @@ pub struct ScenarioArgs {
     /// Checks the files and lists each scenario's steps, without running them.
     #[arg(long)]
     check: bool,
+    /// Scenarios that reach the `pause` step of this name the same way (same setup, bridges, inputs, images, time
+    /// and steps up to it) share one run up to there and go on from copies of its state.
+    #[arg(long, value_name = "NAME")]
+    from_checkpoint: Option<String>,
+    /// Collects firmware code coverage over every scenario and writes it to this directory: `lcov.info` (every
+    /// image), `IMAGE.info` per image and `summary.txt` (functions and lines hit per crate). The boards run one
+    /// instruction at a time.
+    #[arg(long, value_name = "DIR")]
+    coverage: Option<PathBuf>,
 }
 
 fn parse_override(s: &str) -> Result<ImageOverride, String> {
@@ -73,7 +82,12 @@ pub fn scenario(args: ScenarioArgs) -> Result<i32> {
         );
         return Ok(0);
     }
-    let opts = Options { images: args.image.clone(), ..Default::default() };
+    let opts = Options {
+        images: args.image.clone(),
+        from_checkpoint: args.from_checkpoint.clone(),
+        coverage: args.coverage.is_some(),
+        ..Default::default()
+    };
     let to_stdout = args.json.as_deref() == Some(std::path::Path::new("-"));
     let print = !to_stdout;
     let quiet = args.quiet;
@@ -96,6 +110,9 @@ pub fn scenario(args: ScenarioArgs) -> Result<i32> {
     if print {
         println!("{}", scenario::summary(&outcomes));
     }
+    if let Some(dir) = &args.coverage {
+        write_coverage(dir, &outcomes)?;
+    }
     if let Some(path) = &args.junit {
         std::fs::write(path, scenario::junit(&outcomes)).with_context(|| format!("writing {}", path.display()))?;
     }
@@ -108,6 +125,30 @@ pub fn scenario(args: ScenarioArgs) -> Result<i32> {
         }
     }
     Ok(if outcomes.iter().all(Outcome::passed) { 0 } else { 1 })
+}
+
+/// Merges the scenarios' coverage and writes it to `dir` (see `--coverage`).
+fn write_coverage(dir: &std::path::Path, outcomes: &[Outcome]) -> Result<()> {
+    let mut all = sim_host::coverage::Coverage::new();
+    for o in outcomes {
+        if let Some(c) = &o.coverage {
+            all.merge(c);
+        }
+    }
+    std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
+    let report = all.report();
+    report.write_lcov(&dir.join("lcov.info"), "scenarios").with_context(|| format!("writing in {}", dir.display()))?;
+    let mut summary = String::new();
+    for name in all.names() {
+        let r = all.report_of(&name).expect("collected");
+        r.write_lcov(&dir.join(format!("{name}.info")), &name)?;
+        summary.push_str(&format!("{name}:\n{}\n", r.summary()));
+    }
+    summary.push_str(&format!("every image:\n{}", report.summary()));
+    std::fs::write(dir.join("summary.txt"), &summary)?;
+    eprint!("{summary}");
+    eprintln!("coverage: {}", dir.join("lcov.info").display());
+    Ok(())
 }
 
 pub fn setup_text(s: &scenario::Setup) -> String {
@@ -245,6 +286,8 @@ pub fn compare(args: CompareArgs) -> Result<i32> {
         record: true,
         profile: args.profile.then_some(args.profile_interval),
         skip_missing: false,
+        from_checkpoint: None,
+        coverage: false,
     };
     let (oa, ob) = (side(&args.a), side(&args.b));
     // Each scenario twice, A and B side by side

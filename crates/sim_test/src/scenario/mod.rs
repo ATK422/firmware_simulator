@@ -26,7 +26,7 @@ use std::path::{Path, PathBuf};
 pub use output::{human, json, json_one, junit, summary};
 pub use run::{
     BoardRecord, ImageOverride, Line, Options, Outcome, Record, Status, StepResult, describe, file_hash,
-    override_image, run, short_time,
+    override_image, run, shared_checkpoints, short_time,
 };
 pub use spec::{
     BridgeSpec, Bridges, Case, Condition, End, FaultRef, FrameMatch, PinRef, Range, Scenario, Setup, Start,

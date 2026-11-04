@@ -9,6 +9,9 @@ pub struct Pty {
     master: OwnedFd,
     /// Path of the slave side, e.g. `/dev/pts/5`.
     pub path: String,
+    /// Time travel: what was read is recorded, and given again (instead of reading) while recorded history is
+    /// re-executed, when nothing is written either (see [`crate::timetravel`]).
+    pub(crate) tap: Option<crate::timetravel::SharedTap<Vec<u8>>>,
 }
 
 impl Pty {
@@ -32,7 +35,7 @@ impl Pty {
             }
             let flags = libc::fcntl(fd, libc::F_GETFL);
             libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK);
-            Ok(Pty { master, path })
+            Ok(Pty { master, path, tap: None })
         }
     }
 
@@ -52,6 +55,9 @@ impl Pty {
 
     /// Writes UART output to the terminal. Bytes are dropped while nobody has the pty open.
     pub fn write(&self, data: &[u8]) {
+        if self.tap.as_ref().is_some_and(|t| t.lock().unwrap().replaying_last()) {
+            return;
+        }
         // SAFETY: writing from a valid buffer to our own fd
         unsafe {
             libc::write(self.master.as_raw_fd(), data.as_ptr().cast(), data.len());
@@ -60,6 +66,13 @@ impl Pty {
 
     /// Reads whatever the user typed, without blocking.
     pub fn read(&self) -> Vec<u8> {
+        match &self.tap {
+            Some(tap) => tap.lock().unwrap().call(|| self.read_fd()),
+            None => self.read_fd(),
+        }
+    }
+
+    fn read_fd(&self) -> Vec<u8> {
         let mut buf = [0u8; 256];
         // SAFETY: reading into a valid buffer from our own non-blocking fd
         let n = unsafe { libc::read(self.master.as_raw_fd(), buf.as_mut_ptr().cast(), buf.len()) };

@@ -103,6 +103,8 @@ firmware_simulator scenario --check scenarios/             # parse and list the 
 | `--image DIR\|IMAGE\|BOARD=IMAGE` | | Runs another firmware build (repeatable): a directory of images replaces every board's image whose file name is in it, an image every board running one of that file name, `BOARD=IMAGE` one board's |
 | `-q, --quiet` | | Prints only the scenarios that did not pass, and the summary |
 | `--check` | | Reads every file and lists its scenarios and steps as the runner describes them; exits 2 on a mistake |
+| `--from-checkpoint NAME` | | Scenarios that reach the `pause: NAME` step the same way share one run up to it ([below](#checkpoints-one-boot-many-scenarios)) |
+| `--coverage DIR` | | Firmware code coverage over every scenario: `DIR/lcov.info` (every image), `DIR/IMAGE.info` per image, `DIR/summary.txt` ([tools.md](tools.md#code-coverage)) |
 
 **Exit status**: 0 when every scenario passed, 1 when one failed (or could not be set up: a missing image, an
 unknown board), 2 when a file could not be read or has a mistake. Mistakes are found before anything runs, with the
@@ -229,7 +231,7 @@ Every step may have a `name:`, shown instead of the generated description.
 | `input` | `input: {camera_cage.depth.pressure_pa: 120000, port_battery: 13}` | Sets physical inputs |
 | `send` | `send: {board: esc1, message: {Esc: {ThrusterRpm: [0, 0, 0, 0, 1200, 1200, 1200, 1200]}}}` | The board's bridge (or `bridge: internal:3`) sends a titan_link `HostToDevice` message, written as its variant names and fields (`{KillSwitch: {asserting_kill: true}}`, `{Power: {ElectricalCommand: 6}}`). With `every: 100ms` and `within`/`until`, again and again until then, the way titan_bridge forwards a topic |
 | `ivc_send` | `ivc_send: talos_ivc:0x5a`, `ivc_send: {board: surface_ivc, byte: 195}` | Makes an IVC board transmit a byte through its bridge, as `robot --ivc-send` ([robots.md](robots.md#mock-bridges)) |
-| `pause` | `pause: after the replug` | A checkpoint: its evidence is the state of every board (resets, what each core is doing, the last status, the last line) and the frames so far on each bus |
+| `pause` | `pause: after the replug` | A checkpoint, named by its text: its evidence is the state of every board (resets, what each core is doing, the last status, the last line) and the frames so far on each bus; with `--from-checkpoint` scenarios share the run up to it ([below](#checkpoints-one-boot-many-scenarios)) |
 
 ## Checks
 
@@ -303,6 +305,39 @@ cases:
 ```
 
 Steps are numbered through: a case's first step follows the last common one.
+
+## Checkpoints: one boot, many scenarios
+
+`cases` share a boot within one scenario. `--from-checkpoint NAME` does it across scenarios and files: every
+scenario with a `pause: NAME` step that gets there the same way (the same setup, bridges, inputs, images, `time`,
+`threads` and steps up to the pause) shares one run up to it. The first to get there keeps a checkpoint of
+everything at the pause (boards, buses, bridges, what was collected, as `cases` do); the others go on from copies
+of it, so their boot is not run again:
+
+```yaml
+# scenarios/unplug.yaml                 # scenarios/battery.yaml
+name: Unplugged                         name: Battery sag
+board: {image: power_board, file: mk2/power_board}   # (the same setup)
+bridges: [1]                            bridges: [1]
+time: 4s                                time: 4s
+steps:                                  steps:
+  - expect: {log: ROS connected, within: 1s}           - expect: {log: ROS connected, within: 1s}
+  - pause: booted                         - pause: booted
+  - fault: can-unplug                     - input: {stbd_battery: 11.0}
+  - expect: {link: down, within: 1s}      - expect: {status: {faults: 0}, after: 1s}
+```
+
+```bash
+firmware_simulator scenario scenarios/unplug.yaml scenarios/battery.yaml --from-checkpoint booted
+```
+
+The results are the same as without it, step for step and time for time (`crates/sim_test/tests/scenarios.rs`
+checks that); only the wall time changes. A scenario whose later steps include a `never` or `always` watched
+from the start of the run (no `after`, or a fixed `at`) runs on its own, as a copy taken at the pause could not
+have watched them from the start.
+
+A run with a dashboard keeps named checkpoints of its own to come back to: `POST /api/rewind {"save": NAME}`, then
+`{"checkpoint": NAME}`, or the MCP server's `rewind` with `save` and `checkpoint` ([tools.md](tools.md#rewinding)).
 
 ## The shipped scenarios
 

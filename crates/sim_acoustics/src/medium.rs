@@ -86,6 +86,16 @@ impl LivePath {
         }
     }
 
+    /// The recording so far (time travel keeps it with a checkpoint).
+    pub fn points(&self) -> VecDeque<(f64, Vec3)> {
+        self.0.lock().unwrap().clone()
+    }
+
+    /// Replaces the recording (time travel going back to a checkpoint), for every clone.
+    pub fn set_points(&self, points: VecDeque<(f64, Vec3)>) {
+        *self.0.lock().unwrap() = points;
+    }
+
     /// An independent copy of the recording so far.
     pub fn deep_copy(&self) -> LivePath {
         LivePath(Arc::new(Mutex::new(self.0.lock().unwrap().clone())))

@@ -12,6 +12,7 @@ use sim_core::cpu::Cpu;
 use sim_core::time::Time;
 use sim_host::mock_bridge::MockBridge;
 use sim_host::robot::Robot;
+use sim_host::timetravel::{Ran, TimeTravel, Travelled};
 
 /// How a run is done.
 #[derive(Clone, Default)]
@@ -26,6 +27,12 @@ struct How {
     ends: Vec<Time>,
     /// Edits the robot (after loading it, before running).
     sink_vehicle: bool,
+    /// Records the run for time travel, with a checkpoint this often (`sim_host::timetravel`)...
+    record: Option<Time>,
+    /// ...and once at the end, goes back to this time and runs to the end again (a replay).
+    rewind: Option<Time>,
+    /// Collects code coverage.
+    coverage: bool,
 }
 
 const END: Time = Time::from_ms(700);
@@ -41,6 +48,8 @@ struct Run {
     hooks: Vec<String>,
     state: Vec<String>,
     bridge: String,
+    /// Every board's code coverage (with `How::coverage`).
+    coverage: Vec<Option<Box<rp2040::coverage::CoverageMap>>>,
 }
 
 /// Talos (one board switched on later, as in the robot file) with a mock bridge, run as `how` says. Returns the
@@ -83,10 +92,42 @@ fn talos(how: &How) -> Option<(Run, sim_host::runahead::Stats)> {
         let h = hooks.clone();
         s.on_uart_line = Some(Box::new(move |t, n, line| h.lock().unwrap().push(format!("{i} [{t}] uart{n} {line}"))));
     }
+    if how.coverage {
+        for s in &mut r.boards {
+            s.machine.enable_coverage();
+        }
+    }
     let ends = if how.ends.is_empty() { vec![END] } else { how.ends.clone() };
+    let inputs = r.inputs.clone();
+    let mut tt = how.record.map(|every| {
+        let mut tt = TimeTravel::new(&mut r, inputs);
+        tt.every = every;
+        tt
+    });
     for &end in &ends {
-        assert!(r.run_until(end).is_none());
+        match &mut tt {
+            Some(tt) => assert_eq!(tt.run_until(&mut r, end), Ran::Reached),
+            None => assert!(r.run_until(end).is_none()),
+        }
         assert_eq!(r.now, end);
+    }
+    if let (Some(tt), Some(every)) = (&tt, how.record) {
+        // A checkpoint every `every`, or where the first window that ends after it ends (64 slices at most)
+        let at_least = ends.last().unwrap().as_ps() / (every.as_ps() + r.slice.as_ps() * 64);
+        assert!(tt.stats().taken >= at_least, "{:?}", tt.stats());
+    }
+    if let (Some(tt), Some(t)) = (&mut tt, how.rewind) {
+        let before = r.run_ahead_stats;
+        assert_eq!(tt.rewind_to(&mut r, t), Travelled::Arrived);
+        assert!(r.now <= t && r.now + r.slice > t, "{} for {t}", r.now);
+        let end = *ends.last().unwrap();
+        assert_eq!(tt.run_until(&mut r, end), Ran::Reached);
+        assert!(tt.at_frontier());
+        // The replay ran ahead too (its bridge's frames come from the record)
+        if how.run_ahead && how.threads != 1 {
+            let replayed = r.run_ahead_stats.slices - before.slices;
+            assert!(replayed * 10 >= (end - t).as_ps() / r.slice.as_ps() * 9, "{before:?} {:?}", r.run_ahead_stats);
+        }
     }
     if let Some(fixed) = &how.fixed {
         assert_eq!(&r.thread_of_boards(), fixed);
@@ -135,7 +176,8 @@ fn talos(how: &How) -> Option<(Run, sim_host::runahead::Stats)> {
     }
     let bridge = format!("{:?}", bridge.state().received);
     let hooks = std::mem::take(&mut *hooks.lock().unwrap());
-    Some((Run { frames, hooks, state, bridge }, r.run_ahead_stats))
+    let coverage = r.boards.iter().map(|s| s.machine.coverage.clone()).collect();
+    Some((Run { frames, hooks, state, bridge, coverage }, r.run_ahead_stats))
 }
 
 /// Asserts two runs are the same, showing where they first differ.
@@ -149,6 +191,9 @@ fn same(want: &Run, got: &Run, what: &str) {
         }
     }
     assert_eq!(want.bridge, got.bridge, "{what}: what the bridge received");
+    for (i, (a, b)) in want.coverage.iter().zip(&got.coverage).enumerate() {
+        assert!(a == b, "{what}: board {i}'s coverage differs");
+    }
 }
 
 fn turns() -> How {
@@ -294,4 +339,63 @@ fn what_cannot_be_run_ahead_runs_slice_by_slice() {
     );
     assert_eq!(windows(&|r| r.buses[0].endpoints.push(Box::new(Unknown))), 0);
     assert!(windows(&|r| r.buses[0].endpoints.push(Box::new(sim_devices::can::Monitor::default()))) > 0);
+}
+
+/// Recording for time travel takes its checkpoints at boundaries the robot committed (a run is cut into pieces
+/// that end where a checkpoint is due, and a window never goes past the end of a run), and the recorded bridge
+/// still tells when it will send: the robot runs ahead while recording, and in replays, with the same result as
+/// taking turns without recording.
+#[test]
+fn recording_for_time_travel_runs_ahead_the_same() {
+    let Some((want, _)) = talos(&turns()) else { return };
+    let record = |how: How| How { record: Some(Time::from_ms(10)), ..how };
+    let (got, none) = talos(&record(turns())).unwrap();
+    same(&want, &got, "recorded, in turns");
+    assert_eq!(none, Default::default());
+    for how in [ahead(3), How { stress: Some(4), fixed: Some(FIXED.to_vec()), ..ahead(3) }] {
+        let (got, stats) = talos(&record(how.clone())).unwrap();
+        same(&want, &got, &format!("recorded, ahead, stress {:?}", how.stress));
+        assert!(stats.slices >= 6900 && stats.windows < stats.slices / 6, "{stats:?}");
+    }
+    // Back to a time and on to the end again: replayed ahead
+    let (got, _) = talos(&How { rewind: Some(Time::from_us(237_450)), ..record(ahead(3)) }).unwrap();
+    same(&want, &got, "recorded, ahead, replayed");
+    let (got, _) = talos(&How { rewind: Some(Time::from_us(237_450)), ..record(turns()) }).unwrap();
+    same(&want, &got, "recorded, in turns, replayed");
+}
+
+/// Code coverage counts what the committed run executed: what a board ran before it was rolled back does not
+/// count, so the coverage is the same running ahead as taking turns (and with rollbacks forced).
+#[test]
+fn coverage_is_the_same_running_ahead() {
+    let end = Time::from_ms(250);
+    let cov = |how: How| How { coverage: true, ends: vec![end], ..how };
+    let Some((want, _)) = talos(&cov(turns())) else { return };
+    assert!(want.coverage.iter().all(Option::is_some));
+    for how in [ahead(3), How { stress: Some(9), fixed: Some(FIXED.to_vec()), ..ahead(3) }] {
+        let (got, stats) = talos(&cov(how.clone())).unwrap();
+        same(&want, &got, &format!("coverage, ahead, stress {:?}", how.stress));
+        assert!(stats.windows > 0 && stats.rollbacks > 0, "{stats:?}");
+    }
+}
+
+/// A recorded robot takes turns while a debugger could stop it (GDB attached, so a `BKPT` stops; a breakpoint set),
+/// so that stops are as a replay taking turns gives them; otherwise it runs ahead.
+#[test]
+fn a_recorded_robot_takes_turns_while_debugged() {
+    if common::titan_elf("esc_board").is_none() {
+        return;
+    }
+    let windows = |edit: &dyn Fn(&mut Robot)| {
+        let mut r = Robot::load(&common::repo().join("robots/talos.toml")).unwrap();
+        r.threads = 3;
+        edit(&mut r);
+        let inputs = r.inputs.clone();
+        let mut tt = TimeTravel::new(&mut r, inputs);
+        assert_eq!(tt.run_until(&mut r, Time::from_ms(20)), Ran::Reached);
+        r.run_ahead_stats.windows
+    };
+    assert!(windows(&|_| {}) > 0);
+    assert_eq!(windows(&|r| r.boards[2].machine.bkpt_policy = rp2040::machine::BkptPolicy::Stop), 0);
+    assert_eq!(windows(&|r| _ = r.boards[4].machine.breakpoints.insert(0x2004_0000)), 0);
 }

@@ -64,6 +64,109 @@ pub enum StopReason {
     Deadlock,
     /// [`Machine::request_stop`] was called (e.g. a GDB interrupt).
     Requested,
+    /// A data access of a core matched a [`Machine::watchpoints`] entry (`addr`: the watched address). The core
+    /// stops before its next step (`pc`); `at` is where the access was: the time the accessing step started on the
+    /// core's clock (a position, see [`Machine::stop_at`]).
+    Watchpoint { core: u8, pc: u32, addr: u32, kind: WatchKind, at: Time },
+    /// A core reached the position [`Machine::stop_at`] asked for: it is about to take its first step (an
+    /// instruction or an exception entry) at or after that time on its clock.
+    Reached { core: u8, pc: u32 },
+}
+
+impl StopReason {
+    /// Whether the run stopped in the middle of a quantum for a debugger (a breakpoint, a watchpoint, a position
+    /// reached, `BKPT`): the next [`Machine::run_until`] goes on from there exactly as if it had not stopped.
+    pub fn is_debug_stop(&self) -> bool {
+        matches!(
+            self,
+            StopReason::Breakpoint { .. }
+                | StopReason::BkptInstruction { .. }
+                | StopReason::Watchpoint { .. }
+                | StopReason::Reached { .. }
+        )
+    }
+}
+
+/// Which accesses a watchpoint stops at (GDB's `Z2`, `Z3`, `Z4`).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum WatchKind {
+    Write,
+    Read,
+    Access,
+}
+
+/// A data watchpoint: stops the machine after an instruction of either core reads or writes (see [`WatchKind`])
+/// any of the `len` bytes from `addr`. Instruction fetches and DMA do not count, as with the M0+'s DWT.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct Watchpoint {
+    pub addr: u32,
+    pub len: u32,
+    pub kind: WatchKind,
+}
+
+impl Watchpoint {
+    fn hits(&self, addr: u32, bytes: u32, write: bool) -> bool {
+        let kind_ok = match self.kind {
+            WatchKind::Write => write,
+            WatchKind::Read => !write,
+            WatchKind::Access => true,
+        };
+        let (start, end) = (self.addr as u64, self.addr as u64 + self.len.max(1) as u64);
+        kind_ok && (addr as u64) < end && start < addr as u64 + bytes as u64
+    }
+}
+
+/// A core's bus with watchpoints checked on every data access (only used while there are watchpoints).
+struct WatchBus<'a, B> {
+    inner: B,
+    watch: &'a [Watchpoint],
+    hit: Option<(u32, WatchKind)>,
+}
+
+impl<B: sim_core::bus::Bus> WatchBus<'_, B> {
+    fn check(&mut self, addr: u32, size: Size, write: bool) {
+        if self.hit.is_none()
+            && let Some(w) = self.watch.iter().find(|w| w.hits(addr, size.bytes(), write))
+        {
+            // GDB is told the watched address (and kind), not the accessed one
+            self.hit = Some((w.addr, w.kind));
+        }
+    }
+}
+
+impl<B: sim_core::bus::Bus> sim_core::bus::Bus for WatchBus<'_, B> {
+    fn read(&mut self, addr: u32, size: Size) -> Result<u32, sim_core::bus::BusFault> {
+        let r = self.inner.read(addr, size);
+        if r.is_ok() {
+            self.check(addr, size, false);
+        }
+        r
+    }
+    fn write(&mut self, addr: u32, size: Size, value: u32) -> Result<(), sim_core::bus::BusFault> {
+        let r = self.inner.write(addr, size, value);
+        if r.is_ok() {
+            self.check(addr, size, true);
+        }
+        r
+    }
+    fn fetch16(&mut self, addr: u32) -> Result<u16, sim_core::bus::BusFault> {
+        self.inner.fetch16(addr)
+    }
+    fn take_stall_cycles(&mut self) -> u32 {
+        self.inner.take_stall_cycles()
+    }
+    fn peek(&mut self, addr: u32, size: Size) -> Option<u32> {
+        self.inner.peek(addr, size)
+    }
+}
+
+/// Where a run that stopped in the middle of a quantum for a debugger goes on (see [`StopReason::is_debug_stop`]):
+/// the quantum's core, the instructions left of it and its time limit.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+struct Resume {
+    core: usize,
+    left: u32,
+    limit: Time,
 }
 
 /// What to do with a `BKPT` instruction.
@@ -143,6 +246,23 @@ pub struct Machine {
     /// quantum may be fused. After a quiet one (a busy-wait, maybe) the next is left to the busy-wait check, and
     /// after one that reached a peripheral the next is likely to again.
     fuse_next: bool,
+    /// Stop core `c` before its first step (an instruction or an exception entry) at or after time `stop_at[c]` on
+    /// its clock ([`StopReason::Reached`]): a debugger running to a position of the timeline. Cleared when reached.
+    /// While set, that core does not skip busy-waits or fuse quanta (it would jump over the position), and its
+    /// batches end there. Every step of a core starts at a later time than the one before (each takes at least a
+    /// cycle), so a core and a time are a position.
+    pub stop_at: [Option<Time>; 2],
+    /// Data watchpoints (see [`Watchpoint`]). While there are any, the cores run one instruction at a time.
+    pub watchpoints: Vec<Watchpoint>,
+    /// A run that stopped for a debugger in the middle of a quantum goes on from here.
+    resume: Option<Resume>,
+    /// The watchpoint the last step hit: the watched address and kind.
+    watch_hit: Option<(u32, WatchKind)>,
+    /// A watchpoint was hit: the core stops before its next step (`(core, addr, kind, at)`).
+    watch_stop: Option<(usize, u32, WatchKind, Time)>,
+    /// Code coverage: the instructions executed (see [`crate::coverage`]). While it is on, the cores run one
+    /// instruction at a time; the run is the same.
+    pub coverage: Option<Box<crate::coverage::CoverageMap>>,
 }
 
 /// Consecutive quiet quanta of one core looked at for a loop that spans several (see [`SpinWindow`]): a loop
@@ -198,6 +318,27 @@ pub struct Snapshot {
     usb_boot_requested: bool,
     resets: u32,
     last_ran: usize,
+    resume: Option<Resume>,
+    skip_breakpoint: [bool; 2],
+    watch_stop: Option<(usize, u32, WatchKind, Time)>,
+}
+
+impl Snapshot {
+    /// About how many bytes the snapshot holds: its memories (SRAM, XIP SRAM, flash, ROM, USB DPRAM) and a
+    /// rough figure for the rest.
+    pub fn bytes(&self) -> usize {
+        self.sys.sram.len()
+            + self.sys.xip_sram.len()
+            + self.sys.flash.len()
+            + self.sys.rom.len()
+            + self.sys.usb.dpram.len()
+            + 16 * 1024
+    }
+
+    /// The time the snapshot was taken at (the machine's [`Machine::now`]).
+    pub fn now(&self) -> Time {
+        self.now
+    }
 }
 
 impl Machine {
@@ -243,6 +384,12 @@ impl Machine {
             fuse_quanta: true,
             quanta_fused: 0,
             fuse_next: false,
+            stop_at: [None; 2],
+            watchpoints: Vec::new(),
+            resume: None,
+            watch_hit: None,
+            watch_stop: None,
+            coverage: None,
         };
         m.clk_sys = m.sys.clk_sys;
         m.sys.clk_sys_changed = false;
@@ -352,6 +499,18 @@ impl Machine {
             && ((XIP_BASE..XIP_BASE + self.sys.flash.len() as u32).contains(&pc)
                 || (SRAM_BASE..SRAM_END).contains(&pc));
         sp_ok && pc_ok
+    }
+
+    /// A watchpoint hit whose stop is still to come (the core stops before its next step): `(core, watched address,
+    /// kind, the time the accessing step started)`.
+    pub fn pending_watch(&self) -> Option<(usize, u32, WatchKind, Time)> {
+        self.watch_stop
+    }
+
+    /// Turns code coverage on (see [`crate::coverage`]), keeping what was collected if it is on already.
+    pub fn enable_coverage(&mut self) {
+        let size = self.sys.flash.len();
+        self.coverage.get_or_insert_with(|| Box::new(crate::coverage::CoverageMap::new(size)));
     }
 
     /// Asks [`Machine::run_until`] to return at the next instruction boundary.
@@ -757,8 +916,21 @@ impl Machine {
             }
             self.usb_boot_requested = true;
         }
+        let executed = self.cores[c].instructions();
         let mut bus = CoreBus { sys: &mut self.sys, trace: &mut *self.trace, core: c as u8, now };
-        let outcome = self.cores[c].step_on(&mut bus);
+        let outcome = if self.watchpoints.is_empty() {
+            self.cores[c].step_on(&mut bus)
+        } else {
+            let mut bus = WatchBus { inner: bus, watch: &self.watchpoints, hit: None };
+            let outcome = self.cores[c].step_on(&mut bus);
+            self.watch_hit = bus.hit;
+            outcome
+        };
+        if let Some(cov) = &mut self.coverage
+            && self.cores[c].instructions() != executed
+        {
+            cov.mark(pc);
+        }
         match outcome {
             StepOutcome::Ran(cycles) => {
                 self.clocks[c].advance(&self.clk_sys, cycles as u64);
@@ -802,7 +974,11 @@ impl Machine {
     /// or exception tracing).
     #[inline]
     fn can_batch(&self, c: usize) -> bool {
-        self.breakpoints.is_empty() && !self.trace_instructions && !self.cores[c].log_exceptions
+        self.breakpoints.is_empty()
+            && !self.trace_instructions
+            && !self.cores[c].log_exceptions
+            && self.watchpoints.is_empty()
+            && self.coverage.is_none()
     }
 
     /// Runs up to `max_steps` steps of core `c` as one batch (see [`CortexM0Plus::run_batch`]), ending once its
@@ -830,10 +1006,14 @@ impl Machine {
         };
         self.sync_systick_reference(c, self.clocks[c].now);
         // A SysTick on the reference clock is fed between batches: end this one by its next tick
-        let run_cycles = match self.systick_ref[c].and_then(|_| self.next_systick_reference_tick(c)) {
+        let mut run_cycles = match self.systick_ref[c].and_then(|_| self.next_systick_reference_tick(c)) {
             Some(t) => cycles.min(self.clocks[c].cycles_until(&self.clk_sys, t)),
             None => cycles,
         };
+        // A debugger's position: the batch ends with the step that reaches it
+        if let Some(t) = self.stop_at[c] {
+            run_cycles = run_cycles.min(self.clocks[c].cycles_until(&self.clk_sys, t).max(1));
+        }
         // Trapped ROM functions are entered by the single step path
         let trap_below = if self.hle_enabled { ROM_SIZE as u32 } else { 0 };
         let lines = self.cores[c].irq_lines();
@@ -1038,6 +1218,8 @@ impl Machine {
         self.spin_window = None;
         // (Quanta start afresh in each run, as a run's end cuts the last one short)
         self.quantum_left = None;
+        // ...unless the last run stopped for a debugger in the middle of one: that one goes on exactly
+        let mut resume = self.resume.take();
         loop {
             if self.stop_requested {
                 self.stop_requested = false;
@@ -1049,9 +1231,11 @@ impl Machine {
             // Pick the runnable core furthest behind
             let mut pick: Option<usize> = None;
             let mut runnable = 0;
+            let mut can_run = 0u8;
             for c in 0..2 {
                 if self.runnable(c) {
                     runnable += 1;
+                    can_run |= 1 << c;
                     self.catch_up(c);
                     // Ties go to the core that did not run last, so a core woken at the other core's current
                     // time is not starved by a busy-waiting partner
@@ -1063,6 +1247,11 @@ impl Machine {
                         pick = Some(c);
                     }
                 }
+            }
+            // (The core stopped in the middle of its quantum, and can still run unless the host changed it)
+            let resumed = resume.take().filter(|r| can_run & (1 << r.core) != 0);
+            if let Some(r) = resumed {
+                pick = Some(r.core);
             }
 
             let Some(c) = pick else {
@@ -1115,9 +1304,10 @@ impl Machine {
 
             // Run core c for a quantum, stopping at the next event or the end
             self.last_ran = c;
-            let limit = next_event.min(end);
-            let mut left = match self.quantum_left.take() {
-                Some((core, left)) if core == c => left,
+            let limit = resumed.map_or(next_event, |r| r.limit).min(end);
+            let mut left = match (resumed, self.quantum_left.take()) {
+                (Some(r), _) => r.left,
+                (None, Some((core, left))) if core == c => left,
                 _ => self.quantum,
             };
             // Cycles until core c reaches `limit`, carried from one batch to the next (and one quantum to the next)
@@ -1161,6 +1351,8 @@ impl Machine {
             // (A debugger's BKPT stop would come back with the machine's time at a quantum boundary not crossed.)
             let mut fuse = self.fuse_quanta
                 && self.bkpt_policy == BkptPolicy::HardFault
+                && resumed.is_none()
+                && self.stop_at[c].is_none()
                 && !watched
                 && self.fuse_next
                 && runnable == 1
@@ -1168,6 +1360,23 @@ impl Machine {
                 && !counts(self, 1 - c);
             let mut touched = false;
             while left > 0 {
+                if let Some(t) = self.stop_at[c]
+                    && self.clocks[c].now >= t
+                {
+                    self.stop_at[c] = None;
+                    // Going on from here runs the instruction there, breakpoint or not
+                    self.skip_breakpoint[c] = true;
+                    self.resume = Some(Resume { core: c, left, limit });
+                    return StopReason::Reached { core: c as u8, pc: self.cores[c].pc() };
+                }
+                if let Some((core, addr, kind, at)) = self.watch_stop
+                    && core == c
+                {
+                    self.watch_stop = None;
+                    self.skip_breakpoint[c] = true;
+                    self.resume = Some(Resume { core: c, left, limit });
+                    return StopReason::Watchpoint { core: c as u8, pc: self.cores[c].pc(), addr, kind, at };
+                }
                 if self.can_batch(c) {
                     // No breakpoints: nothing to resume from once breakpoints are set again
                     self.skip_breakpoint[c] = false;
@@ -1198,6 +1407,7 @@ impl Machine {
                     if b.steps > 0 {
                         match b.stop {
                             Some(StepOutcome::Breakpoint(imm)) if self.bkpt_policy == BkptPolicy::Stop => {
+                                self.resume = Some(Resume { core: c, left: left + 1, limit });
                                 return StopReason::BkptInstruction { core: c as u8, pc: self.cores[c].pc(), imm };
                             }
                             Some(StepOutcome::Lockup) => {
@@ -1224,6 +1434,7 @@ impl Machine {
                 } else {
                     if self.breakpoints.contains(&pc) && !self.cores[c].is_sleeping() && !self.skip_breakpoint[c] {
                         self.skip_breakpoint[c] = true;
+                        self.resume = Some(Resume { core: c, left: left + 1, limit });
                         return StopReason::Breakpoint { core: c as u8, pc };
                     }
                     // Only the instruction the core stopped at is let through: once it (or any other) runs, the
@@ -1231,11 +1442,13 @@ impl Machine {
                     // writing the PC)
                     self.skip_breakpoint[c] = false;
                 }
+                let step_at = self.clocks[c].now;
                 match self.step_core(c) {
                     StepOutcome::Ran(_) => {}
                     StepOutcome::Sleeping => break,
                     StepOutcome::Breakpoint(imm) => {
                         if self.bkpt_policy == BkptPolicy::Stop {
+                            self.resume = Some(Resume { core: c, left: left + 1, limit });
                             return StopReason::BkptInstruction { core: c as u8, pc, imm };
                         }
                     }
@@ -1245,6 +1458,10 @@ impl Machine {
                     }
                 }
                 self.refresh_irqs();
+                if let Some((addr, kind)) = self.watch_hit.take() {
+                    // The core stops before its next step (in this quantum or its next)
+                    self.watch_stop = Some((c, addr, kind, step_at));
+                }
                 if self.clocks[c].now >= limit || self.cores[c].is_sleeping() || self.stop_requested {
                     break;
                 }
@@ -1301,6 +1518,7 @@ impl Machine {
             } else {
                 self.now = self.now.max(horizon.min(next_event));
                 if let Some((quiet, steps, cycles, holds)) = closed
+                    && self.stop_at[ran].is_none()
                     && !(matches!(quiet, Quiet::Timer(_)) && self.skip_timer_wait(ran, cycles, holds, end))
                 {
                     self.skip_spin(ran, steps, cycles, quiet, holds, end);
@@ -1320,6 +1538,7 @@ impl Machine {
         self.refresh_irqs();
         self.cores[core].wake();
         let outcome = self.step_core(core);
+        self.watch_hit = None;
         let t = self.clocks[core].now;
         if self.sys.sched.next_time() <= t {
             self.fire_events(t);
@@ -1366,6 +1585,12 @@ impl Machine {
             fuse_quanta: self.fuse_quanta,
             quanta_fused: self.quanta_fused,
             fuse_next: false,
+            stop_at: self.stop_at,
+            watchpoints: self.watchpoints.clone(),
+            resume: self.resume,
+            watch_hit: None,
+            watch_stop: self.watch_stop,
+            coverage: self.coverage.clone(),
         }
     }
 
@@ -1384,6 +1609,9 @@ impl Machine {
             usb_boot_requested: self.usb_boot_requested,
             resets: self.resets,
             last_ran: self.last_ran,
+            resume: self.resume,
+            skip_breakpoint: self.skip_breakpoint,
+            watch_stop: self.watch_stop,
         }
     }
 
@@ -1401,6 +1629,10 @@ impl Machine {
         self.usb_boot_requested = s.usb_boot_requested;
         self.resets = s.resets;
         self.last_ran = s.last_ran;
+        self.resume = s.resume;
+        self.skip_breakpoint = s.skip_breakpoint;
+        self.watch_stop = s.watch_stop;
+        self.stop_at = [None; 2];
         self.sys.irq_dirty = true;
         // The run loop's caches describe the state before the restore (as in `fork`, the copy starts without them)
         self.budget_carry = None;
@@ -1443,7 +1675,8 @@ impl Machine {
 /// a busy-wait watch and the fusing hint (which only decide how fast the next run goes, and what the statistics
 /// count), the cycle budget cache, a breakpoint being resumed from, `External` events not yet collected, and the
 /// statistics. A copy of the machine restored from a snapshot and given this back runs on exactly as the machine
-/// did, statistics included (a robot that runs its boards ahead of each other rolls a board back this way).
+/// did, statistics included (a robot that runs its boards ahead of each other rolls a board back this way, and time
+/// travel restores its checkpoints this way).
 #[derive(Clone)]
 pub struct RunCarry {
     budget_carry: Option<(usize, Time, CycleClock, u64, u64)>,

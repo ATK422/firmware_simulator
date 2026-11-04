@@ -27,6 +27,9 @@ impl std::fmt::Display for LogLine {
 pub struct DefmtDecoder {
     table: &'static Table,
     decoder: Box<dyn StreamDecoder + Send + Sync>,
+    /// The bytes fed since the last frame separator (rzCOBS) or the last frame decoded: what the decoder may hold
+    /// of a frame not complete yet (see [`DefmtDecoder::partial`]).
+    tail: Vec<u8>,
 }
 
 impl DefmtDecoder {
@@ -36,26 +39,54 @@ impl DefmtDecoder {
         Ok(table.map(|t| {
             // The stream decoder borrows the table; one table lives for the whole run
             let table: &'static Table = Box::leak(Box::new(t));
-            DefmtDecoder { table, decoder: table.new_stream_decoder() }
+            DefmtDecoder { table, decoder: table.new_stream_decoder(), tail: Vec::new() }
         }))
     }
 
     /// A decoder for the same table with no partial frame buffered (for a snapshot taken between frames).
     pub fn fresh(&self) -> Self {
-        DefmtDecoder { table: self.table, decoder: self.table.new_stream_decoder() }
+        DefmtDecoder { table: self.table, decoder: self.table.new_stream_decoder(), tail: Vec::new() }
+    }
+
+    /// What the decoder holds of a frame that is not complete yet (time travel keeps it with a checkpoint).
+    pub fn partial(&self) -> &[u8] {
+        &self.tail
+    }
+
+    /// A decoder for the same table holding `partial` (from [`DefmtDecoder::partial`]) of a frame.
+    pub fn with_partial(&self, partial: &[u8]) -> Self {
+        let mut d = self.fresh();
+        d.decoder.received(partial);
+        d.tail = partial.to_vec();
+        d
     }
 
     /// Feeds bytes and returns every complete frame.
     pub fn feed(&mut self, bytes: &[u8]) -> Vec<LogLine> {
         self.decoder.received(bytes);
+        if self.table.encoding().can_recover() {
+            // rzCOBS frames end with a zero byte: what follows the last one is all a frame in progress can be
+            match bytes.iter().rposition(|&b| b == 0) {
+                Some(i) => self.tail = bytes[i + 1..].to_vec(),
+                None => self.tail.extend_from_slice(bytes),
+            }
+        } else {
+            self.tail.extend_from_slice(bytes);
+        }
         let mut out = Vec::new();
         loop {
             match self.decoder.decode() {
-                Ok(frame) => out.push(LogLine {
-                    level: frame.level().map(|l| l.as_str().to_string()),
-                    timestamp: frame.display_timestamp().map(|t| t.to_string()),
-                    message: frame.display_message().to_string(),
-                }),
+                Ok(frame) => {
+                    if !self.table.encoding().can_recover() {
+                        // (Raw frames: an approximation, the bytes after a frame in the same feed are kept)
+                        self.tail.clear();
+                    }
+                    out.push(LogLine {
+                        level: frame.level().map(|l| l.as_str().to_string()),
+                        timestamp: frame.display_timestamp().map(|t| t.to_string()),
+                        message: frame.display_message().to_string(),
+                    })
+                }
                 Err(DecodeError::UnexpectedEof) => break,
                 Err(DecodeError::Malformed) if self.table.encoding().can_recover() => {
                     // rzCOBS: the decoder dropped the frame up to its separator
@@ -95,7 +126,7 @@ mod tests {
     fn decoder(encoding: &str) -> DefmtDecoder {
         let json = format!(r#"{{"timestamp":null,"entries":{{}},"bitflags":{{}},"encoding":"{encoding}"}}"#);
         let table: &'static Table = Box::leak(Box::new(serde_json::from_str(&json).unwrap()));
-        DefmtDecoder { table, decoder: table.new_stream_decoder() }
+        DefmtDecoder { table, decoder: table.new_stream_decoder(), tail: Vec::new() }
     }
 
     /// A malformed frame in a raw-encoded stream (here an index the table doesn't have, as after RTT dropped

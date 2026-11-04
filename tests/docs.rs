@@ -76,6 +76,7 @@ const OUTSIDE: &[(&str, &str)] = &[
     ("--tool", "valgrind"),
     ("--repeat", "the bench example"),
     ("--scope", "claude mcp add"),
+    ("--reverse", "GDB/MI's -exec-continue and -exec-step"),
 ];
 
 /// The options of this repository's scripts and the nereus bridge, from their `--help`.
