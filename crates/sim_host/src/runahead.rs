@@ -45,9 +45,26 @@
 //! The result is the same run as taking turns: every bus step sees what it would have and changes what it would
 //! have, every board runs every slice from the state it would have, and the host sides take in the same things in
 //! the same order. Statistics too: a rolled-back machine gets back what its run loop carries
-//! ([`rp2040::RunCarry`]). Robots qualify when nothing outside the simulation feeds or watches a board while it runs
-//! (`Session::can_run_ahead`), every bus endpoint can tell when it will send, and there is no acoustic medium.
-//! [`crate::robot::Robot::run_ahead`] switches it off.
+//! ([`rp2040::RunCarry`]).
+//!
+//! **Live inputs.** An endpoint fed from outside the simulation (SocketCAN, cannelloni: [`CanEndpoint::live`])
+//! cannot tell when it will send, but hands in what reached it at the bus step that reads it. The commit steps the
+//! buses at every boundary as taking turns does, so it reads such an endpoint where taking turns would; what it
+//! handed in can finish at the next boundary at the earliest, so the window is cut where it can ([`Stats::live_cuts`])
+//! and the boards that ran past are rolled back. A host frame thus enters the bus at a well-defined virtual time,
+//! the boundary that read it, never in the past of a board that keeps what it did; given the same arrivals (which
+//! step reads which frame: [`crate::canlog::Arrivals`] logs them), the run is the one taking turns gives. A board's
+//! pseudo terminals are read by the board itself at each boundary (`Session::collect`), and a rollback gives back
+//! what it read (`Session::unread_from`). In real time with live inputs, windows end at most `LIVE_LEAD` ahead of
+//! the wall clock, so what arrives is read about when it arrives.
+//!
+//! **Observers.** Trace sinks get a board's events through a buffer (`HeldTrace`) that a rollback truncates and
+//! the window's end passes on; profilers hold their samples likewise (`Profiler::hold`). Both see
+//! only the run that was kept, as taking turns gives it.
+//!
+//! Robots qualify unless a board has a USB/IP server or an Ethernet cable (whose host sides answer the board at
+//! once) or is traced to the instruction (too many events to hold), a bus endpoint is neither live nor can tell when
+//! it will send, or there is an acoustic medium. [`crate::robot::Robot::run_ahead`] switches it off.
 
 use std::any::Any;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
