@@ -95,6 +95,7 @@ pub struct BenchBuilder {
     bridge: Option<(u8, Time, Option<bool>)>,
     rom_boot: bool,
     record_bus: bool,
+    coverage: bool,
     edit: Option<BoardEdit>,
 }
 
@@ -133,6 +134,12 @@ impl BenchBuilder {
     /// Keep a record of every CAN frame ([`Bench::frames`]).
     pub fn record_bus(mut self) -> Self {
         self.record_bus = true;
+        self
+    }
+
+    /// Collect firmware code coverage ([`Bench::coverage`]; the cores run one instruction at a time).
+    pub fn coverage(mut self) -> Self {
+        self.coverage = true;
         self
     }
 
@@ -187,7 +194,11 @@ impl BenchBuilder {
         } else if self.bridge.is_some() {
             return Err("a bridge needs a board with a CAN bus".into());
         }
-        Ok(Bench { session, inputs, bridge, puddles, image, schedule: Vec::new() })
+        if self.coverage {
+            session.machine.enable_coverage();
+        }
+        let name = self.elf.file_name().map_or("firmware".into(), |n| n.to_string_lossy().into_owned());
+        Ok(Bench { session, inputs, bridge, puddles, image, name, schedule: Vec::new() })
     }
 }
 
@@ -200,6 +211,8 @@ pub struct Bench {
     /// The scripted bridge on the Ethernet cable, for a board with Ethernet instead of CAN.
     pub puddles: Option<PuddlesBridge>,
     image: Image,
+    /// The image's file name.
+    name: String,
     /// Faults still to inject, by time.
     schedule: Vec<(Time, Fault)>,
 }
@@ -212,6 +225,7 @@ impl Bench {
             bridge: None,
             rom_boot: false,
             record_bus: false,
+            coverage: false,
             edit: None,
         }
     }
@@ -399,6 +413,14 @@ impl Bench {
         self.inject(Fault::Panic)
     }
 
+    /// What ran of the firmware so far (with [`BenchBuilder::coverage`]): `report()` gives lines and functions, lcov
+    /// and a summary ([`sim_host::coverage`]).
+    pub fn coverage(&self) -> sim_host::coverage::Coverage {
+        let mut c = sim_host::coverage::Coverage::new();
+        c.add_machine(&self.name, &self.session.machine);
+        c
+    }
+
     /// Resets the chip through the watchdog (scratch registers and RAM kept).
     pub fn watchdog_reset(&mut self) {
         self.session.machine.watchdog_reset(rp2040::periph::timer::WatchdogReset::Force);
@@ -421,7 +443,8 @@ impl Bench {
         if let Some(p) = &puddles {
             session.eth_endpoints.push(Box::new(p.clone()));
         }
-        Bench { session, inputs, bridge, puddles, image: self.image.clone(), schedule: self.schedule.clone() }
+        let (image, name, schedule) = (self.image.clone(), self.name.clone(), self.schedule.clone());
+        Bench { session, inputs, bridge, puddles, image, name, schedule }
     }
 }
 
@@ -515,6 +538,16 @@ impl RobotBench {
             (None, None) => None,
         };
         sim_host::fault::robot_target(&mut self.robot, i, bridge).apply(&fault)
+    }
+
+    /// What ran of each image so far (boards running the same image merged), with coverage on (enable it on each
+    /// board's machine: `machine.enable_coverage()`).
+    pub fn coverage(&self) -> sim_host::coverage::Coverage {
+        let mut c = sim_host::coverage::Coverage::new();
+        for (b, name) in self.robot.boards.iter().zip(&self.robot.images) {
+            c.add_machine(name, &b.machine);
+        }
+        c
     }
 
     /// Injects `fault` on board `board` when the robot reaches `at`.

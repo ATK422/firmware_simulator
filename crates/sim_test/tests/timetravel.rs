@@ -154,4 +154,19 @@ fn a_robot_goes_back_whole() {
     let r = g.robot.run_until(Time::from_ms(400));
     assert!(matches!(r, Some((b, StopReason::Reached { core: c, .. })) if b == esc && c as usize == core), "{r:?}");
     assert_eq!(robot_state(&mut rb.robot), robot_state(&mut g.robot));
+
+    // Steps back on that board's core, the robot with it: as a fresh robot has it at each
+    let mut times = Vec::new();
+    for _ in 0..3 {
+        assert_eq!(tt.reverse_step(&mut rb.robot, esc, core), Travelled::Arrived);
+        let Pos::At { board: b, core: c, time: t } = tt.here() else { panic!("{:?}", tt.here()) };
+        assert_eq!((b, c), (esc, core));
+        assert!(times.last().is_none_or(|&l| t < l) && t < time, "{t} after {times:?}");
+        times.push(t);
+    }
+    let mut h = load();
+    h.robot.boards[esc].machine.stop_at[core] = Some(*times.last().unwrap());
+    let r = h.robot.run_until(Time::from_ms(400));
+    assert!(matches!(r, Some((b, StopReason::Reached { .. })) if b == esc), "{r:?}");
+    assert_eq!(robot_state(&mut rb.robot), robot_state(&mut h.robot));
 }

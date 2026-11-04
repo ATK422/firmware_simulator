@@ -139,3 +139,40 @@ steps:
     let o = sim(&["compare", "--b", &b, path(&p), "--fail-on-regression", "-o", path(&md)]);
     assert_eq!(o.status.code(), Some(1), "{}", text(&o));
 }
+
+#[test]
+fn coverage_and_shared_checkpoints() {
+    if sim_host::titan_rs_image(&repo(), "power_board").is_none() {
+        return;
+    }
+    let p = scenario_file(
+        "cov.yaml",
+        "name: unplugged
+board: {image: power_board, file: BOARD_FILE}
+bridges: [1]
+time: 1s
+steps:
+  - expect: {log: ROS connected, within: 500ms}
+  - pause: booted
+  - fault: can-unplug
+---
+name: plugged
+board: {image: power_board, file: BOARD_FILE}
+bridges: [1]
+time: 1s
+steps:
+  - expect: {log: ROS connected, within: 500ms}
+  - pause: booted
+  - expect: {link: up, within: 200ms}
+",
+    );
+    let dir = temp("cov");
+    let o = sim(&["scenario", path(&p), "--coverage", path(&dir), "--from-checkpoint", "booted", "-j", "1"]);
+    assert!(o.status.success(), "{}", text(&o));
+    let lcov = std::fs::read_to_string(dir.join("lcov.info")).unwrap();
+    assert!(lcov.contains("SF:") && lcov.contains("DA:"), "{lcov}");
+    assert!(dir.join("power_board.info").exists());
+    let summary = std::fs::read_to_string(dir.join("summary.txt")).unwrap();
+    assert!(summary.contains("power_board") && summary.contains("total"), "{summary}");
+    assert!(text(&o).contains("2 passed"), "{}", text(&o));
+}
