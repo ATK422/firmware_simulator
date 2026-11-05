@@ -105,7 +105,7 @@ impl MicroRosUdp {
     }
 
     /// A message frame from a board.
-    fn from_board(&mut self, f: &CanFrame) {
+    fn board_frame(&mut self, f: &CanFrame) {
         let fields = Fields::decode(f.id, f.extended);
         let id = fields.client_id;
         // A message's first frame says how it is sent; a decoder in the other mode is replaced
@@ -164,7 +164,8 @@ impl MicroRosUdp {
     /// Every datagram the agent sent, as CANmore frames to its client.
     fn receive_all(&mut self) -> Vec<CanFrame> {
         let mut out = Vec::new();
-        let mut buf = vec![0u8; 65536];
+        // Larger than any CANmore message: a longer datagram fills it and is counted as oversized
+        let mut buf = [0u8; 2 * canmore::MAX_MSG_LENGTH];
         for (&id, c) in &mut self.clients {
             loop {
                 match c.socket.recv(&mut buf) {
@@ -219,7 +220,7 @@ impl CanEndpoint for MicroRosUdp {
         }
         let fields = Fields::decode(frame.id, frame.extended);
         if fields.frame_type == FrameType::Msg && fields.direction == Direction::ClientToAgent {
-            self.from_board(frame);
+            self.board_frame(frame);
         }
     }
 
@@ -246,7 +247,13 @@ mod tests {
 
     fn frames_of(client: u8, dir: Direction, fd: bool, subtype: u8, msg: &[u8]) -> Vec<CanFrame> {
         MsgEncoder::new(client, dir, fd, subtype, msg)
-            .map(|f| if fd { CanFrame::fd(f.id, f.extended, f.data()) } else { CanFrame::classic(f.id, f.extended, f.data()) })
+            .map(|f| {
+                if fd {
+                    CanFrame::fd(f.id, f.extended, f.data())
+                } else {
+                    CanFrame::classic(f.id, f.extended, f.data())
+                }
+            })
             .collect()
     }
 

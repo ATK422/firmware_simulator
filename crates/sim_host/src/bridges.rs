@@ -358,8 +358,7 @@ pub fn render_script(cmds: &[BridgeCommand], program: &str, robot_file: &str) ->
     // SocketCAN interfaces must exist; CAN over UDP needs nothing on this machine
     let ifaces: Vec<String> = interfaces(cmds).into_iter().filter(|i| cannelloni_addr(i).is_none()).collect();
     if !ifaces.is_empty() {
-        let _ =
-            writeln!(o, "for iface in {}; do", ifaces.iter().map(|i| shell_quote(i)).collect::<Vec<_>>().join(" "));
+        let _ = writeln!(o, "for iface in {}; do", ifaces.iter().map(|i| shell_quote(i)).collect::<Vec<_>>().join(" "));
         let _ = writeln!(o, "    if ! ip link show \"$iface\" >/dev/null 2>&1; then");
         let _ = writeln!(o, "        echo \"no interface $iface (scripts/vcan_up.sh creates vcan interfaces)\" >&2");
         let _ = writeln!(o, "        exit 1");

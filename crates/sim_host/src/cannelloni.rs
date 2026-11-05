@@ -297,11 +297,8 @@ impl Cannelloni {
                             continue;
                         }
                     };
-                    let next_rx_seq = if self.peer.is_some() {
-                        &mut self.next_rx_seq
-                    } else {
-                        &mut self.hub_peer(from).next_rx_seq
-                    };
+                    let next_rx_seq =
+                        if self.peer.is_some() { &mut self.next_rx_seq } else { &mut self.hub_peer(from).next_rx_seq };
                     let gap = next_rx_seq.is_some_and(|s| s != seq);
                     *next_rx_seq = Some(seq.wrapping_add(1));
                     if gap {

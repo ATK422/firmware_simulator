@@ -298,7 +298,8 @@ fn nereus_bridge_python() {
     }
 }
 
-/// An `ip` stand-in for the scripts' interface checks: `STUB_DIR/links` lists `NAME KIND` per interface.
+/// Stand-ins for the scripts' checks: `ip` (`STUB_DIR/links` lists `NAME KIND` per interface), `modinfo` (the vcan
+/// module is there while `STUB_DIR/vcan_module` exists) and `uname` (`STUB_DIR/os`, Linux by default).
 fn stub_ip(dir: &Path) {
     let ip = r#"#!/bin/bash
 echo "ip $*" >> "$STUB_DIR/log"
@@ -309,10 +310,14 @@ if [ "$1 $2" = "link show" ]; then
     echo "1: $3: <NOARP,UP> mtu 72"; echo "    link/can  $kind"
 fi
 "#;
-    let p = dir.join("ip");
-    std::fs::write(&p, ip).unwrap();
-    use std::os::unix::fs::PermissionsExt;
-    std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let modinfo = "#!/bin/bash\n[ -e \"$STUB_DIR/vcan_module\" ] && [ \"$1\" = vcan ]\n";
+    let uname = "#!/bin/bash\nif [ \"$1\" = -s ]; then cat \"$STUB_DIR/os\" 2>/dev/null || echo Linux; else exec /bin/uname \"$@\"; fi\n";
+    for (name, text) in [("ip", ip), ("modinfo", modinfo), ("uname", uname)] {
+        let p = dir.join(name);
+        std::fs::write(&p, text).unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
 }
 
 fn script(stubs: &Path, name: &str, args: &[&str], env: &[(&str, &str)]) -> (i32, String, String) {
@@ -326,14 +331,19 @@ fn script(stubs: &Path, name: &str, args: &[&str], env: &[(&str, &str)]) -> (i32
     run(&mut cmd)
 }
 
-/// `scripts/robot_in_a_box.sh` and `scripts/nereus_firmware_sim.sh` (which need vcan, ROS 2 and nereus to really run)
-/// in `--dry-run`: the commands they would run, and the checks that stop them.
+/// `scripts/robot_in_a_box.sh` and `scripts/nereus_firmware_sim.sh` (which need vcan or a micro-ROS agent, ROS 2 and
+/// nereus to really run) in `--dry-run`: the commands they would run on vcan and on UDP, which they choose, and the
+/// checks that stop them.
 #[test]
 fn robot_in_a_box_and_nereus_scripts() {
-    for s in ["robot_in_a_box.sh", "nereus_firmware_sim.sh", "build_c_boards.sh"] {
+    for s in ["robot_in_a_box.sh", "nereus_firmware_sim.sh", "build_c_boards.sh", "can_transport.sh"] {
         check_bash(&repo().join("scripts").join(s));
         if Command::new("shellcheck").arg("--version").output().is_ok() {
-            let (code, out, _) = run(Command::new("shellcheck").arg(repo().join("scripts").join(s)));
+            let mut sc = Command::new("shellcheck");
+            if s == "can_transport.sh" {
+                sc.args(["--shell", "bash"]);
+            }
+            let (code, out, _) = run(sc.arg(repo().join("scripts").join(s)));
             assert_eq!(code, 0, "shellcheck {s}:\n{out}");
         }
     }
@@ -341,34 +351,65 @@ fn robot_in_a_box_and_nereus_scripts() {
     stub_ip(&d);
     let tf = d.join("tf");
     let tf = tf.to_str().unwrap();
-    // C images: the emulator on can0 and can1, the Orin's micro-ROS agents (no ROS here, so printed)
-    let (code, out, err) = script(&d, "robot_in_a_box.sh", &["--dry-run"], &[("TITAN_FIRMWARE_DIR", tf)]);
+    let tfd = [("TITAN_FIRMWARE_DIR", tf)];
+    // With the vcan module: the emulator on can0 and can1, the Orin's micro-ROS agents (no ROS here, so printed)
+    std::fs::write(d.join("vcan_module"), "").unwrap();
+    let (code, out, err) = script(&d, "robot_in_a_box.sh", &["--dry-run"], &tfd);
     assert_eq!(code, 0, "{err}");
+    assert!(err.contains("CAN transport: vcan (the vcan module is available"), "{err}");
     assert!(out.contains("scripts/vcan_up.sh can0 can1"), "{out}");
-    assert!(
-        out.contains("robots/talos_c.toml --can internal=can0 --realtime") && out.contains("--can external=can1"),
-        "{out}"
-    );
+    assert!(out.contains("robots/talos_c.toml --can internal=can0 --can external=can1 --realtime"), "{out}");
     assert!(out.contains("ros2 launch riptide_hardware2 copro_agent.launch.py robot:=talos"), "{out}");
     assert!(out.contains("No sourced ROS 2 with the riptide workspace found"), "{out}");
     // Rust images: titan_bridge per board, from the bridges command
-    let (code, out, err) = script(&d, "robot_in_a_box.sh", &["--dry-run", "--rust", "--no-vcan"], &[]);
+    let (code, out, err) = script(&d, "robot_in_a_box.sh", &["--dry-run", "--rust", "--transport", "vcan"], &[]);
     assert_eq!(code, 0, "{err}");
-    assert!(!out.contains("vcan_up") && out.contains("robots/talos.toml --can internal=can0"), "{out}");
+    assert!(out.contains("robots/talos.toml --can internal=can0"), "{out}");
     assert!(out.contains("bridges") && out.contains("--format launch"), "{out}");
-    // A real CAN adapter called can0 is never used
+    // A real CAN adapter called can0 is never used, whichever the transport
     std::fs::write(d.join("links"), "can0 mttcan\n").unwrap();
-    let (code, _, err) = script(&d, "robot_in_a_box.sh", &["--dry-run"], &[("TITAN_FIRMWARE_DIR", tf)]);
-    assert_eq!(code, 1);
-    assert!(err.contains("can0 exists and is not a vcan interface"), "{err}");
+    for t in ["vcan", "udp"] {
+        let (code, _, err) = script(&d, "robot_in_a_box.sh", &["--dry-run", "--transport", t], &tfd);
+        assert_eq!(code, 1);
+        assert!(err.contains("can0 exists and is not a vcan interface"), "{err}");
+    }
+    // Interfaces that exist are used without making them again (no sudo), even without the module
     std::fs::write(d.join("links"), "can0 vcan\ncan1 vcan\n").unwrap();
-    let (code, _, err) = script(&d, "robot_in_a_box.sh", &["--dry-run", "--no-vcan"], &[("TITAN_FIRMWARE_DIR", tf)]);
+    std::fs::remove_file(d.join("vcan_module")).unwrap();
+    let (code, out, err) = script(&d, "robot_in_a_box.sh", &["--dry-run"], &tfd);
     assert_eq!(code, 0, "{err}");
+    assert!(err.contains("can0 can1 are vcan interfaces already") && !out.contains("vcan_up"), "{err}{out}");
     // A robot file without the external bus leaves can1 alone
     let (code, out, err) =
-        script(&d, "robot_in_a_box.sh", &["--dry-run", "--no-vcan", "--robot", "robots/talos_c_nereus.toml"], &[]);
+        script(&d, "robot_in_a_box.sh", &["--dry-run", "--robot", "robots/talos_c_nereus.toml"], &[]);
     assert_eq!(code, 0, "{err}");
     assert!(out.contains("--dashboard 127.0.0.1:8080") && !out.contains("external=can1"), "{out}");
+    // No vcan module (WSL2): UDP, a micro-ROS agent for both buses' C boards
+    std::fs::remove_file(d.join("links")).unwrap();
+    let (code, out, err) = script(&d, "robot_in_a_box.sh", &["--dry-run"], &tfd);
+    assert_eq!(code, 0, "{err}");
+    assert!(err.contains("CAN transport: udp (this kernel has no vcan module"), "{err}");
+    assert!(!out.contains("vcan_up") && !out.contains("--can "), "{out}");
+    assert!(
+        out.contains(
+            "robots/talos_c.toml --micro-ros-agent internal=127.0.0.1:8888 --micro-ros-agent external=127.0.0.1:8888"
+        ),
+        "{out}"
+    );
+    assert!(out.contains("MicroXRCEAgent udp4 --port 8888"), "{out}");
+    // macOS: UDP; the Rust images' bridges on a cannelloni hub per bus
+    std::fs::write(d.join("os"), "Darwin\n").unwrap();
+    let (code, out, err) = script(&d, "robot_in_a_box.sh", &["--dry-run", "--rust"], &[]);
+    assert_eq!(code, 0, "{err}");
+    assert!(err.contains("CAN transport: udp (Darwin has no SocketCAN)"), "{err}");
+    assert!(out.contains("--cannelloni internal=127.0.0.1:20000 --cannelloni external=127.0.0.1:20001"), "{out}");
+    assert!(
+        out.contains("--can internal=cannelloni:127.0.0.1:20000 --can external=cannelloni:127.0.0.1:20001"),
+        "{out}"
+    );
+    std::fs::remove_file(d.join("os")).unwrap();
+    let (code, _, err) = script(&d, "robot_in_a_box.sh", &["--transport", "maybe"], &tfd);
+    assert!(code == 2 && err.contains("--transport: auto, vcan or udp"), "{err}");
     let (code, _, err) = script(&d, "robot_in_a_box.sh", &["--stack", "maybe"], &[]);
     assert_eq!(code, 2, "{err}");
     let (code, _, err) = script(&d, "robot_in_a_box.sh", &[], &[]);
@@ -379,25 +420,54 @@ fn robot_in_a_box_and_nereus_scripts() {
     std::fs::create_dir_all(nereus.join("integrations/uwrt/launch")).unwrap();
     std::fs::write(nereus.join("integrations/uwrt/launch/sim.launch.py"), "").unwrap();
     let n = nereus.to_str().unwrap();
-    let (code, out, err) = script(
-        &d,
-        "nereus_firmware_sim.sh",
-        &["--dry-run", "--nereus", n, "--pool", "rpac"],
-        &[("TITAN_FIRMWARE_DIR", tf)],
-    );
+    std::fs::write(d.join("vcan_module"), "").unwrap();
+    let (code, out, err) = script(&d, "nereus_firmware_sim.sh", &["--dry-run", "--nereus", n, "--pool", "rpac"], &tfd);
     assert_eq!(code, 0, "{err}");
     // What's missing is listed, and the commands are printed anyway
     assert!(err.contains("nereus: not built") && err.contains("ROS 2: not sourced"), "{err}");
     assert!(out.contains("make_packs.py") && out.contains("--pool rpac"), "{out}");
+    assert!(out.contains("scripts/vcan_up.sh can0 can1"), "{out}");
     assert!(out.contains("robots/talos_c_nereus.toml --can internal=can0 --realtime"), "{out}");
     assert!(out.contains("--dashboard 127.0.0.1:8080"), "{out}");
     assert!(out.contains("nereus_firmware.launch.py") && out.contains("scenarios/talos_firmware_rpac"), "{out}");
+    assert!(out.contains("rpm_from_forces:=false") && !out.contains("agent:=udp"), "{out}");
     assert!(!out.contains("firmware:=rust"), "{out}");
     let (code, out, err) =
-        script(&d, "nereus_firmware_sim.sh", &["--dry-run", "--nereus", n, "--rust", "--no-vcan"], &[]);
+        script(&d, "nereus_firmware_sim.sh", &["--dry-run", "--nereus", n, "--rust", "--transport", "vcan"], &[]);
     assert_eq!(code, 0, "{err}");
     assert!(out.contains("robots/talos_nereus.toml") && out.contains("firmware:=rust"), "{out}");
-    assert!(out.contains("bridges_launch:="), "{out}");
+    assert!(out.contains("bridges_launch:=") && out.contains("--can internal=can0 --format launch"), "{out}");
+    // UDP (--no-vcan, or no vcan module): the C boards' sessions relayed to a UDP agent, the RPMs from the bridge
+    let (code, out, err) = script(&d, "nereus_firmware_sim.sh", &["--dry-run", "--nereus", n, "--no-vcan"], &tfd);
+    assert_eq!(code, 0, "{err}");
+    assert!(err.contains("micro-ROS agent: neither"), "{err}");
+    assert!(!out.contains("vcan_up") && out.contains("--micro-ros-agent internal=127.0.0.1:8888 --realtime"), "{out}");
+    assert!(out.contains("rpm_from_forces:=true") && out.contains("agent:=udp"), "{out}");
+    // A MicroXRCEAgent on PATH is the agent; the port can move
+    let agent = d.join("MicroXRCEAgent");
+    std::fs::write(&agent, "#!/bin/bash\n").unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&agent, std::fs::Permissions::from_mode(0o755)).unwrap();
+    std::fs::remove_file(d.join("vcan_module")).unwrap();
+    let (code, out, err) =
+        script(&d, "nereus_firmware_sim.sh", &["--dry-run", "--nereus", n, "--agent-port", "9999"], &tfd);
+    assert_eq!(code, 0, "{err}");
+    assert!(err.contains("CAN transport: udp") && !err.contains("micro-ROS agent:"), "{err}");
+    assert!(out.contains("--micro-ros-agent internal=127.0.0.1:9999"), "{out}");
+    assert!(out.contains("agent_cmd:=MicroXRCEAgent udp4 --port 9999"), "{out}");
+    // The Rust images: titan_bridge over CAN over UDP to the emulator's cannelloni hub
+    let (code, out, err) =
+        script(&d, "nereus_firmware_sim.sh", &["--dry-run", "--nereus", n, "--rust", "--hub", "127.0.0.1:20500"], &[]);
+    assert_eq!(code, 0, "{err}");
+    assert!(out.contains("robots/talos_nereus.toml --cannelloni internal=127.0.0.1:20500 --realtime"), "{out}");
+    assert!(out.contains("--can internal=cannelloni:127.0.0.1:20500 --format launch"), "{out}");
+    assert!(out.contains("rpm_from_forces:=true") && !out.contains("agent:=udp"), "{out}");
+    // A titan_bridge without CAN over UDP is reported
+    let tb = d.join("titan_bridge");
+    std::fs::write(&tb, "#!/bin/bash\necho 'usage: titan_bridge --board <b> [--interface can0]'\n").unwrap();
+    std::fs::set_permissions(&tb, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let (code, _, err) = script(&d, "nereus_firmware_sim.sh", &["--dry-run", "--nereus", n, "--rust"], &[]);
+    assert!(code == 0 && err.contains("this build has no CAN over UDP"), "{err}");
     // Without --dry-run the missing pieces stop it before anything starts
     let (code, out, err) = script(&d, "nereus_firmware_sim.sh", &["--nereus", n], &[]);
     assert_eq!(code, 1, "{out}");
