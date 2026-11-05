@@ -11,6 +11,7 @@ use sim_host::Session;
 use sim_host::candiff::{self, Align, DiffOptions};
 use sim_host::canlog::{self, CandumpWriter, Filter, LogFrame, Replay, ReplayOptions, SharedReplay};
 use sim_host::cannelloni::Cannelloni;
+use sim_host::microros_udp::MicroRosUdp;
 use sim_host::robot::Robot;
 
 fn parse_filter(s: &str) -> Result<Filter, String> {
@@ -42,9 +43,16 @@ pub struct CanHostArgs {
     #[arg(long = "replay-iface", value_name = "IFACE[=BUS]")]
     pub replay_ifaces: Vec<String>,
     /// Tunnel the bus to a cannelloni peer over UDP: `LOCAL,PEER` with `run`, `BUS=LOCAL,PEER` with `robot` (e.g.
-    /// `internal=0.0.0.0:20000,192.168.1.50:20000`). Use with `--realtime`.
-    #[arg(long, value_name = "[BUS=]LOCAL,PEER")]
+    /// `internal=0.0.0.0:20000,192.168.1.50:20000`). With `LOCAL` alone (`internal=127.0.0.1:20000`), a hub that
+    /// serves every peer that sends to it, such as titan_bridge's `--interface cannelloni:127.0.0.1:20000`, with no
+    /// vcan. Use with `--realtime`.
+    #[arg(long, value_name = "[BUS=]LOCAL[,PEER]")]
     pub cannelloni: Vec<String>,
+    /// Serve the C boards' micro-ROS-over-CAN sessions to a micro-ROS agent over UDP (`micro_ros_agent udp4 --port
+    /// 8888`), with no vcan and no CAN-capable agent: `HOST[:PORT]` with `run`, `BUS=HOST[:PORT]` with `robot`
+    /// (e.g. `internal=127.0.0.1:8888`). Use with `--realtime`.
+    #[arg(long, value_name = "[BUS=]HOST[:PORT]")]
+    pub micro_ros_agent: Vec<String>,
     /// Log when each frame from the host (`--can`, `--cannelloni`) entered a bus, to the nanosecond, with the bus
     /// name as the interface (`robot` only). `--replay-arrivals` repeats the run exactly from it.
     #[arg(long, value_name = "FILE")]
@@ -60,6 +68,7 @@ impl CanHostArgs {
         self.candump_log.is_some()
             || !self.replay.is_empty()
             || !self.cannelloni.is_empty()
+            || !self.micro_ros_agent.is_empty()
             || self.arrivals_log.is_some()
             || !self.replay_arrivals.is_empty()
     }
@@ -124,7 +133,7 @@ pub fn attach_run(args: &CanHostArgs, session: &mut Session) -> Result<Attached>
         bail!("--arrivals-log and --replay-arrivals are robot options");
     }
     let Some(bus) = session.can_bus.as_mut() else {
-        bail!("--candump-log, --replay and --cannelloni need a --board with a CAN bus");
+        bail!("--candump-log, --replay, --cannelloni and --micro-ros-agent need a --board with a CAN bus");
     };
     let bus_name = bus.name.clone();
     if let Some(path) = &args.candump_log {
@@ -162,12 +171,30 @@ pub fn attach_run(args: &CanHostArgs, session: &mut Session) -> Result<Attached>
         out.replays.push((path.display().to_string(), shared, total));
     }
     for spec in &args.cannelloni {
-        let (local, peer) = Cannelloni::parse_spec(spec).map_err(anyhow::Error::msg)?;
-        let t = Cannelloni::bind(local, peer).with_context(|| format!("binding {local}"))?;
-        session.can_endpoints.push(Box::new(t));
-        log::info!("CAN bus tunnelled (cannelloni over UDP): {local} <-> {peer}");
+        session.can_endpoints.push(Box::new(open_cannelloni(spec, "CAN bus")?));
+    }
+    for spec in &args.micro_ros_agent {
+        session.can_endpoints.push(Box::new(open_micro_ros(spec, "CAN bus")?));
     }
     Ok(out)
+}
+
+/// A `--cannelloni` tunnel (`LOCAL,PEER`) or hub (`LOCAL`).
+fn open_cannelloni(spec: &str, what: &str) -> Result<Cannelloni> {
+    let (local, peer) = Cannelloni::parse_spec(spec).map_err(anyhow::Error::msg)?;
+    let t = Cannelloni::open(local, peer).with_context(|| format!("binding {local}"))?;
+    match peer {
+        Some(peer) => log::info!("{what} tunnelled (cannelloni over UDP): {local} <-> {peer}"),
+        None => log::info!("{what} served to host tools (cannelloni hub over UDP) on {local}"),
+    }
+    Ok(t)
+}
+
+/// A `--micro-ros-agent` relay.
+fn open_micro_ros(spec: &str, what: &str) -> Result<MicroRosUdp> {
+    let m = MicroRosUdp::new(spec).map_err(anyhow::Error::msg)?;
+    log::info!("{what}: the boards' micro-ROS sessions go to the micro-ROS agent at udp {}", m.agent());
+    Ok(m)
 }
 
 /// Attaches the options to a robot's buses; `cans` are its `--can BUS=IFACE` bridges.
@@ -232,12 +259,14 @@ pub fn attach_robot(args: &CanHostArgs, r: &mut Robot, cans: &[(String, String)]
         }
     }
     for spec in &args.cannelloni {
-        let (bus, addrs) = spec.split_once('=').context("--cannelloni BUS=LOCAL,PEER")?;
-        let (local, peer) = Cannelloni::parse_spec(addrs).map_err(anyhow::Error::msg)?;
+        let (bus, addrs) = spec.split_once('=').context("--cannelloni BUS=LOCAL[,PEER]")?;
         let j = bus_index(r, bus)?;
-        let t = Cannelloni::bind(local, peer).with_context(|| format!("binding {local}"))?;
-        r.buses[j].endpoints.push(Box::new(t));
-        log::info!("bus {bus} tunnelled (cannelloni over UDP): {local} <-> {peer}");
+        r.buses[j].endpoints.push(Box::new(open_cannelloni(addrs, &format!("bus {bus}"))?));
+    }
+    for spec in &args.micro_ros_agent {
+        let (bus, agent) = spec.split_once('=').context("--micro-ros-agent BUS=HOST[:PORT]")?;
+        let j = bus_index(r, bus)?;
+        r.buses[j].endpoints.push(Box::new(open_micro_ros(agent, &format!("bus {bus}"))?));
     }
     for (path, log) in read_logs(&args.replay_arrivals)? {
         for iface in canlog::interfaces(&log) {
@@ -425,6 +454,8 @@ pub struct BridgesArgs {
     /// Robot file (robots/*.toml).
     robot: PathBuf,
     /// The interface a bus is bridged to, `BUS=IFACE` (repeatable); by default the Nth bus of the file is `vcanN`.
+    /// `BUS=cannelloni:HOST:PORT` has the bridges use CAN over UDP to the emulator's `--cannelloni BUS=HOST:PORT` hub
+    /// instead (no vcan).
     #[arg(long = "can", value_parser = super::parse_bus_iface)]
     cans: Vec<(String, String)>,
     /// ROS namespace for every bridge, instead of each board's default (`talos`).
@@ -487,13 +518,15 @@ pub fn bridges(args: BridgesArgs) -> Result<()> {
 pub struct TunnelArgs {
     /// SocketCAN interface on this machine (e.g. vcan0).
     iface: String,
-    /// `LOCAL,PEER` UDP addresses: this end, and the emulator's `--cannelloni` address.
+    /// `LOCAL,PEER` UDP addresses: this end, and the emulator's `--cannelloni` address (a tunnel's or a hub's: a
+    /// hub learns this end from what it sends; `0.0.0.0:0` picks any local port).
     addrs: String,
 }
 
 /// Runs a SocketCAN <-> cannelloni tunnel until stopped.
 pub fn can_tunnel(args: TunnelArgs) -> Result<()> {
     let (local, peer) = Cannelloni::parse_spec(&args.addrs).map_err(anyhow::Error::msg)?;
+    let peer = peer.context("can-tunnel needs LOCAL,PEER: this end and the emulator's --cannelloni address")?;
     sim_host::cannelloni::tunnel(&args.iface, local, peer).with_context(|| format!("tunnel on {}", args.iface))
 }
 

@@ -193,6 +193,7 @@ pub mod flush;
 pub mod gdb;
 pub mod host_protocol;
 pub mod jsonlog;
+pub mod microros_udp;
 pub mod mock_bridge;
 pub mod nanoros;
 pub mod parallel;

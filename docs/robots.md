@@ -13,6 +13,7 @@ and replay, log comparison, UDP tunnels, and the real host tools.
 - [Mock agents: nano-ROS and other protocols](#mock-agents-nano-ros-and-other-protocols)
 - [CAN logs: recording, replaying, comparing](#can-logs-recording-replaying-comparing)
 - [CAN over UDP (cannelloni)](#can-over-udp-cannelloni)
+- [Without vcan: UDP](#without-vcan-udp)
 - [titan_bridge command lines: `bridges`](#titan_bridge-command-lines-bridges)
 - [Robot in a box: the Orin's side on vcan](#robot-in-a-box-the-orins-side-on-vcan)
 
@@ -125,7 +126,9 @@ as `[t] NAME uart0: ...`); the run ends with the stop time, the wall time and ea
 | `--udp BOARD:LOCAL=PEER` | | Relays an Ethernet board's UDP through a host socket, e.g. `backplane:127.0.0.1:2203=127.0.0.1:2204` |
 | `--can BUS=IFACE` | | Bridges a bus to a SocketCAN interface, e.g. `internal=vcan0` (repeatable) |
 | `--candump` | | Prints every frame with its bus |
-| `--candump-log FILE`, `--replay FILE`, `--replay-filter`, `--replay-offset`, `--replay-iface IFACE=BUS`, `--cannelloni BUS=LOCAL,PEER` | | [Below](#can-logs-recording-replaying-comparing) |
+| `--candump-log FILE`, `--replay FILE`, `--replay-filter`, `--replay-offset`, `--replay-iface IFACE=BUS` | | [Below](#can-logs-recording-replaying-comparing) |
+| `--cannelloni BUS=LOCAL,PEER`, `--cannelloni BUS=LOCAL` | | CAN over UDP: a tunnel to one peer, or a hub for any number of host tools ([below](#can-over-udp-cannelloni)) |
+| `--micro-ros-agent BUS=HOST[:PORT]` | | Relays the bus's micro-ROS boards to a micro-ROS agent over UDP, with no vcan ([below](#without-vcan-udp)) |
 | `--arrivals-log FILE`, `--replay-arrivals FILE` | | Logs where each frame from `--can`/`--cannelloni` entered a bus; replays such a log at exactly those times ([below](#repeating-a-run-with-host-tools)) |
 | `--usb-cdc BOARD=SINK` | | Opens a board's USB CDC port (pico-sdk stdio_usb, titan_dual_stdio_usb's text log): `stdout` prints its lines as `[t] BOARD usb: ...`, `pty` or `pty:PATH` puts it on a terminal (repeatable; replaces the robot file's `usb_cdc`) |
 | `--usb-cdc2 BOARD=SINK` | | Opens its second CDC port (titan_firmware's micro-ROS USB transport) on `pty` or `pty:PATH` (repeatable; replaces `usb_cdc2`) |
@@ -469,9 +472,71 @@ firmware_simulator robot robots/talos.toml --realtime --cannelloni internal=0.0.
 firmware_simulator can-tunnel vcan0 0.0.0.0:20000,10.0.0.1:20000
 ```
 
-Tested between two emulated buses over loopback (`can_log.rs`: a power board reaches a mock bridge through the
-tunnel). **To verify locally**: `can-tunnel` itself (needs vcan) and interoperation with the real cannelloni
-program (the framing was written from the protocol description).
+With `LOCAL` alone (`--cannelloni internal=127.0.0.1:20000`) the emulator is a **hub**: it needs no peer
+address, learns its peers from the datagrams they send (an empty one, frame count 0, is a keepalive), sends each
+the bus's frames and every other peer's, as on a shared vcan, and forgets a peer it has not heard from for 10 s.
+Host tools that speak cannelloni themselves connect with no vcan anywhere: titan_bridge's `--interface
+cannelloni:127.0.0.1:20000`, or `can-tunnel` for a far vcan (it sends keepalives; the `cannelloni` program does not,
+so use a tunnel with it). A hub binds the address it is given; `0.0.0.0:20000` takes peers from other machines,
+VMs and containers too (`host.docker.internal:20000` from Docker Desktop).
+
+Tested between two emulated buses over loopback (`can_log.rs`: a power board reaches a mock bridge through a
+tunnel and through a hub, with a second peer listening), from the command line (`cli_live.rs`: a peer that only
+knows the hub's address gets every Talos board's heartbeat), and with the real titan_bridge over the hub
+([below](#without-vcan-udp)). **To verify locally**: `can-tunnel` itself (needs vcan) and interoperation with the
+real cannelloni program (the framing was written from the protocol description).
+
+## Without vcan: UDP
+
+vcan needs Linux with the `vcan` module and root (or sudo) to make the interfaces. WSL2's stock kernel has no
+`vcan`, macOS has no SocketCAN, and a laptop without sudo cannot make them. For those, everything the robot
+computer runs reaches the emulated buses over UDP on localhost instead, and the firmware is unchanged:
+
+| Robot computer's side | On vcan | Without vcan |
+|---|---|---|
+| C boards' micro-ROS sessions | `micro_ros_agent can -D can0` (osu-uwrt's fork) | `--micro-ros-agent internal=127.0.0.1:8888` and any micro-ROS agent's `udp4` transport |
+| Rust boards | `titan_bridge --interface can0` | `--cannelloni internal=127.0.0.1:20000` and `titan_bridge --interface cannelloni:127.0.0.1:20000` |
+| The controller's raw thruster frames | written to `can0` | none (no `can0`): `command/thruster_rpm` instead ([nereus.md](nereus.md#the-bridge-node)'s `--rpm-from-forces`) |
+| candump, canmore_cli, upload_tool | on `can0` | not available (they are SocketCAN tools) |
+
+**`--micro-ros-agent BUS=HOST[:PORT]`** (`HOST[:PORT]` with `run`) plays the CAN micro-ROS agent on the bus:
+titan_firmware's micro-ROS CAN transport is packet oriented (one XRCE-DDS packet per CANmore message), so it
+reassembles each board's messages and sends every packet to the agent as one UDP datagram, from a socket of that
+board's own (the agent sees each board as its own UDP client, as boards on a network would be), and hands what the
+agent sends to that socket back to the board as CANmore messages, classic or CAN FD as the board sends. It does
+nothing else: titan_link messages (Rust boards), heartbeats and thruster commands are left alone. Any micro-ROS
+agent with the `udp4` transport serves it: riptide's `micro_ros_agent` package (`ros2 run micro_ros_agent
+micro_ros_agent udp4 --port 8888`), or a standalone `MicroXRCEAgent udp4 --port 8888`
+([nereus.md](nereus.md#the-micro-ros-agent) has how to build one). Use `--realtime`: the agent's timeouts run on
+the wall clock.
+
+```bash
+firmware_simulator robot robots/talos_c.toml --micro-ros-agent internal=127.0.0.1:8888 --micro-ros-agent external=127.0.0.1:8888 --realtime --time 100000s
+MicroXRCEAgent udp4 --port 8888        # or: ros2 run micro_ros_agent micro_ros_agent udp4 --port 8888
+ros2 topic list | grep /talos          # /talos/state/firmware, /talos/state/kill, ...
+
+firmware_simulator robot robots/talos.toml --cannelloni internal=127.0.0.1:20000 --cannelloni external=127.0.0.1:20001 --realtime --time 100000s
+firmware_simulator bridges robots/talos.toml --can internal=cannelloni:127.0.0.1:20000 --can external=cannelloni:127.0.0.1:20001 --format launch -o bridges.launch.py
+ros2 launch ./bridges.launch.py
+```
+
+titan_bridge's `cannelloni:` interface is in titan_firmware_rs's `m12-titan-bridge-udp` branch (not yet in the
+submodule this repository pins, which only the emulator's tests use; the bridge you run is your own build). The
+scripts choose by themselves: `scripts/robot_in_a_box.sh` and `scripts/nereus_firmware_sim.sh` take `--transport
+auto|vcan|udp` (`--no-vcan` is `--transport udp`), and `auto` uses vcan when `can0` and `can1` are vcan interfaces
+already or the module is there (with root or sudo), and UDP otherwise; they print which and why.
+
+What runs where with UDP is up to you: the emulator's addresses can be another machine's. On a Mac, for example,
+the emulator can run natively while ROS runs in a Linux VM: `--micro-ros-agent internal=VM_IP:8888` and an agent in
+the VM, or `--cannelloni internal=0.0.0.0:20000` and the VM's titan_bridges on `cannelloni:MAC_IP:20000`.
+
+Verified here, with no vcan (ROS 2 Humble from uwrt_nix's `ros` shell, Fast DDS): the C PoAC, both ESC boards and
+the camera cage (`robots/talos_c_nereus.toml`) through `--micro-ros-agent` and a stock Micro-XRCE-DDS-Agent v2.4.2
+(`MicroXRCEAgent udp4`): all four sessions, every firmware topic in `ros2 topic list`, `state/firmware` and
+`state/kill` echoed, the software kill asserted and released through `command/software_kill`, and
+`command/thruster_rpm` spinning the ESCs (`state/thrusters/rpm`, the dashboard). The same with the Rust images and
+four real titan_bridges on a hub. In the tests: `microros_udp.rs` (sessions per client, errors), `cli_live.rs` (the
+real C PoAC's packets reach a UDP socket, when `TITAN_FIRMWARE_DIR` has it built).
 
 ## titan_bridge command lines: `bridges`
 
@@ -508,6 +573,9 @@ client ID from the serial number in its board file's `[[flash]]`. The Nth bus of
 | `--probe`, `--probe-time T` | Boot the robot for `T` (1.5 s) and take each board's client ID from its CANmore heartbeats |
 
 ## Robot in a box: the Orin's side on vcan
+
+(Or on UDP where there is no vcan: `--transport udp`, the default without the module; see
+[Without vcan](#without-vcan-udp). The controller's raw thruster frames then go nowhere.)
 
 > **To verify locally.** None of this could run where this guide was written (no vcan module, no
 > `CAP_NET_ADMIN`, no ROS 2, no Docker daemon). The scripts and generated files are checked statically

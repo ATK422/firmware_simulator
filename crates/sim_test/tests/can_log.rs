@@ -142,6 +142,43 @@ fn bridge_on_the_far_side_of_a_cannelloni_tunnel() {
     assert_eq!(far.rx_gaps, 0);
 }
 
+/// No vcan anywhere: the board's bus is a cannelloni hub, and the robot computer's tools reach it as peers that
+/// only know the hub's address (titan_bridge's `--interface cannelloni:HOST:PORT`). A bridge connects the board
+/// through it; a second peer (a candump through `can-tunnel`) sees the bridge's frames as well as the board's, as
+/// on a shared vcan.
+#[test]
+fn bridge_through_a_cannelloni_hub() {
+    let Some(mut board) = power_board(false) else { return };
+    let hub = Cannelloni::hub("127.0.0.1:0".parse().unwrap()).unwrap();
+    let hub_addr = hub.local_addr().unwrap();
+    board.session.can_endpoints.push(Box::new(hub));
+    let rates = board.session.can_bus.as_ref().unwrap().rates;
+    let mut remote = CanBus::new("bridge", rates);
+    let mut bridge = MockBridge::new(1, true, Time::ZERO);
+    bridge.set_kill(Some(false));
+    let watch = bridge.clone();
+    let mut far = Cannelloni::bind("127.0.0.1:0".parse().unwrap(), hub_addr).unwrap();
+    let mut listener = Cannelloni::bind("127.0.0.1:0".parse().unwrap(), hub_addr).unwrap();
+    let mut heard = Vec::new();
+    let mut t = Time::ZERO;
+    while t < Time::from_ms(2500) {
+        t += Time::from_ms(1);
+        board.run_until(t).unwrap();
+        remote.step(&mut [], &mut [&mut bridge, &mut far], t);
+        listener.keepalive();
+        heard.extend(listener.receive_all());
+    }
+    assert!(board.logged("ROS connected"), "{:?}", board.session.logs);
+    let st = watch.statuses();
+    assert!(!st.is_empty(), "the bridge got the board's status through the hub");
+    assert_eq!(st[0].1.board_name.as_str(), "mk2/power_board");
+    assert!(watch.state().errors.is_empty());
+    let dir = |f: &sim_devices::can::CanFrame| canmore::id::Fields::decode(f.id, f.extended).direction;
+    assert!(heard.iter().any(|f| dir(f) == canmore::id::Direction::ClientToAgent), "the board's frames");
+    assert!(heard.iter().any(|f| dir(f) == canmore::id::Direction::AgentToClient), "the bridge's frames, forwarded");
+    assert_eq!((far.rx_gaps, listener.rx_gaps), (0, 0));
+}
+
 /// candump's text output for a frame (`candump -t a -x can0`): `(1700000000.123456)  can0  RX B -  123  [02]  AA BB`.
 fn candump_text(time_ns: u64, iface: &str, f: &sim_devices::can::CanFrame) -> String {
     let id = if f.extended { format!("{:08X}", f.id) } else { format!("{:03X}", f.id) };

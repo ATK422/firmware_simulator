@@ -251,3 +251,110 @@ fn a_robot_behind_real_time_says_so() {
     assert!(out.status.success(), "{err}");
     assert!(err.contains("real-time mode: emulation is ") && err.contains(" behind the wall clock"), "{err}");
 }
+
+/// Talos's Rust boards served to host tools with no vcan: `--cannelloni BUS=ADDR` alone is a hub, and a peer that
+/// only knows its address (as titan_bridge's `--interface cannelloni:HOST:PORT`) gets the bus's frames: every
+/// board's CANmore heartbeat.
+#[test]
+fn a_cannelloni_hub_serves_a_peer_that_only_knows_its_address() {
+    let robot = repo().join("robots/talos_nereus.toml");
+    let hub = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+    let addr = hub.local_addr().unwrap();
+    drop(hub);
+    let mut r = Running::start(&[
+        "robot",
+        robot.to_str().unwrap(),
+        "--cannelloni",
+        &format!("internal={addr}"),
+        "--dashboard",
+        "127.0.0.1:0",
+        "--realtime",
+        "--time",
+        "600s",
+    ]);
+    let peer = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+    peer.set_read_timeout(Some(Duration::from_millis(200))).unwrap();
+    let mut heartbeats = std::collections::BTreeSet::new();
+    let mut seq = 0u8;
+    let t0 = Instant::now();
+    while heartbeats.len() < 4 && t0.elapsed() < Duration::from_secs(60) && r.still_running() {
+        // A keepalive (a datagram without frames) introduces the peer and keeps it known
+        let _ = peer.send_to(&[2, 0, seq, 0, 0], addr);
+        seq = seq.wrapping_add(1);
+        let mut buf = [0u8; 2048];
+        while let Ok(n) = peer.recv(&mut buf) {
+            for f in sim_host::cannelloni::decode(&buf[..n]).unwrap().1 {
+                let fields = canmore::id::Fields::decode(f.id, f.extended);
+                if fields.frame_type == canmore::id::FrameType::Util && fields.noc == canmore::CHAN_HEARTBEAT {
+                    heartbeats.insert(fields.client_id);
+                }
+            }
+        }
+    }
+    assert_eq!(heartbeats.into_iter().collect::<Vec<_>>(), [1, 2, 3, 4], "{}", r.stderr());
+    assert!(r.stderr().contains("cannelloni hub over UDP"), "{}", r.stderr());
+}
+
+/// `--micro-ros-agent BUS=HOST[:PORT]`: a bad address or bus is refused before anything runs.
+#[test]
+fn micro_ros_agent_option_errors() {
+    let robot = repo().join("robots/talos_nereus.toml");
+    for (arg, says) in [("internal=127.0.0.1:99999", "micro-ROS agent address"), ("nobus=127.0.0.1", "nobus")] {
+        let out = Command::new(env!("CARGO_BIN_EXE_firmware_simulator"))
+            .args(["robot", robot.to_str().unwrap(), "--micro-ros-agent", arg, "--dashboard", "127.0.0.1:0"])
+            .args(["--time", "1ms"])
+            .output()
+            .unwrap();
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert!(!out.status.success() && err.contains(says), "{arg}: {err}");
+    }
+}
+
+/// A titan_firmware C board's micro-ROS session over UDP (`--micro-ros-agent`), no vcan and no CAN agent: the
+/// PoAC's XRCE-DDS packets (its agent pings, GET_INFO) reach a UDP socket playing the agent, one datagram per packet,
+/// all from one address (the board's client endpoint). The real agent's whole session is in docs/nereus.md. Needs the C PoAC image
+/// (`$TITAN_FIRMWARE_DIR/talos/PoacBoard/build/poac_board_with_bl.uf2`); skipped without it.
+#[test]
+fn a_c_boards_micro_ros_session_reaches_a_udp_agent() {
+    let Ok(tf) = std::env::var("TITAN_FIRMWARE_DIR") else { return };
+    let image = PathBuf::from(&tf).join("talos/PoacBoard/build/poac_board_with_bl.uf2");
+    if !image.exists() {
+        eprintln!("skipped: no {}", image.display());
+        return;
+    }
+    let robot = temp("udp_agent_poac.toml");
+    std::fs::write(
+        &robot,
+        format!(
+            "[[bus]]\nname = \"internal\"\nrates = \"internal\"\n\n[[board]]\nname = \"poac\"\nboard = {b:?}\n\
+             elf = {e:?}\nrom_boot = true\nbus = \"internal\"\n",
+            b = repo().join("boards/talos/poac_board.toml").to_str().unwrap(),
+            e = image.to_str().unwrap()
+        ),
+    )
+    .unwrap();
+    let agent = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+    agent.set_read_timeout(Some(Duration::from_secs(60))).unwrap();
+    let r = Running::start(&[
+        "robot",
+        robot.to_str().unwrap(),
+        "--micro-ros-agent",
+        &format!("internal={}", agent.local_addr().unwrap()),
+        "--realtime",
+        "--time",
+        "600s",
+    ]);
+    let mut buf = [0u8; 2048];
+    let mut from = Vec::new();
+    while from.len() < 2 {
+        let (n, addr) = agent.recv_from(&mut buf).unwrap_or_else(|e| panic!("{e}: {}", r.stderr()));
+        // XRCE: session 0x80 (no client key), stream 0, then GET_INFO (submessage 2; rmw_uros_ping_agent) or
+        // CREATE_CLIENT (0, with the "XRCE" cookie)
+        let p = &buf[..n];
+        let ok = p.len() >= 8 && p[0] & 0x80 != 0 && (p[4] == 2 || (p[4] == 0 && p.get(8..12) == Some(b"XRCE")));
+        assert!(ok, "{p:02x?}");
+        from.push(addr);
+    }
+    assert_eq!(from[0], from[1], "one client endpoint per board");
+    assert!(r.stderr().contains("micro-ROS over UDP: client 1 -> agent"), "{}", r.stderr());
+}

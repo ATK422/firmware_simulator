@@ -57,7 +57,8 @@ fi
 
 if ! "${sudo[@]}" modprobe vcan; then
     echo "could not load the vcan module: this kernel has no virtual CAN support (common in containers and" >&2
-    echo "cloud VMs). Use the emulator's in-process bus, or --cannelloni to reach a machine that has vcan." >&2
+    echo "cloud VMs, WSL2). Use the emulator's in-process bus, or UDP: --micro-ros-agent and --cannelloni hubs" >&2
+    echo "(the scripts' --transport udp; docs/robots.md#without-vcan-udp)." >&2
     exit 1
 fi
 

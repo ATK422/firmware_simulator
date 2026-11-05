@@ -3,6 +3,10 @@
 //! the emulator's network namespace, a robot computer on the LAN). There, `cannelloni -I vcan0 -R <emulator host>
 //! -r <emulator port> -l <its port>` (or `firmware_simulator can-tunnel`) connects the far `vcan0` to the bus.
 //!
+//! Host tools can also speak it themselves, with no `vcan` anywhere: the emulator's **hub** mode
+//! ([`Cannelloni::hub`]) serves any number of them on one port (titan_bridge's `--interface cannelloni:HOST:PORT`),
+//! which is how the robot computer's side runs where there is no SocketCAN (WSL2, macOS, a laptop without sudo).
+//!
 //! A datagram is a five byte header, then the frames:
 //!
 //! ```text
@@ -122,27 +126,66 @@ pub fn decode(p: &[u8]) -> Result<(u8, Vec<CanFrame>), String> {
     Ok((p[2], frames))
 }
 
+/// How long a hub forgets a peer it has not heard from (see [`Cannelloni::hub`]). Peers send at least a keepalive
+/// every [`KEEPALIVE`].
+pub const HUB_PEER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+/// How often a quiet peer of a hub sends an empty datagram, so the hub keeps it.
+pub const KEEPALIVE: std::time::Duration = std::time::Duration::from_secs(1);
+/// The most peers a hub keeps (the one heard from longest ago goes first).
+pub const HUB_MAX_PEERS: usize = 64;
+
+/// A peer of a hub: where it is, when it was last heard from, and the sequence numbers each way.
+struct HubPeer {
+    addr: SocketAddr,
+    last: std::time::Instant,
+    tx_seq: u8,
+    next_rx_seq: Option<u8>,
+}
+
 /// A bus endpoint that tunnels the bus to a cannelloni peer over UDP: frames on the bus are sent (batched once per
 /// bus step), frames received are put on the bus. Use it in real-time mode, like a SocketCAN bridge.
+///
+/// As a **hub** ([`Cannelloni::hub`]: `--cannelloni BUS=LOCAL`, no peer) it serves any number of peers that send
+/// to its address, each a host tool (titan_bridge's `cannelloni:` interface, `can-tunnel`) as if on a shared vcan:
+/// every peer gets the bus's frames and every other peer's, and a peer it has not heard from for
+/// [`HUB_PEER_TIMEOUT`] is forgotten. Peers are learnt from the datagrams they send (an empty one, frame count 0,
+/// is a keepalive), so the hub needs no peer addresses and works through NAT (a container sending to its host).
 pub struct Cannelloni {
     socket: UdpSocket,
-    pub peer: SocketAddr,
+    /// The peer; `None` for a hub.
+    pub peer: Option<SocketAddr>,
     seq: u8,
-    pending: Vec<CanFrame>,
+    /// Frames to send: from the bus (`None`), or from a hub's peer to the others.
+    pending: Vec<(Option<SocketAddr>, CanFrame)>,
     /// Frames received to answer [`CanEndpoint::waiting`], handed in by the next `take_tx`.
     held: Vec<CanFrame>,
-    /// Frames sent to and received from the peer, and datagrams that could not be decoded.
+    hub: Vec<HubPeer>,
+    /// How long a hub keeps a quiet peer ([`HUB_PEER_TIMEOUT`]).
+    pub hub_timeout: std::time::Duration,
+    /// Frames sent to and received from the peer(s), and datagrams that could not be decoded.
     pub tx_frames: u64,
     pub rx_frames: u64,
     pub rx_errors: u64,
     /// Datagrams that arrived out of sequence (lost or reordered on the way).
     pub rx_gaps: u64,
     next_rx_seq: Option<u8>,
+    /// When something was last sent to the peer (`None`: never).
+    last_tx: Option<std::time::Instant>,
 }
 
 impl Cannelloni {
     /// Binds `local` and sends to `peer`; only datagrams from `peer`'s address are accepted.
     pub fn bind(local: SocketAddr, peer: SocketAddr) -> io::Result<Cannelloni> {
+        Self::open(local, Some(peer))
+    }
+
+    /// Binds `local` as a hub for any number of peers (see [`Cannelloni`]).
+    pub fn hub(local: SocketAddr) -> io::Result<Cannelloni> {
+        Self::open(local, None)
+    }
+
+    /// [`Cannelloni::bind`] with a peer, [`Cannelloni::hub`] without.
+    pub fn open(local: SocketAddr, peer: Option<SocketAddr>) -> io::Result<Cannelloni> {
         let socket = UdpSocket::bind(local)?;
         socket.set_nonblocking(true)?;
         Ok(Cannelloni {
@@ -151,76 +194,165 @@ impl Cannelloni {
             seq: 0,
             pending: Vec::new(),
             held: Vec::new(),
+            hub: Vec::new(),
+            hub_timeout: HUB_PEER_TIMEOUT,
             tx_frames: 0,
             rx_frames: 0,
             rx_errors: 0,
             rx_gaps: 0,
             next_rx_seq: None,
+            last_tx: None,
         })
     }
 
-    /// Parses `LOCAL,PEER` (e.g. `0.0.0.0:20000,192.168.1.50:20001`).
-    pub fn parse_spec(spec: &str) -> Result<(SocketAddr, SocketAddr), String> {
-        let (l, p) = spec.split_once(',').ok_or("expected LOCAL,PEER addresses")?;
+    /// Parses `LOCAL,PEER` (e.g. `0.0.0.0:20000,192.168.1.50:20001`), or `LOCAL` alone for a hub.
+    pub fn parse_spec(spec: &str) -> Result<(SocketAddr, Option<SocketAddr>), String> {
         let addr = |s: &str| s.trim().parse::<SocketAddr>().map_err(|e| format!("{s:?}: {e}"));
-        Ok((addr(l)?, addr(p)?))
+        match spec.split_once(',') {
+            Some((l, p)) => Ok((addr(l)?, Some(addr(p)?))),
+            None => Ok((addr(spec).map_err(|e| format!("expected LOCAL,PEER or LOCAL addresses: {e}"))?, None)),
+        }
     }
 
     pub fn local_addr(&self) -> io::Result<SocketAddr> {
         self.socket.local_addr()
     }
 
-    /// Sends the frames waiting to go to the peer.
+    /// The peers a hub serves now.
+    pub fn hub_peers(&self) -> Vec<SocketAddr> {
+        self.hub.iter().map(|p| p.addr).collect()
+    }
+
+    /// Sends the frames waiting to go to the peer (or to a hub's peers).
     pub fn flush(&mut self) {
         if self.pending.is_empty() {
             return;
         }
-        let frames = std::mem::take(&mut self.pending);
-        for p in encode(&frames, &mut self.seq) {
-            if let Err(e) = self.socket.send_to(&p, self.peer) {
-                log::warn!("cannelloni: sending to {}: {e}", self.peer);
-                return;
+        let pending = std::mem::take(&mut self.pending);
+        if let Some(peer) = self.peer {
+            let frames: Vec<CanFrame> = pending.into_iter().map(|(_, f)| f).collect();
+            for p in encode(&frames, &mut self.seq) {
+                if let Err(e) = self.socket.send_to(&p, peer) {
+                    log::warn!("cannelloni: sending to {peer}: {e}");
+                    return;
+                }
             }
+            self.tx_frames += frames.len() as u64;
+            self.last_tx = Some(std::time::Instant::now());
+            return;
         }
-        self.tx_frames += frames.len() as u64;
+        for peer in &mut self.hub {
+            let frames: Vec<CanFrame> =
+                pending.iter().filter(|(from, _)| *from != Some(peer.addr)).map(|(_, f)| f.clone()).collect();
+            if frames.is_empty() {
+                continue;
+            }
+            for p in encode(&frames, &mut peer.tx_seq) {
+                // A peer that went away answers with an ICMP error, reported on a later call; it is forgotten
+                // once it has been quiet for HUB_PEER_TIMEOUT
+                if let Err(e) = self.socket.send_to(&p, peer.addr) {
+                    log::debug!("cannelloni hub: sending to {}: {e}", peer.addr);
+                    break;
+                }
+            }
+            self.tx_frames += frames.len() as u64;
+        }
     }
 
-    /// Every frame waiting in the socket.
+    /// Sends an empty datagram (frame count 0) if nothing was sent yet or for [`KEEPALIVE`], so a hub learns and
+    /// keeps this peer.
+    pub fn keepalive(&mut self) {
+        let Some(peer) = self.peer else { return };
+        if self.last_tx.is_some_and(|t| t.elapsed() < KEEPALIVE) {
+            return;
+        }
+        let p = [VERSION, OP_DATA, self.seq, 0, 0];
+        self.seq = self.seq.wrapping_add(1);
+        self.last_tx = Some(std::time::Instant::now());
+        if let Err(e) = self.socket.send_to(&p, peer) {
+            log::debug!("cannelloni: keepalive to {peer}: {e}");
+        }
+    }
+
+    /// Every frame waiting in the socket (for a hub, the ones its peers sent, which also go to the other peers).
     pub fn receive_all(&mut self) -> Vec<CanFrame> {
         let mut out = Vec::new();
         let mut buf = [0u8; 65536];
         loop {
             match self.socket.recv_from(&mut buf) {
                 Ok((n, from)) => {
-                    if from.ip() != self.peer.ip() && !self.peer.ip().is_unspecified() {
+                    if let Some(peer) = self.peer
+                        && from.ip() != peer.ip()
+                        && !peer.ip().is_unspecified()
+                    {
                         continue;
                     }
-                    match decode(&buf[..n]) {
-                        Ok((seq, frames)) => {
-                            if self.next_rx_seq.is_some_and(|s| s != seq) {
-                                self.rx_gaps += 1;
-                            }
-                            self.next_rx_seq = Some(seq.wrapping_add(1));
-                            self.rx_frames += frames.len() as u64;
-                            out.extend(frames);
-                        }
+                    let (seq, frames) = match decode(&buf[..n]) {
+                        Ok(d) => d,
                         Err(e) => {
                             if self.rx_errors == 0 {
                                 log::warn!("cannelloni: datagram from {from}: {e}");
                             }
                             self.rx_errors += 1;
+                            continue;
                         }
+                    };
+                    let next_rx_seq =
+                        if self.peer.is_some() { &mut self.next_rx_seq } else { &mut self.hub_peer(from).next_rx_seq };
+                    let gap = next_rx_seq.is_some_and(|s| s != seq);
+                    *next_rx_seq = Some(seq.wrapping_add(1));
+                    if gap {
+                        self.rx_gaps += 1;
                     }
+                    self.rx_frames += frames.len() as u64;
+                    if self.peer.is_none() && self.hub.len() > 1 {
+                        self.pending.extend(frames.iter().map(|f| (Some(from), f.clone())));
+                    }
+                    out.extend(frames);
                 }
                 Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
+                // An ICMP port unreachable from a peer that isn't up (or is gone) shows up here on Linux; it is
+                // consumed, so read on
+                Err(e) if matches!(e.kind(), io::ErrorKind::ConnectionRefused | io::ErrorKind::ConnectionReset) => {
+                    log::debug!("cannelloni: {e}");
+                }
                 Err(e) => {
-                    // An ICMP port unreachable from a peer that isn't up yet shows up here on Linux
                     log::debug!("cannelloni: {e}");
                     break;
                 }
             }
         }
+        if self.peer.is_none() {
+            let timeout = self.hub_timeout;
+            self.hub.retain(|p| {
+                let keep = p.last.elapsed() < timeout;
+                if !keep {
+                    log::info!("cannelloni hub: {} left (nothing from it for {timeout:?})", p.addr);
+                }
+                keep
+            });
+        }
         out
+    }
+
+    /// A hub's record of the peer at `addr`, added if new.
+    fn hub_peer(&mut self, addr: SocketAddr) -> &mut HubPeer {
+        let now = std::time::Instant::now();
+        let at = match self.hub.iter().position(|p| p.addr == addr) {
+            Some(i) => i,
+            None => {
+                if self.hub.len() >= HUB_MAX_PEERS {
+                    let oldest = (0..self.hub.len()).min_by_key(|&i| self.hub[i].last).unwrap();
+                    let gone = self.hub.remove(oldest);
+                    log::warn!("cannelloni hub: {HUB_MAX_PEERS} peers; forgetting {}", gone.addr);
+                }
+                log::info!("cannelloni hub: {addr} joined");
+                self.hub.push(HubPeer { addr, last: now, tx_seq: 0, next_rx_seq: None });
+                self.hub.len() - 1
+            }
+        };
+        self.hub[at].last = now;
+        &mut self.hub[at]
     }
 }
 
@@ -239,7 +371,10 @@ impl CanEndpoint for Cannelloni {
     }
 
     fn receive(&mut self, frame: &CanFrame, _at: Time) {
-        self.pending.push(frame.clone());
+        // A hub with no peers has no one to send to
+        if self.peer.is_some() || !self.hub.is_empty() {
+            self.pending.push((None, frame.clone()));
+        }
     }
 
     /// The far side's frames wait for the bus in a bounded queue (the far `vcan` would refuse writes with `ENOBUFS`
@@ -272,9 +407,11 @@ pub fn tunnel(iface: &str, local: SocketAddr, peer: SocketAddr) -> io::Result<()
         let from_can = can.read_all();
         if !from_can.is_empty() {
             idle = false;
-            udp.pending.extend(from_can);
+            udp.pending.extend(from_can.into_iter().map(|f| (None, f)));
             udp.flush();
         }
+        // So an emulator's hub keeps this tunnel while its vcan is quiet
+        udp.keepalive();
         for f in udp.receive_all() {
             idle = false;
             if let Err(e) = can.write(&f) {
@@ -342,7 +479,9 @@ mod tests {
         let err_frame = [2, 0, 0, 0, 1, 0x20, 0, 0, 4, 0];
         assert_eq!(decode(&err_frame).unwrap().1, vec![], "error frames are dropped");
         assert!(Cannelloni::parse_spec("127.0.0.1:1,127.0.0.1:2").is_ok());
-        assert!(Cannelloni::parse_spec("127.0.0.1:1").is_err());
+        assert_eq!(Cannelloni::parse_spec("127.0.0.1:1"), Ok(("127.0.0.1:1".parse().unwrap(), None)), "a hub");
+        assert!(Cannelloni::parse_spec("127.0.0.1").is_err());
+        assert!(Cannelloni::parse_spec("127.0.0.1:1,nowhere").is_err());
     }
 
     /// cannelloni's parser reads no data for any id with `CAN_RTR_FLAG`, CAN FD or not (and its encoder writes
@@ -410,6 +549,54 @@ mod tests {
         bus.step(&mut [], &mut [&mut mon, &mut t], Time::from_secs(1));
         assert_eq!(mon.received.len(), BRIDGE_TX_QUEUE, "the oldest go out once the bus is free");
         assert_eq!(mon.received[BRIDGE_TX_QUEUE - 1].1, frames[BRIDGE_TX_QUEUE - 1]);
+    }
+
+    /// A hub serves every peer that sends to it, as a shared vcan would: the bus's frames go to all of them, a
+    /// peer's frames go onto the bus and to the other peers (never back to it), an empty datagram is a keepalive,
+    /// and a peer that goes quiet is forgotten.
+    #[test]
+    fn a_hub_serves_its_peers() {
+        let mut hub = Cannelloni::hub("127.0.0.1:0".parse().unwrap()).unwrap();
+        hub.hub_timeout = std::time::Duration::from_millis(300);
+        let at = hub.local_addr().unwrap();
+        let rates = crate::board::bus_rates("internal").unwrap();
+        let mut bus = CanBus::new("internal", rates);
+        let mut board = Monitor::default();
+        let mut a = Cannelloni::bind("127.0.0.1:0".parse().unwrap(), at).unwrap();
+        let mut b = Cannelloni::bind("127.0.0.1:0".parse().unwrap(), at).unwrap();
+        let settle = || std::thread::sleep(std::time::Duration::from_millis(30));
+        // Before anyone has sent, the hub has no one to send to
+        board.outbox.push((Time::from_us(10), CanFrame::classic(0x10, false, &[0])));
+        bus.step(&mut [], &mut [&mut board, &mut hub], Time::from_us(100));
+        assert!(hub.hub_peers().is_empty() && hub.tx_frames == 0);
+        // A says hello with a keepalive (it has sent nothing yet), B with a frame
+        a.keepalive();
+        b.pending.push((None, CanFrame::fd(0x55, true, &[1, 2, 3])));
+        b.flush();
+        settle();
+        bus.step(&mut [], &mut [&mut board, &mut hub], Time::from_us(200));
+        bus.step(&mut [], &mut [&mut board, &mut hub], Time::from_us(300));
+        assert_eq!(hub.hub_peers(), [a.local_addr().unwrap(), b.local_addr().unwrap()]);
+        assert_eq!(board.received.iter().map(|(_, f)| f.id).collect::<Vec<_>>(), [0x55], "B's frame on the bus");
+        // The board answers: both peers get it; A also got B's frame, B did not get its own back
+        board.outbox.push((Time::from_us(310), CanFrame::classic(0x6F, false, &[0xC0])));
+        bus.step(&mut [], &mut [&mut board, &mut hub], Time::from_us(400));
+        bus.step(&mut [], &mut [&mut board, &mut hub], Time::from_us(500));
+        settle();
+        let ids = |t: &mut Cannelloni| t.receive_all().iter().map(|f| f.id).collect::<Vec<_>>();
+        assert_eq!(ids(&mut a), [0x55, 0x6F]);
+        assert_eq!(ids(&mut b), [0x6F]);
+        assert_eq!((a.rx_gaps, b.rx_gaps, hub.rx_gaps), (0, 0, 0), "each peer's own sequence numbers");
+        // B goes quiet and is forgotten; A keeps itself in with keepalives
+        for k in 0..4 {
+            std::thread::sleep(std::time::Duration::from_millis(120));
+            a.last_tx = None;
+            a.keepalive();
+            settle();
+            bus.step(&mut [], &mut [&mut board, &mut hub], Time::from_ms(1 + k));
+        }
+        assert_eq!(hub.hub_peers(), [a.local_addr().unwrap()]);
+        assert_eq!(hub.rx_errors, 0);
     }
 
     /// Two buses joined by a tunnel over loopback: what is sent on one arrives on the other, both ways.

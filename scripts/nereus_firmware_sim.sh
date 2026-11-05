@@ -1,11 +1,16 @@
 #!/usr/bin/env bash
-# One command for Talos's firmware in nereus: vcan can0/can1, the emulated boards on them (with nereus as the
-# physics), nereus with the riptide stack and its viewer, the robot computer's side of the boards, and the bridge
-# between the emulator and nereus. Watch the vehicle in nereus's viewer while the real firmware drives it.
+# One command for Talos's firmware in nereus: the emulated boards (with nereus as the physics), nereus with the
+# riptide stack and its viewer, the robot computer's side of the boards, and the bridge between the emulator and
+# nereus. Watch the vehicle in nereus's viewer while the real firmware drives it.
 #
 #   scripts/nereus_firmware_sim.sh                 # C images from $TITAN_FIRMWARE_DIR (robots/talos_c_nereus.toml)
 #   scripts/nereus_firmware_sim.sh --rust          # titan_firmware_rs images and titan_bridge (robots/talos_nereus.toml)
 #   scripts/nereus_firmware_sim.sh --dry-run       # print what it would run
+#
+# The boards reach the robot computer's side over vcan can0 where the vcan module is (as on the Orin), and over UDP
+# elsewhere (WSL2, macOS, Linux without vcan or sudo): the C boards' micro-ROS sessions go to a micro-ROS agent's
+# udp4 transport, the Rust boards' titan_bridges use CAN over UDP, and the bridge turns the controller's
+# thruster_forces into command/thruster_rpm (the controller's raw CAN frames need can0).
 #
 # Options:
 #   --nereus DIR         your nereus checkout, built with ./build.sh (default $NEREUS_DIR, ~/osu-uwrt/release/nereus,
@@ -18,11 +23,15 @@
 #   --dashboard ADDR     the emulator's dashboard, which the bridge talks to (default 127.0.0.1:8080)
 #   --threads N          the emulator's --threads (default 0: as many as help)
 #   --rpm-from-forces    the bridge also turns the controller's thruster_forces into command/thruster_rpm (for a
-#                        controller that does not write can0 itself, such as riptide_mpc)
+#                        controller that does not write can0 itself, such as riptide_mpc; always with udp)
 #   --depth nereus       nereus publishes depth/pose as without the firmware (default: the firmware's reading)
 #   --actuators nereus   nereus publishes state/actuator/* (default: the PoAC firmware does)
 #   --no-clock-sync      keep nereus at real time even when the emulator is slower
-#   --no-vcan            can0 and can1 exist already (do not run scripts/vcan_up.sh, which needs sudo)
+#   --transport T        auto (default): vcan if the vcan module is there, else udp; vcan: can0 (made with
+#                        scripts/vcan_up.sh and sudo unless it exists); udp: no CAN interfaces
+#   --no-vcan            the same as --transport udp
+#   --agent-port N       udp, C images: the micro-ROS agent's UDP port (default 8888)
+#   --hub ADDR           udp, Rust images: the emulator's cannelloni hub for titan_bridge (default 127.0.0.1:20000)
 #   --dry-run            print the commands instead of running them
 #
 # docs/nereus.md has the setup, what to look for and troubleshooting.
@@ -40,10 +49,12 @@ rmw=""
 dashboard=127.0.0.1:8080
 threads=0
 rpm_from_forces=false
+transport_wanted=auto
+agent_port=8888
+hub=127.0.0.1:20000
 clock_sync=true
 depth=firmware
 actuators=firmware
-vcan=1
 dry=0
 while [ $# -gt 0 ]; do
     case "$1" in
@@ -61,13 +72,25 @@ while [ $# -gt 0 ]; do
         --depth) depth="$2"; shift ;;
         --actuators) actuators="$2"; shift ;;
         --no-clock-sync) clock_sync=false ;;
-        --no-vcan) vcan=0 ;;
+        --transport) transport_wanted="$2"; shift ;;
+        --no-vcan) transport_wanted=udp ;;
+        --agent-port) agent_port="$2"; shift ;;
+        --hub) hub="$2"; shift ;;
         --dry-run) dry=1 ;;
-        -h | --help) sed -n '2,29p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+        -h | --help) sed -n '2,37p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
         *) echo "unknown option $1 (--help)" >&2; exit 2 ;;
     esac
     shift
 done
+
+# shellcheck disable=SC1091
+. "$repo/scripts/can_transport.sh"
+choose_transport "$transport_wanted" can0 can1
+echo "CAN transport: $transport ($transport_why)" >&2
+if [ "$transport" = udp ]; then
+    # complete_controller writes its thruster RPMs to can0 itself; without can0 the bridge makes them
+    rpm_from_forces=true
+fi
 
 problems=()
 need() {
@@ -112,23 +135,35 @@ fi
 if [ -z "${ROS_DISTRO:-}" ] || ! command -v ros2 >/dev/null; then
     need "ROS 2: not sourced (source /opt/ros/humble/setup.bash and your riptide workspace's install/setup.bash)"
 else
-    for pkg in riptide_bringup2 riptide_hardware2 riptide_msgs2; do
+    pkgs=(riptide_bringup2 riptide_msgs2)
+    if [ "$transport" = vcan ] && [ "$rust" -eq 0 ]; then pkgs+=(riptide_hardware2); fi
+    for pkg in "${pkgs[@]}"; do
         if ! ros2 pkg prefix "$pkg" >/dev/null 2>&1; then
             need "ROS 2: no $pkg; source your riptide workspace (osu-uwrt/riptide_release, built with colcon)"
         fi
     done
-    if [ "$rust" -eq 0 ] && ! ros2 pkg prefix micro_ros_agent >/dev/null 2>&1; then
+    if [ "$transport" = vcan ] && [ "$rust" -eq 0 ] && ! ros2 pkg prefix micro_ros_agent >/dev/null 2>&1; then
         need "ROS 2: no micro_ros_agent (build micro-ROS-Agent with osu-uwrt/Micro-XRCE-DDS-Agent's can-support branch, as the Orin has it)"
     fi
 fi
-if [ "$rust" -eq 1 ] && ! command -v titan_bridge >/dev/null; then
-    need "titan_bridge: not on PATH (cargo install --path external/titan_firmware_rs/host/titan_bridge, in riptide-shell)"
-fi
-for i in can0 can1; do
-    if ip -details link show "$i" >/dev/null 2>&1 && ! ip -details link show "$i" | grep -q vcan; then
-        need "$i exists and is not a vcan interface (a real CAN adapter?): unplug it first"
+agent_cmd=()
+if [ "$transport" = udp ] && [ "$rust" -eq 0 ]; then
+    micro_ros_agent_udp "$agent_port"
+    if [ "${#agent_cmd[@]}" -eq 0 ]; then
+        need "micro-ROS agent: neither ROS 2's micro_ros_agent package nor MicroXRCEAgent on PATH (docs/nereus.md#the-micro-ros-agent)"
+        agent_cmd=(MicroXRCEAgent udp4 --port "$agent_port")
     fi
-done
+fi
+if [ "$rust" -eq 1 ]; then
+    if ! command -v titan_bridge >/dev/null; then
+        need "titan_bridge: not on PATH (cargo install --path external/titan_firmware_rs/host/titan_bridge, in a ROS 2 shell)"
+    elif [ "$transport" = udp ] && ! titan_bridge --help 2>&1 | grep -q cannelloni; then
+        need "titan_bridge: this build has no CAN over UDP (--interface cannelloni:HOST:PORT); build a newer titan_firmware_rs"
+    fi
+fi
+while IFS= read -r p; do
+    need "$p"
+done < <(not_a_real_adapter can0 can1)
 if [ "${#problems[@]}" -gt 0 ]; then
     printf '%s\n' "${problems[@]}" >&2
     if [ "$dry" -eq 0 ]; then
@@ -141,15 +176,24 @@ run_dir="${RUN_DIR:-/tmp/nereus_firmware/$(date +%Y%m%d-%H%M%S)}"
 if [ "$dry" -eq 0 ]; then
     mkdir -p "$run_dir"
 fi
-if [ "$vcan" -eq 1 ]; then
+if [ "$transport" = vcan ] && ! vcan_exists can0 can1; then
     run "$repo/scripts/vcan_up.sh" can0 can1
 fi
 scenario="$run_dir/packs/scenarios/talos_firmware_$pool"
 run python3 "$repo/integrations/nereus/make_packs.py" "$nereus" "$run_dir/packs" --pool "$pool" --depth "$depth" \
     --actuators "$actuators"
 
-emu=("$sim" robot "$robot" --can internal=can0 --realtime --time 1000000s --threads "$threads"
-    --dashboard "$dashboard")
+# The robot computer's side of the internal bus
+if [ "$transport" = vcan ]; then
+    link=(--can internal=can0)
+    bridge_iface=can0
+elif [ "$rust" -eq 1 ]; then
+    link=(--cannelloni "internal=$hub")
+    bridge_iface="cannelloni:$hub"
+else
+    link=(--micro-ros-agent "internal=127.0.0.1:$agent_port")
+fi
+emu=("$sim" robot "$robot" "${link[@]}" --realtime --time 1000000s --threads "$threads" --dashboard "$dashboard")
 pid=""
 cleanup() {
     if [ -n "$pid" ]; then
@@ -184,7 +228,9 @@ if [ -n "$rmw" ]; then
     launch+=("rmw:=$rmw")
 fi
 if [ "$rust" -eq 1 ]; then
-    run "$sim" bridges "$robot" --can internal=can0 --format launch -o "$run_dir/bridges.launch.py"
+    run "$sim" bridges "$robot" --can "internal=$bridge_iface" --format launch -o "$run_dir/bridges.launch.py"
     launch+=("firmware:=rust" "bridges_launch:=$run_dir/bridges.launch.py")
+elif [ "$transport" = udp ]; then
+    launch+=("agent:=udp" "agent_cmd:=${agent_cmd[*]}")
 fi
 run "${launch[@]}"

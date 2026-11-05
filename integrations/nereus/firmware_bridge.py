@@ -249,7 +249,13 @@ def main(argv=None):
             period = 1.0 / args.rate
             next_t = time.monotonic()
             while rclpy.ok() and not self.stop.is_set():
-                self.tick()
+                try:
+                    self.tick()
+                except Exception:
+                    # Publishing fails once ROS has shut down (Ctrl-C): that is the end, not an error
+                    if not rclpy.ok() or self.stop.is_set():
+                        return
+                    raise
                 now = time.monotonic()
                 if now - self.last_status >= args.status_every:
                     self.last_status = now
@@ -260,20 +266,33 @@ def main(argv=None):
                             "real time before the boards synced their clocks): the EKF takes depth that much late; "
                             "docs/nereus.md#time"
                         )
-                self.status_pub.publish(self.String(data=json.dumps(self.status)))
+                try:
+                    self.status_pub.publish(self.String(data=json.dumps(self.status)))
+                except Exception:
+                    if not rclpy.ok() or self.stop.is_set():
+                        return
+                    raise
                 next_t += period
                 time.sleep(max(0.0, next_t - time.monotonic()))
                 if time.monotonic() - next_t > 1.0:
                     next_t = time.monotonic()
 
+    from rclpy.executors import ExternalShutdownException
+
     rclpy.init()
     node = FirmwareBridge()
     try:
         rclpy.spin(node)
-    except KeyboardInterrupt:
+    except (KeyboardInterrupt, ExternalShutdownException):
+        # Ctrl-C: rclpy's signal handler may have shut the context down already
         pass
     finally:
         node.stop.set()
+        try:
+            node.thread.join(timeout=2.0)
+        except KeyboardInterrupt:
+            # A second Ctrl-C (ros2 launch passes one on as well): stop waiting
+            pass
         node.destroy_node()
         if rclpy.ok():
             rclpy.shutdown()
