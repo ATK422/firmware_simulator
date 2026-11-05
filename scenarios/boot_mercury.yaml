@@ -3,6 +3,9 @@
 # (standard frame client << 6 | 0x2F, every 500 ms) whether or not a micro-ROS agent answers, with no panic and no
 # watchdog reset. The images come from TITAN_FIRMWARE_DIR (each project's build/NAME_with_bl.uf2); without it this
 # scenario is skipped. Not checked here: anything past "waiting for the agent" (no micro-ROS agent in a scenario).
+# Passes with titan_firmware 058df2a's mercury/PoHalfBoard and mercury/ESCBoard built against the Nix shell's
+# micro-ROS library (it has mercury_msgs); PoHalf's count includes one retransmission of its first heartbeat, sent
+# before the ESC boards' controllers were up to acknowledge it.
 name: Mercury boots and every board comes online on CAN
 robot: robots/mercury.toml
 time: 5s

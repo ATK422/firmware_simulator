@@ -134,7 +134,9 @@ good (the watchdog reset left the watchdog off). Run firmware that erases or pro
 ## Firmware findings so far
 
 Behaviour of the firmware (not the emulator) that looks wrong, each pinned down by a test asserting the behaviour
-of the pinned `external/titan_firmware_rs`, so a fix shows up as a test to update. No firmware was changed here.
+of the pinned `external/titan_firmware_rs` (findings 15-17: of titan_firmware's C apps, at the commits named, with
+the tests skipped unless `TITAN_FIRMWARE_DIR` points at their build), so a fix shows up as a test to update. No
+firmware was changed here.
 Findings 1-3 were fixed in titan_firmware_rs (its PR #1, merged as 4d86d47; pinned here from 94a107e): their tests
 now check the fixed behaviour, and the rows say which commit fixed them. Unless noted, the tests are in
 `crates/sim_test/tests/faults.rs`.
@@ -155,8 +157,16 @@ now check the fixed behaviour, and the rows say which commit fixed them. Unless 
 | 12 | **Found by the fuzzer ([fuzzing.md](fuzzing.md)), on every board: one `Ping` with a wrong `protocol_version`, while ROS is connected, latches `FAULT_ROS_ERROR`.** The link task raises it on the bad ping and lowers it only when a *fresh* connection starts (`titan_rp2040/src/link.rs`); the valid pings that follow every 100 ms keep the link up, so it is never lowered until the link drops. A single stray or corrupted frame marks the board faulted for the rest of the session. Minimised reproducer: that one ping | `firmware_finding_fuzz_bad_protocol_ping_latches_ros_error` |
 | 13 | **Found by the fuzzer, on the power board (and the PoAC and power half boards): a receive FIFO overflow latches `FAULT_CAN_INTERNAL_ERROR` for good.** A babbling node flooding frames addressed to the board (extended id `0x1669410`, a CANmore message frame from the agent to client 1, so it passes the filter) at 83 % bus load for 200 ms overflows the 16-deep RX FIFO; `can_task` raises `FAULT_CAN_INTERNAL_ERROR` on the overflow and nothing in `titan_rp2040` ever lowers it, so it stays set after the bus is quiet and the board is talking normally again. Whether a real board overflows at this load depends on the SPI service time (the emulator's model): check on hardware; the latching does not depend on it | `firmware_finding_fuzz_rx_overflow_latches_can_internal_error` |
 | 14 | **Found by the fuzzer, on the camera cage: a repeated `CYCLE_COMPUTER` command latches `FAULT_ROS_BAD_COMMAND`.** Two electrical commands `CYCLE_COMPUTER` in a row (a ROS command delivered twice) raise it on the second, from the repeat guard in `camera_cage_bb/src/cage.rs` ("Attempting to request multiple cycles in a row"), and nothing lowers it. The guard rearms once the cycle is done (`CYCLE_ACTIVE` is cleared), so later requests work, but the board reports the fault for the rest of the run. Minimised reproducer: the two commands, 7 ms apart | `firmware_finding_fuzz_repeated_cycle_command_latches_bad_command` |
+| 15 | **C firmware (titan_firmware 058df2a): `mercury/ESCBoard` reads each RPM's high byte twice** in its raw CAN thruster command handler (`thruster_cmd_callback`: `(buf[idx] << 8) \| buf[idx]`), fixed in `talos/ESCBoard` only (titan_firmware PR #26). The controller's 1200, -1200, 300 and 0x1234 RPM become core 1's targets 1028, -1029, 257 and 0x1212 | `firmware_finding_mercury_esc_board_reads_each_rpm_high_byte_twice` (`crates/sim_test/tests/c_boards.rs`, with `TITAN_FIRMWARE_DIR`) |
+| 16 | **C firmware (058df2a): `SBCBoard` does not build, and its app sends no CANmore heartbeat.** Its CMakeLists.txt links neither `driver_canbus` nor `micro_ros_can`, whose headers it includes (`scripts/build_c_boards.sh` links them); built, the app calls `canbus_init` but never `canbus_tick`, which sends the heartbeat and serves the bus, so the board falls silent once its bootloader hands over | `talos_c_boards_boot_through_their_bootloader_and_send_heartbeats` (`c_boards.rs`) |
+| 17 | **C IVCBoard2 (`blake/ivc`): `fft_setup` calls `stdio_init_all()` a second time, then `sleep_ms(1000)`.** The second UART initialisation resets UART0 with the end of `[safety]: Clean Boot: Power-on Reset` still in its FIFO (the line reads `[INFO] [0.007601] [safe` on the UART; the USB copy is whole), and start-up waits a second more | `real_c_ivc_board2_hears_the_rust_board` (`crates/sim_host/tests/ivc_link.rs`, with `TITAN_FIRMWARE_DIR` on `blake/ivc`) |
 
-Observations not pinned down by a test: in a Talos run IVCBoard2's CANmore heartbeat comes every 523 ms and its
+Observations not pinned down by a test: titan_firmware 058df2a's `talos/PoacBoard` calls itself "Actuator Board
+Firmware" (its `pico_set_program_name`), and its `talos/Actuator` no longer compiles against riptide_msgs2 as the
+Nix shell's micro-ROS library has it (`ActuatorStatus.CLAW_CLOSED` was split in two, and the later states moved up
+by one). In the emulator the C IVCBoard2 mis-frames a packet that starts about 2.4 s after its app started (it locks on a
+second late and reads the bits shifted by one) and decodes one sent 7.4 s after; whether that is its receiver's
+noise-floor estimate settling or the emulated front end was not looked into. In a Talos run IVCBoard2's CANmore heartbeat comes every 523 ms and its
 link heartbeat every 105 ms instead of 500/100 ms like the other boards (deterministic, so either the firmware's
 timing on IVCBoard2 or an emulation effect). From a test campaign with the C IVCBoard2 (titan_firmware `blake/ivc`, with micro-ROS, not
 in this repository's tests): `storage_init(true)` erases the top 512 KiB of the flash (`flash_range_erase`: eight 64 KiB

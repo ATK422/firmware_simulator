@@ -30,8 +30,10 @@ Always test in release mode: debug builds of the emulator are far too slow for f
 `external/titan_firmware_rs/firmware/target/thumbv6m-none-eabi/release/`, or in `$TITAN_RS_RELEASE_DIR` when that
 is set (a worktree, another checkout of titan_firmware_rs, CI); robot files' image paths are redirected the same
 way. `sim_test::titan_c("basic_template/template_project.elf")` looks under `build/c/`
-(`scripts/build_c_firmware.sh`). When an image is missing they print `skipping: ... not built (...)` and return
-`None`, and the test returns early, **passing**. Run with `--nocapture` (or check for `skipping:` lines) to be sure
+(`scripts/build_c_firmware.sh`), and `sim_test::titan_firmware("talos/ESCBoard/build/esc_board_with_bl.uf2")`
+(`sim_host::titan_firmware_image`) in your titan_firmware checkout, `$TITAN_FIRMWARE_DIR`, for the C board apps
+`scripts/build_c_boards.sh` builds. When an image is missing (or `TITAN_FIRMWARE_DIR` is unset) they print
+`skipping: ... not built (...)` and return `None`, and the test returns early, **passing**. Run with `--nocapture` (or check for `skipping:` lines) to be sure
 a green run actually ran the firmware.
 
 **Which compiler built them.** titan_firmware_rs pins its compiler in `rust-toolchain.toml` (rustc 1.99.0 at the
@@ -246,19 +248,20 @@ pass) without them.
 | `crates/rp2040` unit tests (`src/periph/*`) | Register-level peripheral behaviour from the datasheet |
 | `crates/rp2040/tests/` | Hand-written programs (`m0_blink`, `m1_watchdog`, `m6_resets`), pioasm-assembled PIO programs (`pio_programs`), the bootrom's USB boot (`usb_boot`), and the performance work's equivalence checks (`batching`, `busy_wait`, `systick_reference`) |
 | `crates/sim_devices`, `sim_acoustics`, `sim_physics` unit tests | Each device model, the acoustic channel, the vehicle physics |
-| `crates/sim_host/tests/` | Firmware on boards built by hand, per milestone: `template`, `embassy_blinky`, `gdb`, `pico_sdk`, `can`, `sensors`, `pio`, `flash`, `hle` (`--hle-flash` leaves the flash as the ROM does), `acoustics`, `ivc_link` (also the C IVCBoard2 modem against the Rust one), `usb`, `robot_usb` (USB on robot boards, images from environment variable paths), `vehicle`, `parallel` (threaded robots run as in turn) |
+| `crates/sim_host/tests/` | Firmware on boards built by hand, per milestone: `template`, `embassy_blinky`, `gdb` (the real GDB too: `$GDB`, `gdb-multiarch` or `arm-none-eabi-gdb`), `pico_sdk`, `can`, `sensors`, `pio`, `flash`, `hle` (`--hle-flash` leaves the flash as the ROM does), `acoustics`, `ivc_link` (also the C IVCBoard2 modem against the Rust one, and the real C IVCBoard2 from `$TITAN_FIRMWARE_DIR` on `blake/ivc`), `usb`, `robot_usb` (USB on robot boards, images from environment variable paths), `vehicle`, `parallel` (threaded robots run as in turn) |
 | `crates/sim_test/tests/smoke.rs` | Every titan_firmware_rs board image on its board: connects, reports its identity, no link errors, no panic |
 | `crates/sim_test/tests/robot.rs` | All of Talos on its two buses |
 | `crates/sim_test/tests/puddles.rs` | Puddles over Ethernet/UDP |
 | `crates/sim_test/tests/harness.rs` | The harness itself (snapshots, board edits), the H-bridge board, the Dynamixel bench test |
 | `crates/sim_test/tests/faults.rs` | Fault injection against the safety system, and the `firmware_finding_*` tests |
 | `crates/sim_test/tests/can_log.rs` | Recording, replaying and comparing CAN traffic, a cannelloni tunnel |
+| `crates/sim_test/tests/c_boards.rs` | titan_firmware's C board apps from `$TITAN_FIRMWARE_DIR`: `robots/talos_c.toml` boots every board through its bootloader into its app with CANmore heartbeats, and the Mercury ESC board's raw thruster command finding (skipped without the builds) |
 | `crates/sim_test/tests/vehicle.rs`, `vehicle_talos.rs`, `vehicle_nereus.rs` | Thrusters in the loop on Puddles and Talos, and the controller's raw CAN thruster frames with nereus as the physics |
 | `crates/sim_test/tests/ivc_sweep.rs` | IVC delivery against range and noise (prints tables with `--nocapture`; the slowest suite) |
 | `crates/sim_test/tests/guide.rs` | This page's walkthrough |
 | `crates/sim_test/tests/scenarios.rs` | Every YAML scenario in `scenarios/` ([scenarios.md](scenarios.md)), the runner's verdicts and evidence, determinism on any number of threads, and A/B comparisons of real runs |
 | `crates/sim_test/tests/fuzz_smoke.rs` | A short fixed-seed fuzz campaign on one board: it runs, finds the same things on any number of threads, and every reproducer replays ([fuzzing.md](fuzzing.md)) |
-| `tests/host_cli.rs` (root package) | The command line: robot record/replay/diff, `bridges` outputs, `scripts/vcan_up.sh` with stand-ins, `robot_in_a_box.sh` and `nereus_firmware_sim.sh` in `--dry-run`, the nereus bridge's Python tests, the Docker files' consistency |
+| `tests/host_cli.rs` (root package) | The command line: robot record/replay/diff, `bridges` outputs, `scripts/vcan_up.sh` with stand-ins, `robot_in_a_box.sh` and `nereus_firmware_sim.sh` in `--dry-run`, the nereus bridge's Python tests (its ROS node too, against stand-ins for the dashboard and nereus, when ROS 2 is sourced: `test_firmware_bridge_ros.py`), the Docker files' consistency |
 | `tests/scenario_cli.rs` (root package) | `scenario` and `compare` on the command line: exit statuses, JUnit, JSON, Markdown |
 | `tests/docs.rs` (root package) | Every command line option the docs and the README mention exists |
 
@@ -282,7 +285,10 @@ When the firmware rather than the emulator looks wrong, write a test that assert
   ([scenarios.md](scenarios.md#in-cargo-test-and-ci)).
 * **c-firmware**: installs `gcc-arm-none-eabi`, builds the C programs with `scripts/build_c_firmware.sh` and runs
   the tests that boot them (`sim_host`'s `pico_sdk`, `flash`, `can`). It sets `CMAKE_POLICY_VERSION_MINIMUM=3.5`
-  because the runners' CMake 4 refuses pico-sdk's bundled pioasm and elf2uf2 projects otherwise.
+  because the runners' CMake 4 refuses pico-sdk's bundled pioasm and elf2uf2 projects otherwise. (The same steps
+  in the Nix shell, with its ARM GCC 13.3: the programs build and the 17 tests pass, none skipped.) The C board
+  apps' tests (`c_boards.rs`, the real C IVCBoard2 in `ivc_link.rs`) are not in CI: they need titan_firmware's
+  micro-ROS library; run them with `TITAN_FIRMWARE_DIR` set after `scripts/build_c_boards.sh`.
 * **macos**: installs the firmware's pinned compiler, builds the titan_firmware_rs images and runs clippy and the whole suite natively on macOS (Apple
   silicon). SocketCAN is Linux only; on macOS `SocketCan::open` fails with a clear error and CAN reaches a Linux
   machine through `can-tunnel` instead.

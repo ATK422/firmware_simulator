@@ -11,8 +11,15 @@ nereus's sensors, and the camera cage firmware feels nereus's depth. You watch i
 > the emulator's side (external vehicles, `/api/thrusters` and `/api/vehicle`, the Rust ESC boards spinning to the
 > controller's raw CAN frames: `cargo test --release`), the bridge's logic and the pack generator
 > (`python3 -I -m unittest discover -s integrations/nereus -p 'test_*.py'`), the generated packs against nereus's
-> own validator, and the scripts in `--dry-run`. Nothing has run with ROS. [Below](#to-verify-locally) is the
-> checklist.
+> own validator, and the scripts in `--dry-run`. Since then, under ROS 2 Humble (rclpy, a Nix shell) but with no
+> nereus or vcan, `firmware_bridge.py` ran against the emulator's dashboard (`robots/talos_nereus.toml`, the
+> controller's raw CAN thruster frames over `--cannelloni` from a script, a scripted nereus publishing `/clock`,
+> `simulator/ground_truth` and hosting `real_time_factor`): it put the kill switch in, posted nereus's pose (the
+> vehicle at the posted NED pose), published the firmware's thrust per thruster in the controller's order (12.4,
+> -5.5, 22.5, 0, -5.5, -23.9, 16.1, -8.2 N for 12, -5, 24, 0, -5, -24, 16, -8 N asked; 24 N stops at the boards'
+> limit) and slowed nereus to the emulator's speed. `test_firmware_bridge_ros.py` keeps that check against
+> stand-ins (it runs when ROS 2 is sourced). The rest of [the checklist](#to-verify-locally) still needs nereus,
+> vcan and the agents.
 
 - [How it fits together](#how-it-fits-together)
 - [Setting up the laptop](#setting-up-the-laptop)
@@ -275,7 +282,7 @@ nereus's existing parameter.
 | Boards and agent | `scripts/robot_in_a_box.sh --robot robots/talos_c_nereus.toml` (add `--dashboard 127.0.0.1:8080`), then `ros2 topic list` | The firmware topics of [What you should see](#what-you-should-see) |
 | Packs | `uv run nereus-packs validate /tmp/nereus_firmware/<time>/packs/scenarios/talos_firmware_robosub` (in nereus) | `OK scenario` |
 | nereus up | the script | The viewer, nereus's topics, `/clock` |
-| Bridge | its log and `ros2 topic echo /talos/simulator/firmware_bridge/status` | Status lines with the emulator's speed and the drift near 0 |
+| Bridge | its log and `ros2 topic echo /talos/simulator/firmware_bridge/status` | Status lines with the emulator's speed and the drift near 0 (seen with a scripted nereus; with the real one to verify) |
 | Kill | unkill from the viewer | `state/kill` false, nereus unkilled |
 | Thrust | a goal from the viewer | ESC RPMs on the dashboard, `/talos/simulator/firmware_thruster_forces` non-zero, the vehicle moves |
 | Depth | dive | `/talos/state/depth/raw` follows nereus's depth within a few cm |

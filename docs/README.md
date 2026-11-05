@@ -24,7 +24,9 @@ their sensors, actuators, the water around them and the robot computer's side of
 
 Things marked **to verify locally** need what the cloud environment this was built in lacks: the vcan kernel
 module and `CAP_NET_ADMIN` (SocketCAN), ROS 2 and `titan_bridge`, a Docker daemon, the vhci-hcd module (USB/IP),
-real hardware.
+real hardware. Some were checked later in a Nix shell with ARM GCC, the micro-ROS library, ROS 2 Humble and GDB
+(the C board apps, GDB, the nereus bridge node, `bag_to_calib.py`'s reading of messages); the pages say what, and
+what still needs vcan, an agent, nereus or hardware.
 
 ## Quick start
 

@@ -157,12 +157,15 @@ fn real_c_ivc_board2_hears_the_rust_board() {
         spec.board[1].usb_cdc = None;
         spec.board[1].usb_cdc2 = None;
     });
-    // Not before about 5 s: sent at 3 s, the C receiver locks on a second late and reads the bits shifted
+    // Not too soon after boot: sent at 3 s, the C receiver locks on a second late and reads the bits shifted
     talos.send_at(Time::from_ms(8000), HostToDevice::Ivc2(ivc2::HostToDevice::EnqueueData(0x5A)));
     r.run_until(Time::from_ms(18_000));
     assert!(r.boards[0].logged("Transmitting 0x5a"));
     let c_log = r.boards[1].uart_text[0].clone();
     assert!(c_log.contains("IVCBoard2 1.0-talos/talos/ivc_board"), "{c_log}");
+    // Firmware finding (faults.md, 17): fft_setup's second stdio_init_all() resets UART0 under the end of the
+    // safety line, and start-up then sleeps a second
+    assert!(!c_log.contains("[safety]: Clean Boot") && c_log.contains("[safe[INFO]"), "{c_log}");
     assert!(c_log.contains("RECEIVING PACKET") && c_log.contains("packet read complete with: 90"), "{c_log}");
     assert_eq!(r.boards[1].machine.resets, 0);
 }
