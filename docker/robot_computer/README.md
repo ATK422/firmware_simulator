@@ -78,3 +78,10 @@ and on the robot computer, which has its own `vcan0`/`vcan1` (`scripts/vcan_up.s
 `firmware_simulator can-tunnel vcan0 0.0.0.0:20000,EMULATOR:20000` (and the same for vcan1 on 20001), or with
 `cannelloni -I vcan0 -R EMULATOR -r 20000 -l 20000` (the tunnel uses cannelloni's UDP framing; compatibility with the
 cannelloni program itself is untested).
+
+With no vcan on either side, a titan_bridge that has the `cannelloni:` interface (titan_firmware_rs's
+`m12-titan-bridge-udp` branch or later) talks to the emulator's bus directly: run the emulator with a hub,
+`--cannelloni internal=0.0.0.0:20000 --cannelloni external=0.0.0.0:20001`, and each bridge with
+`--interface cannelloni:EMULATOR:20000` (`firmware_simulator bridges robots/talos.toml --can
+internal=cannelloni:EMULATOR:20000 --can external=cannelloni:EMULATOR:20001` writes them; from Docker Desktop,
+`EMULATOR` is `host.docker.internal`). The image builds titan_bridge from the submodule, which does not have it yet.

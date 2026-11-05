@@ -65,9 +65,15 @@ const OUTSIDE: &[(&str, &str)] = &[
     ("--interface", "titan_bridge"),
     ("--client-id", "titan_bridge"),
     ("--dev", "micro_ros_agent serial"),
+    ("--server-id", "fastdds discovery"),
+    ("--ip-address", "fastdds discovery"),
+    ("--port", "fastdds discovery, the micro-ROS agent's udp4"),
     ("--udp-address", "fastdds discovery (Fast DDS 2.x)"),
     ("--udp-port", "fastdds discovery (Fast DDS 2.x)"),
     ("--no-daemon", "ros2 topic list"),
+    ("--build", "cmake"),
+    ("--install", "cmake"),
+    ("--path", "cargo install"),
     ("--network", "docker run"),
     ("--net", "unshare"),
     ("--once", "ros2 topic pub"),
@@ -275,4 +281,29 @@ fn relative_links_resolve() {
     }
     assert!(broken.is_empty(), "{}", broken.join("\n"));
     assert!(Path::new(&repo().join("docs/README.md")).exists());
+}
+
+/// The other way round for the host side: every option of `run`, `robot`, `bridges` and `can-tunnel` and of the
+/// robot-computer scripts (the CAN transports among them: `--can`, `--cannelloni`, `--micro-ros-agent`,
+/// `--transport`) is mentioned somewhere in the guide or the README.
+#[test]
+fn host_side_options_are_documented() {
+    // Not documented yet (found when this test was added)
+    const UNDOCUMENTED: &[&str] = &["--hydrophone-wav-rate", "--help", "--version"];
+    let text: String = pages().into_iter().map(|(_, t)| t).collect::<Vec<_>>().join("\n");
+    let documented = options(&text);
+    let mut all = BTreeSet::new();
+    for sub in [&["run"][..], &["robot"], &["bridges"], &["can-tunnel"]] {
+        all.extend(help_options(sub));
+    }
+    for s in ["robot_in_a_box.sh", "nereus_firmware_sim.sh"] {
+        let o = Command::new("bash").arg(repo().join("scripts").join(s)).arg("--help").output().unwrap();
+        all.extend(options(&String::from_utf8_lossy(&o.stdout)));
+    }
+    for must in ["--micro-ros-agent", "--cannelloni", "--transport", "--no-vcan", "--agent-port", "--hub"] {
+        assert!(all.contains(must), "{must} is not an option any more");
+    }
+    let missing: Vec<_> =
+        all.iter().filter(|o| !documented.contains(*o) && !UNDOCUMENTED.contains(&o.as_str())).collect();
+    assert!(missing.is_empty(), "options no page mentions: {missing:?}");
 }

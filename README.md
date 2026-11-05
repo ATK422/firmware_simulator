@@ -31,7 +31,8 @@ Every run is repeatable: the same firmware and inputs give exactly the same resu
 
 ## Quick start
 
-**Prerequisites:** Linux or macOS (SocketCAN/vcan for the real `titan_bridge` is Linux only), Rust (stable, 1.85 or newer) with the `thumbv6m-none-eabi` target, git, and read access to the
+**Prerequisites:** Linux, macOS or Windows through WSL2 (the robot computer's tools reach the emulated buses over
+vcan on Linux, and over UDP anywhere: [robots.md](docs/robots.md#without-vcan-udp)), Rust (stable, 1.85 or newer) with the `thumbv6m-none-eabi` target, git, and read access to the
 private repository `ATK422/titan_firmware_rs`. The firmware images build with the compiler titan_firmware_rs pins in
 its `rust-toolchain.toml` (rustc 1.99.0 at the pinned commit): rustup picks it up in that directory, and
 `rustup toolchain install` there installs it with its `thumbv6m-none-eabi` target. The C firmware additionally needs `gcc-arm-none-eabi`, `cmake` and
@@ -186,13 +187,18 @@ host agent on a libnanoros C board, in scenarios too ([nanoros.md](docs/nanoros.
 (`robots/talos_c.toml`, your titan_firmware build) on vcan interfaces named `can0` and `can1`, like the Orin's, and
 starts riptide's `copro_agent.launch.py` (`micro_ros_agent can -D can0`) when it finds a sourced riptide workspace;
 `--rust` runs the titan_firmware_rs images with one `titan_bridge` each instead
-([robots.md](docs/robots.md#robot-in-a-box-the-orins-side-on-vcan)).
+([robots.md](docs/robots.md#robot-in-a-box-the-orins-side-on-vcan)). **Without vcan** (WSL2, macOS, Linux without
+the module or sudo) it uses UDP by itself: `--micro-ros-agent` relays the C boards' micro-ROS sessions to any
+micro-ROS agent's `udp4` transport, and `--cannelloni BUS=ADDR` serves a bus to titan_bridge's
+`--interface cannelloni:ADDR` ([robots.md](docs/robots.md#without-vcan-udp)).
 
-**Watch the firmware drive Talos in nereus.** `scripts/nereus_firmware_sim.sh` brings up vcan, the emulated
-PoAC, ESC boards and camera cage, [nereus](https://github.com/osu-uwrt/nereus) with the riptide stack and its viewer,
+**Watch the firmware drive Talos in nereus.** `scripts/nereus_firmware_sim.sh` brings up the emulated
+PoAC, ESC boards and camera cage (on vcan, or over UDP where there is none: Linux, WSL2 and macOS setup in
+[nereus.md](docs/nereus.md#setting-up-the-laptop)), [nereus](https://github.com/osu-uwrt/nereus) with the riptide stack and its viewer,
 and a bridge: the controller's RPM commands go over `can0` to the emulated ESC boards, the thrust their motors make
 moves nereus's vehicle, and the camera cage feels nereus's depth. nereus is slowed to the emulator's speed so both
-stay on one clock ([nereus.md](docs/nereus.md); to verify locally).
+stay on one clock ([nereus.md](docs/nereus.md); the UDP path has run with ROS 2 and a stand-in for nereus, nereus
+itself is to verify locally).
 
 ```bash
 scripts/nereus_firmware_sim.sh --nereus ~/osu-uwrt/release/nereus      # ROS 2 and the riptide workspace sourced
@@ -394,14 +400,17 @@ not modelled or not yet trusted:
   behaviour that holds for any build (checked with rustc 1.97.0 and 1.99.0), and bench fingerprints are per
   firmware build ([internals.md](docs/internals.md#performance)).
 
-**To verify locally.** The cloud environment this was built in has no vcan module or `CAP_NET_ADMIN`, ROS 2,
-Docker daemon, vhci-hcd module or hardware. These are written and statically checked, but never run for real:
+**To verify locally.** The cloud environment this was built in has no vcan module or `CAP_NET_ADMIN`, nereus,
+Docker daemon, vhci-hcd module or hardware (ROS 2 Humble only lately). These are written and statically checked,
+but never run for real:
 
 * SocketCAN on vcan with the real `titan_bridge`, `canmore_cli` and `upload_tool`, and the `bridges` script and
   launch file in `riptide-shell` ([robot in a box](docs/robots.md#robot-in-a-box-the-orins-side-on-vcan)).
 * The `docker/robot_computer` image and compose file.
-* `scripts/robot_in_a_box.sh` with the C images and riptide's micro-ROS agents, and the firmware in nereus
-  (`scripts/nereus_firmware_sim.sh`, its bridge node and launch file; [the checklist](docs/nereus.md#to-verify-locally)).
+* `scripts/robot_in_a_box.sh` with the C images and riptide's micro-ROS agents on vcan, and the firmware in nereus
+  itself (`scripts/nereus_firmware_sim.sh`; [the checklist](docs/nereus.md#to-verify-locally)). Without vcan, the C
+  boards with a real micro-ROS agent (`udp4`), the Rust boards with real titan_bridges over CAN over UDP, the bridge
+  node under rclpy and the script with a stand-in nereus have run, with ROS 2 Humble from uwrt_nix.
 * `--usbip` against the kernel's vhci-hcd (tested only with an in-process USB/IP client).
 * VCD files in GTKWave/Surfer/PulseView; the MCP server from Claude Code itself (tested with scripted clients)
   ([tools.md](docs/tools.md#to-verify-locally)).
@@ -409,13 +418,13 @@ Docker daemon, vhci-hcd module or hardware. These are written and statically che
 Run locally by the team so far: the dashboard in a browser, the C IVCBoard2 with micro-ROS over USB, the benchmark
 on an i7-12700H (Talos about 0.73x real time on threads).
 
-Run since in a Nix shell with ARM GCC, the micro-ROS library, ROS 2 Humble and GDB (still no vcan, nereus, agent or
+Run since in a Nix shell with ARM GCC, the micro-ROS library, ROS 2 Humble and GDB (still no vcan, nereus or
 Docker daemon): titan_firmware's C Talos and Mercury apps built and booted (`robots/talos_c.toml`,
 `scenarios/boot_mercury.yaml`; [robots.md](docs/robots.md#robot-in-a-box-the-orins-side-on-vcan)), the CI
 c-firmware job's steps, the real C IVCBoard2 hearing the Rust one ([acoustics.md](docs/acoustics.md#c-and-rust-ivcboard2-interop)),
 `gdb-multiarch` and `arm-none-eabi-gdb` on the GDB server with reverse execution, watchpoints and the VS Code
-configurations' commands ([running.md](docs/running.md#debugging-in-vs-code)), the nereus bridge node under ROS 2
-against the dashboard ([nereus.md](docs/nereus.md)), and a Fast DDS discovery server per run.
+configurations' commands ([running.md](docs/running.md#debugging-in-vs-code)), `bag_to_calib.py` reading real ROS
+message classes ([calibration.md](docs/calibration.md)), and a Fast DDS discovery server per run.
 
 **CI** ([`.github/workflows/ci.yml`](.github/workflows/ci.yml)) has three jobs: **test** builds the
 titan_firmware_rs images, runs `cargo fmt --all --check`, `cargo clippy --workspace --all-targets --release -- -D warnings`,

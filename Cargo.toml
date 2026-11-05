@@ -52,6 +52,8 @@ libc = "0.2"
 [dev-dependencies]
 # Already in the dependency tree (sim_host): reading the calibration outputs in tests
 toml = "0.8"
+# CANmore ids in the host tool tests
+canmore = { path = "external/titan_firmware_rs/crates/canmore" }
 
 [profile.release]
 debug = 1

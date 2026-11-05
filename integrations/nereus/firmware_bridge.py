@@ -251,7 +251,13 @@ def main(argv=None):
             period = 1.0 / args.rate
             next_t = time.monotonic()
             while rclpy.ok() and not self.stop.is_set():
-                self.tick()
+                try:
+                    self.tick()
+                except Exception:
+                    # Publishing fails once ROS has shut down (Ctrl-C): that is the end, not an error
+                    if not rclpy.ok() or self.stop.is_set():
+                        return
+                    raise
                 now = time.monotonic()
                 if now - self.last_status >= args.status_every:
                     self.last_status = now
@@ -262,7 +268,12 @@ def main(argv=None):
                             "real time before the boards synced their clocks): the EKF takes depth that much late; "
                             "docs/nereus.md#time"
                         )
-                self.status_pub.publish(self.String(data=json.dumps(self.status)))
+                try:
+                    self.status_pub.publish(self.String(data=json.dumps(self.status)))
+                except Exception:
+                    if not rclpy.ok() or self.stop.is_set():
+                        return
+                    raise
                 next_t += period
                 time.sleep(max(0.0, next_t - time.monotonic()))
                 if time.monotonic() - next_t > 1.0:
@@ -270,6 +281,7 @@ def main(argv=None):
 
     # SIGINT and SIGTERM (what `ros2 launch` sends on shutdown) stop the node here, with its emulator thread
     # joined before the context goes: rclpy's own handlers would shut the context down under that thread and spin
+    # (an ExternalShutdownException, or an RCLError from the wait set, and the thread's publish failing)
     rclpy.init(signal_handler_options=SignalHandlerOptions.NO)
     signal.signal(signal.SIGTERM, signal.default_int_handler)
     node = None
@@ -282,7 +294,11 @@ def main(argv=None):
         if node is not None:
             node.stop.set()
             if hasattr(node, "thread"):
-                node.thread.join(timeout=5)
+                try:
+                    node.thread.join(timeout=2.0)
+                except KeyboardInterrupt:
+                    # A second Ctrl-C (ros2 launch passes one on as well): stop waiting
+                    pass
             node.destroy_node()
         rclpy.try_shutdown()
 

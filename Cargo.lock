@@ -422,6 +422,7 @@ name = "firmware_simulator"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "canmore",
  "clap",
  "env_logger",
  "libc",
