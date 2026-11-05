@@ -46,6 +46,12 @@ rustup target add thumbv6m-none-eabi
 (cd external/titan_firmware_rs && rustup toolchain install)   # the firmware's pinned compiler, with its targets
 ```
 
+**With Nix** instead of rustup and apt: the repository's `flake.nix` uses the team's environment,
+[uwrt_nix](https://github.com/atk422/uwrt_nix) (follow its setup once). `direnv allow` in the checkout, or
+`nix develop` for one session, gives Rust with `thumbv6m-none-eabi`, ARM GCC, CMake, Ninja, the Pico SDK, the
+micro-ROS library, ROS 2 Humble with the riptide messages, and on Linux `can-utils`. `nix develop .#firmware` is
+the build tools alone.
+
 The workspace uses titan_firmware_rs's host crates (`canmore`, `titan_link`), so the emulator does not build
 without that submodule. If cloning it fails, ask for access to `ATK422/titan_firmware_rs`.
 
