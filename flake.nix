@@ -5,6 +5,19 @@
   # Rust with thumbv6m-none-eabi, ROS 2 Humble and the riptide messages, the same versions on every machine
   inputs.uwrt.url = "github:atk422/uwrt_nix";
 
+  # uwrt_nix's binary caches. Nix reads nixConfig only from the flake it is asked for, not from its inputs, so
+  # without these the first shell builds ROS and the micro-ROS library from source
+  nixConfig = {
+    extra-substituters = [
+      "https://ros.cachix.org"
+      "https://uwrt.cachix.org"
+    ];
+    extra-trusted-public-keys = [
+      "ros.cachix.org-1:dSyZxI8geDCJrwgvCOHDoAfOm5sV1wCPjBkKL+38Rvo="
+      "uwrt.cachix.org-1:8jsEBONNUB05TKTqyzw8rWFHZ8cKaBc4PagJJI09qco="
+    ];
+  };
+
   outputs =
     { uwrt, ... }:
     {
