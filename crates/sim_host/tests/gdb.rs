@@ -538,22 +538,56 @@ fn writes_in_the_past_change_the_run_from_there() {
     assert_eq!(ended(&rx).0, Ended::Detached);
 }
 
-/// The real GDB: `reverse-stepi`, the MI command VS Code's Native Debug sends for Step Back
-/// (`-exec-step-instruction --reverse`), and `reverse-continue`. Skipped without `gdb-multiarch`.
-#[test]
-fn gdb_multiarch_steps_and_continues_backwards() {
-    if std::process::Command::new("gdb-multiarch").arg("--version").output().is_err() {
-        eprintln!("skipping: gdb-multiarch not installed");
-        return;
+/// A GDB for Arm to drive the emulator with, as a user would: `$GDB` if set, else `gdb-multiarch` (Debian, Ubuntu),
+/// else `arm-none-eabi-gdb` (Arm's toolchain, Nix, macOS). The tests below skip without one. Checked with
+/// gdb-multiarch 15.1 and arm-none-eabi-gdb 14.
+fn real_gdb() -> Option<String> {
+    let candidates = match std::env::var("GDB") {
+        Ok(g) if !g.is_empty() => vec![g],
+        _ => vec!["gdb-multiarch".to_string(), "arm-none-eabi-gdb".to_string()],
+    };
+    let found = candidates
+        .into_iter()
+        .find(|g| std::process::Command::new(g).arg("--version").output().is_ok_and(|o| o.status.success()));
+    if found.is_none() {
+        eprintln!("skipping: no gdb-multiarch or arm-none-eabi-gdb (or $GDB)");
     }
+    found
+}
+
+/// Runs the real GDB in batch mode on `elf` with `commands` as its command file (so `while` loops work); its
+/// stdout and stderr.
+fn gdb_batch(gdb: &str, elf: &std::path::Path, commands: &[String]) -> String {
+    static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    let n = N.fetch_add(1, Ordering::Relaxed);
+    let script = std::env::temp_dir().join(format!("sim-gdb-{}-{n}.gdb", std::process::id()));
+    let text = ["set pagination off".to_string(), "set confirm off".into()].iter().chain(commands).fold(
+        String::new(),
+        |mut s, c| {
+            s.push_str(c);
+            s.push('\n');
+            s
+        },
+    );
+    std::fs::write(&script, text).unwrap();
+    let out = std::process::Command::new(gdb).args(["-nx", "-batch", "-x"]).arg(&script).arg(elf).output().unwrap();
+    let _ = std::fs::remove_file(&script);
+    String::from_utf8_lossy(&out.stdout).into_owned() + &String::from_utf8_lossy(&out.stderr)
+}
+
+/// The real GDB: `reverse-stepi`, the MI command VS Code's Native Debug sends for Step Back
+/// (`-exec-step-instruction --reverse`), and `reverse-continue`.
+#[test]
+fn real_gdb_steps_and_continues_backwards() {
+    let Some(gdb) = real_gdb() else {
+        return;
+    };
     let (image, session) = blinky();
     let main = image.symbol("main").unwrap().addr & !1;
     let reset = image.symbol("Reset").unwrap().addr & !1;
     let (port, rx) = serve_travel(session);
     let elf = common::repo().join("test_programs/embassy_blinky.elf");
-    let mut cmd = std::process::Command::new("gdb-multiarch");
-    cmd.args(["-nx", "-batch", "-ex", "set pagination off", "-ex", "set confirm off"]);
-    for c in [
+    let commands: Vec<String> = [
         format!("target extended-remote :{port}"),
         "break main".into(),
         "continue".into(),
@@ -569,11 +603,9 @@ fn gdb_multiarch_steps_and_continues_backwards() {
         "reverse-continue".into(),
         "printf \"start %x\\n\", $pc".into(),
         "detach".into(),
-    ] {
-        cmd.args(["-ex", &c]);
-    }
-    let out = cmd.arg(&elf).output().unwrap();
-    let text = String::from_utf8_lossy(&out.stdout).into_owned() + &String::from_utf8_lossy(&out.stderr);
+    ]
+    .into();
+    let text = gdb_batch(&gdb, &elf, &commands);
     // (GDB breaks after main's prologue)
     let at_main = text.split("at main ").nth(1).and_then(|t| t.split_whitespace().next()).expect(&text).to_string();
     let pc = u32::from_str_radix(&at_main, 16).unwrap();
@@ -583,4 +615,183 @@ fn gdb_multiarch_steps_and_continues_backwards() {
     assert!(text.contains("No more reverse-execution history"), "{text}");
     assert!(text.contains(&format!("start {reset:x}")), "the start of the history: {text}");
     assert_eq!(ended(&rx).0, Ended::Detached);
+}
+
+/// The real GDB stepping 300 instructions forward and then back, interrupts and both cores' work included: every
+/// step back lands where the step forward started, with the same registers. Then a watchpoint: `continue` stops
+/// after the write with the new value, `reverse-continue` before it with the old one.
+#[test]
+fn real_gdb_reverse_steps_retrace_the_forward_steps_and_watchpoints_go_both_ways() {
+    let Some(gdb) = real_gdb() else {
+        return;
+    };
+    let (_, session) = blinky();
+    let (port, rx) = serve_travel(session);
+    let elf = common::repo().join("test_programs/embassy_blinky.elf");
+    let n = 300;
+    let commands: Vec<String> = [
+        format!("target extended-remote :{port}"),
+        "break main".into(),
+        "continue".into(),
+        "delete".into(),
+        "set $i = 0".into(),
+        format!("while $i < {n}\nstepi\nprintf \"F %d %x %x %x %x\\n\", $i, $pc, $sp, $r0, $lr\nset $i = $i + 1\nend"),
+        format!("set $i = {}", n - 1),
+        "while $i > 0\nreverse-stepi\nset $i = $i - 1\nprintf \"R %d %x %x %x %x\\n\", $i, $pc, $sp, $r0, $lr\nend"
+            .into(),
+        // A word just below the stack pointer: the next call writes it
+        "watch -location *(unsigned *)($sp - 4)".into(),
+        "continue".into(),
+        "reverse-continue".into(),
+        "detach".into(),
+    ]
+    .into();
+    let text = gdb_batch(&gdb, &elf, &commands);
+    let steps = |k: &str| -> std::collections::BTreeMap<u32, String> {
+        text.lines()
+            .filter_map(|l| l.strip_prefix(k))
+            .map(|l| {
+                let (i, regs) = l.split_once(' ').unwrap();
+                (i.parse().unwrap(), regs.to_string())
+            })
+            .collect()
+    };
+    let (fwd, back) = (steps("F "), steps("R "));
+    assert_eq!(fwd.len(), n as usize, "{text}");
+    assert_eq!(back.len(), n as usize - 1, "{text}");
+    for (i, regs) in &back {
+        assert_eq!(Some(regs), fwd.get(i), "step {i}: {text}");
+    }
+    let pcs: std::collections::BTreeSet<&str> = fwd.values().map(|r| r.split(' ').next().unwrap()).collect();
+    assert!(pcs.len() > 50, "the steps went somewhere: {pcs:?}");
+    // Forward: "Old value = A / New value = B"; backward the same watchpoint, the values the other way round
+    let values: Vec<(&str, &str)> = text
+        .split("Old value = ")
+        .skip(1)
+        .map(|t| {
+            let old = t.lines().next().unwrap().trim();
+            let new = t.split("New value = ").nth(1).unwrap().lines().next().unwrap().trim();
+            (old, new)
+        })
+        .collect();
+    assert_eq!(values.len(), 2, "{text}");
+    assert_eq!((values[1].0, values[1].1), (values[0].1, values[0].0), "{text}");
+    assert_eq!(ended(&rx).0, Ended::Detached);
+}
+
+/// A GDB/MI session with the real GDB, as Cortex-Debug drives one with `servertype: external` and the overrides in
+/// `.vscode/launch.json`: connect, `monitor halt`, run to main, threads, a peripheral block for the SVD view, pause,
+/// Native Debug's Step Back and Reverse Continue, Restart (`monitor reset halt`, flush the register cache), run to
+/// main again, detach.
+#[test]
+fn real_gdb_mi_session_as_cortex_debug_runs_it() {
+    let Some(gdb) = real_gdb() else {
+        return;
+    };
+    let (image, session) = blinky();
+    let reset = image.symbol("Reset").unwrap().addr & !1;
+    let (port, rx) = serve_travel(session);
+    let elf = common::repo().join("test_programs/embassy_blinky.elf");
+    let mut mi = Mi::start(&gdb, &elf);
+    mi.cmd("-gdb-set mi-async on", None);
+    let out = mi.cmd(&format!("-target-select extended-remote localhost:{port}"), None);
+    assert!(out.iter().any(|l| l.contains("^connected")), "{out:?}");
+    // overrideLaunchCommands
+    let out = mi.cmd("-interpreter-exec console \"monitor halt\"", None);
+    assert!(out.iter().any(|l| l == "@\"halted\\n\""), "{out:?}");
+    // runToEntryPoint: main
+    mi.cmd("-break-insert -t --function main", None);
+    let out = mi.cmd("-exec-continue", Some("*stopped"));
+    assert!(
+        out.iter().any(|l| l.starts_with("*stopped,reason=\"breakpoint-hit\"") && l.contains("func=\"main\"")),
+        "{out:?}"
+    );
+    let out = mi.cmd("-thread-info", None);
+    let threads = out.iter().find(|l| l.contains("^done,threads=")).unwrap();
+    assert!(threads.contains("details=\"core 0\"") && threads.contains("details=\"core 1\""), "{threads}");
+    // The Cortex Peripherals view: TIMER's registers (TIMERAWL at 0x28 counts microseconds)
+    let out = mi.cmd("-data-read-memory-bytes 0x40054000 64", None);
+    let mem = out.iter().find(|l| l.contains("contents=")).unwrap();
+    assert_eq!(mem.split("contents=\"").nth(1).unwrap().split('"').next().unwrap().len(), 128, "{mem}");
+    // Pause
+    mi.cmd("-exec-continue", None);
+    std::thread::sleep(Duration::from_millis(200));
+    let out = mi.cmd("-exec-interrupt", Some("*stopped"));
+    assert!(out.iter().any(|l| l.contains("*stopped,reason=\"signal-received\",signal-name=\"SIGINT\"")), "{out:?}");
+    // Native Debug's Step Back, then Reverse Continue to the start of the history (no breakpoints are left)
+    let out = mi.cmd("-exec-step-instruction --reverse", Some("*stopped"));
+    assert!(out.iter().any(|l| l.contains("*stopped,reason=\"end-stepping-range\"")), "{out:?}");
+    let out = mi.cmd("-exec-continue --reverse", Some("*stopped"));
+    assert!(out.iter().any(|l| l.contains("*stopped,reason=\"no-history\"")), "{out:?}");
+    // Restart: overrideRestartCommands, then the reset vector's registers
+    let out = mi.cmd("-interpreter-exec console \"monitor reset halt\"", None);
+    assert!(out.iter().any(|l| l.contains("halted at the reset vector")), "{out:?}");
+    mi.cmd("-interpreter-exec console \"maintenance flush register-cache\"", None);
+    let out = mi.cmd("-data-list-register-values x 15", None);
+    assert!(out.iter().any(|l| l.contains(&format!("value=\"{reset:#x}\""))), "{out:?}");
+    mi.cmd("-break-insert -t --function main", None);
+    let out = mi.cmd("-exec-continue", Some("*stopped"));
+    assert!(out.iter().any(|l| l.starts_with("*stopped,reason=\"breakpoint-hit\"")), "{out:?}");
+    let out = mi.cmd("-target-detach", None);
+    assert!(out.iter().any(|l| l.ends_with("^done")), "{out:?}");
+    mi.cmd("-gdb-exit", None);
+    assert_eq!(ended(&rx).0, Ended::Detached);
+}
+
+/// The real GDB in MI mode over its stdin and stdout, one command at a time.
+struct Mi {
+    child: std::process::Child,
+    lines: std::sync::mpsc::Receiver<String>,
+    token: u32,
+}
+
+impl Mi {
+    fn start(gdb: &str, elf: &std::path::Path) -> Mi {
+        let mut child = std::process::Command::new(gdb)
+            .args(["-nx", "--interpreter=mi2"])
+            .arg(elf)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        let stdout = child.stdout.take().unwrap();
+        let (tx, lines) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            use std::io::BufRead;
+            for l in std::io::BufReader::new(stdout).lines().map_while(Result::ok) {
+                if tx.send(l).is_err() {
+                    break;
+                }
+            }
+        });
+        Mi { child, lines, token: 0 }
+    }
+
+    /// Sends `command` and returns GDB's output up to its result record (`^done`, `^running`, ...), and with
+    /// `until`, on to the first line starting with that (an async record such as `*stopped`).
+    fn cmd(&mut self, command: &str, until: Option<&str>) -> Vec<String> {
+        self.token += 1;
+        let t = self.token.to_string();
+        let stdin = self.child.stdin.as_mut().unwrap();
+        writeln!(stdin, "{t}{command}").unwrap();
+        stdin.flush().unwrap();
+        let mut out = Vec::new();
+        let (mut done, mut seen) = (false, until.is_none());
+        while !(done && seen) {
+            let l = self.lines.recv_timeout(Duration::from_secs(30)).unwrap_or_else(|_| panic!("{command}: {out:?}"));
+            done |= l.starts_with(&format!("{t}^"));
+            assert!(!l.starts_with(&format!("{t}^error")), "{command}: {l}");
+            seen |= until.is_some_and(|u| l.starts_with(u));
+            out.push(l);
+        }
+        out
+    }
+}
+
+impl Drop for Mi {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
 }

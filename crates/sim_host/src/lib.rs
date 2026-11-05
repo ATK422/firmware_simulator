@@ -31,6 +31,27 @@ pub fn titan_rs_image(repo: &std::path::Path, name: &str) -> Option<std::path::P
     None
 }
 
+/// A build output of titan_firmware's C apps in the checkout `$TITAN_FIRMWARE_DIR` (`rel` from its root, e.g.
+/// `talos/ESCBoard/build/esc_board_with_bl.uf2`, where `scripts/build_c_boards.sh` puts it), for a test: `None`, which
+/// the test takes as a reason to skip (saying so), when the variable is unset or the file has not been built.
+pub fn titan_firmware_image(rel: &str) -> Option<std::path::PathBuf> {
+    titan_firmware_image_in(std::env::var_os("TITAN_FIRMWARE_DIR").as_deref().map(std::path::Path::new), rel)
+}
+
+fn titan_firmware_image_in(dir: Option<&std::path::Path>, rel: &str) -> Option<std::path::PathBuf> {
+    let Some(dir) = dir.filter(|d| !d.as_os_str().is_empty()) else {
+        eprintln!("skipping: {rel}: TITAN_FIRMWARE_DIR is not set (a titan_firmware checkout with its C apps built)");
+        return None;
+    };
+    let p = dir.join(rel);
+    if p.exists() {
+        Some(p)
+    } else {
+        eprintln!("skipping: {} not built (scripts/build_c_boards.sh)", p.display());
+        None
+    }
+}
+
 /// Whether a test fails instead of skipping when a titan_firmware_rs image is missing: `SIM_REQUIRE_TITAN_RS` is set
 /// to anything but empty or `0`. titan_firmware_rs's CI sets it, so missing images cannot pass as skipped tests.
 pub fn titan_rs_required() -> bool {
@@ -65,6 +86,20 @@ mod required_tests {
                 assert_eq!(super::titan_rs_image(&dir, "nope"), None);
             }
         }
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_c_app_is_found_in_titan_firmware_dir() {
+        let dir = std::env::temp_dir().join(format!("titan-fw-image-{}", std::process::id()));
+        let build = dir.join("talos/ESCBoard/build");
+        std::fs::create_dir_all(&build).unwrap();
+        std::fs::write(build.join("esc_board_with_bl.uf2"), b"").unwrap();
+        let rel = "talos/ESCBoard/build/esc_board_with_bl.uf2";
+        assert_eq!(super::titan_firmware_image_in(Some(&dir), rel), Some(build.join("esc_board_with_bl.uf2")));
+        assert_eq!(super::titan_firmware_image_in(Some(&dir), "talos/PoacBoard/build/poac_board_with_bl.uf2"), None);
+        assert_eq!(super::titan_firmware_image_in(None, rel), None);
+        assert_eq!(super::titan_firmware_image_in(Some(std::path::Path::new("")), rel), None);
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }

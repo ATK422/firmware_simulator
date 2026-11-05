@@ -139,6 +139,34 @@ fn c_and_rust_ivc_board2_modems_exchange_bytes() {
     assert_eq!(c_log.matches("ROS ivc/rx_new").count(), 1, "{c_log}");
 }
 
+/// The real C IVCBoard2 (titan_firmware `blake/ivc`, with micro-ROS over USB, built in `$TITAN_FIRMWARE_DIR`;
+/// skipped otherwise) in `robots/ivc2_interop.toml` hears the Rust board: the byte the Rust board sends arrives
+/// about 8.7 s later, as the C board's `packet read complete with: 90`. With no micro-ROS agent it does not publish
+/// it, so the other direction (`/talos/ivc/enqueue_data`) needs one.
+#[test]
+fn real_c_ivc_board2_hears_the_rust_board() {
+    let Some(c_image) = sim_host::titan_firmware_image("talos/IVCBoard2/build/IVCBoard2_with_bl.uf2") else {
+        return;
+    };
+    if common::titan_elf("ivc_board2").is_none() {
+        return;
+    }
+    let (mut r, talos, _) = robot("ivc2_interop.toml", |spec| {
+        spec.board[1].elf = c_image;
+        // No ptys: the log is on UART0 too
+        spec.board[1].usb_cdc = None;
+        spec.board[1].usb_cdc2 = None;
+    });
+    // Not before about 5 s: sent at 3 s, the C receiver locks on a second late and reads the bits shifted
+    talos.send_at(Time::from_ms(8000), HostToDevice::Ivc2(ivc2::HostToDevice::EnqueueData(0x5A)));
+    r.run_until(Time::from_ms(18_000));
+    assert!(r.boards[0].logged("Transmitting 0x5a"));
+    let c_log = r.boards[1].uart_text[0].clone();
+    assert!(c_log.contains("IVCBoard2 1.0-talos/talos/ivc_board"), "{c_log}");
+    assert!(c_log.contains("RECEIVING PACKET") && c_log.contains("packet read complete with: 90"), "{c_log}");
+    assert_eq!(r.boards[1].machine.resets, 0);
+}
+
 /// Firmware finding (C IVCBoard2, blake/ivc `tx.c`): `attempt_writing` dequeues the next byte on every main loop pass
 /// even while a packet is going out, and only overwrites `data_to_write`; the packet in flight carries the bits of
 /// the newest byte from then on, and the earlier byte is lost. Two bytes enqueued together arrive as one, the second.

@@ -38,7 +38,13 @@ def parse_args(argv=None):
     p.add_argument("--cmd-field", default="data", help="the array field of the command message")
     p.add_argument("--depth-topic", default="depth/pose", help="depth (PoseWithCovarianceStamped or riptide Depth)")
     p.add_argument("--depth-field", default="pose.pose.position.z", help="field holding the depth")
-    p.add_argument("--depth-up", action="store_true", help="the depth field is a height (z up): negate it")
+    p.add_argument(
+        "--depth-up",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="the depth field is a height, z up, and is negated (riptide's depth/pose and state/depth/raw both are: "
+        "negative below the surface); --no-depth-up for a field that is already positive down",
+    )
     p.add_argument("--imu-topic", default="vectornav/imu", help="sensor_msgs/Imu: attitude and body rates")
     p.add_argument("--dvl-topic", default="dvl/twist", help="DVL body velocity (TwistWithCovarianceStamped)")
     p.add_argument("--dvl-field", default="twist.twist.linear", help="field holding the velocity vector")
@@ -97,6 +103,20 @@ def thruster_names(path, count):
             if names:
                 return names
     return [str(k) for k in range(count)]
+
+
+def merge_partial(last, values, mask):
+    """An array message that carries only some elements (each ESC board publishes its four thrusters of the eight on
+    state/thrusters/rpm and /cmd, the others zero, with `rpm_valid_mask` saying which): the held array with the valid
+    ones replaced. `mask` None: every element is valid."""
+    if mask is None:
+        return list(values)
+    out = list(last) if last is not None else [None] * len(values)
+    out += [None] * (len(values) - len(out))
+    for j, v in enumerate(values):
+        if mask >> j & 1:
+            out[j] = v
+    return out
 
 
 def hold(series, grid):
@@ -176,6 +196,7 @@ def read_bag(args):
     by_topic = {v: k for k, v in want.items() if v in types}
     classes = {t: get_message(types[t]) for t in by_topic}
     streams = {k: [] for k in want}
+    last = {"rpm": None, "cmd": None}
     pose = []
     while reader.has_next():
         name, data, stamp = reader.read_next()
@@ -184,10 +205,10 @@ def read_bag(args):
             continue
         msg = deserialize_message(data, classes[name])
         t = stamp / 1e9
-        if kind == "rpm":
-            streams["rpm"].append((t, [float(x) for x in field(msg, args.rpm_field)]))
-        elif kind == "cmd":
-            streams["cmd"].append((t, [float(x) for x in field(msg, args.cmd_field)]))
+        if kind in ("rpm", "cmd"):
+            values = [float(x) for x in field(msg, args.rpm_field if kind == "rpm" else args.cmd_field)]
+            last[kind] = merge_partial(last[kind], values, getattr(msg, "rpm_valid_mask", None))
+            streams[kind].append((t, last[kind]))
         elif kind == "depth":
             d = float(field(msg, args.depth_field))
             streams["depth"].append((t, -d if args.depth_up else d))
