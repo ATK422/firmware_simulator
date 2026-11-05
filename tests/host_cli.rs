@@ -325,6 +325,9 @@ fn script(stubs: &Path, name: &str, args: &[&str], env: &[(&str, &str)]) -> (i32
     let mut cmd = Command::new("bash");
     cmd.arg(repo().join("scripts").join(name)).args(args).env("PATH", path).env("STUB_DIR", stubs);
     cmd.env_remove("ROS_DISTRO").env("FIRMWARE_SIMULATOR", env!("CARGO_BIN_EXE_firmware_simulator"));
+    // Only what the test gives: a TITAN_FIRMWARE_DIR of the caller's (pointing at built C images) would let a
+    // call that expects the script to stop for the lack of it really start the robot, and never end
+    cmd.env_remove("TITAN_FIRMWARE_DIR");
     for (k, v) in env {
         cmd.env(k, v);
     }
