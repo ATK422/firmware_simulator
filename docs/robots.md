@@ -93,9 +93,15 @@ internal bus, classic external bus). Its boards are titan_firmware's "Triton" bo
 the ESC pins moved, no inverted thrusters and `mercury_msgs`. Only these C apps exist (titan_firmware_rs has no
 Mercury boards: its `po_half_board` is Lilboat's), so `robots/mercury.toml` takes them from `TITAN_FIRMWARE_DIR`,
 and `scenarios/boot_mercury.yaml` (build tags on the UART, each client's CANmore heartbeat, no panic or reset) is
-skipped until it is set. There is no vehicle file: `mercury_descriptions` is empty and `mercury_simulator` loads
-riptide's `talos.yaml`. A firmware finding: `mercury/ESCBoard`'s raw CAN thruster command handler still reads each
-RPM's high byte twice (`(buf[idx] << 8) | buf[idx]`), fixed for `talos/ESCBoard` only (titan_firmware PR #26).
+skipped until it is set. Both apps build with the micro-ROS library that has `mercury_msgs` (the Nix shell's), and
+the scenario passes with them (titan_firmware 058df2a). There is no vehicle file: `mercury_descriptions` is empty
+and `mercury_simulator` loads riptide's `talos.yaml`. A firmware finding, confirmed on the running image
+(`firmware_finding_mercury_esc_board_reads_each_rpm_high_byte_twice` in `crates/sim_test/tests/c_boards.rs`):
+`mercury/ESCBoard`'s raw CAN thruster command handler still reads each RPM's high byte twice
+(`(buf[idx] << 8) | buf[idx]`), fixed for `talos/ESCBoard` only (titan_firmware PR #26). A raw command of 1200,
+-1200, 300 and 0x1234 RPM becomes the target speeds 1028 (0x0404), -1029 (0xFBFB), 257 (0x0101) and 0x1212 in
+core 1's `target_req`; the Talos board's are the ones sent. (Watching the DShot output as well needs a micro-ROS
+agent: without one the boards stay killed and their controllers unconfigured.)
 
 **Tempest** is the AUV before Talos, not a new one: riptide's launch files default to `robot:=tempest` because they
 were carried over from the earlier stack, and `riptide_descriptions/config/tempest.yaml` has not changed since. Its
@@ -581,7 +587,12 @@ client ID from the serial number in its board file's `[[flash]]`. The Nth bus of
 > `CAP_NET_ADMIN`, no ROS 2, no Docker daemon). The scripts and generated files are checked statically
 > (`tests/host_cli.rs`: the vcan script against stand-ins for `ip` and `modprobe`, `robot_in_a_box.sh` and
 > `nereus_firmware_sim.sh` in `--dry-run`, the bridges script with `bash -n`, the launch file with `py_compile`,
-> the compose file's consistency); the C robot files load with stand-in images (`tests/cli.rs`).
+> the compose file's consistency); the C robot files load with stand-in images (`tests/cli.rs`). Since then, in a
+> Nix shell with ARM GCC and the micro-ROS library (still no vcan or Docker daemon), all eight C images of
+> `robots/talos_c.toml` were built and run: every board boots through its bootloader into its app and sends its
+> CANmore heartbeat (`crates/sim_test/tests/c_boards.rs`), except the SBC board (see "The C images" below); four of
+> them have run with a real micro-ROS agent over UDP ([Without vcan](#without-vcan-udp)). Still to verify:
+> everything on vcan, `can1`'s agent and the smart battery's session, and riptide.
 
 **What the Orin does.** Talos's robot computer (an NVIDIA Jetson AGX Orin, JetPack with ROS 2 Humble, the
 `riptide_release` workspace) talks to the boards over plain Linux SocketCAN through the `mttcan` driver: `can0` is
@@ -640,6 +651,21 @@ cd $TITAN_FIRMWARE_DIR/talos/ESCBoard && mkdir -p build && cd build && cmake .. 
 | `led` | `talos/LEDBoard` | `led_board_with_bl.uf2` |
 | `sbc` | `SBCBoard` | `sbc_board_with_bl.uf2` |
 | `battery` | `talos/SmartBattery` | `smart_battery_with_bl.uf2` (external bus) |
+
+Built at titan_firmware 058df2a with the Nix shell's micro-ROS library (`ln -s $MICRO_ROS_LIB_DIR
+$TITAN_FIRMWARE_DIR/lib/micro_ros_pico/libmicroros`), two apps need help, which `scripts/build_c_boards.sh` gives
+without changing the checkout: `SBCBoard` includes `driver/canbus.h` and `micro_ros_pico/transport_can.h` but its
+CMakeLists.txt links neither library (the script links them with a CMake project include), and `talos/Actuator`
+uses `riptide_msgs2/ActuatorStatus.CLAW_CLOSED`, which the library's newer riptide_msgs2 split into
+`CLAW_BOTTLE_CLOSED` and `CLAW_SPOON_CLOSED` (the script defines it as the first; the later states moved up by one,
+so the actuator's claw states read differently against today's messages). With no agent on the bus, each board
+boots through its bootloader (its heartbeat about 80 ms after power-on) into its app, prints its build tag and
+`Clean Boot: Power-on Reset` on UART0, and sends a CANmore heartbeat every 500 ms and micro-ROS's session requests;
+the smart battery, alone on the external bus without the Orin to acknowledge, retransmits each heartbeat three
+times. The SBC board's app (work in progress) never calls `canbus_tick`, so it falls silent once its bootloader
+hands over ([faults.md](faults.md#firmware-findings-so-far)). The eight C boards are much slower to emulate than the
+Rust images (their main loops never sleep): about 0.1x real time on four busy cores, the four of
+`talos_c_nereus.toml` about 0.2x.
 
 The micro-ROS agent's sessions and timeouts are on the wall clock and the firmware's on virtual time; Talos as a
 whole runs slower than real time on one core (see [Speed](#how-a-robot-runs)), so watch the emulator's "behind the

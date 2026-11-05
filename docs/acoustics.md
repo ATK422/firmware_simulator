@@ -307,10 +307,15 @@ Rust to C: the Rust board logs `Transmitting 0x5a` at 30 s and the C board `pack
 `/tmp/c_ivc-log` and as `c_ivc uart0:` lines) about 8.7 s later, and publishes 90 on `/talos/ivc/rx_new`. C to Rust:
 after the `ros2 topic pub` the C board logs `writing out: ...` per bit, and about 9 s later the emulator prints
 `[t] talos_ivc: IVC received 0x5a`. Send one byte at a time, at least 10 s apart, and not from both boards at once.
-**To verify locally** (the micro-ROS library could not be built where this was written): the real C image in the
-emulator, and whether the agent keeps its session while the emulator runs slower than the wall clock (the C modem
-alone runs at about 0.4x real time with the Rust board beside it, so `--realtime` cannot keep up; the firmware's
-own micro-ROS timeouts are on virtual time).
+The real C image (`blake/ivc`'s `talos/IVCBoard2`, built against the Nix shell's micro-ROS library) runs in the
+emulator and hears the Rust board: `--ivc-send 30s@talos_ivc:0x5a` arrives as `packet read complete with: 90`
+8.7 s later, as above (`real_c_ivc_board2_hears_the_rust_board` in `crates/sim_host/tests/ivc_link.rs`, with
+`TITAN_FIRMWARE_DIR` on that branch; it sends 7.4 s after the C app started, as a packet that starts within a few
+seconds of it is mis-framed). Its log line `[safety]: Clean Boot` is cut short on the UART by the firmware itself
+([faults.md](faults.md#firmware-findings-so-far), 17). **To verify locally** (no micro-ROS agent where this was
+checked): the C board publishing what it hears and sending what `/talos/ivc/enqueue_data` asks (C to Rust), and
+whether the agent keeps its session while the emulator runs slower than the wall clock (the pair runs at about
+0.35x real time, so `--realtime` cannot keep up; the firmware's own micro-ROS timeouts are on virtual time).
 
 ## What the pinger amplitude does with distance and why
 

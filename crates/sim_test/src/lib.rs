@@ -72,6 +72,13 @@ pub fn titan_c(rel: &str) -> Option<PathBuf> {
     found(repo().join("build/c").join(rel), "scripts/build_c_firmware.sh")
 }
 
+/// A titan_firmware C app's build output in `$TITAN_FIRMWARE_DIR` (`rel` from the checkout's root, e.g.
+/// `talos/ESCBoard/build/esc_board_with_bl.uf2`), if that is set and the app built (`scripts/build_c_boards.sh`);
+/// tests skip (and say so) otherwise. See [`sim_host::titan_firmware_image`].
+pub fn titan_firmware(rel: &str) -> Option<PathBuf> {
+    sim_host::titan_firmware_image(rel)
+}
+
 fn found(p: PathBuf, how: &str) -> Option<PathBuf> {
     if p.exists() {
         Some(p)

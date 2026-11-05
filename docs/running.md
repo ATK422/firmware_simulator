@@ -282,7 +282,10 @@ Virtual time stops while GDB has the target halted; RTT logs keep flowing while 
 run: a stop in the middle of a quantum or a slice (a breakpoint, a watchpoint, a step) goes on from exactly there,
 and with time travel on (the default with `--gdb`) the run goes on in pieces of 500 µs ending on multiples of
 500 µs, so a run with any number of stops, steps and interrupts is the same as one without. Stepping (`stepi`)
-runs the selected core one step (an instruction, or an exception entry) while the other core runs as scheduled. Peripheral registers read
+runs the selected core one step (an instruction, or an exception entry) while the other core runs as scheduled.
+So, unlike OpenOCD (whose default `cortex_m maskisr auto` masks interrupts while stepping), a step can take an
+interrupt: `next` (VS Code's Step Over) where an interrupt comes due, at a `wfe` say, stops at the start of its
+handler, and `finish` (Step Out) goes back to where it struck. Peripheral registers read
 without side effects (no FIFO pops or spinlock claims), so GDB and an SVD view can read whole register blocks.
 
 ```bash
@@ -399,11 +402,15 @@ its arguments; arguments after the pick in a task's `args` go to the emulator, e
 has no Step Back or Reverse Continue buttons (it does not offer them to VS Code, whatever the server supports): in
 its Debug Console, type `-exec reverse-continue`, `-exec reverse-stepi`, `-exec reverse-next` or
 `-exec monitor rewind 1.5s`. The Native Debug configuration shows both buttons; they send
-`-exec-continue --reverse` and `-exec-step --reverse`, which `crates/sim_host/tests/gdb.rs` drives through
-`gdb-multiarch`.
+`-exec-continue --reverse` and `-exec-step --reverse`, which `crates/sim_host/tests/gdb.rs` drives through the
+real GDB.
 
-The configurations are checked by driving `gdb-multiarch` over GDB/MI with the commands Cortex-Debug sends
-(`crates/sim_host/tests/gdb.rs` has the packet-level tests). VS Code itself is not run in CI.
+The configurations are checked by driving the real GDB over GDB/MI with the commands Cortex-Debug and Native Debug
+send (`real_gdb_mi_session_as_cortex_debug_runs_it` in `crates/sim_host/tests/gdb.rs`: connect, `monitor halt`,
+run to main, both cores' threads, a peripheral block, pause, Step Back, Reverse Continue, Restart, detach), and
+`gdb.rs` also has the packet-level tests. `scripts/vscode_gdb.sh` was run in its three modes (`run`, `elf` with the
+C template, `robot` on Talos's `esc0`) with GDB connecting as the configurations do. VS Code itself has not been
+run against it (to verify locally).
 
 ## USB: BOOTSEL, PICOBOOT, UF2 and CDC
 
@@ -451,12 +458,15 @@ serial links apart; the DDS traffic still meets. Ways to keep runs apart:
   keep `/dev/shm` separate as well (a container does).
 * **Patching the firmware** to set a domain id in its init options, which is a firmware change, not an emulator one.
 
-A run with its own discovery server, for each run with another port, server id and pty paths (**to verify
-locally**: written from the Fast DDS 2.x and micro-ROS documentation, with no ROS 2 here to run it):
+A run with its own discovery server, for each run with another port, server id and pty paths (checked with ROS 2
+Humble's Fast DDS 2.6.12, without a micro-ROS agent: a `ros2 topic pub` and `ros2 topic echo` pointed at one
+server see each other, and tools pointed at another server, or at none, do not; the server's options in 2.x are
+`-i`, `-l` (`--udp-address`) and `-p` (`--udp-port`), and the Nix shell's `fastdds` wrapper does not find its
+`fast-discovery-server`, which takes the same options; **to verify locally**: the agent and the board in it):
 
 ```bash
 PORT=11811                     # 11812, 11813, ... for the other runs
-fastdds discovery --server-id 0 --ip-address 127.0.0.1 --port $PORT &
+fastdds discovery -i 0 -l 127.0.0.1 -p $PORT &   # or fast-discovery-server -i 0 -l 127.0.0.1 -p $PORT
 export ROS_DISCOVERY_SERVER=127.0.0.1:$PORT
 firmware_simulator run $TITAN_FIRMWARE_DIR/talos/IVCBoard2/build/IVCBoard2_with_bl.uf2 \
     --board boards/talos/ivc_board.toml --rom-boot --usb-cdc pty:/tmp/run1-log --usb-cdc2 pty:/tmp/run1-ros \
@@ -466,9 +476,10 @@ ros2 topic echo /talos/ivc/rx_new             # this run's tools, with the same 
 ```
 
 A discovery client only learns about the topics it uses, so `ros2 topic echo` of a known topic works, but
-`ros2 topic list` and the `ros2` daemon need to be a super client: `ROS_SUPER_CLIENT=TRUE` with a recent Fast DDS,
-or a `FASTRTPS_DEFAULT_PROFILES_FILE` with a `SUPER_CLIENT` participant profile in Humble's (the ROS 2 "Using Fast
-DDS Discovery Server" tutorial has one). Restart the daemon (`ros2 daemon stop`) after changing
+`ros2 topic list` and the `ros2` daemon need to be a super client: `ROS_SUPER_CLIENT=TRUE` (Humble's Fast DDS
+2.6 takes it: `ROS_SUPER_CLIENT=TRUE ros2 topic list --no-daemon` lists the run's topics, a plain client only
+`/rosout` and `/parameter_events`), or a `FASTRTPS_DEFAULT_PROFILES_FILE` with a `SUPER_CLIENT` participant profile
+(the ROS 2 "Using Fast DDS Discovery Server" tutorial has one). Restart the daemon (`ros2 daemon stop`) after changing
 `ROS_DISCOVERY_SERVER`. Give the agent and the tools generous timeouts: a
 run that is busy may be slower than real time ([Options](#options)). Several runs in parallel are otherwise
 independent: eight IVCBoard2 runs on a 20-core machine kept up fine in the test campaign.

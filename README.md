@@ -389,8 +389,11 @@ not modelled or not yet trusted:
 * **C board applications in CI**: titan_firmware's C board apps need its prebuilt micro-ROS library (built in
   Docker), so CI and `scripts/build_c_firmware.sh` build only the template, the Titan bootloader, its test app and
   `test_programs/c_ivc_modem` (the C IVC modem without ROS). The C IVCBoard2 with micro-ROS has been run locally
-  (USB, agent, pinger, faults). The firmware is moving to its own nano-ROS, which needs no Docker; once that builds
-  with the plain toolchain, the board apps can join CI with smoke tests like the Rust images.
+  (USB, agent, pinger, faults). With a micro-ROS library at hand (the Nix shell has one), `scripts/build_c_boards.sh`
+  builds the Talos apps and tests boot them from `$TITAN_FIRMWARE_DIR` (`crates/sim_test/tests/c_boards.rs`, the
+  Mercury scenario, the real C IVCBoard2 in `ivc_link.rs`); they skip without it. The firmware is moving to its own
+  nano-ROS, which needs no Docker; once that builds with the plain toolchain, the board apps can join CI with smoke
+  tests like the Rust images.
 * **Same firmware, same results**: firmware built with a different Rust compiler gives slightly different code, so
   bench fingerprints and timing-sensitive IVC results differ from one build to the next. titan_firmware_rs pins its
   compiler (`rust-toolchain.toml`), so images built from the same commit with rustup match; the tests check
@@ -414,6 +417,14 @@ but never run for real:
 
 Run locally by the team so far: the dashboard in a browser, the C IVCBoard2 with micro-ROS over USB, the benchmark
 on an i7-12700H (Talos about 0.73x real time on threads).
+
+Run since in a Nix shell with ARM GCC, the micro-ROS library, ROS 2 Humble and GDB (still no vcan, nereus or
+Docker daemon): titan_firmware's C Talos and Mercury apps built and booted (`robots/talos_c.toml`,
+`scenarios/boot_mercury.yaml`; [robots.md](docs/robots.md#robot-in-a-box-the-orins-side-on-vcan)), the CI
+c-firmware job's steps, the real C IVCBoard2 hearing the Rust one ([acoustics.md](docs/acoustics.md#c-and-rust-ivcboard2-interop)),
+`gdb-multiarch` and `arm-none-eabi-gdb` on the GDB server with reverse execution, watchpoints and the VS Code
+configurations' commands ([running.md](docs/running.md#debugging-in-vs-code)), `bag_to_calib.py` reading real ROS
+message classes ([calibration.md](docs/calibration.md)), and a Fast DDS discovery server per run.
 
 **CI** ([`.github/workflows/ci.yml`](.github/workflows/ci.yml)) has three jobs: **test** builds the
 titan_firmware_rs images, runs `cargo fmt --all --check`, `cargo clippy --workspace --all-targets --release -- -D warnings`,

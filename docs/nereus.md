@@ -19,6 +19,9 @@ localhost, and the bridge makes the controller's RPM commands (see [Transports](
 > `simulator/ground_truth`, the kill and `thruster_forces`: the bridge posted the pose (the camera cage read the
 > depth), drove the ESC boards from the forces, and published their thrust on `simulator/firmware_thruster_forces`.
 > Not run: nereus itself, the riptide stack, the vcan path with ROS. [Below](#to-verify-locally) is the checklist.
+> `integrations/nereus/test_firmware_bridge_ros.py` keeps the bridge node's part as a test (with ROS 2 sourced):
+> against stand-ins for the dashboard and nereus, it checks the forces in the controller's order, the posted NED
+> pose, the kill switch both ways, `real_time_factor` following the emulator, and a clean stop on SIGINT and SIGTERM.
 
 - [How it fits together](#how-it-fits-together)
 - [Transports](#transports)
@@ -436,7 +439,7 @@ To check on your machine:
 | Boards and agent | `scripts/robot_in_a_box.sh --robot robots/talos_c_nereus.toml` (add `--dashboard 127.0.0.1:8080`), then `ros2 topic list` | The firmware topics of [What you should see](#what-you-should-see) |
 | Packs | `uv run nereus-packs validate /tmp/nereus_firmware/<time>/packs/scenarios/talos_firmware_robosub` (in nereus) | `OK scenario` |
 | nereus up | the script | The viewer, nereus's topics, `/clock` |
-| Bridge | its log and `ros2 topic echo /talos/simulator/firmware_bridge/status` | Status lines with the emulator's speed and the drift near 0 |
+| Bridge | its log and `ros2 topic echo /talos/simulator/firmware_bridge/status` | Status lines with the emulator's speed and the drift near 0 (seen with a scripted nereus; with the real one to verify) |
 | Kill | unkill from the viewer | `state/kill` false, nereus unkilled |
 | Thrust | a goal from the viewer | ESC RPMs on the dashboard, `/talos/simulator/firmware_thruster_forces` non-zero, the vehicle moves |
 | Depth | dive | `/talos/state/depth/raw` follows nereus's depth within a few cm |

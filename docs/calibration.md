@@ -240,8 +240,14 @@ yaw, surge and heave velocity.
 
 `bag_to_calib.py` converts REP 103 frames (world east-north-up, body forward-left-up) to the emulator's; its options
 name the topics and the fields that hold the values (`--rpm-topic`, `--rpm-field`, `--depth-field`,
-`--depth-up`, `--odom-topic`, ...: `python3 scripts/bag_to_calib.py --help`). It also writes `pose.csv` from the
-odometry, for the replay.
+`--no-depth-up`, `--odom-topic`, ...: `python3 scripts/bag_to_calib.py --help`). It also writes `pose.csv` from the
+odometry, for the replay. Each ESC board publishes its four thrusters of the eight on `state/thrusters/rpm` (and
+`/cmd`), the others zero, with `rpm_valid_mask` saying which; the script keeps each thruster's last valid value, as
+riptide's `rpm_echo` does. Depth is taken as riptide publishes it, a height (z up: `depth/pose` and
+`state/depth/raw` are negative below the surface), and negated; `--no-depth-up` for a field that is already
+positive down. Its bag reading is tested with ROS 2's real message classes and serialization
+(`scripts/test_bag_to_calib.py`, when ROS 2 and riptide_msgs2 are sourced) with rosbag2's reader stood in for:
+**to verify locally** on a real bag (there was no rosbag2 where this was checked).
 
 ## Replaying a pool test
 

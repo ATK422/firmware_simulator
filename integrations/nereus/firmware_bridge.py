@@ -27,6 +27,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import signal
 import sys
 import threading
 import time
@@ -93,6 +94,7 @@ def main(argv=None):
     from rcl_interfaces.srv import SetParameters
     from rclpy.node import Node
     from rclpy.qos import QoSProfile, ReliabilityPolicy, qos_profile_sensor_data
+    from rclpy.signals import SignalHandlerOptions
     from rosgraph_msgs.msg import Clock
     from std_msgs.msg import Bool, Float32MultiArray, String
 
@@ -277,25 +279,28 @@ def main(argv=None):
                 if time.monotonic() - next_t > 1.0:
                     next_t = time.monotonic()
 
-    from rclpy.executors import ExternalShutdownException
-
-    rclpy.init()
-    node = FirmwareBridge()
+    # SIGINT and SIGTERM (what `ros2 launch` sends on shutdown) stop the node here, with its emulator thread
+    # joined before the context goes: rclpy's own handlers would shut the context down under that thread and spin
+    # (an ExternalShutdownException, or an RCLError from the wait set, and the thread's publish failing)
+    rclpy.init(signal_handler_options=SignalHandlerOptions.NO)
+    signal.signal(signal.SIGTERM, signal.default_int_handler)
+    node = None
     try:
+        node = FirmwareBridge()
         rclpy.spin(node)
-    except (KeyboardInterrupt, ExternalShutdownException):
-        # Ctrl-C: rclpy's signal handler may have shut the context down already
+    except KeyboardInterrupt:
         pass
     finally:
-        node.stop.set()
-        try:
-            node.thread.join(timeout=2.0)
-        except KeyboardInterrupt:
-            # A second Ctrl-C (ros2 launch passes one on as well): stop waiting
-            pass
-        node.destroy_node()
-        if rclpy.ok():
-            rclpy.shutdown()
+        if node is not None:
+            node.stop.set()
+            if hasattr(node, "thread"):
+                try:
+                    node.thread.join(timeout=2.0)
+                except KeyboardInterrupt:
+                    # A second Ctrl-C (ros2 launch passes one on as well): stop waiting
+                    pass
+            node.destroy_node()
+        rclpy.try_shutdown()
 
 
 if __name__ == "__main__":
