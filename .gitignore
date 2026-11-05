@@ -1,3 +1,5 @@
 /target
 /build
 __pycache__/
+/.direnv
+/result
