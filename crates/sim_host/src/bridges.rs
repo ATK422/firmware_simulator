@@ -281,10 +281,33 @@ pub fn emulator_command(robot_file: &str, cmds: &[BridgeCommand]) -> String {
     }
     let mut s = format!("firmware_simulator robot {}", shell_quote(robot_file));
     for (b, i) in pairs {
-        let _ = write!(s, " --can {}", shell_quote(&format!("{b}={i}")));
+        match cannelloni_addr(&i) {
+            Some(addr) => {
+                // The hub binds the address the bridges send to, or every address for a host name (the bridges'
+                // name for the emulator's machine, e.g. host.docker.internal)
+                let local = match addr.parse::<std::net::SocketAddr>() {
+                    Ok(a) => a.to_string(),
+                    Err(_) => format!("0.0.0.0:{}", addr.rsplit_once(':').map(|(_, p)| p).unwrap_or("20000")),
+                };
+                let _ = write!(s, " --cannelloni {}", shell_quote(&format!("{b}={local}")));
+            }
+            None => {
+                let _ = write!(s, " --can {}", shell_quote(&format!("{b}={i}")));
+            }
+        }
     }
     s + " --realtime"
 }
+
+/// The emulator's hub address in a titan_bridge interface `cannelloni:HOST:PORT` (CAN over UDP, no vcan), or
+/// `None` for a SocketCAN interface.
+pub fn cannelloni_addr(iface: &str) -> Option<&str> {
+    iface.strip_prefix(CANNELLONI_PREFIX)
+}
+
+/// How a titan_bridge `--interface` names CAN over UDP to the emulator's `--cannelloni` hub, instead of a SocketCAN
+/// interface (titan_firmware_rs's titan_bridge from the change that added it on).
+pub const CANNELLONI_PREFIX: &str = "cannelloni:";
 
 /// Interfaces the bridges use, in order.
 fn interfaces(cmds: &[BridgeCommand]) -> Vec<String> {
@@ -332,13 +355,17 @@ pub fn render_script(cmds: &[BridgeCommand], program: &str, robot_file: &str) ->
     let _ = writeln!(o, "# and source the ROS 2 environment titan_bridge was built in (riptide-shell).");
     let _ = writeln!(o, "set -euo pipefail\n");
     let _ = writeln!(o, "TITAN_BRIDGE=\"${{TITAN_BRIDGE:-{}}}\"", program.replace(['"', '$', '`', '\\'], ""));
-    let ifaces = interfaces(cmds);
-    let _ = writeln!(o, "for iface in {}; do", ifaces.iter().map(|i| shell_quote(i)).collect::<Vec<_>>().join(" "));
-    let _ = writeln!(o, "    if ! ip link show \"$iface\" >/dev/null 2>&1; then");
-    let _ = writeln!(o, "        echo \"no interface $iface (scripts/vcan_up.sh creates vcan interfaces)\" >&2");
-    let _ = writeln!(o, "        exit 1");
-    let _ = writeln!(o, "    fi");
-    let _ = writeln!(o, "done\n");
+    // SocketCAN interfaces must exist; CAN over UDP needs nothing on this machine
+    let ifaces: Vec<String> = interfaces(cmds).into_iter().filter(|i| cannelloni_addr(i).is_none()).collect();
+    if !ifaces.is_empty() {
+        let _ =
+            writeln!(o, "for iface in {}; do", ifaces.iter().map(|i| shell_quote(i)).collect::<Vec<_>>().join(" "));
+        let _ = writeln!(o, "    if ! ip link show \"$iface\" >/dev/null 2>&1; then");
+        let _ = writeln!(o, "        echo \"no interface $iface (scripts/vcan_up.sh creates vcan interfaces)\" >&2");
+        let _ = writeln!(o, "        exit 1");
+        let _ = writeln!(o, "    fi");
+        let _ = writeln!(o, "done\n");
+    }
     let _ = writeln!(o, "pids=()");
     let _ = writeln!(o, "stop() {{");
     let _ = writeln!(o, "    trap - EXIT INT TERM");
@@ -477,6 +504,31 @@ mod tests {
         assert!(py.contains("    ('battery', ['--board', 'smart_battery', '--interface', 'vcan1', '--namespace', 'talos', '--client-id', '21']),"), "{py}");
         assert_eq!(shell_quote("it's"), r"'it'\''s'");
         assert_eq!(py_str("a'b"), r"'a\'b'");
+    }
+
+    /// Bridges to the emulator's cannelloni hub (no vcan): the interface is passed on, the emulator command
+    /// serves the bus on that address, and the script checks no interfaces.
+    #[test]
+    fn cannelloni_interfaces() {
+        let (spec, dir) = talos();
+        let ifaces = [
+            ("internal".to_string(), "cannelloni:127.0.0.1:20000".to_string()),
+            ("external".to_string(), "cannelloni:host.docker.internal:20001".to_string()),
+        ];
+        let cmds = plan(&spec, &dir, &ifaces, None).unwrap();
+        assert_eq!(
+            cmds[2].args().unwrap().join(" "),
+            "--board esc1 --interface cannelloni:127.0.0.1:20000 --namespace talos --client-id 3"
+        );
+        assert_eq!(
+            emulator_command("robots/talos.toml", &cmds),
+            "firmware_simulator robot robots/talos.toml --cannelloni internal=127.0.0.1:20000 \
+             --cannelloni external=0.0.0.0:20001 --realtime"
+        );
+        let sh = render_script(&cmds, "titan_bridge", "robots/talos.toml");
+        assert!(!sh.contains("ip link show"), "{sh}");
+        assert!(sh.contains("start esc0 --board esc0 --interface cannelloni:127.0.0.1:20000 "), "{sh}");
+        assert_eq!(cannelloni_addr("vcan0"), None);
     }
 
     #[test]
