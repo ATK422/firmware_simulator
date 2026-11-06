@@ -32,7 +32,7 @@ Every run is repeatable: the same firmware and inputs give exactly the same resu
 ## Quick start
 
 **Prerequisites:** Linux, macOS or Windows through WSL2 (the robot computer's tools reach the emulated buses over
-vcan on Linux, and over UDP anywhere: [robots.md](docs/robots.md#without-vcan-udp)), Rust (stable, 1.85 or newer) with the `thumbv6m-none-eabi` target, and git. The firmware images build with the compiler titan_firmware_rs pins in
+vcan on Linux, and over UDP anywhere: [robots.md](docs/robots.md#without-vcan-udp)), Rust (stable, 1.88 or newer) with the `thumbv6m-none-eabi` target, and git. The firmware images build with the compiler titan_firmware_rs pins in
 its `rust-toolchain.toml` (rustc 1.99.0 at the pinned commit): rustup picks it up in that directory, and
 `rustup toolchain install` there installs it with its `thumbv6m-none-eabi` target. The C firmware additionally needs `gcc-arm-none-eabi`, `cmake` and
 `ninja` (optional; only the C tests use it).

@@ -29,6 +29,8 @@ concurrency:
 env:
   CARGO_TERM_COLOR: always
   CARGO_PROFILE_RELEASE_DEBUG: "false"
+  # The same toolchain as ci.yml, so a release is the build CI tested
+  RUST_TOOLCHAIN: "1.99.0"
 
 jobs:
   build:
@@ -50,8 +52,8 @@ jobs:
         run: git submodule update --init external/titan_firmware_rs
       - name: Rust
         run: |
-          rustup toolchain install stable --profile minimal
-          rustup target add ${{ matrix.target }}
+          rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal --target ${{ matrix.target }}
+          rustup default "$RUST_TOOLCHAIN"
       - uses: Swatinem/rust-cache@v2
         with:
           key: ${{ matrix.target }}

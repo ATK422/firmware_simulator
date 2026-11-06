@@ -307,8 +307,8 @@ impl Entry {
         match code.first_chunk::<MAX_BYTES>() {
             Some(c) => {
                 let mut diff = 0;
-                for (k, chunk) in c.chunks_exact(8).enumerate() {
-                    let word = u64::from_le_bytes(chunk.try_into().unwrap_or([0; 8]));
+                for (k, chunk) in c.as_chunks::<8>().0.iter().enumerate() {
+                    let word = u64::from_le_bytes(*chunk);
                     diff |= (word ^ self.code[k]) & self.mask[k];
                 }
                 diff == 0
@@ -619,12 +619,12 @@ impl CortexM0Plus {
         if start & 3 == 0
             && let Some(mem) = bus.ram(start, 4 * count, true)
         {
-            let mut words = mem.chunks_exact_mut(4);
+            let mut words = mem.as_chunks_mut::<4>().0.iter_mut();
             for i in 0..8 {
                 if list & (1 << i) != 0
                     && let Some(w) = words.next()
                 {
-                    w.copy_from_slice(&self.r[i].to_le_bytes());
+                    *w = self.r[i].to_le_bytes();
                 }
             }
             self.r[rn as usize & 7] = start.wrapping_add(4 * count);
@@ -640,12 +640,12 @@ impl CortexM0Plus {
         if start & 3 == 0
             && let Some(mem) = bus.ram(start, 4 * count, false)
         {
-            let mut words = mem.chunks_exact(4);
+            let mut words = mem.as_chunks::<4>().0.iter();
             for i in 0..8 {
                 if list & (1 << i) != 0
                     && let Some(w) = words.next()
                 {
-                    self.r[i] = u32::from_le_bytes([w[0], w[1], w[2], w[3]]);
+                    self.r[i] = u32::from_le_bytes(*w);
                 }
             }
             if list & (1 << rn) == 0 {
@@ -663,12 +663,12 @@ impl CortexM0Plus {
         if start & 3 == 0
             && let Some(mem) = bus.ram(start, 4 * count, true)
         {
-            let mut words = mem.chunks_exact_mut(4);
+            let mut words = mem.as_chunks_mut::<4>().0.iter_mut();
             for i in 0..15 {
                 if list & (1 << i) != 0
                     && let Some(w) = words.next()
                 {
-                    w.copy_from_slice(&self.r[i].to_le_bytes());
+                    *w = self.r[i].to_le_bytes();
                 }
             }
             self.r[13] = start;
@@ -687,7 +687,7 @@ impl CortexM0Plus {
             return None;
         }
         let mem = bus.ram(start, 4 * count, false)?;
-        let mut words = mem.chunks_exact(4).map(|w| u32::from_le_bytes([w[0], w[1], w[2], w[3]]));
+        let mut words = mem.as_chunks::<4>().0.iter().map(|w| u32::from_le_bytes(*w));
         for i in 0..8 {
             if list & (1 << i) != 0
                 && let Some(v) = words.next()

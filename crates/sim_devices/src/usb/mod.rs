@@ -294,7 +294,7 @@ pub fn parse_string(desc: &[u8]) -> Option<String> {
     }
     // bLength counts the header; a shorter one (a broken descriptor) is an empty string
     let n = (desc[0] as usize).clamp(2, desc.len());
-    let units: Vec<u16> = desc[2..n].chunks_exact(2).map(|c| u16::from_le_bytes([c[0], c[1]])).collect();
+    let units: Vec<u16> = desc[2..n].as_chunks::<2>().0.iter().map(|c| u16::from_le_bytes(*c)).collect();
     Some(String::from_utf16_lossy(&units))
 }
 
