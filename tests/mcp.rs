@@ -109,9 +109,19 @@ impl Drop for Client {
 /// Whether a process is gone (reaped, or never there).
 fn gone(pid: u64) -> bool {
     // A zombie is gone for our purposes too: it no longer runs
-    match std::fs::read_to_string(format!("/proc/{pid}/stat")) {
+    if Path::new("/proc/self/stat").exists() {
+        return match std::fs::read_to_string(format!("/proc/{pid}/stat")) {
+            Err(_) => true,
+            Ok(stat) => stat.rsplit(')').next().is_some_and(|rest| rest.trim_start().starts_with('Z')),
+        };
+    }
+    // No /proc (macOS): ps prints nothing for a process that is gone, and Z for a zombie
+    match Command::new("ps").args(["-o", "stat=", "-p", &pid.to_string()]).output() {
+        Ok(o) => {
+            let state = String::from_utf8_lossy(&o.stdout);
+            state.trim().is_empty() || state.trim_start().starts_with('Z')
+        }
         Err(_) => true,
-        Ok(stat) => stat.rsplit(')').next().is_some_and(|rest| rest.trim_start().starts_with('Z')),
     }
 }
 
