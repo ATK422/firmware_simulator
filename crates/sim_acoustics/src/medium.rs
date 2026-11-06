@@ -301,6 +301,8 @@ struct Wave {
     /// Grid index of `samples[0]`.
     base: u64,
     samples: VecDeque<f32>,
+    /// The last sample computed that is not zero (either sign), by grid index.
+    last_loud: Option<u64>,
 }
 
 /// Where a projector's drive was ([`ProjectorState::mark`]), to go back to.
@@ -372,6 +374,23 @@ impl WaveReader<'_> {
     pub fn pressure(&mut self, t: f64) -> f64 {
         self.wave.pressure(t, self.drive)
     }
+
+    /// Whether [`WaveReader::pressure`] is exactly zero (either sign) at every time from `from` to `to` (s): every
+    /// sample it would interpolate between is computed and zero. Computes the samples up to there first, as far as
+    /// the drive is known (as reading them would).
+    pub fn silent(&mut self, from: f64, to: f64) -> bool {
+        if to < 0.0 {
+            return true;
+        }
+        // The samples `pressure` reads at times from..=to (its `floor` does not shrink as the time grows)
+        let first = if from < 0.0 { -1 } else { (from * RATE_HZ).floor() as i64 };
+        let last = (to * RATE_HZ).floor() as u64 + 1;
+        let w = &mut *self.wave;
+        if last >= w.computed() {
+            w.compute_to(last, self.drive);
+        }
+        last < w.computed() && w.last_loud.is_none_or(|l| (l as i64) < first)
+    }
 }
 
 impl Wave {
@@ -415,8 +434,11 @@ impl Wave {
                 high += (end - t).as_ps();
             }
             let v = self.drive_v * high as f64 / STEP_PS as f64;
-            let p = self.resonator.process(v) * self.gain;
-            self.samples.push_back(p as f32);
+            let p = (self.resonator.process(v) * self.gain) as f32;
+            if p.to_bits() & 0x7FFF_FFFF != 0 {
+                self.last_loud = Some(n);
+            }
+            self.samples.push_back(p);
             if self.samples.len() as f64 > HISTORY_S * RATE_HZ {
                 self.samples.pop_front();
                 self.base += 1;
@@ -521,6 +543,7 @@ impl Medium {
             progress: Time::ZERO,
             base: 0,
             samples: VecDeque::new(),
+            last_loud: None,
         };
         let drive_state = Drive { edges: VecDeque::new(), progress: Time::ZERO, pushed: 0 };
         self.projectors.push(Projector {
