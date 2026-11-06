@@ -86,6 +86,7 @@ fi
 # shellcheck disable=SC1091
 . "$repo/scripts/can_transport.sh"
 choose_transport "$transport_wanted" can0 can1
+# shellcheck disable=SC2154 # transport and transport_why: set by can_transport.sh
 echo "CAN transport: $transport ($transport_why)" >&2
 
 # A real CAN adapter called can0 would get the emulator's frames (or the controller's): refuse anything but vcan
@@ -103,10 +104,8 @@ if [ "$dry" -eq 0 ]; then
     mkdir -p "$run_dir"
 fi
 # The external bus (the smart battery) when the robot file has one
-external=0
 buses=(internal)
 if grep -q '^name = "external"' "$robot" 2>/dev/null; then
-    external=1
     buses+=(external)
 fi
 # How each bus reaches the robot computer's side: its vcan, or UDP (one micro-ROS agent for both buses' C boards,

@@ -86,6 +86,7 @@ done
 # shellcheck disable=SC1091
 . "$repo/scripts/can_transport.sh"
 choose_transport "$transport_wanted" can0 can1
+# shellcheck disable=SC2154 # transport and transport_why: set by can_transport.sh
 echo "CAN transport: $transport ($transport_why)" >&2
 if [ "$transport" = udp ]; then
     # complete_controller writes its thruster RPMs to can0 itself; without can0 the bridge makes them
