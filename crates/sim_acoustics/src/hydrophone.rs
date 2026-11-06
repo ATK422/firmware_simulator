@@ -15,6 +15,8 @@
 //! samples there are all zero: one not driven, its ringing died away below the smallest `f32`) is left out of the
 //! sum, which changes nothing: the sum starts at +0 and is never -0, and adding a zero of either sign to it leaves
 //! it as it is (`Hydrophone::skip_quiet`; in a pool of IVC boards, which transmit now and then, most of the time).
+//! The others' paths are computed [`LANES`] at a time in SIMD lanes and added up in the same order as one at a time,
+//! which changes no bit either ([`crate::lanes`], `Hydrophone::lanes`).
 //!
 //! In a shared [`Medium`](crate::medium::Medium) the hydrophone also hears the other boards' projectors. When
 //! the hydrophone or a projector moves, every path is recomputed each [`BLOCK_STEPS`] and the delays and gains are
@@ -31,6 +33,7 @@ use sim_core::time::Time;
 use crate::chain::{Chain, ChainSpec};
 use crate::env::Environment;
 use crate::geometry::Vec3;
+use crate::lanes::{self, LANES};
 use crate::medium::{Medium, ProjectorState, SharedMedium, Trajectory, WaveReader};
 use crate::noise;
 use crate::transducer::Transducer;
@@ -59,6 +62,78 @@ struct Tap {
     volts_per_upa: [f64; 2],
 }
 
+/// The taps of each origin side by side, [`LANES`] at a time, for the path sum in lanes
+/// ([`Hydrophone::raw_lanes`]): their delays and gains at the block's start, and how much they change over it (as
+/// [`Hydrophone::raw`] computes them). An origin's last lanes are padded with copies of its last tap, whose values
+/// are computed and never added.
+#[derive(Clone, Debug, Default)]
+struct WideTaps {
+    groups: Vec<Group>,
+    lanes: Vec<TapLanes>,
+}
+
+/// [`LANES`] taps of an origin.
+#[derive(Clone, Debug)]
+struct TapLanes {
+    d0: [f64; LANES],
+    dd: [f64; LANES],
+    g0: [f64; LANES],
+    dg: [f64; LANES],
+}
+
+/// An origin's taps in [`WideTaps`]: `len` of them, in its lanes from `start` to `end`.
+#[derive(Clone, Debug)]
+struct Group {
+    from: Origin,
+    slot: usize,
+    len: usize,
+    start: usize,
+    end: usize,
+}
+
+/// Room for [`Hydrophone::raw_lanes`]'s values: lanes for an origin's taps.
+#[derive(Clone, Debug, Default)]
+struct Scratch {
+    at: Vec<[f64; LANES]>,
+    p: Vec<[f64; LANES]>,
+    k: Vec<[f64; LANES]>,
+    b: Vec<[f64; LANES]>,
+}
+
+impl Scratch {
+    fn fit(&mut self, n: usize) {
+        for v in [&mut self.at, &mut self.p, &mut self.k, &mut self.b] {
+            if v.len() < n {
+                v.resize(n, [0.0; LANES]);
+            }
+        }
+    }
+}
+
+impl WideTaps {
+    fn of(taps: &[Tap]) -> WideTaps {
+        let mut w = WideTaps::default();
+        let mut i = 0;
+        while i < taps.len() {
+            let (from, slot) = (taps[i].from, taps[i].slot);
+            let len = taps[i..].iter().take_while(|t| t.slot == slot).count();
+            let start = w.lanes.len();
+            for c in 0..len.div_ceil(LANES) {
+                let tap = |j: usize| &taps[i + (c * LANES + j).min(len - 1)];
+                w.lanes.push(TapLanes {
+                    d0: std::array::from_fn(|j| tap(j).delay_s[0]),
+                    dd: std::array::from_fn(|j| tap(j).delay_s[1] - tap(j).delay_s[0]),
+                    g0: std::array::from_fn(|j| tap(j).volts_per_upa[0]),
+                    dg: std::array::from_fn(|j| tap(j).volts_per_upa[1] - tap(j).volts_per_upa[0]),
+                });
+            }
+            w.groups.push(Group { from, slot, len, start, end: w.lanes.len() });
+            i += len;
+        }
+        w
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct Hydrophone {
     pub env: Arc<Environment>,
@@ -84,6 +159,16 @@ pub struct Hydrophone {
     /// Leave out the taps of origins that give exactly zero (on by default; off only to check that it changes
     /// nothing).
     pub skip_quiet: bool,
+    /// Compute each origin's paths together, in SIMD lanes, and add them up in order, exactly as one at a time
+    /// ([`crate::lanes`]; on by default; off: `Hydrophone::raw` path by path, the reference).
+    pub lanes: bool,
+    /// The taps as [`Hydrophone::lanes`] reads them.
+    wide: WideTaps,
+    /// Whether each projector's taps in the block are close enough in delay for the lanes (their reads are far
+    /// less than the projector's history apart, see `WaveReader::pressure_lanes`).
+    lanes_ok: bool,
+    /// Room for the lanes' values.
+    scratch: Scratch,
     /// Steps computed with some origin left out (statistics).
     quiet_steps: u64,
     moves: bool,
@@ -144,6 +229,10 @@ impl Hydrophone {
             spans: Vec::new(),
             quiet: Vec::new(),
             skip_quiet: true,
+            lanes: true,
+            wide: WideTaps::default(),
+            lanes_ok: false,
+            scratch: Scratch::default(),
             quiet_steps: 0,
             moves: false,
             centre_hz: centre,
@@ -259,7 +348,11 @@ impl Hydrophone {
                 );
             }
         }
+        self.wide = WideTaps::of(&taps);
         self.taps = taps;
+        // (A margin as `find_quiet`'s for the rounding of the delays, many times over)
+        self.lanes_ok =
+            spans[nsrc..].iter().all(|&(short, long)| short > long || long - short < crate::medium::HISTORY_S - 0.01);
         self.spans = spans;
         self.block = Some((block, nproj));
     }
@@ -326,6 +419,60 @@ impl Hydrophone {
                 }
             };
             v += gain * p;
+        }
+        if self.noise_rms_v > 0.0 {
+            v += self.noise_rms_v * noise::gaussian(self.seed, n);
+        }
+        if let Some(sh) = &self.env.shrimp {
+            v += self.shrimp(sh, t);
+        }
+        v
+    }
+
+    /// [`Hydrophone::raw`] at grid step `n`, the same to the bit, with [`LANES`] paths of an origin computed at
+    /// a time ([`crate::lanes`]): their terms (each path's gain times the origin's pressure at the step's time less
+    /// its delay, as `raw` computes them) in loops over the lanes that vectorize, then added to the sum one after
+    /// the other in the order `raw` adds them.
+    fn raw_lanes(&self, n: u64, heard: &mut [Option<WaveReader<'_>>], scratch: &mut Scratch) -> f64 {
+        let t = n as f64 / self.rate;
+        let f = (n % BLOCK_STEPS) as f64 / BLOCK_STEPS as f64;
+        let mut v = 0.0;
+        for g in &self.wide.groups {
+            if self.quiet.get(g.slot).copied().unwrap_or(false) {
+                continue;
+            }
+            let taps = &self.wide.lanes[g.start..g.end];
+            let at = &mut scratch.at[..taps.len()];
+            for (at, tl) in at.iter_mut().zip(taps) {
+                lanes::times(at, &tl.d0, &tl.dd, t, f);
+            }
+            let p = &mut scratch.p[..taps.len()];
+            match g.from {
+                Origin::Source(i) => {
+                    let s = &self.env.sources[i];
+                    for (k, (p, at)) in p.iter_mut().zip(at.iter()).enumerate() {
+                        let real = (g.len - k * LANES).min(LANES);
+                        for j in 0..real {
+                            p[j] = s.pressure(at[j]);
+                        }
+                        // (The padding's terms are computed too, and never added)
+                        p[real..].fill(0.0);
+                    }
+                }
+                Origin::Projector(i) => match heard.get_mut(i).and_then(Option::as_mut) {
+                    Some(r) => {
+                        r.pressure_lanes(at, g.len, p, &mut scratch.k[..taps.len()], &mut scratch.b[..taps.len()])
+                    }
+                    None => p.fill([0.0; LANES]),
+                },
+            }
+            for (k, (p, tl)) in p.iter().zip(taps).enumerate() {
+                let mut term = [0.0; LANES];
+                lanes::terms(&mut term, &tl.g0, &tl.dg, p, f);
+                for &term in &term[..(g.len - k * LANES).min(LANES)] {
+                    v += term;
+                }
+            }
         }
         if self.noise_rms_v > 0.0 {
             v += self.noise_rms_v * noise::gaussian(self.seed, n);
@@ -413,9 +560,19 @@ impl Hydrophone {
             if self.quiet.contains(&true) {
                 self.quiet_steps += last - n + 1;
             }
-            for n in n..=last {
-                let raw = self.raw(n, heard);
-                self.last = self.chain.process(raw, pins);
+            if self.lanes && self.lanes_ok {
+                let mut scratch = std::mem::take(&mut self.scratch);
+                scratch.fit(self.wide.groups.iter().map(|g| g.end - g.start).max().unwrap_or(0));
+                for n in n..=last {
+                    let raw = self.raw_lanes(n, heard, &mut scratch);
+                    self.last = self.chain.process(raw, pins);
+                }
+                self.scratch = scratch;
+            } else {
+                for n in n..=last {
+                    let raw = self.raw(n, heard);
+                    self.last = self.chain.process(raw, pins);
+                }
             }
             drop(few);
             drop(many);
@@ -652,6 +809,287 @@ mod tests {
             // Most steps left some origin out: the projector after its drive, the pinger between pulses
             assert!(on.quiet_steps > on.samples, "{} of {}", on.quiet_steps, on.samples);
             assert_eq!(off.quiet_steps, 0);
+        }
+    }
+
+    /// xorshift64: the tests' random numbers.
+    struct Rng(u64);
+
+    impl Rng {
+        fn next(&mut self) -> u64 {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            self.0
+        }
+
+        fn below(&mut self, n: u64) -> u64 {
+            self.next() % n.max(1)
+        }
+
+        /// Uniform in `0..1`.
+        fn unit(&mut self) -> f64 {
+            (self.next() >> 11) as f64 / (1u64 << 53) as f64
+        }
+
+        fn pick<T: Copy>(&mut self, of: &[T]) -> T {
+            of[self.below(of.len() as u64) as usize]
+        }
+
+        /// A gain: mostly ordinary, sometimes zero of either sign, subnormal, tiny enough for subnormal products,
+        /// or huge.
+        fn gain(&mut self) -> f64 {
+            let sign = if self.next() & 1 == 0 { 1.0 } else { -1.0 };
+            sign * match self.below(10) {
+                0 => 0.0,
+                1 => f64::from_bits(1 + self.below(1 << 52)),
+                2 => 1e-300 * self.unit(),
+                3 => 1e300 * self.unit(),
+                _ => 1e-9 * (0.5 + self.unit()),
+            }
+        }
+
+        /// A projector sample: mostly ordinary, sometimes zero of either sign or subnormal.
+        fn sample(&mut self) -> f32 {
+            let sign = if self.next() & 1 == 0 { 1.0 } else { -1.0 };
+            sign * match self.below(8) {
+                0 => 0.0,
+                1 => f32::from_bits(1 + self.below(1 << 23) as u32),
+                _ => (1e9 * self.unit()) as f32,
+            }
+        }
+    }
+
+    /// Sources of every kind the hydrophone sums: a pinger whose pulses come and go within the delays read, a tone and
+    /// a chirp.
+    fn sources() -> Vec<Source> {
+        vec![
+            Source {
+                position: [20.0, 6.0, 2.0],
+                waveform: Waveform::Pinger { hz: 25_000.0, pulse: 4e-3, period: 9e-3, start: 0.05 },
+                rms_upa: 1e9,
+            },
+            Source { position: [3.0, 2.0, 1.0], waveform: Waveform::Tone { hz: 31_000.0 }, rms_upa: 1e7 },
+            Source {
+                position: [12.0, 9.0, 0.5],
+                waveform: Waveform::Chirp { f0: 20e3, f1: 40e3, duration: 3e-3, period: 7e-3 },
+                rms_upa: 3e8,
+            },
+        ]
+    }
+
+    #[test]
+    fn lanes_give_every_raw_value_bit_for_bit() {
+        // Random taps (every count of them from none to more than eight lanes' worth, odd ones and fewer than a
+        // lane), delays and gains (moving: changing over the block; zeros, subnormal and huge gains), over sources
+        // and projectors whose samples are random (zeros, subnormal) with times read before the first sample,
+        // after the last one computed, before time zero and across the deque's wrap; quiet origins left out; steps
+        // anywhere in a block and at its edges, with noise and shrimp or without: `raw_lanes` gives `raw`'s value
+        // to the bit, through the lanes and through the fallback one time at a time
+        let mut r = Rng(0x2545_F491_4F6C_DD1D);
+        let (mut reads, mut wrapped, mut reordered) = ([0u64; 2], false, false);
+        let counts = [0usize, 1, 2, 3, 7, 8, 9, 15, 16, 17, 31, 63, 64, 65, 70];
+        for case in 0..400 {
+            let mut env = pool();
+            env.sources = sources();
+            if case % 3 == 0 {
+                env.noise = crate::noise::Noise::White { level_db_re_upa_per_hz: 60.0 };
+            }
+            if case % 5 == 0 {
+                env.shrimp = Some(crate::noise::Shrimp { rate_hz: 2_000.0, peak_db_re_upa: 150.0, decay_us: 50.0 });
+            }
+            let medium = Medium::shared(Arc::new(env));
+            let t: Transducer = toml::from_str("rvs_db = -190").unwrap();
+            let drive = crate::medium::DriveSpec { pin: 7, supply_v: 12.0, nominal_hz: Some(25e3) };
+            {
+                let mut m = medium.lock().unwrap();
+                // Three heard and the hydrophone's own board's (not heard: its taps read zero)
+                for owner in [0, 0, 1, 0] {
+                    let id = m.add_projector(owner, "tx", t.clone(), Trajectory::Fixed([1.0; 3]), &drive);
+                    // Mostly all the times read, sometimes few of them
+                    let len = r.pick(&[0, 1, 2, 9, 100, 5_000, 60_000, 200_000, 200_000, 200_000]);
+                    let samples: Vec<f32> = (0..len).map(|_| r.sample()).collect();
+                    let base = if len >= 200_000 { 1_900_000 } else { 1_960_000 + r.below(30_000) };
+                    m.projectors[id].state.set_samples(base, &samples, r.below(len + 1) as usize);
+                }
+            }
+            let env = medium.lock().unwrap().env.clone();
+            let mut h = Hydrophone::new(env, [0.0; 3], t, ChainSpec::default()).in_medium(medium.clone(), 1);
+            h.refresh_heard(&medium.lock().unwrap(), 1);
+            let nsrc = h.env.sources.len();
+            let mut taps = Vec::new();
+            for slot in 0..nsrc + 4 {
+                let from = if slot < nsrc { Origin::Source(slot) } else { Origin::Projector(slot - nsrc) };
+                for _ in 0..r.pick(&counts) {
+                    // Sometimes times before zero, the future, or not numbers
+                    let d0 = match if case % 4 == 1 { r.below(20) } else { 9 } {
+                        0 => 3.0 + r.unit(),
+                        1 => -1e-3 * r.unit(),
+                        2 => r.pick(&[f64::NAN, f64::INFINITY, f64::NEG_INFINITY, 0.0]),
+                        _ => 0.08 * r.unit(),
+                    };
+                    let d1 = match r.below(4) {
+                        0 => d0,
+                        1 => d0 + 1e-2 * r.unit(),
+                        _ => d0 + 2e-6 * (r.unit() - 0.5),
+                    };
+                    taps.push(Tap { from, slot, delay_s: [d0, d1], volts_per_upa: [r.gain(), r.gain()] });
+                }
+            }
+            h.wide = WideTaps::of(&taps);
+            h.taps = taps;
+            h.quiet = match case % 4 {
+                0 => Vec::new(),
+                _ => (0..nsrc + 4).map(|_| r.below(4) == 0).collect(),
+            };
+            let states = h.heard.clone();
+            let mut heard: Vec<_> = states.iter().map(|s| s.as_ref().map(|s| s.read())).collect();
+            let mut scratch = Scratch::default();
+            scratch.fit(h.wide.groups.iter().map(|g| g.end - g.start).max().unwrap_or(0));
+            let mut backwards = h.clone();
+            backwards.taps.reverse();
+            for _ in 0..30 {
+                let n = match r.below(4) {
+                    0 => 2_000_000 + 1_000 * r.below(60) + r.pick(&[0, 1, 999]),
+                    _ => 2_000_000 + r.below(60_000),
+                };
+                let (want, got) = (h.raw(n, &mut heard), h.raw_lanes(n, &mut heard, &mut scratch));
+                assert_eq!(want.to_bits(), got.to_bits(), "case {case}, step {n}: {want:e} vs {got:e}");
+                // The same terms added in another order give another sum somewhere: the comparison would see a
+                // change of order
+                reordered |= backwards.raw(n, &mut heard).to_bits() != want.to_bits();
+            }
+            drop(heard);
+            for s in states.iter().flatten() {
+                let [lanes, each] = s.lane_reads();
+                (reads[0], reads[1]) = (reads[0] + lanes, reads[1] + each);
+                wrapped |= s.wraps() && lanes > 0;
+            }
+        }
+        assert!(reads[0] > 1_000 && reads[1] > 1_000, "{reads:?}");
+        assert!(wrapped && reordered, "{wrapped} {reordered}");
+    }
+
+    #[test]
+    fn subnormal_and_zero_terms_are_computed_as_ieee() {
+        // Every term subnormal or zero (samples of a few subnormal f32s, gains so small that their products are
+        // subnormal f64s, or zero of either sign): the lanes give the sums `raw` does, subnormal ones among them
+        // (no flush to zero), and zero samples give +0
+        let medium = Medium::shared(Arc::new(pool()));
+        let t: Transducer = toml::from_str("rvs_db = -190").unwrap();
+        let drive = crate::medium::DriveSpec { pin: 7, supply_v: 12.0, nominal_hz: Some(25e3) };
+        let mut r = Rng(0x9E37_79B9_7F4A_7C15);
+        let id = medium.lock().unwrap().add_projector(0, "tx", t.clone(), Trajectory::Fixed([1.0; 3]), &drive);
+        let env = medium.lock().unwrap().env.clone();
+        for samples in [0, 1, 2] {
+            let wave: Vec<f32> = (0..20_000)
+                .map(|i| match samples {
+                    0 => f32::from_bits(1 + r.below(64) as u32) * if i % 2 == 0 { 1.0 } else { -1.0 },
+                    1 => 0.0,
+                    _ => -0.0,
+                })
+                .collect();
+            medium.lock().unwrap().projectors[id].state.set_samples(990_000, &wave, 0);
+            let mut h =
+                Hydrophone::new(env.clone(), [0.0; 3], t.clone(), ChainSpec::default()).in_medium(medium.clone(), 1);
+            h.refresh_heard(&medium.lock().unwrap(), 1);
+            h.taps = (0..63)
+                .map(|i| {
+                    let d0 = 1e-3 + 1e-4 * i as f64 + 1e-7 * r.unit();
+                    let g = [1e-290, 5e-300, -3e-280, 0.0, -0.0][i % 5] * (1.0 + r.unit());
+                    Tap { from: Origin::Projector(0), slot: 0, delay_s: [d0, d0 + 1e-7], volts_per_upa: [g, g * 0.9] }
+                })
+                .collect();
+            h.wide = WideTaps::of(&h.taps);
+            let states = h.heard.clone();
+            let mut heard: Vec<_> = states.iter().map(|s| s.as_ref().map(|s| s.read())).collect();
+            let mut scratch = Scratch::default();
+            scratch.fit(8);
+            let mut tiny = 0;
+            for n in 1_000_000..1_002_000 {
+                let (want, got) = (h.raw(n, &mut heard), h.raw_lanes(n, &mut heard, &mut scratch));
+                assert_eq!(want.to_bits(), got.to_bits(), "step {n}: {want:e} vs {got:e}");
+                if samples == 0 {
+                    tiny += (want != 0.0 && want.abs() < f64::MIN_POSITIVE) as u32;
+                } else {
+                    assert_eq!(got.to_bits(), 0.0f64.to_bits(), "step {n}");
+                }
+            }
+            assert!(samples != 0 || tiny > 1_000, "{tiny}");
+            drop(heard);
+            assert!(states.iter().flatten().all(|s| s.lane_reads()[0] > 0));
+        }
+    }
+
+    /// A projector in `env` driven in bursts (3 ms of a square wave at 25 kHz, 4 ms off, for 300 ms) and a hydrophone
+    /// hearing it, either on a trajectory.
+    fn bursts_link(env: Environment, tx: Trajectory, rx: Trajectory) -> Hydrophone {
+        use crate::medium::{DriveSpec, Medium};
+        let medium = Medium::shared(Arc::new(env));
+        let t: Transducer =
+            toml::from_str("tvr = { resonance_hz = 25_000, q = 6, peak_db = 140 }\nrvs_db = -190").unwrap();
+        {
+            let mut m = medium.lock().unwrap();
+            let id = m.add_projector(0, "tx", t.clone(), tx, &DriveSpec { pin: 7, supply_v: 12.0, nominal_hz: None });
+            let half = Time::from_ps(1_000_000_000_000 / 50_000);
+            let mut at = Time::ZERO;
+            while at < Time::from_ms(300) {
+                let burst_end = at + Time::from_ms(3);
+                let mut level = true;
+                while at < burst_end {
+                    m.edge(id, at, level);
+                    level = !level;
+                    at += half;
+                }
+                m.edge(id, at, false);
+                at += Time::from_ms(4);
+            }
+            m.progress(0, Time::from_ms(500));
+        }
+        let chain = ChainSpec { gain_db: 30.0, bandpass_hz: Some([15_000.0, 45_000.0]), ..Default::default() };
+        let env = medium.lock().unwrap().env.clone();
+        Hydrophone::new(env, [0.0; 3], t, chain).in_medium(medium, 1).moving(rx)
+    }
+
+    #[test]
+    fn lanes_change_no_sample() {
+        // A projector driven in bursts and silent between them, a pinger, noise and shrimp, heard over the pool's
+        // 63 paths each, fixed and moving ends (blocks of taps interpolated and rebuilt), sampled at uneven
+        // intervals with gaps short and long (where the chain restarts from its preroll), the silent origins left
+        // out and not: every sample the same to the bit with the path sum in lanes and one path at a time
+        let mut env = pool();
+        env.sources.push(sources().remove(0));
+        env.noise = crate::noise::Noise::White { level_db_re_upa_per_hz: 50.0 };
+        env.shrimp = Some(crate::noise::Shrimp { rate_hz: 500.0, peak_db_re_upa: 160.0, decay_us: 80.0 });
+        let moving = |x: f64, v: f64| Trajectory::Linear { start_m: [x, 6.0, 1.5], velocity_mps: [v, 0.2, 0.0] };
+        let ends = [
+            (Trajectory::Fixed([10.0, 6.0, 1.5]), Trajectory::Fixed([5.0, 6.0, 1.5])),
+            (Trajectory::Fixed([10.0, 6.0, 1.5]), moving(5.0, 0.5)),
+            (moving(10.0, -1.5), Trajectory::Fixed([5.0, 6.0, 1.5])),
+            (moving(10.0, -1.5), moving(5.0, 1.5)),
+        ];
+        let mut r = Rng(0xD1B5_4A32_D192_ED03);
+        for (i, (tx, rx)) in ends.into_iter().enumerate() {
+            for skip_quiet in [true, false] {
+                let mut lanes = bursts_link(env.clone(), tx.clone(), rx.clone());
+                let mut each = bursts_link(env.clone(), tx.clone(), rx.clone());
+                (lanes.skip_quiet, each.skip_quiet, each.lanes) = (skip_quiet, skip_quiet, false);
+                let mut t = Time::from_us(1);
+                while t < Time::from_ms(320) {
+                    let pins = (r.below(50) == 0) as u32;
+                    let (a, b) = (lanes.sample(t, pins), each.sample(t, pins));
+                    assert_eq!(a.to_bits(), b.to_bits(), "ends {i}, skip_quiet {skip_quiet}, at {t}");
+                    t += Time::from_ps(match r.below(2_000) {
+                        0 => 2_500_000_000,
+                        1 => 1_500_000_000,
+                        2 => 10_000_000 * r.below(100),
+                        k => 1_000_000 * (1 + k % 3) + r.below(1_000_000),
+                    });
+                }
+                let medium = lanes.medium().unwrap().clone();
+                let reads = medium.lock().unwrap().projectors[0].state.lane_reads();
+                assert!(reads[0] > 10_000, "{reads:?}");
+            }
         }
     }
 

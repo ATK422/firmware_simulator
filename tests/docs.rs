@@ -82,6 +82,7 @@ const OUTSIDE: &[(&str, &str)] = &[
     ("--tool", "valgrind"),
     ("--repeat", "the bench example"),
     ("--stats", "the bench example"),
+    ("--no-lanes", "the bench example"),
     ("--scope", "claude mcp add"),
     ("--reverse", "GDB/MI's -exec-continue and -exec-step"),
     ("--ros-prefix", "nano_ros_codegen"),

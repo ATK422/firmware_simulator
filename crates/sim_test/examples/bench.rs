@@ -8,6 +8,9 @@
 //!
 //! `--stats` prints what running ahead did in each robot case (windows, slices, rollbacks, cuts).
 //!
+//! `--no-lanes` has the hydrophones of robots in water sum their paths one at a time (`Hydrophone::lanes` off, the
+//! reference): the fingerprints must not change.
+//!
 //! `--coverage` collects code coverage (the cores run one instruction at a time): the fingerprints must not change.
 //!
 //! `--checkpoint-every` records the runs for time travel (`sim_host::timetravel`, as `run --gdb` and the dashboard
@@ -21,7 +24,9 @@
 //! `nereus_t3_ls` run `robots/talos_nereus.toml` as nereus drives it over vcan (every host side behind a live
 //! endpoint, the external vehicle's pose set between 10 ms runs) on one thread, three, and three slice by slice;
 //! their fingerprints match each other's. `ivc2_pool` is two Rust IVCBoard2s in the pool's acoustic medium,
-//! `ivc2_pool_t2` the same on two threads (same fingerprint); `ivc_board2_c`, `ivc2_pool_c` and `ivc2_pool_c_t2`
+//! `ivc2_pool_t2` the same on two threads (same fingerprint), `ivc2_pool_busy` and `ivc2_pool_busy_t2` the same
+//! while a packet crosses the water the whole run (Talos's board transmits from 300 ms on, and the other board's
+//! hydrophone hears its projector over the pool's 63 paths); `ivc_board2_c`, `ivc2_pool_c` and `ivc2_pool_c_t2`
 //! the same with titan_firmware's C IVCBoard2 (`robots/ivc2_pool_c.toml`), booted through the bootrom and its
 //! bootloader, run only when `TITAN_FIRMWARE_DIR` points at a build of it (skipped otherwise).
 //!
@@ -49,6 +54,9 @@ use sim_test::{Bench, RobotBench, Session, Time};
 /// `--stats`: print what running ahead did in each robot case.
 static STATS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
+/// `--no-lanes`: hydrophones sum their paths one at a time (`Hydrophone::lanes` off).
+static NO_LANES: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 struct Case {
     name: &'static str,
     kind: Kind,
@@ -69,6 +77,9 @@ enum Kind {
         threads: isize,
         live: bool,
         needs: Option<&'static str>,
+        /// The first bridge has its board transmit acoustically from [`BUSY_FROM`] on, so a packet crosses the
+        /// water for the whole run (`ivc2_pool_busy`).
+        busy: bool,
     },
     /// A titan_firmware C image (relative to `TITAN_FIRMWARE_DIR`; skipped without it) on its board file, booted
     /// through the bootrom and its bootloader, with no host on its bus (there is no mock bridge for the C boards).
@@ -91,37 +102,93 @@ const CASES: &[Case] = &[
     Case { name: "ivc_board2", kind: Kind::Board { elf: "ivc_board2", board: "talos/ivc_board", client: 8 } },
     Case {
         name: "talos",
-        kind: Kind::Robot { file: "talos.toml", bridges: TALOS_BRIDGES, threads: 1, live: false, needs: None },
+        kind: Kind::Robot {
+            file: "talos.toml",
+            bridges: TALOS_BRIDGES,
+            threads: 1,
+            live: false,
+            needs: None,
+            busy: false,
+        },
     },
     Case {
         name: "talos_mt",
-        kind: Kind::Robot { file: "talos.toml", bridges: TALOS_BRIDGES, threads: 4, live: false, needs: None },
+        kind: Kind::Robot {
+            file: "talos.toml",
+            bridges: TALOS_BRIDGES,
+            threads: 4,
+            live: false,
+            needs: None,
+            busy: false,
+        },
     },
     Case {
         name: "talos_t2",
-        kind: Kind::Robot { file: "talos.toml", bridges: TALOS_BRIDGES, threads: 2, live: false, needs: None },
+        kind: Kind::Robot {
+            file: "talos.toml",
+            bridges: TALOS_BRIDGES,
+            threads: 2,
+            live: false,
+            needs: None,
+            busy: false,
+        },
     },
     Case {
         name: "talos_t3",
-        kind: Kind::Robot { file: "talos.toml", bridges: TALOS_BRIDGES, threads: 3, live: false, needs: None },
+        kind: Kind::Robot {
+            file: "talos.toml",
+            bridges: TALOS_BRIDGES,
+            threads: 3,
+            live: false,
+            needs: None,
+            busy: false,
+        },
     },
     Case {
         name: "talos_t6",
-        kind: Kind::Robot { file: "talos.toml", bridges: TALOS_BRIDGES, threads: 6, live: false, needs: None },
+        kind: Kind::Robot {
+            file: "talos.toml",
+            bridges: TALOS_BRIDGES,
+            threads: 6,
+            live: false,
+            needs: None,
+            busy: false,
+        },
     },
     // On three threads in step slice by slice (`Robot::run_ahead` off), for comparison
     Case {
         name: "talos_t3_ls",
-        kind: Kind::Robot { file: "talos.toml", bridges: TALOS_BRIDGES, threads: -3, live: false, needs: None },
+        kind: Kind::Robot {
+            file: "talos.toml",
+            bridges: TALOS_BRIDGES,
+            threads: -3,
+            live: false,
+            needs: None,
+            busy: false,
+        },
     },
     // Talos with its bridge behind a live endpoint (as on vcan); fingerprints match each other's
     Case {
         name: "talos_live_t3",
-        kind: Kind::Robot { file: "talos.toml", bridges: TALOS_BRIDGES, threads: 3, live: true, needs: None },
+        kind: Kind::Robot {
+            file: "talos.toml",
+            bridges: TALOS_BRIDGES,
+            threads: 3,
+            live: true,
+            needs: None,
+            busy: false,
+        },
     },
     Case {
         name: "talos_live_t3_ls",
-        kind: Kind::Robot { file: "talos.toml", bridges: TALOS_BRIDGES, threads: -3, live: true, needs: None },
+        kind: Kind::Robot {
+            file: "talos.toml",
+            bridges: TALOS_BRIDGES,
+            threads: -3,
+            live: true,
+            needs: None,
+            busy: false,
+        },
     },
     // nereus over vcan (live endpoints, an external vehicle); its fingerprints match each other's
     Case { name: "nereus", kind: Kind::Nereus { threads: 1 } },
@@ -129,25 +196,81 @@ const CASES: &[Case] = &[
     Case { name: "nereus_t3_ls", kind: Kind::Nereus { threads: -3 } },
     Case {
         name: "ivc2_pool",
-        kind: Kind::Robot { file: "ivc2_pool.toml", bridges: IVC2_BRIDGES, threads: 1, live: false, needs: None },
+        kind: Kind::Robot {
+            file: "ivc2_pool.toml",
+            bridges: IVC2_BRIDGES,
+            threads: 1,
+            live: false,
+            needs: None,
+            busy: false,
+        },
     },
     // The same on two threads, running ahead of each other within the acoustic lookahead; same fingerprint
     Case {
         name: "ivc2_pool_t2",
-        kind: Kind::Robot { file: "ivc2_pool.toml", bridges: IVC2_BRIDGES, threads: 2, live: false, needs: None },
+        kind: Kind::Robot {
+            file: "ivc2_pool.toml",
+            bridges: IVC2_BRIDGES,
+            threads: 2,
+            live: false,
+            needs: None,
+            busy: false,
+        },
+    },
+    // The same while a packet crosses the water the whole time (Talos's board transmits from 300 ms on, 9 s a byte):
+    // every hydrophone sample sums the other board's 63 paths
+    Case {
+        name: "ivc2_pool_busy",
+        kind: Kind::Robot {
+            file: "ivc2_pool.toml",
+            bridges: IVC2_BRIDGES,
+            threads: 1,
+            live: false,
+            needs: None,
+            busy: true,
+        },
+    },
+    Case {
+        name: "ivc2_pool_busy_t2",
+        kind: Kind::Robot {
+            file: "ivc2_pool.toml",
+            bridges: IVC2_BRIDGES,
+            threads: 2,
+            live: false,
+            needs: None,
+            busy: true,
+        },
     },
     // titan_firmware's C IVCBoard2, alone and two in the pool (in turn and on two threads; the pool's fingerprints
     // match each other's)
     Case { name: "ivc_board2_c", kind: Kind::CBoard { image: C_IVC2, board: "talos/ivc_board" } },
     Case {
         name: "ivc2_pool_c",
-        kind: Kind::Robot { file: "ivc2_pool_c.toml", bridges: &[], threads: 1, live: false, needs: Some(C_IVC2) },
+        kind: Kind::Robot {
+            file: "ivc2_pool_c.toml",
+            bridges: &[],
+            threads: 1,
+            live: false,
+            needs: Some(C_IVC2),
+            busy: false,
+        },
     },
     Case {
         name: "ivc2_pool_c_t2",
-        kind: Kind::Robot { file: "ivc2_pool_c.toml", bridges: &[], threads: 2, live: false, needs: Some(C_IVC2) },
+        kind: Kind::Robot {
+            file: "ivc2_pool_c.toml",
+            bridges: &[],
+            threads: 2,
+            live: false,
+            needs: Some(C_IVC2),
+            busy: false,
+        },
     },
 ];
+
+/// When a busy case's board is told to transmit (after its bridge connects, at about 0.32 s, the bytes are queued
+/// and the first goes out at 0.37 s).
+const BUSY_FROM: Time = Time::from_ms(300);
 
 /// The IVC2 pool's mock bridges, one per vehicle's bus.
 const IVC2_BRIDGES: &[(&str, u8)] = &[("talos", 8), ("surface", 8)];
@@ -296,11 +419,17 @@ fn run(
                 fingerprint: h.finish(),
             })
         }
-        Kind::Robot { file, bridges, live, needs, .. } => {
+        Kind::Robot { file, bridges, live, needs, busy, .. } => {
             if let Some(image) = needs {
                 sim_test::titan_firmware(image).ok_or("TITAN_FIRMWARE_DIR not set or image not built")?;
             }
             let mut r = RobotBench::load(file, bridges, |_| {})?;
+            if busy {
+                let b = r.bridges.iter().flatten().next().ok_or("no bridge to transmit through")?;
+                for byte in [0x5a, 0xa5, 0x3c, 0xc3] {
+                    b.send_at(BUSY_FROM, sim_host::mock_bridge::IvcModem::Ivc2.transmit(byte));
+                }
+            }
             if live {
                 for (rb, b) in r.robot.buses.iter_mut().zip(&r.bridges) {
                     rb.endpoints.clear();
@@ -319,6 +448,13 @@ fn run(
                 }
             }
             r.robot.run_ahead = !matches!(case.kind, Kind::Robot { threads, .. } if threads < 0);
+            if NO_LANES.load(std::sync::atomic::Ordering::Relaxed) {
+                for s in r.robot.boards.iter_mut() {
+                    for h in sim_host::acoustic::hydrophones(&mut s.machine) {
+                        h.lanes = false;
+                    }
+                }
+            }
             let (wall, cpu) = (Instant::now(), cpu_time());
             let mut stats = None;
             match travel {
@@ -475,6 +611,7 @@ fn main() {
             "--checkpoint-every" => travel = Some(Travel { every: parse_time(&value()), budget }),
             "--coverage" => coverage = true,
             "--stats" => STATS.store(true, std::sync::atomic::Ordering::Relaxed),
+            "--no-lanes" => NO_LANES.store(true, std::sync::atomic::Ordering::Relaxed),
             "--checkpoint-memory" => budget = value().parse::<usize>().expect("--checkpoint-memory MB") << 20,
             "--bench" => {} // passed by `cargo bench`-style runners
             other => panic!("unknown argument {other} (--time T, --repeat N, --only a,b, --threads N)"),

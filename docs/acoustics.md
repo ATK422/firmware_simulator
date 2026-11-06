@@ -174,7 +174,9 @@ threads, ahead of each other by up to the shortest delay between any hydrophone 
 what moving vehicles can close), with the same results as taking turns; boards closer than 15 cm, or carried by a
 simulated vehicle, take turns ([internals.md](internals.md#sessions-and-robots)). A hydrophone leaves out sources
 and projectors that are exactly silent over what it computes (a pinger between pulses, a board not transmitting),
-which changes no sample.
+which changes no sample, and computes the paths of the others eight at a time in SIMD lanes, adding them up in the
+same order as one at a time, so that every sample is the same to the bit
+([internals.md](internals.md#sessions-and-robots), *Acoustic media*).
 
 `robots/ivc_pool.toml` (two first-generation IVCBoards, 17/19 kHz FSK) and `robots/ivc2_pool.toml` (two
 IVCBoard2s) put one board on each of two vehicles' buses, 5 m apart in the pool:
