@@ -358,19 +358,24 @@ Measured with `cargo run --release -p sim_test --example bench -- --time 2s --re
 
 | Run | CPU time | Speed vs real time |
 |---|---|---|
-| `template` (power board) | 0.03 s | about 75x |
-| IVCBoard2 | 0.55 s | about 3.6x |
-| ESC board (four DShot ESCs on PIO) | 1.35 s | about 1.5x |
-| IVC2 pool (two boards in the water) | 2.15 s | about 0.9x |
-| Talos (nine boards), one thread | 3.7 s | about 0.54x |
-| Talos on three or four threads | 5-6 s (1.6-1.7 s wall) | about 1.2x |
-| Talos on three threads, its bridge on a live endpoint (as on vcan) | 5.2 s (1.8 s wall) | about 1.1x (0.7x before) |
-| nereus setup (`robots/talos_nereus.toml`, live host sides, external vehicle), three threads | 4.8 s (1.8-2.1 s wall) | about 1.0x (0.7x before) |
+| `template` (power board) | 0.02 s | about 90x |
+| IVCBoard2 | 0.50 s | about 4x |
+| IVCBoard2, titan_firmware's C app | 0.51 s | about 3.9x |
+| ESC board (four DShot ESCs on PIO) | 1.29 s | about 1.55x |
+| IVC2 pool (two boards in the water) | 1.41 s (0.95 s wall on two threads) | about 1.4x (2.1x) |
+| Talos (nine boards), one thread | 3.5 s | about 0.57x |
+| Talos on three or four threads | 4.7-5.5 s (1.6 s wall) | about 1.25x |
+| Talos on three threads, its bridge on a live endpoint (as on vcan) | 4.9 s (1.66 s wall) | about 1.2x (0.7x before) |
+| nereus setup (`robots/talos_nereus.toml`, live host sides, external vehicle), three threads | 4.5 s (1.7 s wall) | about 1.17x (0.7x before) |
+
+`cargo build --profile fast` (fat LTO) is a few percent faster than release, and `scripts/build_pgo.sh` (PGO on top,
+trained on the bench) 11-21 % faster; both take longer to build, and run exactly the same
+([internals.md](docs/internals.md#build-profiles)).
 
 So single boards run at or above real time. All of Talos keeps up with `--realtime` on three or more free cores:
 its boards run on threads by default (`--threads`) and ahead of each other between the slices where a CAN frame
-could reach them, which makes it about 2.2x faster than on one core (1.6-1.7 s for 2 s of virtual time, about
-1.2x real time); the costlier ESC board sets the pace. That holds with the real host tools too: frames from
+could reach them, which makes it about 2.2x faster than on one core (1.6 s for 2 s of virtual time, about
+1.25x real time); the costlier ESC board sets the pace. That holds with the real host tools too: frames from
 `--can` (SocketCAN) or `--cannelloni` enter the bus at the slice boundary that reads them, boards that already ran
 past it are rolled back, and with `--realtime` the emulator stays within 2 ms of the wall clock, so the robot in a
 box and the firmware in nereus keep up. Details: [internals.md](docs/internals.md#performance),

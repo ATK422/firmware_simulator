@@ -88,11 +88,18 @@ scheduled. Counters (timer, PWM, watchdog) are computed lazily from virtual time
    board waits out each 400 µs DShot frame time in such a loop (`while Instant::now() < min_frame_time {}`), which
    was 45 % of its quanta.
 4. **Quantum fusing** (`Machine::fuse_quanta`). While the other core cannot run, no SysTick counts the core clock
-   and the last quantum wrote memory and touched nothing else (the core is computing), the next quantum's first batch
-   may run on through up to 64 quanta: the boundaries in between would change nothing, since events are not due before the
-   limit and nothing that could wake the other core happens in a batch that touches only memory. A fused batch ends
-   after any other access (it may schedule an event or wake the other core) and after a timer read (busy-waits
-   poll the timer, and are only found at quantum boundaries); the rest of that quantum runs as usual.
+   and (where busy-waits are skipped, below) the last quantum was not quiet (it wrote memory or reached a
+   peripheral: the core is computing or polling), the next quantum's first batch may run on through up to 64 quanta: the boundaries in between would change
+   nothing, since no event is due before the limit and nothing wakes the other core. A fused batch ends after an
+   access that would make a boundary do something (`BatchBus::fuse`): one that moves the next event (or, when the
+   end of the run is the limit, brings one before it), changes either core's interrupt lines, or needs the machine
+   (a clock, reset or PSM change); accesses that leave all that alone, such as polling a UART or SPI status
+   register or feeding the watchdog, it runs through. Where busy-waits are skipped (the core's SysTick counts
+   nothing), it also ends at a timer or XOSC read once it has only read memory for two quanta's worth of cycles
+   (busy-waits poll those, and are only found at quantum boundaries), and the quanta after that are not fused; the
+   rest of that quantum runs as usual. Fused batches used to end at every access other than to memory, so the C
+   IVCBoard2's main loop, which polls peripherals and the timer and feeds the watchdog between its FFTs, ran in
+   16-instruction quanta (3 M per 2 s of virtual time), each costing about 600 host instructions of run-loop work.
    **SysTick on the reference clock** (CLKSOURCE clear: the watchdog's 1 µs tick, as pico-sdk and so the C firmware
    set it up) is fed lazily: when a batch starts, when the core is asked whether it wakes, and within a batch just
    before an instruction accesses a SysTick register (`Bus::take_reference_ticks`), so that every access sees the
@@ -135,7 +142,9 @@ scheduled. Counters (timer, PWM, watchdog) are computed lazily from virtual time
 `crates/sim_test/tests/fast_paths.rs` and the PIO tests (random programs, with each switch on and off) compare
 runs with and without them (`fast_paths.rs` also for `System::pio_fast_reads` and `System::sio_fast_irqs`, which
 spares the interrupt-line recomputation after SIO accesses other than to the FIFOs, `System::xosc_fast_reads` and
-`Machine::skip_spins`).
+`Machine::skip_spins`, and for `Machine::fuse_quanta` on the C IVCBoard2 too when `TITAN_FIRMWARE_DIR` is set).
+`fused_quanta.rs` has a two-core program whose fused batches poll peripherals, feed the watchdog, move the next
+event and wake the other core; it fails if a fused batch runs through any of the last two.
 
 Resets go through the same loop: a watchdog reset or `SYSRESETREQ` is a `ResetRequest` the machine carries out
 (`watchdog_reset`, `run_pin_reset`, `power_cycle`, `power_on_at`), with the reset kind reported in
@@ -524,14 +533,15 @@ with (built in the Nix shell), `ivc_board2_c` is `ccb6914471f62e02` and `ivc2_po
 Before comparing a change against these, check the images are that build (the bench prints the same fingerprints
 for the same images on any machine); when the pin moves, they change and this table with it.
 
-Measured on a 4-core machine (best wall time of three for 2 s of virtual time; CPU time is the same where one thread
-runs): template 0.03 s, ESC board 1.4 s, IVCBoard2 0.51-0.56 s (3.6-3.9x real time), the C IVCBoard2 0.65-0.68 s
-(about 3x; it was 1.4 s, 1.4x, while SysTick's reference ticks ended every batch and its bootloader ran from XIP
-SRAM through the general bus path: see the run loop), Talos 3.7-3.9 s, the IVC2 pool 1.44-1.52 s in turn (1.3-1.4x)
-and 0.97-1.02 s on two threads (about 2x; 2.17 s, 0.92x, when pools took turns and heard every silent path), the pool
-of C IVCBoard2s 1.65-1.70 s in turn and 1.17-1.20 s on two threads (1.7x; it was 3.82 s, 0.52x). Talos on threads
-(wall time): 1.7-1.8 s on three or four (1.1-1.2x real time), 2.4-2.5 s on two (both ESC boards share a thread
-with others there); slice by slice on three it was 2.5 s.
+Measured on a 4-core machine (best wall time of three for 2 s of virtual time, release profile; CPU time is the
+same where one thread runs): template 0.02 s, ESC board 1.29 s (1.55x real time), IVCBoard2 0.50 s (4x), the C
+IVCBoard2 0.51 s (3.9x; 0.665 s while fused batches ended at every peripheral access, see the run loop, and 1.4 s,
+1.4x, while SysTick's reference ticks ended every batch and its bootloader ran from XIP SRAM through the general bus
+path), Talos 3.5 s (0.57x; 3.9 s before), the IVC2 pool 1.41 s in turn (1.4x) and 0.94-0.96 s on two threads
+(2.1x; 2.17 s, 0.92x, when pools took turns and heard every silent path), the pool of C IVCBoard2s 1.34 s in turn
+and 0.99-1.0 s on two threads (2x; it was 3.82 s, 0.52x, then 1.66 s and 1.18 s). Talos on threads (wall time):
+1.6 s on three or four (1.2-1.25x real time), 2.3 s on two (both ESC boards share a thread with others there);
+slice by slice on three 2.35-2.4 s. nereus_t3 1.7 s (1.17x).
 The ESC board waits out each 400 µs DShot frame time on the timer (skipped across ticks up to its deadline, see
 the run loop), so what is left of its time is the frame itself: the control loop polling FSTAT while the PIO
 sends the frame and receives the replies. Per 100 µs slice an ESC board takes about 70 µs on average but its frames
@@ -540,10 +550,39 @@ about 2.4 s however many threads there are: about 0.8x real time. Running ahead 
 then bound by its costliest board, an ESC board at about 1.4 s, plus about 0.2-0.3 s for the windows (430 per 2 s:
 the one that is ahead waits for the other at each window's end; reruns after 100-150 rollbacks per ESC board; about
 36 µs per checkpoint). Under
-callgrind (400 ms, `--repeat 1`) the ESC board executes 2,510 M host instructions, against 3,692 M before these
-skips: about 45 % in the interpreter and the run loop's per-quantum work, 20 % in advancing the PIO (half of it
-ticking the receivers between their counted loops) and 5 % resolving pins. IVCBoard2 is all interpretation
-(1,660 M); there the dispatch's indirect branch, rather than the instructions executed, sets the pace (an
-interpreter with fewer instructions per op was slower on the wall clock). At boot, embassy's clock setup polls the
+callgrind (400 ms, `--repeat 1`) the ESC board executes 2,408 M host instructions, against 3,692 M before these
+skips (2,532 M before fused batches ran through peripheral accesses): about 45 % in the interpreter and the run
+loop's per-quantum work, 20 % in advancing the PIO (half of it ticking the receivers between their counted loops)
+and 5 % resolving pins. IVCBoard2 is all interpretation (1,605 M); there the dispatch's indirect branch, rather
+than the instructions executed, sets the pace (an interpreter with fewer instructions per op was slower on the wall
+clock). Its hydrophone ADC (500 kS/s into SRAM through DMA while it captures) costs little: over 2 s, 200 k
+events of which ADC conversions are most, 2.9 % of the host instructions in firing them (the conversion, the DMA
+transfer, the interrupt lines), against 93 % in batches, so the ADC and DMA are not made lazy as SysTick is. The C
+IVCBoard2 was the same 2.9 % for its ADC and DMA (it samples at about 93 kS/s), but 3.1 M batches for 78 M
+instructions: its main loop polls the UART, SPI and timer and feeds the watchdog, which ended every fused batch,
+so it ran in 16-instruction quanta with about 600 host instructions of run-loop work each (18 % of its time in the
+run loop itself, 4.6 % in recomputing interrupt lines after its peripheral reads). Fused batches now run through
+such accesses (see the run loop): 12.1 G host instructions for 2 s became 9.8 G, 3,836 M for its first 400 ms
+(boot, mostly) against 5,178 M. At boot, embassy's clock setup polls the
 XOSC status register for its 128 ms start-up delay (on the ring oscillator); that wait is skipped as a busy-wait
 (a three-instruction loop, so over three quanta).
+
+### Build profiles
+
+`release` (what the tests, CI and the commands above use) keeps cargo's 16 codegen units and no LTO, so that a
+change to one crate relinks quickly. Two optional builds are faster, and run exactly the same (same fingerprints):
+
+* `cargo build --profile fast` (binaries in `target/fast/`): whole-program (fat) LTO in one codegen unit. The bench
+  runs 3-7 % faster than release (IVCBoard2 0.55 to 0.51 s, the C IVCBoard2 0.665 to 0.635 s, the ESC board 1.42 to
+  1.37 s, Talos 3.87 to 3.75 s, the IVC2 pool 1.50 to 1.43 s); a clean build takes twice as long (`firmware_simulator`
+  about 125 s against 62 s on 4 cores, the bench another 66 s against 35 s) and every link redoes the LTO, which is
+  why the test suite's release profile does not use it. Thin LTO in one codegen unit gained 1-2 %,
+  `panic = "abort"` nothing on top of fat LTO (and the parallel runs and the scenario runner catch panics, so it is
+  not an option), `-C target-cpu=native` nothing (and is not portable: measure it on your machine if you like, with
+  `RUSTFLAGS="-C target-cpu=native" cargo build --profile fast`).
+* `scripts/build_pgo.sh` (needs `rustup component add llvm-tools` and the titan_firmware_rs images): the `fast`
+  profile with profile-guided optimisation, trained by running the bench for 1 s of virtual time per case. Against
+  release: IVCBoard2 0.46 s (16 % faster), the C IVCBoard2 0.525 s (21 %), the ESC board 1.25 s (12 %), Talos
+  3.39 s (12 %), the IVC2 pool 1.33 s (11 %). The script takes about 6 minutes (an instrumented build, the
+  training, the final build). The profile is only as good as the code it was trained on: rerun it after changing
+  the emulator.

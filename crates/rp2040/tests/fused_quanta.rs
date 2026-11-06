@@ -176,3 +176,168 @@ fn event_scheduled_inside_a_fused_batch() {
     assert_eq!(state, state_ref);
     assert_eq!(trace, trace_ref);
 }
+
+/// Core 0 computes while polling peripherals: each time round its inner loop it writes SRAM, reads UART0's flags and
+/// the timer twice; each time round the outer loop it writes to core 1's SIO FIFO, which wakes core 1 from WFI (its
+/// handler drains the FIFO and toggles GPIO 24: when core 1 wakes depends on where core 0's quantum ends), and feeds
+/// the watchdog (moving its timeout, at times the next event). Every other time it also arms a timer alarm a tick
+/// ahead (its handler toggles GPIO 25), then either busy-waits on the timer until three ticks past it, or moves the alarm two
+/// ticks later (the next event moves later) and polls on. A fused batch runs on through the polling and the
+/// feeding, and must end where an access moves the next event or wakes core 1, and at the busy-wait, for it to be
+/// found. Assembled from:
+///
+/// ```text
+/// .org 0x000; .word 0x20002000, 0x20000101   .org 0x040; .word 0x20000181 (TIMER_IRQ_0)
+/// .org 0x100                                 .org 0x180
+///     ldr r3, =0x20000400 (scratch)          timer_irq:
+///     ldr r4, =0x40034000 (UART0)                ldr r1, =0x40054000
+///     ldr r5, =0x40058000 (WATCHDOG)             movs r0, #1
+///     ldr r6, =0x40054000 (TIMER)                str r0, [r1, #0x34] (INTR)
+///     ldr r7, =0xD0000000 (SIO)                  ldr r1, =0xD000001C (GPIO_OUT_XOR)
+/// outer: movs r1, #40                            ldr r0, =1 << 25
+/// inner: str r1, [r3]                            str r0, [r1]
+///     ldr r0, [r4, #0x18] (UARTFR)               bx lr
+///     ldr r0, [r6, #0x28] (TIMERAWL)         .org 0x200 (core 1)
+///     ldr r0, [r6, #0x28]                    reset1: wfi
+///     subs r1, #1                                b reset1
+///     bne inner                              .org 0x220
+///     str r1, [r7, #0x54] (FIFO_WR)          sio_irq1:
+///     ldr r2, =16                                ldr r1, =0xD0000000
+///     str r2, [r5, #4] (LOAD: feed)          pop: ldr r0, [r1, #0x58] (FIFO_RD)
+///     ldr r2, [r3, #4]                           ldr r0, [r1, #0x50] (FIFO_ST)
+///     adds r2, #1                                lsls r0, r0, #31 (VLD)
+///     str r2, [r3, #4]                           bne pop
+///     lsls r0, r2, #31                           ldr r0, =1 << 24
+///     bne outer                                  str r0, [r1, #0x1C] (GPIO_OUT_XOR)
+///     ldr r0, [r6, #0x28]                        bx lr
+///     adds r0, #1                            .org 0x800 (core 1's vectors)
+///     str r0, [r6, #0x10] (ALARM0)           .word 0x20003000, 0x20000201
+///     lsls r1, r2, #30                       .org 0x880; .word 0x20000221 (SIO_IRQ_PROC1)
+///     bpl wait_setup
+///     adds r0, #2
+///     str r0, [r6, #0x10]
+///     b outer
+/// wait_setup: adds r0, #3
+/// wait: ldr r2, [r6, #0x28]
+///     cmp r2, r0
+///     bcc wait
+///     b outer
+/// ```
+#[test]
+fn fused_batches_run_through_polling() {
+    use rp2040::StopReason;
+    use rp2040::memmap::{IO_BANK0_BASE, RESETS_BASE, SIO_BASE, SRAM_BASE, TIMER_BASE, WATCHDOG_BASE};
+    use sim_core::bus::Size;
+    use sim_core::trace::NullSink;
+
+    const PROGRAM: &[(u32, u32)] = &[
+        (0x000, 0x20002000),
+        (0x004, 0x20000101),
+        (0x040, 0x20000181),
+        (0x100, 0x4C114B10),
+        (0x104, 0x4E124D11),
+        (0x108, 0x21284F12),
+        (0x10C, 0x69A06019),
+        (0x110, 0x6AB06AB0),
+        (0x114, 0xD1F93901),
+        (0x118, 0x4A0F6579),
+        (0x11C, 0x685A606A),
+        (0x120, 0x605A3201),
+        (0x124, 0xD1F007D0),
+        (0x128, 0x30016AB0),
+        (0x12C, 0x07916130),
+        (0x130, 0x3002D502),
+        (0x134, 0xE7E86130),
+        (0x138, 0x6AB23003),
+        (0x13C, 0xD3FC4282),
+        (0x140, 0x0000E7E3),
+        (0x144, 0x20000400),
+        (0x148, 0x40034000),
+        (0x14C, 0x40058000),
+        (0x150, 0x40054000),
+        (0x154, 0xD0000000),
+        (0x158, 0x00000010),
+        (0x180, 0x20014903),
+        (0x184, 0x49036348),
+        (0x188, 0x60084803),
+        (0x18C, 0x00004770),
+        (0x190, 0x40054000),
+        (0x194, 0xD000001C),
+        (0x198, 0x02000000),
+        (0x200, 0xE7FDBF30),
+        (0x220, 0x6D884903),
+        (0x224, 0x07C06D08),
+        (0x228, 0x4802D1FB),
+        (0x22C, 0x477061C8),
+        (0x230, 0xD0000000),
+        (0x234, 0x01000000),
+        (0x800, 0x20003000),
+        (0x804, 0x20000201),
+        (0x880, 0x20000221),
+    ];
+    let run = |fuse: bool, slice: Time| {
+        let mut m = Machine::new(MachineConfig::default());
+        m.fuse_quanta = fuse;
+        let sink = VecSink::new(&[Category::Gpio]);
+        m.set_trace(Box::new(sink.clone()));
+        for &(off, v) in PROGRAM {
+            assert!(m.sys.poke(SRAM_BASE + off, Size::Word, v));
+        }
+        m.direct_boot().unwrap();
+        let mut trace = NullSink;
+        let mut bus = rp2040::system::CoreBus { sys: &mut m.sys, trace: &mut trace, core: 1, now: Time::ZERO };
+        m.cores[1].reset(&mut bus, SRAM_BASE + 0x800);
+        m.core_enabled[1] = true;
+        let mut w = |addr: u32, v: u32| m.sys.write(&mut NullSink, 0, Time::ZERO, addr, Size::Word, v).unwrap();
+        w(WATCHDOG_BASE + 0x2C, 1 << 9 | 480); // a timer tick every 480 reference clock cycles (40 µs)
+        // IO_BANK0, PADS_BANK0, TIMER and UART0 out of reset
+        w(RESETS_BASE + 0x3000, 1 << 5 | 1 << 8 | 1 << 21 | 1 << 22);
+        for pin in [24, 25] {
+            w(IO_BANK0_BASE + pin * 8 + 4, 5); // SIO
+        }
+        w(SIO_BASE + 0x24, 3 << 24); // GPIO_OE_SET
+        w(TIMER_BASE + 0x38, 1); // INTE: alarm 0
+        w(WATCHDOG_BASE + 0x04, 16);
+        w(WATCHDOG_BASE, 1 << 30); // CTRL: ENABLE (eight ticks, fed in time: it never fires)
+        m.cores[0].nvic.enabled = 1;
+        m.cores[1].nvic.enabled = 1 << 16;
+        let end = Time::from_ms(12);
+        let mut t = Time::ZERO;
+        while t < end {
+            t = (t + slice).min(end);
+            assert_eq!(m.run_until(t), StopReason::TimeLimit);
+        }
+        let mut out = vec![format!("now {} resets {}", m.now, m.resets)];
+        for (c, core) in m.cores.iter().enumerate() {
+            let regs: Vec<u32> = (0..core.num_regs()).map(|r| core.read_reg(r)).collect();
+            out.push(format!(
+                "core{c} at {}: {} cycles, {} instructions, regs {regs:08x?}",
+                m.core_time(c),
+                core.cycles(),
+                core.instructions()
+            ));
+        }
+        out.push(format!(
+            "sram {:x}",
+            m.sys.sram.iter().fold(0u64, |h, &b| (h ^ b as u64).wrapping_mul(0x100_0000_01b3))
+        ));
+        let trace: Vec<String> = sink.take().into_iter().map(|(t, e)| format!("[{t}] {e}")).collect();
+        (out, trace, m.quanta_fused, m.spin_skipped)
+    };
+    // (Slices of a millisecond leave the watchdog's timeout the next event, before the end of the run, at times)
+    for slice in [Time::from_us(100), Time::from_us(37), Time::from_ms(1)] {
+        let (out, trace, fused, skipped) = run(true, slice);
+        let (out_ref, trace_ref, _, _) = run(false, slice);
+        assert_eq!(out, out_ref);
+        assert_eq!(trace, trace_ref);
+        // Both handlers ran, many times
+        for pin in [24, 25] {
+            let n = trace.iter().filter(|l| l.contains(&format!("GPIO{pin} "))).count();
+            assert!(n > 20, "GPIO {pin} toggled {n} times: {trace:?}");
+        }
+        assert!(out[0].ends_with("resets 0"), "{out:?}");
+        // Fused through the polling, and the busy-waits were still found
+        assert!(fused > 500, "{fused} quanta fused (slice {slice})");
+        assert!(skipped > 0, "{skipped} skipped (slice {slice})");
+    }
+}

@@ -3,7 +3,8 @@
 //! times, every message the bridge received with its time, UART and RTT text, and the final CPU registers, cycle and
 //! instruction counts, clocks and SRAM.
 //!
-//! * Quantum fusing (`Machine::fuse_quanta`, see `Machine::run_until`).
+//! * Quantum fusing (`Machine::fuse_quanta`, see `Machine::run_until`), also on titan_firmware's C IVCBoard2 with
+//!   `TITAN_FIRMWARE_DIR` set (its main loop polls peripherals, which fused batches run through).
 //! * PIO register reads that change nothing skip the second advance (`System::pio_fast_reads`).
 //! * SIO accesses other than to the FIFOs leave the interrupt lines alone (`System::sio_fast_irqs`).
 //! * XOSC reads skip the general path and leave quanta quiet (`System::xosc_fast_reads`), so that embassy-rp's
@@ -77,6 +78,45 @@ fn ivc_board2_fused_as_unfused() {
 #[test]
 fn template_fused_as_unfused() {
     same("template", "mk2/power_board", 1);
+}
+
+/// titan_firmware's C IVCBoard2 (blake/ivc), booted through the bootrom and its bootloader, for `until`: what it did
+/// (as [`run_skipped`] has it) and how many quanta were fused. `None` without `TITAN_FIRMWARE_DIR` (skipped).
+fn run_c_ivc(until: Time, setup: impl Fn(&mut Machine)) -> Option<(Vec<String>, u64)> {
+    let image = sim_test::titan_firmware("talos/IVCBoard2/build/IVCBoard2_with_bl.uf2")?;
+    let mut b = Bench::builder(&image).board("talos/ivc_board").rom_boot().boot().unwrap();
+    setup(&mut b.session.machine);
+    b.run_until(until).unwrap();
+    let s = &b.session;
+    let mut out: Vec<String> = s.logs.iter().map(|(t, l)| format!("[{t}] {l}")).collect();
+    out.push(format!("rtt {:?}", s.rtt_text));
+    out.push(format!("uart {:?}", s.uart_text));
+    let m = &s.machine;
+    out.push(format!("now {}", m.now));
+    for (c, core) in m.cores.iter().enumerate() {
+        let regs: Vec<u32> = (0..core.num_regs()).map(|r| core.read_reg(r)).collect();
+        out.push(format!(
+            "core{c} at {}: {} cycles, {} instructions, regs {regs:08x?}",
+            m.core_time(c),
+            core.cycles(),
+            core.instructions()
+        ));
+    }
+    out.push(format!("sram {:x}", m.sys.sram.iter().fold(0u64, |h, &b| (h ^ b as u64).wrapping_mul(0x100_0000_01b3))));
+    Some((out, m.quanta_fused))
+}
+
+#[test]
+fn c_ivc_board2_fused_as_unfused() {
+    // Its main loop polls peripherals (UART, SPI, the timer) and feeds the watchdog between the FFTs, which a fused
+    // batch runs through, while the ADC samples into SRAM through DMA; past the second of boot, the FFT setup's
+    // sleep_ms(1000), into its sampling
+    let until = Time::from_ms(1300);
+    let Some((a, fused)) = run_c_ivc(until, |_| {}) else { return };
+    let (b, none) = run_c_ivc(until, |m| m.fuse_quanta = false).unwrap();
+    assert_eq!(none, 0);
+    assert!(fused > 100_000, "{fused} quanta fused");
+    compare("IVCBoard2 (C)", &a, &b);
 }
 
 fn same_pio(elf: &str, board: &str, client: u8) {

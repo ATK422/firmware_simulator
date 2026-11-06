@@ -58,6 +58,16 @@ canmore = { path = "external/titan_firmware_rs/crates/canmore" }
 [profile.release]
 debug = 1
 
+# The fastest emulator (docs/internals.md, "Performance"): `cargo build --profile fast`, binaries in `target/fast/`.
+# Whole-program LTO in one codegen unit runs the bench 3-7 % faster than release, but takes twice as long to build
+# from clean and redoes the LTO on every link, so release (which the test suite uses) stays without it.
+# `scripts/build_pgo.sh` builds this profile trained on the bench.
+[profile.fast]
+inherits = "release"
+debug = false
+lto = "fat"
+codegen-units = 1
+
 [profile.dev]
 # The interpreter is unusably slow unoptimised; keep debug info but optimise
 opt-level = 1
