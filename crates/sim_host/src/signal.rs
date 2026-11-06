@@ -39,6 +39,24 @@ pub fn install() -> std::io::Result<()> {
             return Err(std::io::Error::last_os_error());
         }
     }
+    // A process inherits its signal mask from whatever started it. If that blocked SIGINT (some shells, wrappers
+    // and dev environments do), a handler never runs and Ctrl-C does nothing at all, the first time or the fifth.
+    // So unblock them here, on the main thread, before any thread starts (threads inherit the mask).
+    // SAFETY: plain sigset operations on local values
+    unsafe {
+        let mut set: libc::sigset_t = std::mem::zeroed();
+        let mut old: libc::sigset_t = std::mem::zeroed();
+        libc::sigemptyset(&mut set);
+        libc::sigaddset(&mut set, libc::SIGINT);
+        libc::sigaddset(&mut set, libc::SIGTERM);
+        if libc::pthread_sigmask(libc::SIG_UNBLOCK, &set, &mut old) == 0
+            && (libc::sigismember(&old, libc::SIGINT) == 1 || libc::sigismember(&old, libc::SIGTERM) == 1)
+        {
+            log::warn!(
+                "SIGINT/SIGTERM were blocked by whatever started the emulator (so Ctrl-C did nothing); unblocked them"
+            );
+        }
+    }
     Ok(())
 }
 

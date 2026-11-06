@@ -812,10 +812,25 @@ pub fn serve(listener: &TcpListener, session: &mut Session) -> io::Result<Ended>
 }
 
 /// Waits for a debugger on `listener`: a connection that closes before sending anything (a port check) is let go.
-/// Returns the connection and its first message.
-fn accept_debugger(listener: &TcpListener) -> io::Result<(Connection<TcpStream>, Incoming)> {
+/// Returns the connection and its first message, or `None` if a signal asked the run to stop while waiting
+/// ([`crate::signal`]: a blocking `accept` would be restarted after Ctrl-C, leaving only the second one to quit).
+fn accept_debugger(listener: &TcpListener) -> io::Result<Option<(Connection<TcpStream>, Incoming)>> {
+    listener.set_nonblocking(true)?;
     loop {
-        let (stream, peer) = listener.accept()?;
+        let (stream, peer) = match listener.accept() {
+            Ok(c) => c,
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                if crate::signal::requested() {
+                    return Ok(None);
+                }
+                std::thread::sleep(std::time::Duration::from_millis(50));
+                continue;
+            }
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(e),
+        };
+        // Some systems (macOS) hand out connections non-blocking like their listener
+        stream.set_nonblocking(false)?;
         stream.set_nodelay(true)?;
         let mut conn = Connection::new(stream);
         match conn.recv() {
@@ -824,7 +839,7 @@ fn accept_debugger(listener: &TcpListener) -> io::Result<(Connection<TcpStream>,
             }
             Ok(first) => {
                 log::info!("GDB connected from {peer}");
-                return Ok((conn, first));
+                return Ok(Some((conn, first)));
             }
         }
     }
@@ -833,7 +848,9 @@ fn accept_debugger(listener: &TcpListener) -> io::Result<(Connection<TcpStream>,
 /// Serves one GDB connection on `listener`, driving `target` until GDB detaches or disconnects, or the run is
 /// asked to stop.
 pub fn serve_target(listener: &TcpListener, target: &mut dyn Target) -> io::Result<Ended> {
-    let (mut conn, first) = accept_debugger(listener)?;
+    let Some((mut conn, first)) = accept_debugger(listener)? else {
+        return Ok(Ended::Stopped);
+    };
     let old_policy = target.session().machine.bkpt_policy;
     target.session().machine.bkpt_policy = BkptPolicy::Stop;
     let mut stub = GdbStub::new();
