@@ -128,7 +128,9 @@ scheduled. Counters (timer, PWM, watchdog) are computed lazily from virtual time
    (`Machine::coverage`) does too, marking each executed instruction.
 
 `Machine::skip_spins`, `Machine::skip_timer_waits`, `Machine::fuse_quanta`, `Pio::skip_loops`,
-`Pio::skip_counted`, `Pio::loop_inputs` and `Pio::fast_run` switch the skips and the fusing off;
+`Pio::skip_counted`, `Pio::loop_inputs` and `Pio::fast_run` switch the skips and the fusing off (and in the water
+`Hydrophone::skip_quiet` and `Hydrophone::lanes` theirs, see *Acoustic media* below: the hydrophone unit tests and
+`crates/sim_host/tests/acoustic_threads.rs` compare runs with them on and off);
 `crates/rp2040/tests/batching.rs`, `busy_wait.rs`, `timer_waits.rs`, `fused_quanta.rs`,
 `crates/sim_test/tests/fast_paths.rs` and the PIO tests (random programs, with each switch on and off) compare
 runs with and without them (`fast_paths.rs` also for `System::pio_fast_reads` and `System::sio_fast_irqs`, which
@@ -244,7 +246,49 @@ zero at every time its paths read (`Source::silent`: a pinger between pulses; `W
 whose samples there are all zero, not driven or its ringing below the smallest `f32`): the sum starts at +0, is
 never -0, and adding ±0 leaves it as it is, so `Hydrophone::skip_quiet` changes no sample (tested bit for bit, and
 on the pool while a packet crosses). Between transmissions this takes away what hearing the other board's 63 paths
-costs, which was about as much as the board itself. The board driving a projector and the hydrophones reading it hold different locks
+costs, which was about as much as the board itself.
+
+*The path sum in lanes* (`sim_acoustics::lanes`, `Hydrophone::raw_lanes`; `Hydrophone::lanes`, on by default).
+While a projector transmits, each step a hydrophone computes sums the 63 paths of the pool for it: under callgrind
+(2 s of `ivc2_pool_busy`, a packet crossing from 0.37 s on) the hydrophones took 19.7 % of the pool's host
+instructions summed one path at a time (5.27 G of 26.8 G, against 1.80 G in the quiet pool: 3.5 G, 13 %, was the
+other board's paths). Floating-point addition is not associative, so a step's paths must be added in the order
+`Hydrophone::raw` adds them; what is independent is each path's term, its gain times the origin's pressure at the
+step's time less its delay (with the delay and the gain interpolated across the block, the sample before that time
+and the fraction past it, and the two samples interpolated). So the taps are kept per origin in lanes of eight
+(`WideTaps`: delays and gains at the block's start and their change over it, as `raw` computes them; an origin's
+last lanes padded with copies of its last tap, computed and never added), each step computes eight terms at a
+time with the operations `raw` does, in the same order, in loops over fixed-size arrays that LLVM vectorizes on the
+baseline targets (SSE2 on x86-64, NEON on aarch64: two `f64`s per instruction; the kernels in `lanes` take
+references, which tells LLVM their output does not overlap their input), and adds them to the step's sum one after
+the other. Nothing asks for a fused multiply-add (Rust never contracts `a * b + c`; the x86-64 code has none even
+built for `x86-64-v3`, the aarch64 code none) and nothing sets flush-to-zero, so subnormals are computed as IEEE says
+on both. `f64::floor` has no SSE2 instruction (each was a call into the runtime, the costliest part of the sum one
+path at a time): `lanes::floor_small` computes it exactly as `(x + 2^52) - 2^52`, less one if that rounded up, for
+the `0 <= x < 2^52` the times are, and `lanes::whole` gets the sample index from the same addition's bits. A
+projector's samples are read eight times at once (`WaveReader::pressure_lanes`) from the slices of its sample deque
+where every one read is computed and none is before the first kept; otherwise (a time before zero, beyond what is
+known, not a number) one time after the other as `pressure` reads them. Computing up to the latest sample first
+changes nothing, as a sample never changes once computed and this computes nothing further than reading in turn
+does; only the forgetting of samples older than the projector's second of history could tell the order of reads
+apart, so the lanes are used only while a projector's paths in a block are less than 0.99 s apart in delay
+(`Hydrophone::lanes_ok`; otherwise one path at a time). The hydrophone alone, hearing a projector transmit over the
+pool's 63 paths at 500 kS/s (`cargo run --release -p sim_acoustics --example hydrophone_bench`), runs 2.2-2.3x as
+fast (0.28 s for a second of sound, from 0.65 s; 63 ns of each 1 µs step are the receive chain and the noise); the
+pool while a packet crosses executes 10 % fewer host instructions (24.0 G) and takes 1.41 s rather than 1.56 s on
+one thread, the quiet pool 3.6 % fewer (its hydrophones check eight paths at a time for silence) and 1.38 s rather
+than 1.42 s. AVX2 lanes (four `f64`s) were tried by building for `x86-64-v3`: 10 % more on the hydrophone alone, not
+worth runtime detection and `unsafe`. The unit tests compare `raw_lanes` with `raw` bit for bit (`f64::to_bits`)
+over random taps (every count from none to more than eight lanes, delays and gains changing over the block, zeros,
+subnormal and huge gains), random projector samples (zeros, subnormals, reads before the first sample, after the
+last known one, before time zero, not a number, across the deque's wrap), sources of each kind, quiet origins and
+block edges; all-subnormal and all-zero terms; and every ADC sample of hydrophones hearing a projector driven in
+bursts, a pinger, noise and shrimp, with fixed and moving ends (1.5 m/s), uneven sampling, gaps and prerolls, with
+the silent origins left out or not, lanes on and off. Adding a chunk's terms in reverse, a `mul_add` in the delays
+or a gain multiplied out each make them fail. `bench --no-lanes` runs the robots' hydrophones one path at a time:
+every fingerprint is the same.
+
+The board driving a projector and the hydrophones reading it hold different locks
 (`medium::ProjectorState`), and a hydrophone holds the medium only to refresh its paths. Boards closer than a
 slice's sound (15 cm), paths longer than 0.4 s and transducers on a simulated vehicle (`Trajectory::Live`, known
 only as the vehicle moves) take turns. `crates/sim_host/tests/acoustic_threads.rs` compares the IVC pool on threads,
@@ -448,14 +492,16 @@ runs the template, ESC and IVCBoard2 images on their boards and the Talos (also 
 threads: `talos_t2`, `talos_t3`, `talos_mt`, `talos_t6`, and on three slice by slice without running ahead:
 `talos_t3_ls`; `--threads N` sets `talos_mt`'s and prints the grouping; `talos_live_t3` and `talos_live_t3_ls`
 with the bridge behind a live endpoint, as on vcan; `nereus`, `nereus_t3` and `nereus_t3_ls`: the nereus setup)
-and IVC2 pool robots (`ivc2_pool`, and on two threads `ivc2_pool_t2`; with `TITAN_FIRMWARE_DIR` set, the C
+and IVC2 pool robots (`ivc2_pool`, and on two threads `ivc2_pool_t2`; `ivc2_pool_busy` and `ivc2_pool_busy_t2`
+the same while a packet crosses the water the whole run; with `TITAN_FIRMWARE_DIR` set, the C
 IVCBoard2 alone, `ivc_board2_c`, and two of them in the pool, `ivc2_pool_c` and `ivc2_pool_c_t2`; skipped
 otherwise) for 2 s of virtual time, and prints the best wall time, virtual/wall (above 1 keeps up with
 `--realtime`), CPU time, instructions executed, the share skipped in busy-waits, emulated MIPS, and a fingerprint
 of everything the run produced (log lines and their times, bridge messages, UART/RTT text, CPU registers, cycle
 counts, SRAM). The fingerprint must not change when the emulator is made faster. Wall time is noisy on a shared
 machine: compare the best of several repeats, or the instruction counts under `valgrind --tool=callgrind` with
-`--repeat 1`. `--stats` prints what running ahead did in each robot case.
+`--repeat 1`. `--stats` prints what running ahead did in each robot case; `--no-lanes` has the hydrophones sum
+their paths one at a time (the fingerprints must not change).
 
 Fingerprints are per firmware build: new images, or the same source built by another compiler, give new ones
 (so do instruction counts). titan_firmware_rs pins its compiler in its `rust-toolchain.toml`, so images built from
@@ -469,6 +515,7 @@ the same commit with rustup agree. With the pinned titan_firmware_rs (94a107e, r
 | `talos`, `talos_mt`, `talos_t2`, `talos_t3`, `talos_t6`, `talos_t3_ls`, `talos_live_t3`, `talos_live_t3_ls` | `a02da435f15bdb96` |
 | `nereus`, `nereus_t3`, `nereus_t3_ls` | `081433a1925d555f` |
 | `ivc2_pool`, `ivc2_pool_t2` | `d2a2e6a73362cf3e` |
+| `ivc2_pool_busy`, `ivc2_pool_busy_t2` | `38cd81918232caa8` |
 
 The C cases' fingerprints are those of your titan_firmware build; for the `blake/ivc` IVCBoard2 these were measured
 with (built in the Nix shell), `ivc_board2_c` is `ccb6914471f62e02` and `ivc2_pool_c`, `ivc2_pool_c_t2`

@@ -28,6 +28,7 @@ use sim_core::time::Time;
 
 use crate::env::Environment;
 use crate::geometry::Vec3;
+use crate::lanes::{self, LANES};
 use crate::transducer::{Response, Transducer};
 
 /// Projector pressure history kept for hydrophones to read back: paths up to about 1.5 km.
@@ -35,6 +36,8 @@ pub const HISTORY_S: f64 = 1.0;
 /// Sample rate of the projector waveforms.
 pub const RATE_HZ: f64 = 1_000_000.0;
 const STEP_PS: u64 = 1_000_000;
+/// Samples kept: [`HISTORY_S`] of them.
+const HISTORY_LEN: u64 = (HISTORY_S * RATE_HZ) as u64;
 
 pub type SharedMedium = Arc<Mutex<Medium>>;
 
@@ -303,6 +306,9 @@ struct Wave {
     samples: VecDeque<f32>,
     /// The last sample computed that is not zero (either sign), by grid index.
     last_loud: Option<u64>,
+    /// Sets of times `pressure_lanes` read in lanes, and one by one (tests).
+    #[cfg(test)]
+    lane_reads: [u64; 2],
 }
 
 /// Where a projector's drive was ([`ProjectorState::mark`]), to go back to.
@@ -356,6 +362,34 @@ impl ProjectorState {
         w.progress = w.progress.min(mark.progress);
     }
 
+    /// Replaces the waveform's samples with `samples` from grid step `base` on, the deque's storage wrapping round
+    /// after `wrap` of them (tests: `pressure_lanes` reads either half). The drive is never known further.
+    #[cfg(test)]
+    pub(crate) fn set_samples(&self, base: u64, samples: &[f32], wrap: usize) {
+        let mut w = lock(&self.wave);
+        let mut d = VecDeque::with_capacity(samples.len());
+        // (Moving the deque's head along by its capacity less `wrap`)
+        for _ in 0..d.capacity() - wrap.min(d.capacity()) {
+            d.push_back(0.0);
+            d.pop_front();
+        }
+        d.extend(samples.iter().copied());
+        w.base = base;
+        w.samples = d;
+    }
+
+    /// Sets of times read in lanes, and one by one ([`Wave::pressure_lanes`]; tests).
+    #[cfg(test)]
+    pub(crate) fn lane_reads(&self) -> [u64; 2] {
+        lock(&self.wave).lane_reads
+    }
+
+    /// Whether the samples' storage wraps round (tests).
+    #[cfg(test)]
+    pub(crate) fn wraps(&self) -> bool {
+        !lock(&self.wave).samples.as_slices().1.is_empty()
+    }
+
     /// Reads the waveform (holding its lock until the reader is dropped).
     pub fn read(&self) -> WaveReader<'_> {
         WaveReader { wave: lock(&self.wave), drive: &self.drive }
@@ -373,6 +407,21 @@ impl WaveReader<'_> {
     #[inline]
     pub fn pressure(&mut self, t: f64) -> f64 {
         self.wave.pressure(t, self.drive)
+    }
+
+    /// [`WaveReader::pressure`] at each of the first `n` times of `t`, into `out`, the same to the bit, read as it
+    /// reads them; the times after the `n`th are copies of one before it, and `k` and `b` are room for as many
+    /// values (see [`crate::lanes`]).
+    #[inline(always)]
+    pub fn pressure_lanes(
+        &mut self,
+        t: &[[f64; LANES]],
+        n: usize,
+        out: &mut [[f64; LANES]],
+        k: &mut [[f64; LANES]],
+        b: &mut [[f64; LANES]],
+    ) {
+        self.wave.pressure_lanes(t, n, out, k, b, self.drive)
     }
 
     /// Whether [`WaveReader::pressure`] is exactly zero (either sign) at every time from `from` to `to` (s): every
@@ -439,7 +488,7 @@ impl Wave {
                 self.last_loud = Some(n);
             }
             self.samples.push_back(p);
-            if self.samples.len() as f64 > HISTORY_S * RATE_HZ {
+            if self.samples.len() as u64 > HISTORY_LEN {
                 self.samples.pop_front();
                 self.base += 1;
             }
@@ -472,6 +521,88 @@ impl Wave {
         let a = self.sample(k, drive);
         let b = self.sample(k + 1, drive);
         a + (b - a) * f
+    }
+
+    /// [`Wave::pressure`] at each of the first `n` times of `t`, into `out`, the same to the bit, reading the samples
+    /// as it reads them (the times after the `n`th are copies of a time before it: computed too, and of no use; `k`
+    /// and `b` are room for as many values): in loops over the lanes that vectorize (see [`crate::lanes`]) where all
+    /// the samples read are computed and none is forgotten; else one time after the other.
+    ///
+    /// Computing the samples up to the latest of them first, rather than as each time comes, changes nothing: a
+    /// sample is computed once and never changes, this computes no further than reading them in turn would, and
+    /// forgets none of them (they are far less than the history apart). A caller reading several sets of times
+    /// (the hydrophone's steps) keeps all of them that close together (`Hydrophone::lanes_ok`), so that none reads
+    /// a sample another one's computing forgot, where reading them in turn would still have had it.
+    #[inline(always)]
+    fn pressure_lanes(
+        &mut self,
+        t: &[[f64; LANES]],
+        n: usize,
+        out: &mut [[f64; LANES]],
+        k: &mut [[f64; LANES]],
+        b: &mut [[f64; LANES]],
+        drive: &Mutex<Drive>,
+    ) {
+        // `pressure`'s `x`, its `k` (`x.floor() as u64`, which is `floor_small(x)` for these, and exactly an `f64`)
+        // and its `f` (into `out`); whether every time is one `floor_small` takes, and every sample read is there
+        let (first, last) = (self.base as f64, self.computed() as f64 - 1.0);
+        let (mut ok, mut there) = (true, true);
+        for ((t, f), k) in t.iter().zip(out.iter_mut()).zip(k.iter_mut()) {
+            let (o, h) = lanes::split(t, RATE_HZ, k, f, first, last);
+            (ok, there) = (ok & o, there & h);
+        }
+        if !ok {
+            return self.pressure_each(t, n, out, drive);
+        }
+        if !there {
+            let (mut lo, mut hi) = (u64::MAX, 0);
+            for &k in k.iter().flatten() {
+                (lo, hi) = (lo.min(lanes::whole(k)), hi.max(lanes::whole(k)));
+            }
+            // Computing up to the latest forgets none of them (the earliest is far less than the history before)
+            if hi + 1 >= self.computed() && hi + 2 <= lo + HISTORY_LEN {
+                self.compute_to(hi + 1, drive);
+            }
+            if lo < self.base || hi + 1 >= self.computed() {
+                return self.pressure_each(t, n, out, drive);
+            }
+        }
+        // All of them there: each read gives what it would in turn. The two samples each time reads (the first
+        // into `k`, which is done with then)
+        let (front, back) = self.samples.as_slices();
+        let base = self.base;
+        for (k, b) in k.iter_mut().zip(b.iter_mut()) {
+            for j in 0..LANES {
+                let i = (lanes::whole(k[j]) - base) as usize;
+                let (x, y) = if i + 1 < front.len() {
+                    (front[i], front[i + 1])
+                } else if i >= front.len() {
+                    (back[i - front.len()], back[i + 1 - front.len()])
+                } else {
+                    (front[i], back[0])
+                };
+                (k[j], b[j]) = (x as f64, y as f64);
+            }
+        }
+        for ((f, a), b) in out.iter_mut().zip(k.iter()).zip(b.iter()) {
+            lanes::interpolate(f, a, b);
+        }
+        #[cfg(test)]
+        {
+            self.lane_reads[0] += 1;
+        }
+    }
+
+    /// [`Wave::pressure`] at each of the first `n` times of `t` in turn.
+    #[cold]
+    fn pressure_each(&mut self, t: &[[f64; LANES]], n: usize, out: &mut [[f64; LANES]], drive: &Mutex<Drive>) {
+        #[cfg(test)]
+        {
+            self.lane_reads[1] += 1;
+        }
+        for i in 0..n {
+            out[i / LANES][i % LANES] = self.pressure(t[i / LANES][i % LANES], drive);
+        }
     }
 }
 
@@ -544,6 +675,8 @@ impl Medium {
             base: 0,
             samples: VecDeque::new(),
             last_loud: None,
+            #[cfg(test)]
+            lane_reads: [0; 2],
         };
         let drive_state = Drive { edges: VecDeque::new(), progress: Time::ZERO, pushed: 0 };
         self.projectors.push(Projector {

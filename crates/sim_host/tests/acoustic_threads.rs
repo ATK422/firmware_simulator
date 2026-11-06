@@ -25,10 +25,14 @@ struct How {
     stress: Option<u64>,
     /// Every hydrophone computes every tap, silent origins too (`Hydrophone::skip_quiet` off).
     every_tap: bool,
+    /// Every hydrophone sums its paths one at a time (`Hydrophone::lanes` off, the reference).
+    one_path: bool,
 }
 
-const TURNS: How = How { threads: 1, run_ahead: true, stress: None, every_tap: false };
-const AHEAD: How = How { threads: 2, run_ahead: true, stress: None, every_tap: false };
+const TURNS: How = How { threads: 1, run_ahead: true, stress: None, every_tap: false, one_path: false };
+const AHEAD: How = How { threads: 2, run_ahead: true, stress: None, every_tap: false, one_path: false };
+/// Taking turns, every hydrophone summing every path one at a time: the sound as computed before any fast path.
+const REFERENCE: How = How { every_tap: true, one_path: true, ..TURNS };
 
 #[derive(Debug, PartialEq)]
 struct Run {
@@ -66,6 +70,7 @@ fn run(mut r: Robot, bridges: &[MockBridge], how: How, send: Option<Time>, piece
     for b in &mut r.boards {
         for h in sim_host::acoustic::hydrophones(&mut b.machine) {
             h.skip_quiet = !how.every_tap;
+            h.lanes = !how.one_path;
         }
     }
     let hooks = Arc::new(Mutex::new(Vec::new()));
@@ -163,8 +168,14 @@ fn a_pool_on_threads_gives_the_same_run_as_turns() {
         want.hooks.len(),
         want.frames.len()
     );
-    for how in [AHEAD, How { threads: 0, ..AHEAD }, How { run_ahead: false, ..AHEAD }, How { every_tap: true, ..TURNS }]
-    {
+    for how in [
+        AHEAD,
+        How { threads: 0, ..AHEAD },
+        How { run_ahead: false, ..AHEAD },
+        How { every_tap: true, ..TURNS },
+        How { one_path: true, ..TURNS },
+        REFERENCE,
+    ] {
         let (r, b) = pool();
         let (got, r) = run(r, &b, how, Some(Time::from_ms(400)), &PIECES);
         same(&want, &got, &format!("{} threads, ahead {}", how.threads, how.run_ahead));
@@ -200,11 +211,11 @@ fn closing_vehicles_on_threads_give_the_same_run_as_turns() {
     };
     let (r, b) = pool();
     let (want, _) = run(r, &b, TURNS, Some(Time::from_ms(400)), &PIECES);
-    for how in [AHEAD, How { stress: Some(3), ..AHEAD }] {
+    for how in [AHEAD, How { stress: Some(3), ..AHEAD }, REFERENCE] {
         let (r, b) = pool();
         let (got, r) = run(r, &b, how, Some(Time::from_ms(400)), &PIECES);
-        same(&want, &got, &format!("stress {:?}", how.stress));
-        assert!(r.run_ahead_stats.windows > 0, "{:?}", r.run_ahead_stats);
+        same(&want, &got, &format!("stress {:?}, one path at a time {}", how.stress, how.one_path));
+        assert!(how.threads == 1 || r.run_ahead_stats.windows > 0, "{:?}", r.run_ahead_stats);
     }
 }
 
@@ -254,6 +265,10 @@ fn a_byte_crosses_the_pool_on_threads_as_in_turns() {
     let (got, threaded) = received(AHEAD);
     assert_eq!(bytes, threaded);
     same(&want, &got, "on threads");
+    // And as the hydrophones computed it one path at a time
+    let (got, reference) = received(REFERENCE);
+    assert_eq!(bytes, reference);
+    same(&want, &got, "one path at a time");
 }
 
 /// Two C IVCBoard2s (titan_firmware's blake/ivc, through the bootrom and their bootloader), when
@@ -271,4 +286,7 @@ fn a_pool_of_c_boards_on_threads_gives_the_same_run_as_turns() {
     let (got, r) = run(r, &b, AHEAD, None, &pieces);
     same(&want, &got, "C boards on threads");
     assert!(r.run_ahead_stats.windows > 0);
+    let (r, b) = load("ivc2_pool_c.toml", |_| {});
+    let (got, _) = run(r, &b, REFERENCE, None, &pieces);
+    same(&want, &got, "C boards, one path at a time");
 }
