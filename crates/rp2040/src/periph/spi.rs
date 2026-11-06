@@ -133,7 +133,7 @@ impl Spi {
     }
 
     pub fn irq(&self) -> bool {
-        self.imsc & 0xF != 0 && self.ris() & self.imsc & 0xF != 0
+        self.ris() & self.imsc & 0xF != 0
     }
 
     /// Starts the next frame if the controller is idle. Returns the frame and when it completes.

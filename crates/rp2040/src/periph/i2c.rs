@@ -196,7 +196,7 @@ impl I2c {
     }
 
     pub fn irq(&self) -> bool {
-        self.intr_mask != 0 && self.raw_intr() & self.intr_mask != 0
+        self.raw_intr() & self.intr_mask != 0
     }
 
     pub fn tx_dreq(&self) -> bool {
