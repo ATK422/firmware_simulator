@@ -2097,8 +2097,10 @@ pub struct BatchBus<'a> {
     core_lines: u32,
     /// Interrupt lines computed during the batch, for the machine to hand to both cores.
     lines: Option<[u32; 2]>,
-    /// What the batch did besides reading memory: see [`BatchBus::quiet`].
+    /// What the batch did besides reading memory: see [`BatchBus::quiet`]. In a fused batch, since the last timer
+    /// or XOSC read; `noisy_before` keeps what came before (see [`BatchBus::end_at_poll`]).
     noisy: bool,
+    noisy_before: bool,
     timer_ticks: Option<u64>,
     ticked: bool,
     /// The first time a register the batch read quietly (XOSC, see [`BatchBus::holds_until`]) would read
@@ -2112,10 +2114,21 @@ pub struct BatchBus<'a> {
     /// reference clock (see [`BatchBus::set_reference_ticks`]), and the tick generator's version then.
     ref_ticks: Option<u64>,
     tick_version: u64,
-    /// End the batch after an access that goes through the general path (a fused batch, see
-    /// `Machine::run_until`: such an access may schedule an event or wake the other core, which the machine must
-    /// look at by the end of the quantum).
-    pub end_on_slow: bool,
+    /// The batch is fused (see `Machine::run_until` and [`BatchBus::fuse`]): it ends after an access that goes
+    /// through the general path and changes something the machine looks at between quanta.
+    end_on_slow: bool,
+    /// For a fused batch: it also ends after a timer or XOSC read once it has been quiet for that many cycles
+    /// (busy-waits poll those, and the machine only finds them at quantum boundaries; see
+    /// [`BatchBus::end_at_poll`]), and the cycles into the batch from which it has been.
+    end_on_timer: Option<u64>,
+    quiet_from: u64,
+    /// The fused batch ended after such a read.
+    ended_at_poll: bool,
+    /// For a fused batch: the scheduler's next event time at its start, the batch's limit, and the other core's
+    /// interrupt lines then.
+    fused_next_event: Time,
+    fused_limit: Time,
+    other_lines: u32,
 }
 
 /// What a batch touched, for busy-wait skipping (see `Machine::run_until`).
@@ -2157,6 +2170,7 @@ impl<'a> BatchBus<'a> {
             core_lines,
             lines: None,
             noisy: false,
+            noisy_before: false,
             timer_ticks: None,
             ticked: false,
             holds_until: Time::MAX,
@@ -2165,7 +2179,39 @@ impl<'a> BatchBus<'a> {
             ref_ticks: None,
             tick_version: 0,
             end_on_slow: false,
+            end_on_timer: None,
+            quiet_from: 0,
+            ended_at_poll: false,
+            fused_next_event: Time::MAX,
+            fused_limit: Time::MAX,
+            other_lines: 0,
         }
+    }
+
+    /// Makes this a fused batch (see `Machine::run_until`), which runs on through quantum boundaries: it ends after
+    /// an access that may make a boundary do something, one that schedules or cancels an event so that the next
+    /// one is due at another time, or changes either core's interrupt lines (the other core, which cannot run,
+    /// might wake), or needs the machine for another reason ([`BatchBus::ATTENTION`]). Accesses that leave all
+    /// that alone (polling a UART, feeding the watchdog) change nothing a boundary would look at. With
+    /// `end_on_timer` it also ends after a timer or XOSC read that a busy-wait could be polling, so that the
+    /// busy-waits the machine skips are found: one that comes at least that many cycles after the batch last did
+    /// anything but read memory (see [`BatchBus::end_at_poll`]).
+    /// `other_lines`: the other core's interrupt lines as its NVIC has them. `limit`: where the batch ends, the
+    /// next event or the end of the run, whichever is first (the machine's own limits, such as SysTick, come on
+    /// top).
+    pub fn fuse(&mut self, end_on_timer: Option<u64>, other_lines: u32, limit: Time) {
+        self.end_on_slow = true;
+        self.end_on_timer = end_on_timer;
+        self.fused_next_event = self.sys.sched.next_time();
+        self.fused_limit = limit;
+        self.other_lines = other_lines;
+    }
+
+    /// For a fused batch: whether the quanta it runs through would still end where it does, and fire no event
+    /// before: the next event is the same, or (the end of the run being the limit) still not before the limit.
+    fn fused_limit_holds(&mut self) -> bool {
+        let next = self.sys.sched.next_time();
+        next == self.fused_next_event || (self.fused_limit < self.fused_next_event && next >= self.fused_limit)
     }
 
     /// The running core's SysTick counts the reference clock (the watchdog's tick) and has been fed `ticks` of it:
@@ -2191,7 +2237,7 @@ impl<'a> BatchBus<'a> {
     /// Whether the batch only read memory (and the timer, always at the same tick count), writing nothing: then
     /// running it again from the same core state does exactly the same, as long as the tick count holds.
     pub fn quiet(&self) -> Option<Quiet> {
-        match (self.noisy, self.ticked, self.timer_ticks) {
+        match (self.noisy || self.noisy_before, self.ticked, self.timer_ticks) {
             (true, _, _) => None,
             (false, true, _) => Some(Quiet::Ticked),
             (false, false, None) => Some(Quiet::Memory),
@@ -2204,6 +2250,11 @@ impl<'a> BatchBus<'a> {
     /// ends before then (`Time::MAX`: nothing it read changes by itself).
     pub fn holds_until(&self) -> Time {
         self.holds_until
+    }
+
+    /// Whether the fused batch ended at a timer or XOSC read a busy-wait could be polling ([`BatchBus::end_at_poll`]).
+    pub fn ended_at_poll(&self) -> bool {
+        self.ended_at_poll
     }
 
     /// Interrupt lines recomputed during the batch, for cores 0 and 1.
@@ -2261,12 +2312,8 @@ impl<'a> BatchBus<'a> {
         };
         match raw {
             Some(v) => {
-                // A fused batch ends here too: polling the timer is what busy-waits do, and the machine only finds
-                // those at quantum boundaries
                 self.touched = true;
-                if self.end_on_slow {
-                    self.after |= Self::ATTENTION;
-                }
+                self.end_at_poll();
                 if self.timer_ticks.is_some_and(|t| t != ticks) {
                     self.ticked = true;
                 }
@@ -2286,17 +2333,34 @@ impl<'a> BatchBus<'a> {
         let off = addr & 0xFFC;
         match self.sys.clocks.xosc.read(now, off) {
             Some(v) => {
-                // A fused batch ends here too, as after a timer read: busy-waits poll it
+                // As after a timer read: busy-waits poll it
                 self.touched = true;
-                if self.end_on_slow {
-                    self.after |= Self::ATTENTION;
-                }
+                self.end_at_poll();
                 if let Some(t) = self.sys.clocks.xosc.read_changes_at(now, off) {
                     self.holds_until = self.holds_until.min(t);
                 }
                 Ok(mem::lane(v, addr, size))
             }
             None => self.slow_read_general(addr, size),
+        }
+    }
+
+    /// After a timer or XOSC read in a fused batch with `end_on_timer`: polling those is what busy-waits do, and the
+    /// machine only finds them at quantum boundaries (where it skips them), from whole quanta that only read. The
+    /// batch ends here once it has only read since a poll at least `end_on_timer` cycles back; a loop that does
+    /// anything else in between is no busy-wait. (Only how soon busy-waits are found depends on this: fusing
+    /// changes nothing else.)
+    #[inline]
+    fn end_at_poll(&mut self) {
+        if let Some(quiet) = self.end_on_timer {
+            if self.noisy {
+                self.noisy_before = true;
+                self.noisy = false;
+                self.quiet_from = self.elapsed;
+            } else if self.elapsed - self.quiet_from >= quiet {
+                self.after |= Self::ATTENTION;
+                self.ended_at_poll = true;
+            }
         }
     }
 
@@ -2334,11 +2398,6 @@ impl<'a> BatchBus<'a> {
         let s = &mut *self.sys;
         self.xip_ok = s.xip_ready_from(now);
         self.touched = true;
-        if self.end_on_slow {
-            // The machine takes over (the rest of the quantum is not fused) and refreshes the interrupt lines
-            self.after |= Self::ATTENTION;
-            return;
-        }
         if s.clk_sys_changed || s.reset_request.is_some() || s.psm_forced_off != 0 || s.psm_released != 0 {
             // The machine handles these, then refreshes the interrupt lines
             self.after |= Self::ATTENTION;
@@ -2349,8 +2408,15 @@ impl<'a> BatchBus<'a> {
             self.after |= Self::ATTENTION;
             return;
         }
+        // A fused batch's end was set by the next event (or the end of the run), and the quanta it runs through
+        // would fire none: the machine takes over (the rest of the quantum is not fused) once an access changes
+        // that
+        if self.end_on_slow && !self.fused_limit_holds() {
+            self.after |= Self::ATTENTION;
+            return;
+        }
         // The lines are recomputed once the whole instruction is done, as the run loop would
-        if s.irq_dirty {
+        if self.sys.irq_dirty {
             self.after |= Self::CHECK_IRQS;
         }
     }
@@ -2376,6 +2442,10 @@ impl<'a> BatchBus<'a> {
             self.lines = Some(lines);
             if lines[self.core as usize] != self.core_lines {
                 self.core_lines = lines[self.core as usize];
+                return true;
+            }
+            // The other core, which the quantum boundaries a fused batch runs through would hand them to, may wake
+            if self.end_on_slow && lines[1 - self.core as usize] != self.other_lines {
                 return true;
             }
         }

@@ -301,6 +301,9 @@ impl SpinWindow {
 /// Quanta one fused batch may run through at most (bounds how long busy-wait detection waits, see
 /// [`Machine::run_until`]).
 const FUSE_QUANTA: u32 = 64;
+/// A fused batch where busy-waits are skipped ends at a timer or XOSC read after it has only read memory for this
+/// many quanta's worth of cycles (`BatchBus::fuse`).
+const QUIET_POLL_QUANTA: u64 = 2;
 
 /// A snapshot of a machine: everything except the trace sink (and the host's settings: breakpoints, HLE, quantum).
 #[derive(Clone)]
@@ -995,6 +998,13 @@ impl Machine {
         outcome
     }
 
+    /// Whether core `c`'s busy-waits are skipped (`skip_spin`, `skip_timer_wait`): while its SysTick counts nothing.
+    fn skippable(&self, c: usize) -> bool {
+        !(self.cores[c].systick.counts_core_clock()
+            || self.cores[c].systick.counts_reference_clock()
+            || self.systick_ref[c].is_some())
+    }
+
     /// Whether core `c`'s steps can be batched: nothing needs to see every instruction (breakpoints, instruction
     /// or exception tracing).
     #[inline]
@@ -1008,15 +1018,15 @@ impl Machine {
 
     /// Runs up to `max_steps` steps of core `c` as one batch (see [`CortexM0Plus::run_batch`]), ending once its
     /// time reaches `limit`, and handles the batch's last step as [`Machine::step_core`] would. Instructions in
-    /// the middle of a batch touched nothing but memory, so they needed no handling of their own.
+    /// the middle of a batch needed no handling of their own.
     ///
     /// `budget` carries the cycles left until `limit` between batches of one quantum: it is used if set, and set
     /// again afterwards unless something other than the batch's own cycles may have moved the core's clock.
     ///
     /// Also returns whether the batch was quiet (see [`BatchBus::quiet`]) and needed no handling afterwards, with
-    /// the time until which what it read holds ([`BatchBus::holds_until`]), and whether it reached a peripheral
-    /// other than by reading the timer or XOSC. With `fused`, the batch ends after such an access (see
-    /// [`BatchBus::end_on_slow`]).
+    /// the time until which what it read holds ([`BatchBus::holds_until`]). With `fused`, it may run on through
+    /// quantum boundaries (see [`BatchBus::fuse`]), and also returns whether it ended where a busy-wait may start
+    /// ([`BatchBus::ended_at_poll`]).
     fn run_batch(
         &mut self,
         c: usize,
@@ -1048,15 +1058,19 @@ impl Machine {
         // Trapped ROM functions are entered by the single step path
         let trap_below = if self.hle_enabled { ROM_SIZE as u32 } else { 0 };
         let lines = self.cores[c].irq_lines();
+        let (skippable, other_lines) = (self.skippable(c), self.cores[1 - c].irq_lines());
         let mut bus = BatchBus::new(&mut self.sys, &mut *self.trace, c as u8, self.clocks[c], self.clk_sys, lines);
-        bus.end_on_slow = fused;
+        if fused {
+            // (Timer and XOSC reads end it only where busy-waits are skipped, see `run_until`)
+            bus.fuse(skippable.then_some(QUIET_POLL_QUANTA * self.quantum as u64), other_lines, limit);
+        }
         bus.set_reference_ticks(self.systick_ref[c]);
         let b = self.cores[c].run_batch(&mut bus, max_steps, run_cycles, trap_below);
         if self.systick_ref[c].is_some() {
             self.systick_ref[c] = bus.reference_ticks();
         }
         let mut quiet = bus.quiet().map(|q| (q, bus.holds_until()));
-        let touched = bus.touched();
+        let polled = bus.ended_at_poll();
         if let Some(lines) = bus.take_lines() {
             for (core, l) in self.cores.iter_mut().zip(lines) {
                 core.set_irq_lines(l);
@@ -1064,7 +1078,7 @@ impl Machine {
         }
         if b.steps == 0 {
             *budget = Some(cycles);
-            return (b, None, touched);
+            return (b, None, polled);
         }
         self.clocks[c].advance(&self.clk_sys, b.cycles);
         match b.stop {
@@ -1100,7 +1114,7 @@ impl Machine {
             }
             Some(_) => quiet = None,
         }
-        (b, quiet, touched)
+        (b, quiet, polled)
     }
 
     /// After a quantum (or a few in a row, see [`SpinWindow`]) in which core `c` ran `steps` instructions taking
@@ -1372,14 +1386,16 @@ impl Machine {
             }
             let mut spin = Some((Quiet::Memory, 0u32, 0u64, Time::MAX));
             // Quantum fusing: the first batch may run on through further quanta when the boundaries between them
-            // would change nothing. The other core cannot run, and nothing that could wake it happens inside a
-            // batch that touches only memory (the batch ends after any other access, which may also schedule an
-            // event); no SysTick counts the core clock (counted at boundaries; one on the reference clock is fed
-            // when accessed, and the batch ends before either core's pends its exception, see `run_batch`); events
-            // are not due before `limit`, which ends the batch. Only the busy-wait check looks at quantum
-            // boundaries, and skipping a loop is the same as running it; so that loops are still found, only quanta
-            // that follow one that wrote memory and touched nothing else are fused, and a timer read (busy-waits
-            // poll the timer) ends a fused batch too.
+            // would change nothing. The other core cannot run, and the batch ends after an access that could wake
+            // it (one that changes its interrupt lines) or that moves the next event (`BatchBus::fuse`): accesses
+            // that schedule nothing earlier and leave the lines alone (polling a peripheral, feeding the watchdog)
+            // are as invisible to a boundary as memory accesses. No SysTick counts the core clock (counted at
+            // boundaries; one on the reference clock is fed when accessed, and the batch ends before either core's
+            // pends its exception, see `run_batch`); events are not due before `limit`, which ends the batch. Only
+            // the busy-wait check looks at quantum boundaries, and skipping a loop is the same as running it; so
+            // that loops are still found where they are skipped (`skippable`), a quiet quantum (one that only read)
+            // is not fused after, and a timer read after a stretch of only reading (busy-waits poll the timer) ends
+            // a fused batch too (`BatchBus::end_at_poll`).
             let counts = |m: &Machine, k: usize| m.cores[k].systick.counts_core_clock();
             // (A debugger's BKPT stop would come back with the machine's time at a quantum boundary not crossed.)
             let mut fuse = self.fuse_quanta
@@ -1391,7 +1407,7 @@ impl Machine {
                 && runnable == 1
                 && !counts(self, c)
                 && !counts(self, 1 - c);
-            let mut touched = false;
+            let mut polling = false;
             while left > 0 {
                 if let Some(t) = self.stop_at[c]
                     && self.clocks[c].now >= t
@@ -1414,8 +1430,9 @@ impl Machine {
                     // No breakpoints: nothing to resume from once breakpoints are set again
                     self.skip_breakpoint[c] = false;
                     let extra = if fuse { self.quantum.saturating_mul(FUSE_QUANTA - 1) } else { 0 };
-                    let (b, quiet, slow) = self.run_batch(c, left.saturating_add(extra), limit, &mut budget, fuse);
-                    touched |= slow;
+                    let (b, quiet, polled) = self.run_batch(c, left.saturating_add(extra), limit, &mut budget, fuse);
+                    // (A busy-wait may have started: the quanta from here are not fused, for it to be found)
+                    polling |= polled;
                     fuse = false;
                     let merged = match (spin.map(|s| s.0), quiet.map(|q| q.0)) {
                         (Some(Quiet::Memory), Some(q)) | (Some(q), Some(Quiet::Memory)) => Some(q),
@@ -1459,7 +1476,6 @@ impl Machine {
                 left -= 1;
                 budget = None;
                 spin = None;
-                touched = true;
                 fuse = false;
                 let pc = self.cores[c].pc();
                 if self.breakpoints.is_empty() {
@@ -1507,10 +1523,10 @@ impl Machine {
             // Busy-waits are skipped only while the core's SysTick counts nothing (`skip_spin`, `skip_timer_wait`):
             // otherwise there is no loop to look for, and a quantum that only read memory is fused after as one that
             // wrote it is
-            let skippable = !(self.cores[c].systick.counts_core_clock()
-                || self.cores[c].systick.counts_reference_clock()
-                || self.systick_ref[c].is_some());
-            self.fuse_next = !touched && (spin.is_none() || !skippable);
+            let skippable = self.skippable(c);
+            // Loops are found from quiet quanta (where busy-waits are skipped at all): the quantum after one is not
+            // fused, while one that wrote memory or touched a peripheral is fused after
+            self.fuse_next = (spin.is_none() && !polling) || !skippable;
             // A whole quantum that only read memory and the timer: watch the next one, and if the quanta since the
             // window's start came back to where it started, skip the ones that would repeat them
             let spin = spin.filter(|&(_, n, _, _)| n == self.quantum && skippable);
