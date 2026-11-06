@@ -367,3 +367,72 @@ fn a_c_boards_micro_ros_session_reaches_a_udp_agent() {
     assert_eq!(from[0], from[1], "one client endpoint per board");
     assert!(r.stderr().contains("micro-ROS over UDP: client 1 -> agent"), "{}", r.stderr());
 }
+
+/// Starts a long run of the blink test program (no firmware build needed), with `pre` run in the child before
+/// exec, and waits until it has started running.
+fn long_run(extra: &[&str], pre: Option<fn() -> std::io::Result<()>>) -> Running {
+    let blink = repo().join("test_programs/blink.elf");
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_firmware_simulator"));
+    cmd.args(["run", blink.to_str().unwrap(), "--time", "100000s", "--realtime"]).args(extra);
+    if let Some(pre) = pre {
+        use std::os::unix::process::CommandExt;
+        // SAFETY: the hook only calls async-signal-safe functions (sigprocmask)
+        unsafe { cmd.pre_exec(pre) };
+    }
+    let mut child = cmd.stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().unwrap();
+    let stdout = collect(child.stdout.take().unwrap());
+    let stderr = collect(child.stderr.take().unwrap());
+    let mut r = Running { child, stdout, stderr };
+    assert!(wait_until(30, || !r.still_running() || r.stderr().contains("INFO")), "{}", r.stderr());
+    std::thread::sleep(Duration::from_millis(300));
+    r
+}
+
+/// Sends one SIGINT and returns the exit code, or `None` if the run was still going 10 s later.
+fn one_ctrl_c(r: &mut Running) -> Option<i32> {
+    // SAFETY: kill(2) on our own child
+    unsafe { libc::kill(r.child.id() as libc::pid_t, libc::SIGINT) };
+    let t0 = Instant::now();
+    while t0.elapsed() < Duration::from_secs(10) {
+        if let Some(status) = r.child.try_wait().unwrap() {
+            use std::os::unix::process::ExitStatusExt;
+            return Some(status.code().unwrap_or(128 + status.signal().unwrap_or(0)));
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    None
+}
+
+/// A run started with SIGINT and SIGTERM blocked (inherited from whatever started it: some shells, wrappers and
+/// dev environments do this) used to ignore every Ctrl-C. The emulator unblocks them, says so, and one Ctrl-C
+/// ends the run cleanly.
+#[test]
+fn ctrl_c_ends_a_run_started_with_sigint_blocked() {
+    fn block() -> std::io::Result<()> {
+        // SAFETY: sigprocmask on local sets, async-signal-safe
+        unsafe {
+            let mut set: libc::sigset_t = std::mem::zeroed();
+            libc::sigemptyset(&mut set);
+            libc::sigaddset(&mut set, libc::SIGINT);
+            libc::sigaddset(&mut set, libc::SIGTERM);
+            if libc::sigprocmask(libc::SIG_BLOCK, &set, std::ptr::null_mut()) != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+        }
+        Ok(())
+    }
+    let mut r = long_run(&[], Some(block));
+    assert_eq!(one_ctrl_c(&mut r), Some(130), "{}", r.stderr());
+    assert!(r.stderr().contains("were blocked by whatever started the emulator"), "{}", r.stderr());
+    assert!(r.stderr().contains("(Interrupted)"), "{}", r.stderr());
+}
+
+/// Ctrl-C while the run waits for GDB to connect ends it at once (a blocking accept would have been restarted,
+/// leaving only a second Ctrl-C to quit).
+#[test]
+fn ctrl_c_while_waiting_for_gdb_ends_the_run() {
+    let mut r = long_run(&["--gdb", "127.0.0.1:0"], None);
+    assert!(wait_until(10, || r.stderr().contains("waiting for GDB")), "{}", r.stderr());
+    assert_eq!(one_ctrl_c(&mut r), Some(130), "{}", r.stderr());
+    assert!(r.stderr().contains("(Interrupted)"), "{}", r.stderr());
+}
