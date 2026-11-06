@@ -1,8 +1,11 @@
 //! Boards in a shared acoustic medium: the pin device that feeds a board's projector.
 
-use sim_acoustics::Hydrophone;
-use sim_acoustics::medium::SharedMedium;
+use std::sync::Arc;
+
+use sim_acoustics::medium::{SharedMedium, Trajectory};
+use sim_acoustics::{Environment, Hydrophone};
 use sim_core::analog::AnalogSource;
+use sim_core::time::Time;
 use sim_devices::DeviceCtx;
 use sim_devices::fault::FaultyAnalog;
 use sim_devices::pin::PinDevice;
@@ -44,6 +47,112 @@ impl PinDevice for ProjectorPin {
 
     fn as_any_mut(&mut self) -> Option<&mut dyn std::any::Any> {
         Some(self)
+    }
+}
+
+/// How far the boards in an acoustic medium can run ahead of each other, so that they can run on threads with the
+/// same results as taking turns ([`crate::robot::Robot::run_until`]).
+///
+/// A board sees another only through the water: its hydrophone reads another board's projector at the time the
+/// sound left it, the time it arrives less the delay of each path (the direct one and the reflections, which are
+/// longer). A projector's waveform is computed only once its board has run past it (see
+/// [`sim_acoustics::medium`]), so while every board stays less than the shortest delay between a hydrophone and
+/// another board's projector ahead of where all of them were, every read gets exactly what it would taking turns.
+/// The delays are bounded from below over a span of time: the shortest path at its start (less a margin for the
+/// hydrophone's 1 ms blocks, whose delays are interpolated, and for its preroll), less how much both ends can close
+/// in on each other at their greatest speeds (an image of a moving projector moves as fast as it does).
+/// Trajectories recorded as a vehicle simulation runs ([`Trajectory::Live`]) are not known ahead: robots with
+/// one take turns.
+pub(crate) struct Lookahead {
+    env: Arc<Environment>,
+    pairs: Vec<Pair>,
+}
+
+/// A hydrophone and a projector of another board.
+struct Pair {
+    rx: Trajectory,
+    tx: Trajectory,
+    /// The greatest speeds of both, added (m/s).
+    closing: f64,
+    hz: f64,
+}
+
+/// What a lookahead leaves aside: the reads of a hydrophone at a time `t` reach its steps before `t` (an ADC
+/// conversion, a sample of the grid and the next one to interpolate), which this covers many times over.
+const MARGIN: Time = Time::from_us(50);
+/// Before the start of a span, how far back paths may be interpolated from (a block of 1 ms, and the hydrophone's
+/// preroll after a gap, 1 ms).
+const BEFORE: f64 = 2.5e-3;
+/// Paths longer than this do not run apart: the projectors keep 1 s of their waveforms
+/// ([`sim_acoustics::medium::HISTORY_S`]), which boards apart could reach from either end.
+const LONGEST_S: f64 = 0.4;
+
+/// The greatest speed along `t` (m/s), if it is known ahead.
+fn top_speed(t: &Trajectory) -> Option<f64> {
+    match t {
+        Trajectory::Fixed(_) => Some(0.0),
+        Trajectory::Linear { velocity_mps, .. } => Some(sim_acoustics::geometry::norm(*velocity_mps)),
+        Trajectory::Waypoints(points) => points.windows(2).try_fold(0f64, |top, w| {
+            let ((t0, p0), (t1, p1)) = (w[0], w[1]);
+            let d = sim_acoustics::geometry::norm(sim_acoustics::geometry::sub(p1, p0));
+            match t1 - t0 {
+                dt if dt > 0.0 => Some(top.max(d / dt)),
+                _ if d == 0.0 => Some(top),
+                // A jump
+                _ => None,
+            }
+        }),
+        Trajectory::Live(_) => None,
+    }
+}
+
+impl Lookahead {
+    /// The lookahead of `robot`'s boards in its medium: `None` without a medium; `Err` if a trajectory is not known
+    /// ahead (they must take turns).
+    pub(crate) fn of(robot: &mut crate::robot::Robot) -> Result<Option<Lookahead>, ()> {
+        let Some(medium) = robot.medium.clone() else { return Ok(None) };
+        let (env, projectors): (Arc<Environment>, Vec<(usize, Trajectory, f64)>) = {
+            let m = medium.lock().unwrap();
+            (m.env.clone(), m.projectors.iter().map(|p| (p.owner, p.trajectory.clone(), p.nominal_hz)).collect())
+        };
+        let mut pairs = Vec::new();
+        for (b, board) in robot.boards.iter_mut().enumerate() {
+            for h in hydrophones(&mut board.machine).filter(|h| h.medium().is_some_and(|m| Arc::ptr_eq(m, &medium))) {
+                for (_, tx, hz) in projectors.iter().filter(|p| p.0 != b) {
+                    let closing = top_speed(&h.trajectory).ok_or(())? + top_speed(tx).ok_or(())?;
+                    pairs.push(Pair { rx: h.trajectory.clone(), tx: tx.clone(), closing, hz: *hz });
+                }
+            }
+        }
+        // Every trajectory must be known ahead, those no hydrophone of another board hears included
+        if projectors.iter().any(|p| top_speed(&p.1).is_none()) {
+            return Err(());
+        }
+        Ok(Some(Lookahead { env, pairs }))
+    }
+
+    /// How far ahead of `start` (where every board is) the boards can run, for a run of up to `span` from there:
+    /// none of them reads another's projector at a time it has not reached by `start`.
+    pub(crate) fn ahead(&self, start: Time, span: Time) -> Time {
+        let a = (start.as_secs_f64() - BEFORE).max(0.0);
+        let b = (start + span).as_secs_f64() + BEFORE;
+        let c = self.env.sound_speed;
+        let mut shortest = f64::INFINITY;
+        for p in &self.pairs {
+            let (tx, rx) = (p.tx.at(a), p.rx.at(a));
+            let paths = self.env.paths(tx, rx, p.hz);
+            let longest = paths.iter().map(|q| q.delay_s).fold(0.0, f64::max);
+            if longest + p.closing * (b - a) / c > LONGEST_S {
+                return Time::ZERO;
+            }
+            let direct = sim_acoustics::geometry::norm(sim_acoustics::geometry::sub(tx, rx)) / c;
+            let first = paths.iter().map(|q| q.delay_s).fold(direct, f64::min);
+            shortest = shortest.min(first - p.closing * (b - a) / c);
+        }
+        if shortest == f64::INFINITY {
+            return Time::MAX;
+        }
+        Time::from_secs_f64(shortest.max(0.0)).saturating_sub(MARGIN)
     }
 }
 
@@ -144,6 +253,51 @@ pub fn relink(m: &mut rp2040::Machine, old: &SharedMedium, new: &SharedMedium) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn lookahead(rx: Trajectory, tx: Trajectory) -> Lookahead {
+        let water = sim_acoustics::water::Water { sound_speed_mps: Some(1500.0), ..Default::default() };
+        let env = Arc::new(Environment::open_water(water));
+        let closing = top_speed(&rx).unwrap() + top_speed(&tx).unwrap();
+        Lookahead { env, pairs: vec![Pair { rx, tx, closing, hz: 50_000.0 }] }
+    }
+
+    #[test]
+    fn the_lookahead_is_the_shortest_delay_less_what_the_ends_can_close() {
+        // 6 m of water at 1500 m/s: 4 ms, less the margin
+        let fixed = lookahead(Trajectory::Fixed([0.0, 0.0, 1.0]), Trajectory::Fixed([6.0, 0.0, 1.0]));
+        let ahead = fixed.ahead(Time::from_secs(2), Time::from_secs(1));
+        assert_eq!(ahead, Time::from_us(4_000) - MARGIN);
+        // Closing at 3 m/s: what they can close from 2.5 ms before the span to 2.5 ms after it comes off
+        let rx = Trajectory::Linear { start_m: [0.0, 0.0, 1.0], velocity_mps: [1.0, 0.0, 0.0] };
+        let tx = Trajectory::Linear { start_m: [6.0, 0.0, 1.0], velocity_mps: [-2.0, 0.0, 0.0] };
+        let moving = lookahead(rx, tx);
+        let ahead = moving.ahead(Time::ZERO, Time::from_ms(100));
+        // (The span starts at 0, so from 0)
+        let want = (6.0 - 3.0 * (0.1 + BEFORE)) / 1500.0;
+        assert!((ahead.as_secs_f64() - (want - MARGIN.as_secs_f64())).abs() < 1e-9, "{ahead}");
+        // Later they are closer, until there is nothing left
+        assert!(moving.ahead(Time::from_secs(1), Time::from_ms(100)) < ahead);
+        assert_eq!(moving.ahead(Time::from_secs(2), Time::from_ms(100)), Time::ZERO);
+        // Nobody to hear: no limit
+        assert_eq!(Lookahead { env: fixed.env.clone(), pairs: Vec::new() }.ahead(Time::ZERO, Time::MAX), Time::MAX);
+    }
+
+    #[test]
+    fn paths_known_ahead_have_a_top_speed() {
+        assert_eq!(top_speed(&Trajectory::Fixed([1.0; 3])), Some(0.0));
+        let l = Trajectory::Linear { start_m: [0.0; 3], velocity_mps: [3.0, 4.0, 0.0] };
+        assert_eq!(top_speed(&l), Some(5.0));
+        let w = Trajectory::Waypoints(vec![
+            (0.0, [0.0; 3]),
+            (2.0, [2.0, 0.0, 0.0]),
+            (3.0, [5.0, 0.0, 0.0]),
+            (4.0, [5.0, 0.0, 0.0]),
+        ]);
+        assert_eq!(top_speed(&w), Some(3.0));
+        let jump = Trajectory::Waypoints(vec![(1.0, [0.0; 3]), (1.0, [1.0, 0.0, 0.0])]);
+        assert_eq!(top_speed(&jump), None);
+        assert_eq!(top_speed(&Trajectory::Live(sim_acoustics::medium::LivePath::new([0.0; 3]))), None);
+    }
     use sim_acoustics::chain::ChainSpec;
     use sim_acoustics::medium::Medium;
     use sim_acoustics::transducer::Transducer;

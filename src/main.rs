@@ -117,7 +117,8 @@ struct RobotArgs {
     realtime: bool,
     /// Run the boards on up to this many threads (0, the default: up to one per core; 1: in turn on one). Results
     /// are the same with any number; the boards are spread by what they cost, and only as many threads are used as
-    /// make the slices shorter. Robots in an acoustic environment always run their boards in turn.
+    /// make the slices shorter. Boards in an acoustic environment run apart as far as the sound between them takes to
+    /// arrive (in turn if closer than 15 cm, or carried by a simulated vehicle).
     #[arg(long, default_value_t = 0)]
     threads: usize,
     /// On threads, keep the boards in step slice by slice instead of letting them run ahead of each other between

@@ -50,6 +50,10 @@ use crate::session::{CanCallback, Session};
 use crate::usb::CdcSink;
 use crate::vehicle::{VehicleSim, VehicleSpec};
 
+/// Boards in an acoustic medium run on threads in pieces of at most this, each checked for how far apart the water
+/// lets them run through it (see [`Robot::run_until`]).
+pub const MEDIUM_PIECE: Time = Time::from_secs(1);
+
 /// A CAN bus of the robot with the host endpoints on it.
 pub struct RobotBus {
     pub bus: CanBus,
@@ -90,7 +94,7 @@ pub struct Robot {
     pub medium: Option<SharedMedium>,
     pub slice: Time,
     /// Threads the boards may run on (1, the default: the calling thread only; 0: one per core). Boards in an
-    /// acoustic medium always take turns on one (see [`crate::parallel`]).
+    /// acoustic medium run on them as far apart as the water lets them (see [`Robot::run_until`]).
     pub threads: usize,
     /// On threads, let the boards run ahead of each other between the slices where they can see each other (on
     /// by default; off to check that it changes nothing): see [`crate::runahead`].
@@ -201,12 +205,20 @@ impl Robot {
         for v in &self.vehicles {
             v.update_outputs();
         }
+        if self.medium.is_some() {
+            return self.run_in_medium(end, None);
+        }
         if crate::parallel::worth_it(self, end) {
             if crate::runahead::possible(self) {
-                return crate::runahead::run_until(self, end, None);
+                return crate::runahead::run_until(self, end, None, None);
             }
-            return crate::parallel::run_until(self, end);
+            return crate::parallel::run_until(self, end, None);
         }
+        self.run_in_turn(end)
+    }
+
+    /// The boards in turn, slice by slice, on the calling thread.
+    fn run_in_turn(&mut self, end: Time) -> Option<(usize, StopReason)> {
         while self.now < end && !crate::signal::is_set(self.stop_flag) {
             let t = (self.now + self.slice).min(end);
             for (i, b) in self.boards.iter_mut().enumerate() {
@@ -237,13 +249,48 @@ impl Robot {
     /// the windows short. Stops and [`Robot::stop_flag`] as [`Robot::run_until`].
     pub fn run_until_after(&mut self, soft: Time, end: Time) -> Option<(usize, StopReason)> {
         let soft = soft.min(end);
+        if self.medium.is_some() && soft < end {
+            for v in &self.vehicles {
+                v.update_outputs();
+            }
+            return self.run_in_medium(end, Some(soft));
+        }
         if soft < end && crate::parallel::worth_it(self, end) && crate::runahead::possible(self) {
             for v in &self.vehicles {
                 v.update_outputs();
             }
-            return crate::runahead::run_until(self, end, Some(soft));
+            return crate::runahead::run_until(self, end, Some(soft), None);
         }
         self.run_until(soft)
+    }
+
+    /// [`Robot::run_until`] (with `soft`, [`Robot::run_until_after`]) for boards in an acoustic medium: in pieces of
+    /// at most [`MEDIUM_PIECE`], on threads where the boards can run at least a slice apart through the whole piece
+    /// ([`crate::acoustic::Lookahead`]), running ahead of each other as far as the water lets them; otherwise (one
+    /// thread, boards within a slice's sound of each other, a transducer on a simulated vehicle, whose path is not
+    /// known ahead) in turn. The same run either way.
+    fn run_in_medium(&mut self, end: Time, soft: Option<Time>) -> Option<(usize, StopReason)> {
+        let look = match crate::acoustic::Lookahead::of(self) {
+            Ok(l) if crate::parallel::max_threads(self) > 1 => l,
+            _ => return self.run_in_turn(soft.unwrap_or(end)),
+        };
+        while self.now < end && !crate::signal::is_set(self.stop_flag) {
+            let piece = (self.now + MEDIUM_PIECE).min(end);
+            let apart = look.as_ref().is_none_or(|l| l.ahead(self.now, piece - self.now) >= self.slice);
+            let stop = if apart && crate::parallel::worth_it(self, piece) {
+                if crate::runahead::possible(self) {
+                    crate::runahead::run_until(self, piece, soft.map(|s| s.min(piece)), look.as_ref())
+                } else {
+                    crate::parallel::run_until(self, soft.map_or(piece, |s| s.min(piece)), look.as_ref())
+                }
+            } else {
+                self.run_in_turn(soft.map_or(piece, |s| s.min(piece).max(self.now)))
+            };
+            if stop.is_some() || soft.is_some_and(|s| self.now >= s) {
+                return stop;
+            }
+        }
+        None
     }
 
     /// Plugs board `i`'s USB port into a host controller model (once; the host enumerates whatever the firmware

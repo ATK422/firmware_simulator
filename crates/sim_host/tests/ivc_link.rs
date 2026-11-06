@@ -104,8 +104,8 @@ fn ivc2_boards_exchange_a_byte_across_the_pool() {
     assert!(high > 0.05 && high > 10.0 * other, "{high} {other}");
     // Talos's projector was driven for the whole packet (18 slots of 500 ms), the surface's never
     let m = r.medium.as_ref().unwrap().lock().unwrap();
-    assert!(m.projectors[0].edge_count > 800_000, "{}", m.projectors[0].edge_count);
-    assert!(m.projectors[1].edge_count < 10);
+    assert!(m.projectors[0].edge_count() > 800_000, "{}", m.projectors[0].edge_count());
+    assert!(m.projectors[1].edge_count() < 10);
 }
 
 /// The C IVCBoard2 modem (titan_firmware blake/ivc's ivc/rx/tx/consensus/fft code, unmodified, with UART0 in place

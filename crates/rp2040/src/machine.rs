@@ -1504,10 +1504,16 @@ impl Machine {
                 Some(b) => Some((c, limit, self.clocks[c], self.clk_sys.hz(), b)),
                 None => None,
             };
-            self.fuse_next = !touched && spin.is_none();
+            // Busy-waits are skipped only while the core's SysTick counts nothing (`skip_spin`, `skip_timer_wait`):
+            // otherwise there is no loop to look for, and a quantum that only read memory is fused after as one that
+            // wrote it is
+            let skippable = !(self.cores[c].systick.counts_core_clock()
+                || self.cores[c].systick.counts_reference_clock()
+                || self.systick_ref[c].is_some());
+            self.fuse_next = !touched && (spin.is_none() || !skippable);
             // A whole quantum that only read memory and the timer: watch the next one, and if the quanta since the
             // window's start came back to where it started, skip the ones that would repeat them
-            let spin = spin.filter(|&(_, n, _, _)| n == self.quantum);
+            let spin = spin.filter(|&(_, n, _, _)| n == self.quantum && skippable);
             self.spin_watch = spin.filter(|_| self.skip_spins).map(|_| c);
             let mut closed = None;
             if let (Some(w), Some((q, n, cy, h))) = (self.spin_window.as_mut(), spin) {

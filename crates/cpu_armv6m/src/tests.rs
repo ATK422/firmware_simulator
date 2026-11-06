@@ -1454,6 +1454,65 @@ fn random_programs_run_as_decoded_as_interpreted() {
 }
 
 #[test]
+fn loops_within_a_block_run_as_decoded_as_interpreted() {
+    // A counted loop that fits in one block (a body, SUBS r5, #1, BNE back to the start), run many times round
+    // in one batch; its stores (relative to r6 and r7, which may point at the loop itself in RAM) can overwrite
+    // it, and then it must be decoded again
+    let mut rng = XorShift(0x100B_5E1F);
+    for program in 0..400 {
+        let len = 1 + (rng.next() % 16) as usize;
+        let mut code = Vec::new();
+        while code.len() < len {
+            let rd = (rng.next() % 5) as u16;
+            code.push(match rng.next() % 10 {
+                0 => ldr_i(rd, 6 + (rng.next() % 2) as u16, (rng.next() % 32) as u16),
+                1 => str_i(rd, 6 + (rng.next() % 2) as u16, (rng.next() % 32) as u16),
+                2 => strh_i(rd, 7, (rng.next() % 32) as u16),
+                3 => ldrh_i(rd, 6, (rng.next() % 32) as u16),
+                4 => dp((rng.next() % 16) as u16, rd, (rng.next() % 5) as u16),
+                5 => adds_r(rd, (rng.next() % 8) as u16, (rng.next() % 8) as u16),
+                6 => lsls_i(rd, (rng.next() % 5) as u16, (rng.next() % 32) as u16),
+                7 => cmp_i((rng.next() % 8) as u16, (rng.next() % 256) as u16),
+                8 => mov_hi(rd, 8 + (rng.next() % 5) as u16),
+                _ => movs(rd, (rng.next() % 256) as u16),
+            });
+        }
+        code.push(subs_i8(5, 1));
+        code.push(bcond(1, -(code.len() as i16 + 2)));
+        // Past the loop: spin
+        code.push(b(-2));
+        let at = if program % 2 == 0 { CODE } else { RAM + 0x800 };
+        let mut interp = Rig::new(&[NOP]);
+        random_state(&mut interp.cpu, &mut rng, true);
+        interp.cpu.r[5] = 1 + rng.next() % 50;
+        interp.cpu.r[6] = RAM + 0x7C0 + (rng.next() % 32) * 4;
+        // Mostly at the loop's own code (in RAM, a store there changes it)
+        interp.cpu.r[7] = if rng.next().is_multiple_of(4) { RAM + 0x400 } else { at + (rng.next() % 16) * 2 };
+        for (i, hw) in code.iter().enumerate() {
+            let (buf, off) = interp.bus.region(at + 2 * i as u32).unwrap();
+            mem::write(buf, off, Size::Half, *hw as u32);
+        }
+        interp.cpu.r[15] = at;
+        let mut decoded = Rig { cpu: interp.cpu.clone(), bus: TestBus::new() };
+        decoded.bus.rom = interp.bus.rom.clone();
+        decoded.bus.ram = interp.bus.ram.clone();
+        for batch in 0..4 {
+            let max_steps = 1 + rng.next() % 400;
+            let budget = 1 + (rng.next() % 800) as u64;
+            let x = batch_on(&mut interp, false, max_steps, budget);
+            let y = batch_on(&mut decoded, true, max_steps, budget);
+            assert_eq!(x, y, "program {program} batch {batch}");
+            assert_eq!(core_state(&interp.cpu), core_state(&decoded.cpu), "program {program} batch {batch}");
+            assert_eq!(interp.bus.writes, decoded.bus.writes, "program {program} batch {batch}");
+            if interp.cpu.ipsr() != 0 {
+                break;
+            }
+        }
+        assert_eq!(interp.bus.ram, decoded.bus.ram, "program {program}");
+    }
+}
+
+#[test]
 fn a_store_into_the_running_block_takes_effect() {
     // In RAM: r0 points at the MOVS r2, #1 two instructions on; r1 holds MOVS r2, #7
     let code = [strh_i(1, 0, 0), NOP, movs(2, 1), adds_i8(2, 1), b(-2)];
