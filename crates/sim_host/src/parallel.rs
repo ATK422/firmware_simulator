@@ -2,9 +2,11 @@
 //!
 //! Within one slice of [`crate::robot::Robot::run_until`] the boards do not see each other: frames between them are
 //! delivered by the buses after the slice, and each machine (its cores, peripherals and devices) is its own. So
-//! they can run on several threads and end the slice exactly as they would have one after the other. Boards in an
-//! acoustic medium are the exception (a hydrophone can hear a projector of another board within the same slice
-//! over a short enough path), so robots with a medium run their boards in turn.
+//! they can run on several threads and end the slice exactly as they would have one after the other. In an
+//! acoustic medium a hydrophone could hear a projector of another board within the same slice over a short enough
+//! path: such robots run on threads only while every path between boards is longer than a slice
+//! ([`crate::acoustic::Lookahead`], checked by `Robot::run_until`), and each board tells the medium how far it got,
+//! as taking turns does.
 //!
 //! Slices are short (100 µs of virtual time), so what it costs to hand the boards out each slice decides whether
 //! threads pay at all. For each call of `run_until`, scoped worker threads start once and each runs a fixed group
@@ -36,6 +38,8 @@ use std::time::{Duration, Instant};
 use rp2040::StopReason;
 use sim_core::time::Time;
 
+use sim_acoustics::medium::SharedMedium;
+
 use crate::robot::{Robot, end_slice, power_on_by};
 use crate::session::Session;
 
@@ -56,7 +60,7 @@ const MIN_SLICES: u64 = 8;
 
 /// Whether running `robot` to `end` should go through [`run_until`].
 pub(crate) fn worth_it(robot: &Robot, end: Time) -> bool {
-    robot.medium.is_none() && max_threads(robot) > 1 && end > robot.now + Time(robot.slice.as_ps() * MIN_SLICES)
+    max_threads(robot) > 1 && end > robot.now + Time(robot.slice.as_ps() * MIN_SLICES)
 }
 
 /// Host time per slice that each extra thread is assumed to cost (waking it, waiting for it), in nanoseconds:
@@ -264,6 +268,8 @@ struct Shared<'a> {
     quit: AtomicBool,
     /// Boards that stopped for a reason other than reaching the end of the slice.
     stops: Mutex<Vec<(usize, StopReason)>>,
+    /// The acoustic medium, told how far each board got (as taking turns does).
+    medium: Option<SharedMedium>,
     /// The first panic of a board, to go on unwinding on the calling thread.
     panic: Mutex<Option<Box<dyn Any + Send>>>,
     caller: Thread,
@@ -281,7 +287,11 @@ impl Shared<'_> {
             let start = Instant::now();
             // A panic goes on on the calling thread, once every thread is done with the slice
             match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| board.run_machine_through_lockups(until))) {
-                Ok(StopReason::TimeLimit) => {}
+                Ok(StopReason::TimeLimit) => {
+                    if let Some(m) = &self.medium {
+                        lock(m).progress(i, until);
+                    }
+                }
                 Ok(other) => lock(&self.stops).push((i, other)),
                 Err(panic) => {
                     lock(&self.panic).get_or_insert(panic);
@@ -328,14 +338,32 @@ impl Drop for Crew<'_, '_> {
     }
 }
 
-/// [`Robot::run_until`] for boards that may run side by side (no acoustic medium, more than one thread allowed).
-/// The same run as taking turns: every slice ends with the same boards in the same state, and the end of the
-/// slice is done on the calling thread in the same order. If a board stops for another reason than reaching the
-/// slice's end, the others have still run to it, and the one with the lowest index is returned.
-pub(crate) fn run_until(robot: &mut Robot, end: Time) -> Option<(usize, StopReason)> {
+/// [`Robot::run_until`] for boards that may run side by side (more than one thread allowed; in an acoustic medium,
+/// `acoustic` says the boards can be at least a slice apart until `end`, see [`Robot::run_until`]). The same run as
+/// taking turns: every slice ends with the same boards in the same state, and the end of the slice is done on the
+/// calling thread in the same order. If a board stops for another reason than reaching the slice's end, the others
+/// have still run to it, and the one with the lowest index is returned.
+pub(crate) fn run_until(
+    robot: &mut Robot,
+    end: Time,
+    acoustic: Option<&crate::acoustic::Lookahead>,
+) -> Option<(usize, StopReason)> {
     let max_threads = max_threads(robot);
+    debug_assert!(acoustic.is_none_or(|l| l.ahead(robot.now, end.saturating_sub(robot.now)) >= robot.slice));
     let Robot {
-        boards, buses, board_bus, power_on, vehicles, slice, now, realtime, pacing, balance, stop_flag, ..
+        boards,
+        buses,
+        board_bus,
+        power_on,
+        vehicles,
+        slice,
+        now,
+        realtime,
+        pacing,
+        balance,
+        stop_flag,
+        medium,
+        ..
     } = robot;
     let n = boards.len();
     balance.fit(n, max_threads);
@@ -348,6 +376,7 @@ pub(crate) fn run_until(robot: &mut Robot, end: Time) -> Option<(usize, StopReas
         running: AtomicUsize::new(0),
         quit: AtomicBool::new(false),
         stops: Mutex::new(Vec::new()),
+        medium: medium.clone(),
         panic: Mutex::new(None),
         caller: std::thread::current(),
     };

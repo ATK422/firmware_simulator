@@ -6,17 +6,22 @@
 //! is given as a resonance. The result is the pressure the projector radiates, in µPa at 1 m, kept for the last
 //! [`HISTORY_S`] so hydrophones can read it back at whatever delay each propagation path has.
 //!
-//! Boards run in turns (see `sim_host::robot`), so a projector's waveform is only known up to the time its board
-//! has reached. Each board reports its progress; samples are computed and cached only once the whole step is known,
-//! and a hydrophone asking further ahead gets the last known value without it being cached. Any path longer than
-//! the robot's slice (100 µs, 15 cm of water) therefore always reads exact values.
+//! A projector's waveform is only known up to the time its board has reached. Each board reports its progress;
+//! samples are computed and cached only once the whole step is known, and a hydrophone asking further ahead gets
+//! the last known value without it being cached. Boards taking turns (see `sim_host::robot`) are at most a slice
+//! apart, so any path longer than the robot's slice (100 µs, 15 cm of water) always reads exact values; boards
+//! running ahead of each other on threads do so only as far as the shortest path between them allows.
+//!
+//! What a board drives into its projector ([`Projector::edge`], [`Medium::progress`]) and the waveform computed
+//! from it for the hydrophones each have a lock of their own ([`ProjectorState`]), so that a hydrophone reading
+//! other boards' projectors and those boards driving theirs do not wait for each other.
 //!
 //! Vehicles can move ([`Trajectory`]): the hydrophone recomputes its paths every millisecond and interpolates the
 //! delays in between, so a closing or opening range shifts the received frequency (Doppler) and timing. A
 //! [`LivePath`] is a trajectory written as it happens, by a vehicle simulation running alongside the boards.
 
 use std::collections::VecDeque;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard};
 
 use serde::Deserialize;
 use sim_core::time::Time;
@@ -216,7 +221,7 @@ impl Resonator {
 }
 
 /// A board's projector in the medium.
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub struct Projector {
     /// Which board drives it (its hydrophone doesn't hear it through the water).
     pub owner: usize,
@@ -224,34 +229,172 @@ pub struct Projector {
     pub transducer: Transducer,
     pub trajectory: Trajectory,
     pub nominal_hz: f64,
+    /// What it is driven with and radiates, shared with the hydrophones that read it (see [`ProjectorState`]).
+    pub state: Arc<ProjectorState>,
+}
+
+impl Clone for Projector {
+    /// A copy with a state of its own (snapshots).
+    fn clone(&self) -> Self {
+        let drive = lock(&self.state.drive).clone();
+        let wave = lock(&self.state.wave).clone();
+        Projector {
+            owner: self.owner,
+            name: self.name.clone(),
+            transducer: self.transducer.clone(),
+            trajectory: self.trajectory.clone(),
+            nominal_hz: self.nominal_hz,
+            state: Arc::new(ProjectorState { drive: Apart(Mutex::new(drive)), wave: Apart(Mutex::new(wave)) }),
+        }
+    }
+}
+
+fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// A projector's drive and waveform. The board driving it adds level changes and progress to `drive`; reading
+/// the waveform (`wave`) moves them over as it needs them, and computes the samples whose whole step is known.
+/// Lock order: `wave` before `drive`.
+#[derive(Debug)]
+pub struct ProjectorState {
+    drive: Apart<Mutex<Drive>>,
+    wave: Apart<Mutex<Wave>>,
+}
+
+/// On a cache line of its own: the board driving a projector and the hydrophones reading it run on different
+/// threads, each writing one of the locks.
+#[derive(Debug)]
+#[repr(align(128))]
+struct Apart<T>(T);
+
+impl<T> std::ops::Deref for Apart<T> {
+    type Target = T;
+    fn deref(&self) -> &T {
+        &self.0
+    }
+}
+
+/// What the board has driven and not yet handed to the waveform.
+#[derive(Clone, Debug)]
+struct Drive {
+    /// Level changes, oldest first.
+    edges: VecDeque<(Time, bool)>,
+    progress: Time,
+    /// Level changes ever added.
+    pushed: u64,
+}
+
+/// The radiated waveform.
+#[derive(Clone, Debug)]
+struct Wave {
     drive_v: f64,
     /// µPa at 1 m per volt of drive at the nominal frequency (the TVR's peak for a resonance).
     gain: f64,
     resonator: Resonator,
-    /// Level changes not yet folded into samples, oldest first.
+    /// Level changes taken from the drive and not yet folded into samples, oldest first, and how many were taken.
     edges: VecDeque<(Time, bool)>,
+    taken: u64,
     level: bool,
+    /// The drive's progress when last taken.
     progress: Time,
     /// Grid index of `samples[0]`.
     base: u64,
     samples: VecDeque<f32>,
-    /// Number of drive level changes seen.
-    pub edge_count: u64,
 }
 
-impl Projector {
+/// Where a projector's drive was ([`ProjectorState::mark`]), to go back to.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DriveMark {
+    pushed: u64,
+    progress: Time,
+}
+
+impl ProjectorState {
+    fn add_edge(&self, t: Time, level: bool) {
+        let mut d = lock(&self.drive);
+        d.edges.push_back((t, level));
+        d.progress = d.progress.max(t);
+        d.pushed += 1;
+    }
+
+    fn add_progress(&self, t: Time) {
+        let mut d = lock(&self.drive);
+        d.progress = d.progress.max(t);
+    }
+
+    /// Level changes the drive has had.
+    pub fn edge_count(&self) -> u64 {
+        lock(&self.drive).pushed
+    }
+
+    /// Where the drive is now.
+    pub fn mark(&self) -> DriveMark {
+        let d = lock(&self.drive);
+        DriveMark { pushed: d.pushed, progress: d.progress }
+    }
+
+    /// Takes the drive back to `mark` (its board is rolled back there): the level changes added since are
+    /// forgotten, and the progress is as it was. None of them can have been folded into samples yet (hydrophones
+    /// only read steps known before the board's rollback point); panics otherwise.
+    pub fn back_to(&self, mark: DriveMark) {
+        let mut w = lock(&self.wave);
+        let mut d = lock(&self.drive);
+        let mut drop = d.pushed - mark.pushed;
+        let here = drop.min(d.edges.len() as u64);
+        let keep = d.edges.len() - here as usize;
+        d.edges.truncate(keep);
+        drop -= here;
+        assert!(drop <= w.edges.len() as u64, "level changes to forget were already in the waveform");
+        let keep = w.edges.len() - drop as usize;
+        w.edges.truncate(keep);
+        w.taken -= drop;
+        d.pushed = mark.pushed;
+        d.progress = mark.progress;
+        w.progress = w.progress.min(mark.progress);
+    }
+
+    /// Reads the waveform (holding its lock until the reader is dropped).
+    pub fn read(&self) -> WaveReader<'_> {
+        WaveReader { wave: lock(&self.wave), drive: &self.drive }
+    }
+}
+
+/// A projector's waveform being read ([`ProjectorState::read`]).
+pub struct WaveReader<'a> {
+    wave: MutexGuard<'a, Wave>,
+    drive: &'a Mutex<Drive>,
+}
+
+impl WaveReader<'_> {
+    /// Radiated pressure at `t` seconds (µPa at 1 m), interpolated between grid steps.
+    #[inline]
+    pub fn pressure(&mut self, t: f64) -> f64 {
+        self.wave.pressure(t, self.drive)
+    }
+}
+
+impl Wave {
     fn computed(&self) -> u64 {
         self.base + self.samples.len() as u64
     }
 
     /// Computes grid steps up to and including `k`, as far as the drive is known.
-    fn compute_to(&mut self, k: u64) {
+    fn compute_to(&mut self, k: u64, drive: &Mutex<Drive>) {
         while self.computed() <= k {
             let n = self.computed();
             let start = Time(n * STEP_PS);
             let end = Time((n + 1) * STEP_PS);
             if end > self.progress {
-                return;
+                // What the board has driven since
+                let mut d = lock(drive);
+                self.progress = d.progress;
+                self.taken += d.edges.len() as u64;
+                self.edges.extend(d.edges.drain(..));
+                drop(d);
+                if end > self.progress {
+                    return;
+                }
             }
             // Fraction of the step the pin was high
             let mut high = 0u64;
@@ -281,11 +424,14 @@ impl Projector {
         }
     }
 
-    fn sample(&mut self, k: u64) -> f64 {
+    #[inline]
+    fn sample(&mut self, k: u64, drive: &Mutex<Drive>) -> f64 {
         if k < self.base {
             return 0.0;
         }
-        self.compute_to(k);
+        if k >= self.computed() {
+            self.compute_to(k, drive);
+        }
         let i = (k - self.base) as usize;
         match self.samples.get(i) {
             Some(v) => *v as f64,
@@ -293,17 +439,35 @@ impl Projector {
         }
     }
 
-    /// Radiated pressure at `t` seconds (µPa at 1 m), interpolated between grid steps.
-    pub fn pressure(&mut self, t: f64) -> f64 {
+    #[inline]
+    fn pressure(&mut self, t: f64, drive: &Mutex<Drive>) -> f64 {
         if t < 0.0 {
             return 0.0;
         }
         let x = t * RATE_HZ;
         let k = x.floor() as u64;
         let f = x - k as f64;
-        let a = self.sample(k);
-        let b = self.sample(k + 1);
+        let a = self.sample(k, drive);
+        let b = self.sample(k + 1, drive);
         a + (b - a) * f
+    }
+}
+
+impl Projector {
+    /// Radiated pressure at `t` seconds (µPa at 1 m), interpolated between grid steps.
+    pub fn pressure(&self, t: f64) -> f64 {
+        self.state.read().pressure(t)
+    }
+
+    /// Number of drive level changes seen.
+    pub fn edge_count(&self) -> u64 {
+        self.state.edge_count()
+    }
+
+    /// Grid steps computed so far.
+    #[cfg(test)]
+    fn computed(&self) -> u64 {
+        lock(&self.state.wave).computed()
     }
 }
 
@@ -347,37 +511,51 @@ impl Medium {
             Some(max) => drive.supply_v.min(max),
             None => drive.supply_v,
         };
+        let wave = Wave {
+            drive_v,
+            gain,
+            resonator,
+            edges: VecDeque::new(),
+            taken: 0,
+            level: false,
+            progress: Time::ZERO,
+            base: 0,
+            samples: VecDeque::new(),
+        };
+        let drive_state = Drive { edges: VecDeque::new(), progress: Time::ZERO, pushed: 0 };
         self.projectors.push(Projector {
             owner,
             name: name.to_string(),
             transducer,
             trajectory,
             nominal_hz: drive.nominal_hz.unwrap_or(nominal),
-            drive_v,
-            gain,
-            resonator,
-            edges: VecDeque::new(),
-            level: false,
-            progress: Time::ZERO,
-            base: 0,
-            samples: VecDeque::new(),
-            edge_count: 0,
+            state: Arc::new(ProjectorState { drive: Apart(Mutex::new(drive_state)), wave: Apart(Mutex::new(wave)) }),
         });
         self.projectors.len() - 1
     }
 
     /// Projector `id`'s drive pin changed to `level` at `t`.
     pub fn edge(&mut self, id: usize, t: Time, level: bool) {
-        let p = &mut self.projectors[id];
-        p.edges.push_back((t, level));
-        p.progress = p.progress.max(t);
-        p.edge_count += 1;
+        self.projectors[id].state.add_edge(t, level);
     }
 
     /// Board `owner` has run up to `t`: its projectors' drive is known up to then.
     pub fn progress(&mut self, owner: usize, t: Time) {
-        for p in self.projectors.iter_mut().filter(|p| p.owner == owner) {
-            p.progress = p.progress.max(t);
+        for p in self.projectors.iter().filter(|p| p.owner == owner) {
+            p.state.add_progress(t);
+        }
+    }
+
+    /// Where the drives of board `owner`'s projectors are, to take them back there ([`Medium::back_to`]).
+    pub fn mark(&self, owner: usize) -> Vec<DriveMark> {
+        self.projectors.iter().filter(|p| p.owner == owner).map(|p| p.state.mark()).collect()
+    }
+
+    /// Takes the drives of board `owner`'s projectors back to `marks` ([`Medium::mark`]): the board was rolled back
+    /// to where they were taken.
+    pub fn back_to(&self, owner: usize, marks: &[DriveMark]) {
+        for (p, m) in self.projectors.iter().filter(|p| p.owner == owner).zip(marks) {
+            p.state.back_to(*m);
         }
     }
 }
@@ -433,6 +611,56 @@ mod tests {
         let id2 = projector(&mut m2);
         square(&mut m2, id2, 30_000.0, Time::from_ms(5));
         assert!(peak(&mut m2, id2, 3e-3, 4e-3) < expected / 3.0);
+    }
+
+    #[test]
+    fn a_drive_goes_back_to_a_mark() {
+        let mut m = medium();
+        let id = projector(&mut m);
+        square(&mut m, id, 50_000.0, Time::from_ms(2));
+        let reference = m.clone();
+        let mark = m.mark(0);
+        assert_eq!(mark.len(), 1);
+        // Driven on, and partly read (the reading takes over level changes it has not folded in yet)
+        for k in 0..40u64 {
+            m.edge(id, Time::from_ms(2) + Time::from_us(10 * k), k % 2 == 0);
+        }
+        m.progress(0, Time::from_ms(3));
+        let _ = m.projectors[id].pressure(1.5e-3);
+        let edges = m.projectors[id].edge_count();
+        m.back_to(0, &mark);
+        assert_eq!(m.projectors[id].edge_count(), edges - 40);
+        // Driven again as before the mark: the waveform is the one the copy taken there computes
+        square_from(&mut m, id, Time::from_ms(2), Time::from_ms(4));
+        let mut copy = reference;
+        square_from(&mut copy, id, Time::from_ms(2), Time::from_ms(4));
+        for k in 0..3_000 {
+            let t = k as f64 * 1.3e-6;
+            assert_eq!(m.projectors[id].pressure(t).to_bits(), copy.projectors[id].pressure(t).to_bits(), "{t}");
+        }
+    }
+
+    #[test]
+    fn copies_drive_and_read_on_their_own() {
+        let mut m = medium();
+        let id = projector(&mut m);
+        let mut copy = m.clone();
+        square(&mut copy, id, 50_000.0, Time::from_ms(2));
+        assert_eq!(m.projectors[id].edge_count(), 0);
+        assert!(copy.projectors[id].pressure(1e-3).abs() > 1.0);
+        assert_eq!(m.projectors[id].pressure(1e-3), 0.0);
+    }
+
+    /// Level changes every 10 us from `from` to `to`, starting high, and the progress to `to`.
+    fn square_from(m: &mut Medium, id: usize, from: Time, to: Time) {
+        let mut t = from;
+        let mut level = true;
+        while t < to {
+            m.edge(id, t, level);
+            level = !level;
+            t += Time::from_us(10);
+        }
+        m.progress(0, to);
     }
 
     #[test]

@@ -3,8 +3,10 @@
 //!
 //! ```text
 //! cargo run --release -p sim_test --example bench -- [--time 2s] [--repeat 3] [--only esc_board,talos] [--threads N]
-//!     [--checkpoint-every 10ms] [--checkpoint-memory 512] [--coverage]
+//!     [--checkpoint-every 10ms] [--checkpoint-memory 512] [--coverage] [--stats]
 //! ```
+//!
+//! `--stats` prints what running ahead did in each robot case (windows, slices, rollbacks, cuts).
 //!
 //! `--coverage` collects code coverage (the cores run one instruction at a time): the fingerprints must not change.
 //!
@@ -43,6 +45,9 @@ use sim_core::sched::Fnv;
 use sim_devices::can::{CanEndpoint, CanFrame};
 use sim_host::socketcan::Live;
 use sim_test::{Bench, RobotBench, Session, Time};
+
+/// `--stats`: print what running ahead did in each robot case.
+static STATS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 struct Case {
     name: &'static str,
@@ -331,6 +336,9 @@ fn run(
                     r.robot.names.iter().zip(r.robot.thread_of_boards()).map(|(n, t)| format!("{n}:{t}")).collect();
                 println!("{:<11} threads (0: the calling one): {}", case.name, on.join(" "));
             }
+            if STATS.load(std::sync::atomic::Ordering::Relaxed) {
+                println!("{:<11} running ahead: {:?}", case.name, r.robot.run_ahead_stats);
+            }
             for s in &r.robot.boards {
                 hash_session(&mut h, s);
             }
@@ -466,6 +474,7 @@ fn main() {
             "--threads" => threads = Some(value().parse().expect("--threads N")),
             "--checkpoint-every" => travel = Some(Travel { every: parse_time(&value()), budget }),
             "--coverage" => coverage = true,
+            "--stats" => STATS.store(true, std::sync::atomic::Ordering::Relaxed),
             "--checkpoint-memory" => budget = value().parse::<usize>().expect("--checkpoint-memory MB") << 20,
             "--bench" => {} // passed by `cargo bench`-style runners
             other => panic!("unknown argument {other} (--time T, --repeat N, --only a,b, --threads N)"),

@@ -177,7 +177,7 @@ cases: [...]                                             # branches from a snaps
 | `agents` | Mock agents ([robots.md](robots.md#mock-agents-nano-ros-and-other-protocols)), as `--mock-agent`: `nanoros:BOARD` for a nano-ROS board (its `ros_toml` from the robot file), `nanoros:BOARD=PATH` with its `ros.toml` (looked for from the scenario's directory up), `titan_link:BOARD` the same as a bridge for the board. Early: nano-ROS is still changing ([nanoros.md](nanoros.md)) |
 | `inputs` | `BOARD.INPUT: VALUE` (or `INPUT` with one board), as in the board files ([boards.md](boards.md#inputs)); set before the boards start. A vehicle drives its sensors' inputs itself ([vehicles.md](vehicles.md)) |
 | `time` | How long to run: `15s`, `1500ms`, or a number of seconds |
-| `threads` | As `robot --threads` ([robots.md](robots.md#how-a-robot-runs)); 1 by default. Robots in water always take turns |
+| `threads` | As `robot --threads` ([robots.md](robots.md#how-a-robot-runs)); 1 by default. Robots in water run apart as far as the sound between their boards allows |
 | `steps`, `cases` | Below |
 
 **Paths** (robot files, board files, images) are looked for from the scenario's directory and then each

@@ -64,7 +64,15 @@
 //!
 //! Robots qualify unless a board has a USB/IP server or an Ethernet cable (whose host sides answer the board at
 //! once) or is traced to the instruction (too many events to hold), a bus endpoint is neither live nor can tell when
-//! it will send, or there is an acoustic medium. [`crate::robot::Robot::run_ahead`] switches it off.
+//! it will send. [`crate::robot::Robot::run_ahead`] switches it off.
+//!
+//! **Acoustic media.** Boards in water also see each other through it: a hydrophone reads another board's projector
+//! at the time the sound left it. A projector's waveform is only computed where its board has run past, so windows
+//! are cut to the shortest delay between boards ([`crate::acoustic::Lookahead`]): every read is of a time all boards
+//! had reached at the window's start, exactly what taking turns gives. Each board tells the medium how far it got
+//! after each slice, as taking turns does, and a rollback takes its projectors' drives back with it
+//! ([`sim_acoustics::medium::Medium::back_to`]). `Robot::run_until` runs such robots in pieces of up to a second
+//! and checks each piece can run apart (else it takes turns).
 
 use std::any::Any;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
@@ -79,6 +87,8 @@ use sim_core::trace::{Category, TraceSink, VecSink};
 use sim_devices::can::CanBus;
 use sim_devices::can::{BitRates, BusError, CanFrame, CanNode, TxRequest};
 use sim_devices::dshot::{Esc, Motor};
+
+use sim_acoustics::medium::{DriveMark, SharedMedium};
 
 use crate::parallel::{FIRST_REGROUP_SLICES, REGROUP_SLICES, lock, max_threads, wait_for};
 use crate::profile::{ProfileMark, Profiler};
@@ -115,7 +125,6 @@ pub struct Stats {
 /// Whether `robot` can run its boards ahead of each other (see the module documentation).
 pub(crate) fn possible(robot: &Robot) -> bool {
     robot.run_ahead
-        && robot.medium.is_none()
         && robot.boards.iter().all(|b| b.can_run_ahead() && !b.machine.trace.wants(Category::Instruction))
         && robot.buses.iter().all(|rb| rb.endpoints.iter().all(|e| e.live() || e.idle_until().is_some()))
 }
@@ -169,6 +178,8 @@ struct LaneCheckpoint {
     at: usize,
     board: RollbackPoint,
     power: (Time, bool),
+    /// Where its projectors' drives were in the acoustic medium.
+    drives: Vec<DriveMark>,
     /// Trace events held at the time.
     trace: usize,
     profile: Option<ProfileMark>,
@@ -317,6 +328,9 @@ impl Bounds {
 struct Lane<'a> {
     session: &'a mut Session,
     power: &'a mut (Time, bool),
+    /// Its index in the robot (its projectors' owner in the medium), and the acoustic medium.
+    index: usize,
+    medium: Option<SharedMedium>,
     /// The rates of its bus, to time its frames.
     rates: Option<BitRates>,
     /// The pin devices of its ESCs that a vehicle reads.
@@ -387,6 +401,9 @@ impl Lane<'_> {
         self.checkpoints.truncate(k + 1);
         let c = &self.checkpoints[k];
         self.session.roll_back(&c.board);
+        if let Some(m) = &self.medium {
+            lock(m).back_to(self.index, &c.drives);
+        }
         self.session.unread_from(self.bounds.time(c.at));
         *self.power = c.power;
         self.at = c.at;
@@ -446,7 +463,13 @@ impl Lane<'_> {
             let run =
                 std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| self.session.run_machine_through_lockups(t)));
             match run {
-                Ok(StopReason::TimeLimit) => {}
+                Ok(StopReason::TimeLimit) => {
+                    // As taking turns tells it (other boards' hydrophones only read what it drove before the
+                    // window's start, see `crate::acoustic::Lookahead`)
+                    if let Some(m) = &self.medium {
+                        lock(m).progress(self.index, t);
+                    }
+                }
                 Ok(other) => {
                     self.stop = Some((self.at + 1, other));
                     shared.announce(self.window, self.at + 1);
@@ -490,6 +513,7 @@ impl Lane<'_> {
                     at: self.at,
                     board: self.session.rollback_point(),
                     power: *self.power,
+                    drives: self.medium.as_ref().map_or(Vec::new(), |m| lock(m).mark(self.index)),
                     trace: self.trace.as_ref().map_or(0, HeldTrace::len),
                     profile: self.session.profiler.as_ref().map(Profiler::mark),
                 });
@@ -650,8 +674,14 @@ fn horizon(buses: &[RobotBus], bounds: &Bounds) -> usize {
 }
 
 /// [`Robot::run_until`] for a robot that can run its boards ahead of each other ([`possible`]). With `soft`, it
-/// returns once a window ends at or after `soft` ([`Robot::run_until_after`]).
-pub(crate) fn run_until(robot: &mut Robot, end: Time, soft: Option<Time>) -> Option<(usize, StopReason)> {
+/// returns once a window ends at or after `soft` ([`Robot::run_until_after`]). In an acoustic medium, `acoustic`
+/// bounds how far the boards can run apart, at least a slice until `end` (see [`Robot::run_until`]).
+pub(crate) fn run_until(
+    robot: &mut Robot,
+    end: Time,
+    soft: Option<Time>,
+    acoustic: Option<&crate::acoustic::Lookahead>,
+) -> Option<(usize, StopReason)> {
     let max_threads = max_threads(robot);
     let n = robot.boards.len();
     let live = has_live_inputs(robot);
@@ -681,6 +711,7 @@ pub(crate) fn run_until(robot: &mut Robot, end: Time, soft: Option<Time>) -> Opt
         stop_flag,
         run_ahead_stress,
         run_ahead_stats,
+        medium,
         ..
     } = robot;
     let mut stress = run_ahead_stress.map(sim_devices::fault::Rng::new);
@@ -699,6 +730,8 @@ pub(crate) fn run_until(robot: &mut Robot, end: Time, soft: Option<Time>) -> Opt
             Mutex::new(Lane {
                 session,
                 power,
+                index: i,
+                medium: medium.clone(),
                 rates: board_bus[i].map(|j| buses[j].bus.rates),
                 escs: std::mem::take(&mut escs[i]),
                 follower: follower[i],
@@ -748,6 +781,14 @@ pub(crate) fn run_until(robot: &mut Robot, end: Time, soft: Option<Time>) -> Opt
                 window += 1;
                 let bounds = Bounds { start: *now, slice: *slice, end };
                 let mut last = horizon(buses, &bounds).min(MAX_WINDOW).min(bounds.count());
+                if let Some(look) = acoustic {
+                    // As far apart as the water lets them (at least a slice, which `Robot::run_until` checked for
+                    // the whole run: a part of it can only let them further)
+                    let span = Time(bounds.slice.as_ps() * MAX_WINDOW as u64).min(end - bounds.start);
+                    let ahead = look.ahead(bounds.start, span);
+                    debug_assert!(ahead >= bounds.slice, "{ahead} ahead of {}", bounds.start);
+                    last = last.min((ahead.as_ps() / bounds.slice.as_ps().max(1)) as usize).max(1);
+                }
                 if *realtime && live {
                     let (wall, slept) = wall_horizon(pacing, &bounds);
                     last = last.min(wall);

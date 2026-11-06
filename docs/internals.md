@@ -149,8 +149,8 @@ channels as a debug probe would, decoding defmt with the ELF's table), the UARTs
 `sim_host::robot::Robot` runs several sessions to the same time in 100 µs slices; after each slice every bus
 arbitrates and delivers what its nodes and endpoints sent, vehicles step, and the acoustic medium learns how far
 each board got. Boards do not see each other within a slice, so they can run on several threads
-(`Robot::threads`, `sim_host::parallel`) with identical results, except in an acoustic medium where a hydrophone
-can hear another board within the slice.
+(`Robot::threads`, `sim_host::parallel`) with identical results; in an acoustic medium only as far apart as the sound
+between them takes to arrive (see *Acoustic media* below).
 
 **Threads** (`sim_host::parallel`). For each `Robot::run_until` of at least 8 slices, scoped threads start once
 and each runs a fixed group of boards in place: each board sits behind a `Mutex` that only one thread wants at a
@@ -216,7 +216,7 @@ events through a buffer (`HeldTrace`) that a rollback truncates and each window'
 their samples (`Profiler::hold`, `mark`, `back_to`, `commit`) the same way: both see exactly the committed run.
 Boards with USB/IP or an Ethernet cable (their host sides answer the board at once: ARP, the mock bridge; rolling
 them back would need snapshots of the endpoints, and Puddles is a single board anyway), endpoints that are
-neither live nor can tell when they send, and acoustic media keep the slice-by-slice threads. `crates/sim_host/tests/runahead.rs`
+neither live nor can tell when they send keep the slice-by-slice threads. `crates/sim_host/tests/runahead.rs`
 compares Talos frame by frame, line by line (the hooks' order across boards included) and state by state against
 taking turns: on 2, 3 and any threads, in uneven pieces, with a vehicle that moves the camera cage's input, with
 stops, and with a stress mode (`Robot::run_ahead_stress`) that makes every board ignore where its window ends
@@ -226,6 +226,26 @@ and replayed), a host frame landing in boards' windows, in real time (no read mo
 wall clock), the nereus setup (`robots/talos_nereus.toml`: live host sides, an external vehicle posted between
 runs), and with traces and profiles; `crates/sim_host/tests/robot_usb.rs` with a board fed from a terminal;
 `crates/sim_test/tests/run_ahead_thrusters.rs` with the thrusters spinning and the vehicle moving.
+
+*Acoustic media.* Boards in water see each other through it too: a hydrophone reads another board's projector at
+the time the sound left it, the time it arrives less each path's delay. A projector's waveform is computed only
+where its board has run past (`sim_acoustics::medium`), so boards that stay less than the shortest delay ahead of
+where all of them were read exactly what taking turns gives them. `acoustic::Lookahead` bounds that delay over a
+span of time: the shortest path (direct or reflected) between each hydrophone and every other board's projector at
+the span's start, less 2.5 ms before it (the hydrophone interpolates its paths over 1 ms blocks and rolls back 1 ms
+after a gap) and what both ends' greatest speeds can close until 2.5 ms after it (Doppler and moving vehicles; an
+image of a moving projector moves as fast), less 50 µs. `Robot::run_until` runs a robot in water in pieces of up
+to a second (`MEDIUM_PIECE`); a piece runs on threads where the bound is at least a slice through it, and running
+ahead cuts each window to it (the pool's 5 m: 33 slices). Each board tells the medium how far it got after each of
+its slices, as taking turns does; a rollback point notes where its projectors' drives were (`Medium::mark`), and a
+rollback takes them back (`Medium::back_to`: the level changes since are forgotten; none can have been folded into
+samples). The board driving a projector and the hydrophones reading it hold different locks
+(`medium::ProjectorState`), and a hydrophone holds the medium only to refresh its paths. Boards closer than a
+slice's sound (15 cm), paths longer than 0.4 s and transducers on a simulated vehicle (`Trajectory::Live`, known
+only as the vehicle moves) take turns. `crates/sim_host/tests/acoustic_threads.rs` compares the IVC pool on threads,
+running ahead, slice by slice and with forced rollbacks against taking turns (CAN frames, lines in order across
+boards, what the bridges received, every ADC sample of the listening hydrophone, machine state) while a packet
+crosses the water, with both vehicles closing at 1.5 m/s each, the whole byte exchange, and the C IVCBoard2 pool.
 
 Both run their machines through `Session::run_machine`, which goes through the session's sampling profiler when
 it has one (the profiler cuts the run at its sample times; a robot's worker thread takes the board's profiler with

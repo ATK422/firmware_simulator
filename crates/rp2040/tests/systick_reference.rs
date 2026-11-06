@@ -99,9 +99,10 @@ const BUF: u32 = SRAM_BASE + 0x1000;
 
 /// Core 0 computing into SRAM with SysTick on the reference clock (`rvr`, interrupting), polling SYST_CVR and
 /// SYST_CSR between rounds into a ring at `BUF`; its handler counts at `COUNTER` and writes a new RVR each time.
-/// Core 0's code is in XIP SRAM with `xip`. Core 1 sleeps in WFI with SysTick on the reference clock too
+/// Core 0's code is in XIP SRAM with `xip`; with `quiet` its rounds only read memory (a quantum that only reads
+/// is fused after while SysTick counts: there is no busy-wait to skip). Core 1 sleeps in WFI with SysTick on the reference clock too
 /// (`rvr1`), its handler counting at `COUNTER1`. The watchdog tick divides `clk_ref` by `cycles`.
-fn computing(cycles: u32, rvr: u32, rvr1: u32, xip: bool) -> Machine {
+fn computing(cycles: u32, rvr: u32, rvr1: u32, xip: bool, quiet: bool) -> Machine {
     use rp2040::memmap::XIP_SRAM_BASE;
     let mut m = Machine::new(MachineConfig::default());
     let base = if xip { XIP_SRAM_BASE + 0x100 } else { SRAM_BASE + 0x400 };
@@ -137,26 +138,26 @@ fn computing(cycles: u32, rvr: u32, rvr1: u32, xip: bool) -> Machine {
     }
     assert!(m.sys.poke(SRAM_BASE + 0x11E, Size::Half, COUNTER1 >> 16));
     let core0: [u16; 24] = [
-        0x4C09, // ldr r4, [pc, #36] (BUF)
-        0x4D0A, // ldr r5, [pc, #40] (SYST_CSR)
-        0x2600, // movs r6, #0
-        0x23C8, // outer: movs r3, #200
-        0x6022, // inner: str r2, [r4, #0]
-        0x3203, // adds r2, #3
-        0x4357, // muls r7, r2
-        0x3B01, // subs r3, #1
-        0xD1FA, // bne inner
-        0x68A8, // ldr r0, [r5, #8] (SYST_CVR)
-        0x6829, // ldr r1, [r5, #0] (SYST_CSR: COUNTFLAG, cleared by the read)
-        0x00F7, // lsls r7, r6, #3
-        0x193F, // adds r7, r7, r4
-        0x60B8, // str r0, [r7, #8]
-        0x60F9, // str r1, [r7, #12]
-        0x3601, // adds r6, #1
-        0x273F, // movs r7, #63
-        0x403E, // ands r6, r7
-        0xE7EF, // b outer
-        0xBF00, // nop
+        0x4C09,                              // ldr r4, [pc, #36] (BUF)
+        0x4D0A,                              // ldr r5, [pc, #40] (SYST_CSR)
+        0x2600,                              // movs r6, #0
+        0x23C8,                              // outer: movs r3, #200
+        if quiet { 0x6822 } else { 0x6022 }, // inner: ldr r2, [r4, #0] or str r2, [r4, #0]
+        0x3203,                              // adds r2, #3
+        0x4357,                              // muls r7, r2
+        0x3B01,                              // subs r3, #1
+        0xD1FA,                              // bne inner
+        0x68A8,                              // ldr r0, [r5, #8] (SYST_CVR)
+        0x6829,                              // ldr r1, [r5, #0] (SYST_CSR: COUNTFLAG, cleared by the read)
+        0x00F7,                              // lsls r7, r6, #3
+        0x193F,                              // adds r7, r7, r4
+        0x60B8,                              // str r0, [r7, #8]
+        0x60F9,                              // str r1, [r7, #12]
+        0x3601,                              // adds r6, #1
+        0x273F,                              // movs r7, #63
+        0x403E,                              // ands r6, r7
+        0xE7EF,                              // b outer
+        0xBF00,                              // nop
         BUF as u16,
         (BUF >> 16) as u16,
         SYST_CSR as u16,
@@ -237,12 +238,19 @@ fn computed(m: &mut Machine, end: Time, pieces: u64, batched: bool) -> Vec<Strin
 #[test]
 fn batches_run_across_reference_ticks_as_steps_do() {
     // Ticks of 1 us and of one clk_ref cycle; code in SRAM and in XIP SRAM; in one run and in uneven pieces
-    for (cycles, xip, pieces) in [(12, false, 1), (12, true, 7), (1, false, 3), (1, true, 1)] {
+    for (cycles, xip, pieces, quiet) in [
+        (12, false, 1, false),
+        (12, true, 7, false),
+        (1, false, 3, false),
+        (1, true, 1, false),
+        (12, false, 5, true),
+        (1, true, 1, true),
+    ] {
         let end = Time::from_us(12_345);
-        let mut batched = computing(cycles, 200, 150, xip);
+        let mut batched = computing(cycles, 200, 150, xip, quiet);
         let a = computed(&mut batched, end, pieces, true);
-        let b = computed(&mut computing(cycles, 200, 150, xip), end, pieces, false);
-        assert_eq!(a, b, "cycles {cycles}, xip {xip}, pieces {pieces}");
+        let b = computed(&mut computing(cycles, 200, 150, xip, quiet), end, pieces, false);
+        assert_eq!(a, b, "cycles {cycles}, xip {xip}, pieces {pieces}, quiet {quiet}");
         // It ran: both handlers were called many times, core 0 read SysTick as it counted
         let calls: Vec<u32> = [COUNTER, COUNTER1].iter().map(|&a| batched.sys.peek(a, Size::Word).unwrap()).collect();
         assert!(calls.iter().all(|&n| n > 20), "{calls:?}");

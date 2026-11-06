@@ -227,8 +227,12 @@ exactly as if they had taken turns (tests check Talos frame by frame on any numb
 thread for many slices, grouped by what it was measured to cost: on Talos the two ESC boards each get a thread and
 the other seven share a third. Only as many threads are used as make the slices shorter, so a robot of light
 boards stays on one, and if the cores are busy with other programs (the slices are not shorter on threads) the
-boards go back to taking turns for a while. Robots in an acoustic environment always take turns, since a
-hydrophone can hear another board within the slice. Emulator log lines from different boards can interleave
+boards go back to taking turns for a while. Boards in an acoustic environment run on threads too, as far ahead of
+each other as the water lets them: a hydrophone hears another board's projector only after the sound has crossed the
+water (3.4 ms for the pool's 5 m), so the boards run apart up to the shortest delay between any hydrophone and
+another board's projector, less what their greatest speeds can close over the run (scripted trajectories); the run is
+exactly that of taking turns. Boards less than a slice's sound apart (15 cm) and transducers on a simulated vehicle
+(whose path is only known as it happens) take turns. Emulator log lines from different boards can interleave
 differently with threads; what the boards do does not change. `Robot::threads` defaults to 1 in code (tests).
 
 **Running ahead.** On threads, the boards also run ahead of each other between the slices where they can see each

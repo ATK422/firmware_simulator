@@ -25,7 +25,7 @@ use sim_core::time::Time;
 use crate::chain::{Chain, ChainSpec};
 use crate::env::Environment;
 use crate::geometry::Vec3;
-use crate::medium::{Medium, SharedMedium, Trajectory};
+use crate::medium::{Medium, ProjectorState, SharedMedium, Trajectory, WaveReader};
 use crate::noise;
 use crate::transducer::Transducer;
 use crate::wav::Wav;
@@ -65,6 +65,9 @@ pub struct Hydrophone {
     medium: Option<(SharedMedium, usize)>,
     /// Block the taps were computed for, and how many projectors there were.
     block: Option<(u64, usize)>,
+    /// The state of each projector in the medium it hears (not its own board's), by index; refreshed from the
+    /// medium at each [`Hydrophone::sample`].
+    heard: Vec<Option<std::sync::Arc<ProjectorState>>>,
     moves: bool,
     /// Centre of the receive chain's band, where the noise level is taken.
     centre_hz: f64,
@@ -119,6 +122,7 @@ impl Hydrophone {
             taps: Vec::new(),
             medium: None,
             block: None,
+            heard: Vec::new(),
             moves: false,
             centre_hz: centre,
             noise_rms_v,
@@ -150,6 +154,7 @@ impl Hydrophone {
         if let Some(m) = &mut self.medium {
             m.0 = medium;
         }
+        self.heard.clear();
     }
 
     /// Replaces the trajectory (a vehicle moved somewhere else between runs).
@@ -191,14 +196,14 @@ impl Hydrophone {
     }
 
     /// Recomputes the taps for the block holding grid step `n`, if needed.
-    fn update_taps(&mut self, n: u64, med: Option<&Medium>) {
+    fn update_taps(&mut self, n: u64, med: Option<(&Medium, usize)>) {
+        let (med, owner) = (med.map(|m| m.0), med.map(|m| m.1));
         let block = n / BLOCK_STEPS;
         let nproj = med.map_or(0, |m| m.projectors.len());
         match self.block {
             Some((b, np)) if np == nproj && (b == block || !self.moves) => return,
             _ => {}
         }
-        let owner = self.medium.as_ref().map(|m| m.1);
         self.moves = self.trajectory.moves()
             || med.is_some_and(|m| m.projectors.iter().any(|p| Some(p.owner) != owner && p.trajectory.moves()));
         let t0 = (block * BLOCK_STEPS) as f64 / self.rate;
@@ -234,9 +239,22 @@ impl Hydrophone {
         self
     }
 
-    /// Hydrophone output (before the chain) at grid step `n`.
-    fn raw(&mut self, n: u64, mut med: Option<&mut Medium>) -> f64 {
-        self.update_taps(n, med.as_deref());
+    /// Points [`Hydrophone::heard`] at the states of `med`'s projectors (other boards' ones).
+    fn refresh_heard(&mut self, med: &Medium, owner: usize) {
+        let owner = Some(owner);
+        let same = self.heard.len() == med.projectors.len()
+            && self.heard.iter().zip(&med.projectors).all(|(h, p)| match h {
+                Some(h) => std::sync::Arc::ptr_eq(h, &p.state),
+                None => Some(p.owner) == owner,
+            });
+        if !same {
+            self.heard = med.projectors.iter().map(|p| (Some(p.owner) != owner).then(|| p.state.clone())).collect();
+        }
+    }
+
+    /// Hydrophone output (before the chain) at grid step `n`, with the taps for its block, reading the projectors
+    /// it hears through `heard` (by projector index).
+    fn raw(&mut self, n: u64, heard: &mut [Option<WaveReader<'_>>]) -> f64 {
         let t = n as f64 / self.rate;
         let f = (n % BLOCK_STEPS) as f64 / BLOCK_STEPS as f64;
         let mut v = 0.0;
@@ -245,7 +263,9 @@ impl Hydrophone {
             let gain = tap.volts_per_upa[0] + (tap.volts_per_upa[1] - tap.volts_per_upa[0]) * f;
             let p = match tap.from {
                 Origin::Source(i) => self.env.sources[i].pressure(t - delay),
-                Origin::Projector(i) => med.as_deref_mut().map_or(0.0, |m| m.projectors[i].pressure(t - delay)),
+                Origin::Projector(i) => {
+                    heard.get_mut(i).and_then(Option::as_mut).map_or(0.0, |w| w.pressure(t - delay))
+                }
             };
             v += gain * p;
         }
@@ -304,12 +324,43 @@ impl Hydrophone {
                 k.saturating_sub(PREROLL_STEPS)
             }
         };
-        let medium = self.medium.as_ref().map(|m| m.0.clone());
-        let mut guard = medium.as_ref().map(|m| m.lock().unwrap());
-        for n in from..=k {
-            let raw = self.raw(n, guard.as_deref_mut());
-            self.last = self.chain.process(raw, pins);
+        // (Taken out rather than cloned: the count of a shared `Arc` is a cache line every board's thread writes.)
+        let medium = self.medium.take();
+        let mut n = from;
+        while n <= k {
+            // The taps for step n's block, holding the medium only for that; then the steps up to the next block
+            // whose taps differ, holding only the projectors heard
+            {
+                let guard = medium.as_ref().map(|(m, owner)| (m.lock().unwrap_or_else(|e| e.into_inner()), *owner));
+                self.update_taps(n, guard.as_ref().map(|(m, owner)| (&**m, *owner)));
+                if let Some((m, owner)) = &guard {
+                    self.refresh_heard(m, *owner);
+                }
+            }
+            let last = if self.moves { k.min((n / BLOCK_STEPS + 1) * BLOCK_STEPS - 1) } else { k };
+            let states = std::mem::take(&mut self.heard);
+            // Readers on the stack for a few projectors (a pool of boards), else in a vector
+            let mut few: [Option<WaveReader<'_>>; 4] = [None, None, None, None];
+            let mut many = Vec::new();
+            let heard: &mut [Option<WaveReader<'_>>] = if states.len() <= few.len() {
+                for (r, s) in few.iter_mut().zip(&states) {
+                    *r = s.as_ref().map(|s| s.read());
+                }
+                &mut few[..states.len()]
+            } else {
+                many.extend(states.iter().map(|s| s.as_ref().map(|s| s.read())));
+                &mut many
+            };
+            for n in n..=last {
+                let raw = self.raw(n, heard);
+                self.last = self.chain.process(raw, pins);
+            }
+            drop(few);
+            drop(many);
+            self.heard = states;
+            n = last + 1;
         }
+        self.medium = medium;
         self.step = Some(k);
         self.samples += 1;
         if self.chain.at_rail(self.last) {
@@ -525,7 +576,15 @@ mod tests {
             let medium = h.medium().unwrap().clone();
             let (mut worst, mut peak, mut worst_at_boundary) = (0f64, 0f64, 0f64);
             for n in 50_000..150_000u64 {
-                let got = h.raw(n, Some(&mut medium.lock().unwrap()));
+                let got = {
+                    let m = medium.lock().unwrap();
+                    h.update_taps(n, Some((&m, 1)));
+                    h.refresh_heard(&m, 1);
+                    drop(m);
+                    let states = h.heard.clone();
+                    let mut heard: Vec<_> = states.iter().map(|s| s.as_ref().map(|s| s.read())).collect();
+                    h.raw(n, &mut heard)
+                };
                 let want = exact_raw(&h, n);
                 peak = peak.max(want.abs());
                 worst = worst.max((got - want).abs());
