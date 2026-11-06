@@ -468,7 +468,14 @@ mod tests {
     fn relay_only_forwards_datagrams_from_the_peer() {
         let bridge = UdpSocket::bind("127.0.0.1:0").unwrap();
         let other_port = UdpSocket::bind("127.0.0.1:0").unwrap();
-        let stranger = UdpSocket::bind("127.0.0.2:0").unwrap();
+        // Another host's IP: a second loopback address, which Linux has (all of 127/8) and macOS doesn't by default
+        let stranger = match UdpSocket::bind("127.0.0.2:0") {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("skipping: no second loopback address here to send from ({e})");
+                return;
+            }
+        };
         let mut relay = UdpRelay::bind("127.0.0.1:0".parse().unwrap(), bridge.local_addr().unwrap()).unwrap();
         let to = relay.local_addr().unwrap();
         // The board has sent something: its MAC is known

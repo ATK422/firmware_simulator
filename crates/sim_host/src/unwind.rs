@@ -164,7 +164,7 @@ impl UnwindTable {
 
 /// Whether Thumb code contains a `BL` or `BLX Rm`.
 fn contains_call(code: &[u8]) -> bool {
-    let h: Vec<u16> = code.chunks_exact(2).map(|c| u16::from_le_bytes([c[0], c[1]])).collect();
+    let h: Vec<u16> = code.as_chunks::<2>().0.iter().map(|c| u16::from_le_bytes(*c)).collect();
     let mut i = 0;
     while i < h.len() {
         if h[i] & 0xF800 == 0xF000 && h.get(i + 1).is_some_and(|n| n & 0xD000 == 0xD000) {

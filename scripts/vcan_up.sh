@@ -48,14 +48,14 @@ exists() {
 if [ "$down" -eq 1 ]; then
     for i in "${ifaces[@]}"; do
         if exists "$i"; then
-            "${sudo[@]}" ip link delete dev "$i"
+            ${sudo[@]+"${sudo[@]}"} ip link delete dev "$i"
             echo "$i removed"
         fi
     done
     exit 0
 fi
 
-if ! "${sudo[@]}" modprobe vcan; then
+if ! ${sudo[@]+"${sudo[@]}"} modprobe vcan; then
     echo "could not load the vcan module: this kernel has no virtual CAN support (common in containers and" >&2
     echo "cloud VMs, WSL2). Use the emulator's in-process bus, or UDP: --micro-ros-agent and --cannelloni hubs" >&2
     echo "(the scripts' --transport udp; docs/robots.md#without-vcan-udp)." >&2
@@ -64,14 +64,14 @@ fi
 
 for i in "${ifaces[@]}"; do
     if ! exists "$i"; then
-        "${sudo[@]}" ip link add dev "$i" type vcan
+        ${sudo[@]+"${sudo[@]}"} ip link add dev "$i" type vcan
     fi
     # The MTU can only change while the interface is down; leave one that is already right (and maybe in use) alone
     if ! ip link show "$i" | grep -q 'mtu 72 '; then
-        "${sudo[@]}" ip link set dev "$i" down
-        "${sudo[@]}" ip link set dev "$i" mtu 72
+        ${sudo[@]+"${sudo[@]}"} ip link set dev "$i" down
+        ${sudo[@]+"${sudo[@]}"} ip link set dev "$i" mtu 72
     fi
-    "${sudo[@]}" ip link set dev "$i" txqueuelen 1000
-    "${sudo[@]}" ip link set dev "$i" up
+    ${sudo[@]+"${sudo[@]}"} ip link set dev "$i" txqueuelen 1000
+    ${sudo[@]+"${sudo[@]}"} ip link set dev "$i" up
     echo "$i up (CAN FD MTU 72)"
 done

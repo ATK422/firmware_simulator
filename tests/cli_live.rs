@@ -258,20 +258,29 @@ fn a_robot_behind_real_time_says_so() {
 #[test]
 fn a_cannelloni_hub_serves_a_peer_that_only_knows_its_address() {
     let robot = repo().join("robots/talos_nereus.toml");
-    let hub = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
-    let addr = hub.local_addr().unwrap();
-    drop(hub);
-    let mut r = Running::start(&[
-        "robot",
-        robot.to_str().unwrap(),
-        "--cannelloni",
-        &format!("internal={addr}"),
-        "--dashboard",
-        "127.0.0.1:0",
-        "--realtime",
-        "--time",
-        "600s",
-    ]);
+    // A free port for the hub. Between freeing it here and the emulator binding it, another test may take it
+    // (macOS hands out ephemeral ports in order): then the emulator says so and exits, and it gets another
+    let (mut r, addr) = (0..5)
+        .find_map(|_| {
+            let hub = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+            let addr = hub.local_addr().unwrap();
+            drop(hub);
+            let mut r = Running::start(&[
+                "robot",
+                robot.to_str().unwrap(),
+                "--cannelloni",
+                &format!("internal={addr}"),
+                "--dashboard",
+                "127.0.0.1:0",
+                "--realtime",
+                "--time",
+                "600s",
+            ]);
+            let taken = wait_until(5, || !r.still_running() || r.stderr().contains("cannelloni hub over UDP"))
+                && r.stderr().contains("Address already in use");
+            (!taken).then_some((r, addr))
+        })
+        .expect("a free port for the hub in 5 tries");
     let peer = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
     peer.set_read_timeout(Some(Duration::from_millis(200))).unwrap();
     let mut heartbeats = std::collections::BTreeSet::new();

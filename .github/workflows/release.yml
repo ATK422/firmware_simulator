@@ -1,0 +1,139 @@
+# Prebuilt emulator binaries, so other repositories' CI (titan_firmware, nano_ros, ...) can run the firmware in the
+# emulator without building it (see action.yml and docs/ci.md).
+#
+#   * a push to master   updates the `nightly` pre-release (the tag moves to that commit)
+#   * a tag `v*`         makes a release with that name
+#   * a pull request     builds and smoke-tests every archive, and keeps them as workflow artifacts (no release)
+#
+# Each archive, firmware_simulator-TARGET.tar.gz, holds `bin/firmware_simulator` and the data files the command line
+# reads (boards/, robots/, environments/, vehicles/, scenarios/), with a .sha256 next to it. The bootrom and the
+# dashboard are compiled in.
+name: Release
+
+on:
+  push:
+    branches: [master]
+    tags: ["v*"]
+  pull_request:
+    paths:
+      - .github/workflows/release.yml
+      - action.yml
+      - Cargo.toml
+      - Cargo.lock
+  workflow_dispatch:
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_PROFILE_RELEASE_DEBUG: "false"
+  # The same toolchain as ci.yml, so a release is the build CI tested
+  RUST_TOOLCHAIN: "1.99.0"
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Ubuntu 22.04's glibc (2.35), so the Linux binaries also run on 22.04, ROS 2 Humble's release
+          - { os: ubuntu-22.04, target: x86_64-unknown-linux-gnu }
+          - { os: ubuntu-22.04-arm, target: aarch64-unknown-linux-gnu }
+          - { os: macos-latest, target: aarch64-apple-darwin }
+          - { os: macos-latest, target: x86_64-apple-darwin }
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - name: Submodules
+        # The workspace builds against titan_firmware_rs's host crates (canmore, titan_link)
+        run: git submodule update --init external/titan_firmware_rs
+      - name: Rust
+        run: |
+          rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal --target ${{ matrix.target }}
+          rustup default "$RUST_TOOLCHAIN"
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+      - name: Build
+        run: cargo build --release --locked --bin firmware_simulator --target ${{ matrix.target }}
+      - name: Package
+        shell: bash
+        run: |
+          name=firmware_simulator-${{ matrix.target }}
+          mkdir -p "dist/$name/bin"
+          cp "target/${{ matrix.target }}/release/firmware_simulator" "dist/$name/bin/"
+          cp -R boards robots environments vehicles scenarios README.md "dist/$name/"
+          git rev-parse HEAD > "dist/$name/COMMIT"
+          tar -C dist -czf "dist/$name.tar.gz" "$name"
+          (cd dist && shasum -a 256 "$name.tar.gz" > "$name.tar.gz.sha256")
+          cat "dist/$name.tar.gz.sha256"
+      - name: Smoke test
+        # Every archive but the cross-built Intel macOS one runs where it was built
+        if: matrix.target != 'x86_64-apple-darwin'
+        shell: bash
+        run: |
+          d=dist/firmware_simulator-${{ matrix.target }}
+          "$d/bin/firmware_simulator" --version
+          "$d/bin/firmware_simulator" scenario --check "$d/scenarios"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: firmware_simulator-${{ matrix.target }}
+          path: dist/firmware_simulator-${{ matrix.target }}.tar.gz*
+          if-no-files-found: error
+
+  publish:
+    if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    outputs:
+      tag: ${{ steps.release.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Release
+        id: release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          ls -l dist
+          if [ "${GITHUB_REF_TYPE}" = tag ]; then
+            tag=${GITHUB_REF_NAME}
+            gh release create "$tag" dist/* --title "$tag" --generate-notes
+          else
+            # nightly: the newest master, replaced on every push (the tag moves to this commit)
+            tag=nightly
+            gh release delete "$tag" --cleanup-tag --yes 2>/dev/null || true
+            gh release create "$tag" dist/* --prerelease --target "$GITHUB_SHA" --title "nightly" \
+              --notes "Built from ${GITHUB_SHA} on $(date -u +%Y-%m-%d). Replaced on every push to master."
+          fi
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+
+  action:
+    # The action, as other repositories use it, against the release just published
+    needs: publish
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, ubuntu-24.04-arm, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./
+        id: sim
+        with:
+          version: ${{ needs.publish.outputs.tag }}
+      - name: The action's outputs
+        shell: bash
+        run: |
+          firmware_simulator --version
+          test -d "$FIRMWARE_SIMULATOR_HOME/boards"
+          test "${{ steps.sim.outputs.home }}" = "$FIRMWARE_SIMULATOR_HOME"
+          firmware_simulator scenario --check "$FIRMWARE_SIMULATOR_HOME/scenarios"

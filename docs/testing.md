@@ -293,18 +293,16 @@ When the firmware rather than the emulator looks wrong, write a test that assert
   silicon). SocketCAN is Linux only; on macOS `SocketCan::open` fails with a clear error and CAN reaches a Linux
   machine through `can-tunnel` instead.
 
-`external/titan_firmware_rs` is the private repository `ATK422/titan_firmware_rs`. Give the workflow a token that
-can read it as the repository secret **`TITAN_FIRMWARE_RS_TOKEN`** (a fine-grained personal access token with
-"Contents: read" on that repository). Without it the submodule is not fetched, the "Firmware images" step fails
-loudly, and the firmware tests would otherwise skip. The c-firmware job needs it too: the emulator's workspace uses
-titan_firmware_rs's host crates (`canmore`, `titan_link`), so its tests can't build without the submodule.
+Both submodules are public, so the workflow needs no secrets. Every job fetches `external/titan_firmware_rs`:
+the emulator's workspace uses its host crates (`canmore`, `titan_link`), and the firmware tests use its images.
+
+Prebuilt binaries for other repositories' CI, and the GitHub Action that installs them, are in [ci.md](ci.md).
 
 ### In titan_firmware_rs
 
 titan_firmware_rs runs this repository's firmware tests on every push and pull request of its own, in
 `.github/workflows/emulator.yml` there ("Emulator CI" in its README). The workflow builds the images with the
-firmware's pinned compiler, checks out this repository at `master` (with the `FIRMWARE_SIMULATOR_TOKEN` secret,
-since this repository may be private), and puts its own checkout in place of `external/titan_firmware_rs`. This
+firmware's pinned compiler, checks out this repository at `master` (public, so no secret is needed), and puts its own checkout in place of `external/titan_firmware_rs`. This
 repository's host crates and images then both come from that commit, and no submodule is fetched. It then runs:
 
 ```bash
