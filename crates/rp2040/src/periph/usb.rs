@@ -415,7 +415,8 @@ impl Usb {
     }
 
     pub fn irq(&self) -> bool {
-        self.ints() != 0
+        // (Most firmware enables none: spare collecting the raw status)
+        self.inte != 0 && self.ints() != 0
     }
 
     /// A register read. SOF_RD clears the SOF interrupt; `line_state` comes from [`Usb::line_state`].
