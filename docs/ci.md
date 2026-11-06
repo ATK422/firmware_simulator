@@ -23,7 +23,8 @@ JUnit output. Runs are deterministic, so a scenario that passes once passes ever
 
 Each holds `bin/firmware_simulator`, the data files the command line reads (`boards/`, `robots/`, `environments/`,
 `vehicles/`, `scenarios/`), this README and `COMMIT` (the commit it was built from); a `.sha256` sits next to each
-archive. The bootrom and the dashboard are compiled in. No firmware images are included: bring your own.
+archive. The bootrom and the dashboard are compiled in, and the binary is built with the `fast` profile (fat LTO,
+3-7 % faster than a `--release` build; [internals.md](internals.md)). No firmware images are included: bring your own.
 
 A scenario outside this repository finds the emulator's files by their short names (`board: {file: mk2/power_board}`,
 `robot: talos`): files are looked for from the scenario's directory up first, then in `$FIRMWARE_SIMULATOR_HOME`,

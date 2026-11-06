@@ -58,13 +58,14 @@ jobs:
         with:
           key: ${{ matrix.target }}
       - name: Build
-        run: cargo build --release --locked --bin firmware_simulator --target ${{ matrix.target }}
+        # The fast profile (fat LTO, one codegen unit): 3-7 % faster than release, built once per release
+        run: cargo build --profile fast --locked --bin firmware_simulator --target ${{ matrix.target }}
       - name: Package
         shell: bash
         run: |
           name=firmware_simulator-${{ matrix.target }}
           mkdir -p "dist/$name/bin"
-          cp "target/${{ matrix.target }}/release/firmware_simulator" "dist/$name/bin/"
+          cp "target/${{ matrix.target }}/fast/firmware_simulator" "dist/$name/bin/"
           cp -R boards robots environments vehicles scenarios README.md "dist/$name/"
           git rev-parse HEAD > "dist/$name/COMMIT"
           tar -C dist -czf "dist/$name.tar.gz" "$name"
