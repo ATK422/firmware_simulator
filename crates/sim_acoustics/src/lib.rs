@@ -11,6 +11,7 @@
 //! * [`geometry`]: positions, boundaries and the image method
 //! * [`env`]: environment files and propagation paths
 //! * [`hydrophone`]: a hydrophone in an environment, driving an ADC input
+//! * [`lanes`]: its path sum, several paths at a time in SIMD lanes, bit for bit as one at a time
 //! * [`medium`]: water shared by several boards, their projectors driven by pins, moving vehicles
 //! * [`wav`]: WAV reading and writing
 //!
@@ -20,6 +21,7 @@ pub mod chain;
 pub mod env;
 pub mod geometry;
 pub mod hydrophone;
+pub mod lanes;
 pub mod medium;
 pub mod noise;
 pub mod source;
