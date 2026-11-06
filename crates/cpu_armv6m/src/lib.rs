@@ -596,6 +596,7 @@ impl CortexM0Plus {
         }
         if addr >= ppb::PPB_BASE {
             self.batch_break = true;
+            self.feed_reference_ticks(bus, addr);
             return Ok(self.ppb_read(addr, size));
         }
         Ok(bus.read(addr, size)?)
@@ -614,6 +615,7 @@ impl CortexM0Plus {
         }
         if addr >= ppb::PPB_BASE {
             self.batch_break = true;
+            self.feed_reference_ticks(bus, addr);
             self.ppb_write(addr, size, v);
             return Ok(());
         }
@@ -643,6 +645,21 @@ impl CortexM0Plus {
     pub fn tick_systick_reference(&mut self, ticks: u64) {
         if self.systick.tick_reference(ticks) {
             self.scb.systick_pending = true;
+        }
+    }
+
+    /// Before an access to `addr` in the PPB: a SysTick register gets the reference clock ticks the bus says
+    /// went by in the batch so far ([`Bus::take_reference_ticks`]), so that it reads and is written as when fed
+    /// before every instruction.
+    #[cold]
+    #[inline(never)]
+    fn feed_reference_ticks<B: Bus + ?Sized>(&mut self, bus: &mut B, addr: u32) {
+        if addr & !0xF == ppb::SYST_CSR {
+            let n = bus.take_reference_ticks();
+            if n != 0 && self.systick.tick_reference(n) {
+                self.scb.systick_pending = true;
+                self.exc_changed = true;
+            }
         }
     }
 

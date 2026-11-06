@@ -1,0 +1,32 @@
+# robots/ivc2_pool.toml with titan_firmware's C IVCBoard2 (the blake/ivc branch) on both vehicles: Talos, and a
+# second vehicle 5 m away, talking acoustically through environments/pool.toml. Each board boots through the
+# bootrom and its CAN bootloader, like a powered-on board. The image comes from your titan_firmware checkout
+# (TITAN_FIRMWARE_DIR), built as for robots/ivc2_interop.toml.
+#
+#   firmware_simulator robot robots/ivc2_pool_c.toml --time 5s
+[environment]
+file = "../environments/pool.toml"
+
+[[bus]]
+name = "talos"
+
+[[bus]]
+name = "surface"
+
+[[board]]
+name = "talos_ivc"
+board = "../boards/talos/ivc_board.toml"
+elf = "${TITAN_FIRMWARE_DIR}/talos/IVCBoard2/build/IVCBoard2_with_bl.uf2"
+rom_boot = true
+bus = "talos"
+position_m = [5.0, 6.0, 1.5]
+
+[[board]]
+name = "surface_ivc"
+board = "../boards/talos/ivc_board.toml"
+elf = "${TITAN_FIRMWARE_DIR}/talos/IVCBoard2/build/IVCBoard2_with_bl.uf2"
+rom_boot = true
+bus = "surface"
+# Switched on a little after Talos
+power_on_ms = 37
+position_m = [10.0, 6.0, 1.5]

@@ -5,6 +5,7 @@
 use rp2040::memmap::{SRAM_BASE, WATCHDOG_BASE};
 use rp2040::{Machine, MachineConfig, StopReason};
 use sim_core::bus::Size;
+use sim_core::cpu::Cpu;
 use sim_core::time::Time;
 use sim_core::trace::NullSink;
 
@@ -91,4 +92,161 @@ fn systick_on_the_core_clock_is_not_fed_reference_ticks() {
     let core_cycles = 0xFF_FFFF - cvr as u64;
     let expect = m.clk_sys().cycles_in(Time::from_ms(1));
     assert!(core_cycles.abs_diff(expect) < 100, "{core_cycles} vs {expect}");
+}
+
+const COUNTER1: u32 = SRAM_BASE + 0x204;
+const BUF: u32 = SRAM_BASE + 0x1000;
+
+/// Core 0 computing into SRAM with SysTick on the reference clock (`rvr`, interrupting), polling SYST_CVR and
+/// SYST_CSR between rounds into a ring at `BUF`; its handler counts at `COUNTER` and writes a new RVR each time.
+/// Core 0's code is in XIP SRAM with `xip`. Core 1 sleeps in WFI with SysTick on the reference clock too
+/// (`rvr1`), its handler counting at `COUNTER1`. The watchdog tick divides `clk_ref` by `cycles`.
+fn computing(cycles: u32, rvr: u32, rvr1: u32, xip: bool) -> Machine {
+    use rp2040::memmap::XIP_SRAM_BASE;
+    let mut m = Machine::new(MachineConfig::default());
+    let base = if xip { XIP_SRAM_BASE + 0x100 } else { SRAM_BASE + 0x400 };
+    let (code, handler) = (base, base + 0x40);
+    let words = [
+        (0x00, 0x2000_2000),
+        // A stub that goes there: ldr r0, [pc, #0]; bx r0
+        (0x04, SRAM_BASE + 0x301),
+        (0x300, 0x4700_4800),
+        (0x304, code + 1),
+        (0x3C, handler + 1),
+        (0x800, 0x2000_3000),
+        (0x804, SRAM_BASE + 0x101),
+        (0x83C, SRAM_BASE + 0x111),
+    ];
+    for (off, v) in words {
+        assert!(m.sys.poke(SRAM_BASE + off, Size::Word, v));
+    }
+    // Core 1: wfi in a loop, its handler counting
+    let core1: [(u32, u16); 9] = [
+        (0x100, 0xBF30), // wfi
+        (0x102, 0xE7FD), // b 0x100
+        (0x110, 0x4802), // ldr r0, [pc, #8] (COUNTER1)
+        (0x112, 0x6801), // ldr r1, [r0]
+        (0x114, 0x3101), // adds r1, #1
+        (0x116, 0x6001), // str r1, [r0]
+        (0x118, 0x4770), // bx lr
+        (0x11A, 0xBF00), // nop
+        (0x11C, COUNTER1 as u16),
+    ];
+    for (off, hw) in core1 {
+        assert!(m.sys.poke(SRAM_BASE + off, Size::Half, hw as u32));
+    }
+    assert!(m.sys.poke(SRAM_BASE + 0x11E, Size::Half, COUNTER1 >> 16));
+    let core0: [u16; 24] = [
+        0x4C09, // ldr r4, [pc, #36] (BUF)
+        0x4D0A, // ldr r5, [pc, #40] (SYST_CSR)
+        0x2600, // movs r6, #0
+        0x23C8, // outer: movs r3, #200
+        0x6022, // inner: str r2, [r4, #0]
+        0x3203, // adds r2, #3
+        0x4357, // muls r7, r2
+        0x3B01, // subs r3, #1
+        0xD1FA, // bne inner
+        0x68A8, // ldr r0, [r5, #8] (SYST_CVR)
+        0x6829, // ldr r1, [r5, #0] (SYST_CSR: COUNTFLAG, cleared by the read)
+        0x00F7, // lsls r7, r6, #3
+        0x193F, // adds r7, r7, r4
+        0x60B8, // str r0, [r7, #8]
+        0x60F9, // str r1, [r7, #12]
+        0x3601, // adds r6, #1
+        0x273F, // movs r7, #63
+        0x403E, // ands r6, r7
+        0xE7EF, // b outer
+        0xBF00, // nop
+        BUF as u16,
+        (BUF >> 16) as u16,
+        SYST_CSR as u16,
+        (SYST_CSR >> 16) as u16,
+    ];
+    let handler0: [u16; 14] = [
+        0x4804,                       // ldr r0, [pc, #16] (COUNTER)
+        0x6801,                       // ldr r1, [r0]
+        0x3101,                       // adds r1, #1
+        0x6001,                       // str r1, [r0]
+        0x4A03,                       // ldr r2, [pc, #12] (SYST_RVR)
+        0x2307,                       // movs r3, #7
+        0x400B,                       // ands r3, r1
+        0x3300 | (rvr & 0xFF) as u16, // adds r3, #rvr: the next period varies with the count
+        0x6013,                       // str r3, [r2]
+        0x4770,                       // bx lr
+        COUNTER as u16,
+        (COUNTER >> 16) as u16,
+        SYST_RVR as u16,
+        (SYST_RVR >> 16) as u16,
+    ];
+    let mut put = |addr: u32, hws: &[u16]| {
+        for (k, hw) in hws.iter().enumerate() {
+            let a = addr + 2 * k as u32;
+            if xip {
+                let off = (a - XIP_SRAM_BASE) as usize;
+                m.sys.xip_sram[off..off + 2].copy_from_slice(&hw.to_le_bytes());
+            } else {
+                assert!(m.sys.poke(a, Size::Half, *hw as u32));
+            }
+        }
+    };
+    put(code, &core0);
+    put(handler, &handler0);
+    m.direct_boot().unwrap();
+    m.sys.write(&mut NullSink, 0, Time::ZERO, WATCHDOG_BASE + 0x2C, Size::Word, 1 << 9 | cycles).unwrap();
+    let st = &mut m.cores[0].systick;
+    (st.rvr, st.cvr, st.csr) = (rvr, 0, 0b011); // ENABLE, TICKINT, CLKSOURCE = reference
+    let mut trace = NullSink;
+    let mut bus = rp2040::system::CoreBus { sys: &mut m.sys, trace: &mut trace, core: 1, now: Time::ZERO };
+    m.cores[1].reset(&mut bus, SRAM_BASE + 0x800);
+    m.core_enabled[1] = true;
+    let st = &mut m.cores[1].systick;
+    (st.rvr, st.cvr, st.csr) = (rvr1, 0, 0b011);
+    m
+}
+
+/// Everything observable of a run of [`computing`] to `end` in `pieces` runs, batched or one instruction at a time.
+fn computed(m: &mut Machine, end: Time, pieces: u64, batched: bool) -> Vec<String> {
+    if !batched {
+        m.breakpoints.insert(0xFFFF_FFF1);
+    }
+    for k in 1..=pieces {
+        assert_eq!(m.run_until(Time(end.as_ps() * k / pieces)), StopReason::TimeLimit);
+    }
+    let mut out = vec![format!("now {}", m.now)];
+    for c in 0..2 {
+        let core = &m.cores[c];
+        let regs: Vec<u32> = (0..core.num_regs()).map(|r| core.read_reg(r)).collect();
+        let st = &core.systick;
+        out.push(format!(
+            "core{c} at {}: {} cycles, {} instructions, regs {regs:08x?}, systick {:x} {} {}",
+            m.core_time(c),
+            core.cycles(),
+            core.instructions(),
+            st.csr,
+            st.rvr,
+            st.cvr
+        ));
+    }
+    for a in [COUNTER, COUNTER1] {
+        out.push(format!("{a:x}: {}", m.sys.peek(a, Size::Word).unwrap()));
+    }
+    out.push(format!("{:?}", (0..130).map(|k| m.sys.peek(BUF + 4 * k, Size::Word).unwrap()).collect::<Vec<_>>()));
+    out
+}
+
+#[test]
+fn batches_run_across_reference_ticks_as_steps_do() {
+    // Ticks of 1 us and of one clk_ref cycle; code in SRAM and in XIP SRAM; in one run and in uneven pieces
+    for (cycles, xip, pieces) in [(12, false, 1), (12, true, 7), (1, false, 3), (1, true, 1)] {
+        let end = Time::from_us(12_345);
+        let mut batched = computing(cycles, 200, 150, xip);
+        let a = computed(&mut batched, end, pieces, true);
+        let b = computed(&mut computing(cycles, 200, 150, xip), end, pieces, false);
+        assert_eq!(a, b, "cycles {cycles}, xip {xip}, pieces {pieces}");
+        // It ran: both handlers were called many times, core 0 read SysTick as it counted
+        let calls: Vec<u32> = [COUNTER, COUNTER1].iter().map(|&a| batched.sys.peek(a, Size::Word).unwrap()).collect();
+        assert!(calls.iter().all(|&n| n > 20), "{calls:?}");
+        // ...and its quanta were fused across ticks
+        assert!(batched.quanta_fused > 100, "{} quanta fused: {a:?}", batched.quanta_fused);
+    }
 }

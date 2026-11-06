@@ -116,6 +116,15 @@ pub trait Bus {
         true
     }
 
+    /// Ticks of SysTick's reference clock (CLKSOURCE clear) since SysTick was last fed them, up to the current
+    /// instruction's start, which a CPU running a batch feeds it before an access to a SysTick register: a machine
+    /// that lets a batch run across ticks (feeding SysTick between batches) answers here, so that the access sees
+    /// the counter as it is then. The default (a machine that feeds SysTick before every instruction) has none.
+    #[inline]
+    fn take_reference_ticks(&mut self) -> u64 {
+        0
+    }
+
     /// Reads without side effects, for debuggers and tracing. `None` if the location cannot be peeked.
     fn peek(&mut self, addr: u32, size: Size) -> Option<u32> {
         let _ = (addr, size);
