@@ -21,7 +21,7 @@ Every run is repeatable: the same firmware and inputs give exactly the same resu
 **Full guide: [docs/](docs/README.md)** · Design and milestones: [PLAN.md](PLAN.md)
 
 - [Quick start](#quick-start)
-- [More ways to use it](#more-ways-to-use-it): tests in YAML and firmware A/B comparisons, coding agents (MCP), C firmware with micro-ROS, nano-ROS boards, the robot computer on vcan, the firmware in nereus, IVC in the water, calibration and pool-test replay, fuzzing
+- [More ways to use it](#more-ways-to-use-it): tests in YAML and firmware A/B comparisons, other repositories' CI, coding agents (MCP), C firmware with micro-ROS, nano-ROS boards, the robot computer on vcan, the firmware in nereus, IVC in the water, calibration and pool-test replay, fuzzing
 - [What it can do](#what-it-can-do)
 - [Boards, firmware and robots](#boards-firmware-and-robots)
 - [Architecture](#architecture)
@@ -32,8 +32,7 @@ Every run is repeatable: the same firmware and inputs give exactly the same resu
 ## Quick start
 
 **Prerequisites:** Linux, macOS or Windows through WSL2 (the robot computer's tools reach the emulated buses over
-vcan on Linux, and over UDP anywhere: [robots.md](docs/robots.md#without-vcan-udp)), Rust (stable, 1.85 or newer) with the `thumbv6m-none-eabi` target, git, and read access to the
-private repository `ATK422/titan_firmware_rs`. The firmware images build with the compiler titan_firmware_rs pins in
+vcan on Linux, and over UDP anywhere: [robots.md](docs/robots.md#without-vcan-udp)), Rust (stable, 1.88 or newer) with the `thumbv6m-none-eabi` target, and git. The firmware images build with the compiler titan_firmware_rs pins in
 its `rust-toolchain.toml` (rustc 1.99.0 at the pinned commit): rustup picks it up in that directory, and
 `rustup toolchain install` there installs it with its `thumbv6m-none-eabi` target. The C firmware additionally needs `gcc-arm-none-eabi`, `cmake` and
 `ninja` (optional; only the C tests use it).
@@ -42,7 +41,7 @@ its `rust-toolchain.toml` (rustc 1.99.0 at the pinned commit): rustup picks it u
 
 ```bash
 git clone https://github.com/ATK422/firmware_simulator && cd firmware_simulator
-git submodule update --init       # external/titan_firmware_rs is private: ATK422/titan_firmware_rs
+git submodule update --init       # external/titan_firmware_rs is ATK422/titan_firmware_rs
 rustup target add thumbv6m-none-eabi
 (cd external/titan_firmware_rs && rustup toolchain install)   # the firmware's pinned compiler, with its targets
 ```
@@ -54,7 +53,7 @@ micro-ROS library, ROS 2 Humble with the riptide messages, and on Linux `can-uti
 the build tools alone.
 
 The workspace uses titan_firmware_rs's host crates (`canmore`, `titan_link`), so the emulator does not build
-without that submodule. If cloning it fails, ask for access to `ATK422/titan_firmware_rs`.
+without that submodule.
 
 **2. Build the firmware images and the emulator.**
 
@@ -154,6 +153,16 @@ ESC speeds, CPU load) for a pull request ([scenarios.md](docs/scenarios.md)):
 ```bash
 firmware_simulator scenario scenarios/ --junit results.xml
 firmware_simulator compare --a $FW --b ~/other-build/thumbv6m-none-eabi/release scenarios/ -o ab.md
+```
+
+**Run it in another repository's CI.** Every push to master publishes prebuilt binaries (Linux x86_64 and arm64,
+macOS) as the `nightly` release, and `uses: ATK422/firmware_simulator@nightly` installs one on a runner and runs your
+scenarios with JUnit output, with no Rust build ([ci.md](docs/ci.md)):
+
+```yaml
+- uses: ATK422/firmware_simulator@nightly
+  with:
+    scenarios: tests/emulator/
 ```
 
 **Let a coding agent drive it (MCP).** `firmware_simulator mcp` is an MCP server: an agent can run a board or a
@@ -435,9 +444,9 @@ message classes ([calibration.md](docs/calibration.md)), and a Fast DDS discover
 titan_firmware_rs images, runs `cargo fmt --all --check`, `cargo clippy --workspace --all-targets --release -- -D warnings`,
 `python3 scripts/gen_boards.py --check` and every test, then prints the smoke and sweep tables; **c-firmware**
 builds the C programs and runs the tests that boot them; **macos** builds and tests the emulator natively on
-macOS. All need the repository secret
-**`TITAN_FIRMWARE_RS_TOKEN`**: a fine-grained token with "Contents: read" on `ATK422/titan_firmware_rs`. Without it
-the firmware step fails loudly ([testing.md](docs/testing.md#ci)).
+macOS; none needs a secret ([testing.md](docs/testing.md#ci)). **Release**
+([`.github/workflows/release.yml`](.github/workflows/release.yml)) publishes the prebuilt binaries other
+repositories' CI installs with the action ([ci.md](docs/ci.md)).
 
 ## Contributing
 

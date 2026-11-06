@@ -752,7 +752,9 @@ fn a_live_run_replays_exactly_from_its_logged_arrivals() {
     log.flush().unwrap();
     let text = String::from_utf8(out.0.lock().unwrap().clone()).unwrap();
     let logged = sim_host::canlog::parse(&text).unwrap();
-    assert_eq!(logged.len(), 40, "{text}");
+    // The feeder sends its 40 frames on the wall clock over about 264 ms of the 300 ms run; a machine whose sleeps
+    // overshoot (macOS runners) gets fewer in before the end. What matters is that whatever arrived replays exactly.
+    assert!((10..=40).contains(&logged.len()), "{} logged:\n{text}", logged.len());
     let replayed = Some(Arc::new(logged));
     for how in [
         How { threads: 1, ends: ends.clone(), replayed: replayed.clone(), ..live() },

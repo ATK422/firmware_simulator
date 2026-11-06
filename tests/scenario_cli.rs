@@ -189,3 +189,27 @@ steps:
     assert!(summary.contains("power_board") && summary.contains("total"), "{summary}");
     assert!(text(&o).contains("2 passed"), "{}", text(&o));
 }
+
+#[test]
+fn a_scenario_outside_the_repository_finds_board_files_in_firmware_simulator_home() {
+    // As another repository's CI has it: its own scenario, the emulator's board files by short name
+    let p = temp("outside.yaml");
+    std::fs::write(
+        &p,
+        "name: outside\nboard: {image: power_board, file: mk2/power_board}\nbridges: [1]\ntime: 1s\nsteps:\n  - expect: {log: ROS connected, within: 1s}\n",
+    )
+    .unwrap();
+    let run = |home: Option<&Path>| {
+        let mut c = Command::new(env!("CARGO_BIN_EXE_firmware_simulator"));
+        c.args(["scenario", "--check", path(&p)]).env_remove("FIRMWARE_SIMULATOR_HOME");
+        if let Some(h) = home {
+            c.env("FIRMWARE_SIMULATOR_HOME", h);
+        }
+        c.output().unwrap()
+    };
+    let o = run(Some(&repo()));
+    assert!(o.status.success(), "{}", text(&o));
+    let o = run(None);
+    assert!(!o.status.success(), "{}", text(&o));
+    assert!(text(&o).contains("boards/mk2/power_board.toml not found"), "{}", text(&o));
+}

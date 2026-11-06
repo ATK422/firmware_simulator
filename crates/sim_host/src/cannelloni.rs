@@ -613,10 +613,20 @@ mod tests {
         let (mut ma, mut mb) = (Monitor::default(), Monitor::default());
         ma.outbox.push((Time::from_us(10), CanFrame::fd(0x55, true, &[1, 2, 3])));
         mb.outbox.push((Time::from_us(20), CanFrame::classic(0x6F, false, &[0xC0])));
-        for k in 1..=5 {
+        // Loopback delivers at once on Linux and a moment later elsewhere (macOS): step until both frames are
+        // across, or two seconds pass
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        for k in 1.. {
             let t = Time::from_us(100 * k);
             bus_a.step(&mut [], &mut [&mut ma, &mut ta], t);
             bus_b.step(&mut [], &mut [&mut mb, &mut tb], t);
+            let across = !ma.received.is_empty() && !mb.received.is_empty();
+            if k >= 5 && (across || std::time::Instant::now() > deadline) {
+                break;
+            }
+            if k >= 5 {
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
         }
         assert_eq!(mb.received.iter().map(|(_, f)| f.id).collect::<Vec<_>>(), [0x55]);
         assert_eq!(ma.received.iter().map(|(_, f)| f.id).collect::<Vec<_>>(), [0x6F]);

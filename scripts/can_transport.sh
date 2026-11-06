@@ -1,3 +1,4 @@
+# shellcheck disable=SC2034 # transport, transport_why and agent_cmd are this file's outputs, for the scripts that source it
 # Sourced by scripts/robot_in_a_box.sh and scripts/nereus_firmware_sim.sh: how the robot computer's side reaches
 # the emulated CAN buses.
 #
