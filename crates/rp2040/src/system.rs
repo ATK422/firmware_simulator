@@ -352,7 +352,7 @@ impl System {
     }
 
     /// What a busy-wait's read of `addr` gives at `now`, for `CortexM0Plus::timer_wait`: the memory a batch reads
-    /// directly (SRAM, ROM, flash with XIP working), or the timer's raw low and high words.
+    /// directly (SRAM, XIP SRAM, ROM, flash with XIP working), or the timer's raw low and high words.
     pub fn timer_wait_read(&self, now: Time, addr: u32, size: Size) -> cpu_armv6m::WaitRead {
         use cpu_armv6m::WaitRead;
         let sram = addr.wrapping_sub(SRAM_BASE) as usize;
@@ -368,6 +368,10 @@ impl System {
         }
         if (addr as usize) < ROM_SIZE {
             return WaitRead::Value(mem::read(&self.rom, addr as usize, size));
+        }
+        let xip_sram = addr.wrapping_sub(XIP_SRAM_BASE) as usize;
+        if xip_sram < XIP_SRAM_SIZE {
+            return WaitRead::Value(mem::read(&self.xip_sram, xip_sram, size));
         }
         match addr {
             a if a == TIMER_BASE + timer::TIMERAWL => WaitRead::TimerLow,
@@ -391,6 +395,10 @@ impl System {
         }
         if (addr as usize) < ROM_SIZE {
             return half(&self.rom, addr as usize);
+        }
+        let xip_sram = addr.wrapping_sub(XIP_SRAM_BASE) as usize;
+        if xip_sram < XIP_SRAM_SIZE {
+            return half(&self.xip_sram, xip_sram);
         }
         None
     }
@@ -2057,7 +2065,7 @@ impl Bus for CoreBus<'_> {
 
 /// One core's view of the system bus while it runs a batch of instructions (`CortexM0Plus::run_batch`).
 ///
-/// SRAM, ROM and flash (while XIP works) are read and written directly. Everything else goes through
+/// SRAM, XIP SRAM, ROM and flash (while XIP works) are read and written directly. Everything else goes through
 /// [`System::read`]/[`System::write`] at the exact time of the accessing instruction (the batch's start time plus
 /// the cycles the batch took before it). The run loop handles a few things after every instruction; the batch
 /// does what they amount to after each such access and ends ([`Bus::take_attention`]) only when the machine has
@@ -2100,6 +2108,10 @@ pub struct BatchBus<'a> {
     slow: bool,
     /// An access in the batch went through the general path or read the timer or XOSC.
     touched: bool,
+    /// The reference clock tick count the running core's SysTick has been fed up to, while it counts the
+    /// reference clock (see [`BatchBus::set_reference_ticks`]), and the tick generator's version then.
+    ref_ticks: Option<u64>,
+    tick_version: u64,
     /// End the batch after an access that goes through the general path (a fused batch, see
     /// `Machine::run_until`: such an access may schedule an event or wake the other core, which the machine must
     /// look at by the end of the quantum).
@@ -2150,8 +2162,24 @@ impl<'a> BatchBus<'a> {
             holds_until: Time::MAX,
             slow: false,
             touched: false,
+            ref_ticks: None,
+            tick_version: 0,
             end_on_slow: false,
         }
+    }
+
+    /// The running core's SysTick counts the reference clock (the watchdog's tick) and has been fed `ticks` of it:
+    /// a batch may then run across ticks, an access to a SysTick register taking the ticks since
+    /// ([`Bus::take_reference_ticks`]). The machine ends the batch before the counter would pend its exception;
+    /// an access that changes the tick generator ends it too.
+    pub fn set_reference_ticks(&mut self, ticks: Option<u64>) {
+        self.ref_ticks = ticks;
+        self.tick_version = self.sys.watchdog.tick.version();
+    }
+
+    /// The reference clock tick count SysTick has been fed up to by the end of the batch.
+    pub fn reference_ticks(&self) -> Option<u64> {
+        self.ref_ticks
     }
 
     /// Whether an access in the batch went through the general path (reached a peripheral or found XIP not set
@@ -2316,6 +2344,11 @@ impl<'a> BatchBus<'a> {
             self.after |= Self::ATTENTION;
             return;
         }
+        // The batch's end was set by when SysTick's next reference tick pends its exception
+        if self.ref_ticks.is_some() && s.watchdog.tick.version() != self.tick_version {
+            self.after |= Self::ATTENTION;
+            return;
+        }
         // The lines are recomputed once the whole instruction is done, as the run loop would
         if s.irq_dirty {
             self.after |= Self::CHECK_IRQS;
@@ -2367,6 +2400,10 @@ impl Bus for BatchBus<'_> {
         if addr & !0x3FFF == TIMER_BASE {
             return self.timer_read(addr, size);
         }
+        let xip_sram = addr.wrapping_sub(XIP_SRAM_BASE) as usize;
+        if xip_sram < XIP_SRAM_SIZE {
+            return Ok(mem::read(&self.sys.xip_sram, xip_sram, size));
+        }
         self.slow_read(addr, size)
     }
 
@@ -2376,6 +2413,12 @@ impl Bus for BatchBus<'_> {
         if sram < SRAM_SIZE {
             self.noisy = true;
             mem::write(&mut self.sys.sram, sram, size, value);
+            return Ok(());
+        }
+        let xip_sram = addr.wrapping_sub(XIP_SRAM_BASE) as usize;
+        if xip_sram < XIP_SRAM_SIZE {
+            self.noisy = true;
+            mem::write(&mut self.sys.xip_sram, xip_sram, size, value);
             return Ok(());
         }
         self.slow_write(addr, size, value)
@@ -2401,6 +2444,10 @@ impl Bus for BatchBus<'_> {
         if (addr as usize) < ROM_SIZE {
             return half(&self.sys.rom, addr as usize);
         }
+        let xip_sram = addr.wrapping_sub(XIP_SRAM_BASE) as usize;
+        if xip_sram < XIP_SRAM_SIZE {
+            return half(&self.sys.xip_sram, xip_sram);
+        }
         None
     }
 
@@ -2416,6 +2463,8 @@ impl Bus for BatchBus<'_> {
             (&self.sys.sram[..], addr.wrapping_sub(SRAM_BASE) as usize)
         } else if (addr as usize) < ROM_SIZE {
             (&self.sys.rom[..], addr as usize)
+        } else if addr.wrapping_sub(XIP_SRAM_BASE) < XIP_SRAM_SIZE as u32 {
+            (&self.sys.xip_sram[..], addr.wrapping_sub(XIP_SRAM_BASE) as usize)
         } else {
             return None;
         };
@@ -2461,6 +2510,12 @@ impl Bus for BatchBus<'_> {
         {
             return Ok(v);
         }
+        let xip_sram = addr.wrapping_sub(XIP_SRAM_BASE) as usize;
+        if xip_sram < XIP_SRAM_SIZE
+            && let Some(v) = half(&self.sys.xip_sram, xip_sram)
+        {
+            return Ok(v);
+        }
         self.slow_read_general(addr, Size::Half).map(|v| v as u16)
     }
 
@@ -2472,6 +2527,14 @@ impl Bus for BatchBus<'_> {
     #[inline]
     fn take_attention(&mut self) -> bool {
         self.after != 0 && self.settle()
+    }
+
+    fn take_reference_ticks(&mut self) -> u64 {
+        // As `Machine::feed_systick_reference`
+        let Some(seen) = self.ref_ticks else { return 0 };
+        let ticks = self.sys.watchdog.tick.ticks(self.now());
+        self.ref_ticks = Some(ticks);
+        ticks.saturating_sub(seen)
     }
 
     fn peek(&mut self, addr: u32, size: Size) -> Option<u32> {

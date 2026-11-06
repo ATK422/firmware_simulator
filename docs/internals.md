@@ -55,7 +55,8 @@ scheduled. Counters (timer, PWM, watchdog) are computed lazily from virtual time
    event; then fires every event both cores have reached. Peripheral accesses are stamped with the accessing
    core's time. SIO FIFO and spinlock accesses are atomic per access, so larger quanta only shift interleaving.
 2. **Batches.** Within a quantum a core runs instructions back to back against a `BatchBus` that reads and writes
-   SRAM, ROM and flash directly (generic over the bus so it inlines). A batch ends only where the machine has
+   SRAM, XIP SRAM, ROM and flash directly (generic over the bus so it inlines; titan_firmware's C bootloader runs
+   from XIP SRAM). A batch ends only where the machine has
    something to do: an access that changed the core's interrupt lines, `clk_sys`, a reset or PSM request; a PPB
    access, `SEV`, sleep, `BKPT`, a fault, a pending exception, the quantum or the time limit. Batching is off
    while anything needs to see each instruction (breakpoints, `instr`/`exc` tracing), which is also how tests get
@@ -86,12 +87,19 @@ scheduled. Counters (timer, PWM, watchdog) are computed lazily from virtual time
    anything else, a store, or a timer value used any other way, and the loop is left to the plain skip. The ESC
    board waits out each 400 µs DShot frame time in such a loop (`while Instant::now() < min_frame_time {}`), which
    was 45 % of its quanta.
-4. **Quantum fusing** (`Machine::fuse_quanta`). While the other core cannot run, no SysTick counts and the last
-   quantum wrote memory and touched nothing else (the core is computing), the next quantum's first batch may run on
-   through up to 64 quanta: the boundaries in between would change nothing, since events are not due before the
+4. **Quantum fusing** (`Machine::fuse_quanta`). While the other core cannot run, no SysTick counts the core clock
+   and the last quantum wrote memory and touched nothing else (the core is computing), the next quantum's first batch
+   may run on through up to 64 quanta: the boundaries in between would change nothing, since events are not due before the
    limit and nothing that could wake the other core happens in a batch that touches only memory. A fused batch ends
    after any other access (it may schedule an event or wake the other core) and after a timer read (busy-waits
    poll the timer, and are only found at quantum boundaries); the rest of that quantum runs as usual.
+   **SysTick on the reference clock** (CLKSOURCE clear: the watchdog's 1 µs tick, as pico-sdk and so the C firmware
+   set it up) is fed lazily: when a batch starts, when the core is asked whether it wakes, and within a batch just
+   before an instruction accesses a SysTick register (`Bus::take_reference_ticks`), so that every access sees the
+   counter as if fed tick by tick. A batch ends at the first instruction boundary from a picosecond before the
+   tick at which the counter pends its exception (a fused one also at the other core's), where the exception is
+   then taken as before, and after an access that changes the tick generator. Batches used to end at every tick
+   and fusing was off, which made the C IVCBoard2 twice as costly per cycle as the Rust one.
 5. **Idle fast-forward.** When both cores sleep (`WFI`/`WFE` with nothing pending) time jumps to the next event,
    bounded by SysTick wake-ups. Embassy firmware spends most of its time there. With nothing scheduled at all the
    run stops with `StopReason::Deadlock`.

@@ -24,6 +24,8 @@ pub struct TickGen {
     cache_from: Cell<Time>,
     cache_to: Cell<Time>,
     cache_ticks: Cell<u64>,
+    /// Counts the configuration changes (see [`TickGen::version`]).
+    version: u64,
 }
 
 impl TickGen {
@@ -38,6 +40,7 @@ impl TickGen {
             cache_from: Cell::new(Time::MAX),
             cache_to: Cell::new(Time::ZERO),
             cache_ticks: Cell::new(0),
+            version: 0,
         }
     }
 
@@ -57,8 +60,14 @@ impl TickGen {
 
     /// Empties the count cache (the configuration is about to change).
     fn forget(&mut self) {
+        self.version += 1;
         self.cache_from.set(Time::MAX);
         self.cache_to.set(Time::ZERO);
+    }
+
+    /// Changes whenever the configuration does (the times of future ticks may have moved).
+    pub fn version(&self) -> u64 {
+        self.version
     }
 
     /// Ticks generated since power-on.
