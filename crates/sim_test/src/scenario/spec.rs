@@ -750,6 +750,11 @@ fn check_times(st: &Step, end: Time) -> R<()> {
 /// Finds `rel` from `dir` or the closest directory above it that has it (so `robots/talos.toml` works from
 /// `scenarios/`, and from any directory under the repository).
 pub fn find_upward(dir: &Path, rel: &Path) -> Option<PathBuf> {
+    find_upward_in(dir, rel, &data_dirs())
+}
+
+/// `rel` from `dir` or a directory above it, else in one of `data` (in order).
+fn find_upward_in(dir: &Path, rel: &Path, data: &[PathBuf]) -> Option<PathBuf> {
     if rel.is_absolute() {
         return rel.exists().then(|| rel.to_path_buf());
     }
@@ -761,7 +766,22 @@ pub fn find_upward(dir: &Path, rel: &Path) -> Option<PathBuf> {
         }
         d = here.parent();
     }
-    None
+    data.iter().map(|d| d.join(rel)).find(|p| p.exists())
+}
+
+/// Where the emulator's own data files (boards/, robots/, environments/, vehicles/) are found when a scenario
+/// outside its repository names them: `$FIRMWARE_SIMULATOR_HOME`, then the directory above the running binary's
+/// (an installed release: `bin/firmware_simulator` next to `boards/`). Searched only after the scenario's own
+/// directories, so a repository's files come first.
+fn data_dirs() -> Vec<PathBuf> {
+    let mut dirs = Vec::new();
+    if let Some(home) = std::env::var_os("FIRMWARE_SIMULATOR_HOME") {
+        dirs.push(PathBuf::from(home));
+    }
+    if let Some(root) = std::env::current_exe().ok().and_then(|e| Some(e.parent()?.parent()?.to_path_buf())) {
+        dirs.push(root);
+    }
+    dirs
 }
 
 fn find_file(dir: &Path, s: &str, what: &str) -> R<PathBuf> {
@@ -1577,5 +1597,26 @@ cases:
         assert!(parse_time("-1s").is_err() && parse_time("soon").is_err());
         assert!(Range { min: Some(1.0), max: None }.contains(1.0));
         assert!(!Range { min: None, max: Some(1.0) }.contains(1.5));
+    }
+
+    #[test]
+    fn files_outside_the_scenarios_tree_come_from_the_data_dirs() {
+        let tmp = std::env::temp_dir().join(format!("find_upward_in_{}", std::process::id()));
+        let (outside, home, other) = (tmp.join("consumer/tests"), tmp.join("home"), tmp.join("other"));
+        for d in [&outside, &home.join("boards/talos"), &other.join("boards/talos")] {
+            std::fs::create_dir_all(d).unwrap();
+        }
+        std::fs::write(home.join("boards/talos/poac_board.toml"), "").unwrap();
+        std::fs::write(other.join("boards/talos/poac_board.toml"), "").unwrap();
+        let rel = Path::new("boards/talos/poac_board.toml");
+        // Not above the scenario: the first data dir that has it
+        assert_eq!(find_upward_in(&outside, rel, &[home.clone(), other.clone()]), Some(home.join(rel)));
+        assert_eq!(find_upward_in(&outside, rel, &[tmp.join("none"), other.clone()]), Some(other.join(rel)));
+        assert_eq!(find_upward_in(&outside, rel, &[]), None);
+        // The scenario's own tree comes first
+        std::fs::create_dir_all(tmp.join("consumer/boards/talos")).unwrap();
+        std::fs::write(tmp.join("consumer/boards/talos/poac_board.toml"), "").unwrap();
+        assert_eq!(find_upward_in(&outside, rel, std::slice::from_ref(&home)), Some(tmp.join("consumer").join(rel)));
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 }

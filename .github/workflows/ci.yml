@@ -2,10 +2,8 @@
 # rust-toolchain.toml), then runs every test: the emulator's own, a smoke test for
 # every board image, the robot, IVC link and sweep tests, Puddles over UDP, and the YAML scenarios in scenarios/.
 #
-# external/titan_firmware_rs is the private repository ATK422/titan_firmware_rs: give the workflow a token that can
-# read it as the repository secret TITAN_FIRMWARE_RS_TOKEN (a fine-grained token with "Contents: read" on that
-# repository). Both jobs need it (the emulator's workspace uses its host crates). Without it the "firmware images"
-# step fails loudly and the C job can't build the tests.
+# Both submodules are public (osu-uwrt/titan_firmware, ATK422/titan_firmware_rs), so no secrets are needed. Every job
+# needs external/titan_firmware_rs: the emulator's workspace uses its host crates (canmore, titan_link).
 name: CI
 
 on:
@@ -24,14 +22,9 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Submodules
-        env:
-          TOKEN: ${{ secrets.TITAN_FIRMWARE_RS_TOKEN }}
         run: |
           git submodule update --init external/titan_firmware
-          if [ -n "$TOKEN" ]; then
-            git config --global url."https://x-access-token:${TOKEN}@github.com/".insteadOf "https://github.com/"
-          fi
-          git submodule update --init external/titan_firmware_rs || echo "::warning::could not fetch external/titan_firmware_rs (set the TITAN_FIRMWARE_RS_TOKEN secret)"
+          git submodule update --init external/titan_firmware_rs
 
       - name: Rust
         run: |
@@ -93,14 +86,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Submodules
-        env:
-          TOKEN: ${{ secrets.TITAN_FIRMWARE_RS_TOKEN }}
         run: |
           git submodule update --init external/titan_firmware
-          if [ -n "$TOKEN" ]; then
-            git config --global url."https://x-access-token:${TOKEN}@github.com/".insteadOf "https://github.com/"
-          fi
-          git submodule update --init external/titan_firmware_rs || echo "::warning::could not fetch external/titan_firmware_rs (set the TITAN_FIRMWARE_RS_TOKEN secret)"
+          git submodule update --init external/titan_firmware_rs
       - name: Rust
         run: |
           rustup toolchain install stable --profile minimal --component clippy
@@ -137,17 +125,12 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Submodules
-        env:
-          TOKEN: ${{ secrets.TITAN_FIRMWARE_RS_TOKEN }}
         run: |
           git submodule update --init external/titan_firmware
           git -C external/titan_firmware submodule update --init --recursive
           # The emulator's workspace uses titan_firmware_rs's host crates (canmore, titan_link), so the tests need it
           # too (not its firmware images)
-          if [ -n "$TOKEN" ]; then
-            git config --global url."https://x-access-token:${TOKEN}@github.com/".insteadOf "https://github.com/"
-          fi
-          git submodule update --init external/titan_firmware_rs || echo "::warning::could not fetch external/titan_firmware_rs (set the TITAN_FIRMWARE_RS_TOKEN secret)"
+          git submodule update --init external/titan_firmware_rs
       - name: Toolchain
         run: |
           sudo apt-get update
