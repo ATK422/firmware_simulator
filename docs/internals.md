@@ -448,12 +448,14 @@ runs the template, ESC and IVCBoard2 images on their boards and the Talos (also 
 threads: `talos_t2`, `talos_t3`, `talos_mt`, `talos_t6`, and on three slice by slice without running ahead:
 `talos_t3_ls`; `--threads N` sets `talos_mt`'s and prints the grouping; `talos_live_t3` and `talos_live_t3_ls`
 with the bridge behind a live endpoint, as on vcan; `nereus`, `nereus_t3` and `nereus_t3_ls`: the nereus setup)
-and IVC2 pool robots for 2 s of virtual time, and prints the best wall time, virtual/wall (above 1 keeps up with
+and IVC2 pool robots (`ivc2_pool`, and on two threads `ivc2_pool_t2`; with `TITAN_FIRMWARE_DIR` set, the C
+IVCBoard2 alone, `ivc_board2_c`, and two of them in the pool, `ivc2_pool_c` and `ivc2_pool_c_t2`; skipped
+otherwise) for 2 s of virtual time, and prints the best wall time, virtual/wall (above 1 keeps up with
 `--realtime`), CPU time, instructions executed, the share skipped in busy-waits, emulated MIPS, and a fingerprint
 of everything the run produced (log lines and their times, bridge messages, UART/RTT text, CPU registers, cycle
 counts, SRAM). The fingerprint must not change when the emulator is made faster. Wall time is noisy on a shared
 machine: compare the best of several repeats, or the instruction counts under `valgrind --tool=callgrind` with
-`--repeat 1`.
+`--repeat 1`. `--stats` prints what running ahead did in each robot case.
 
 Fingerprints are per firmware build: new images, or the same source built by another compiler, give new ones
 (so do instruction counts). titan_firmware_rs pins its compiler in its `rust-toolchain.toml`, so images built from
@@ -466,15 +468,23 @@ the same commit with rustup agree. With the pinned titan_firmware_rs (94a107e, r
 | `ivc_board2` | `9316e6e8f76e2f2c` |
 | `talos`, `talos_mt`, `talos_t2`, `talos_t3`, `talos_t6`, `talos_t3_ls`, `talos_live_t3`, `talos_live_t3_ls` | `a02da435f15bdb96` |
 | `nereus`, `nereus_t3`, `nereus_t3_ls` | `081433a1925d555f` |
-| `ivc2_pool` | `d2a2e6a73362cf3e` |
+| `ivc2_pool`, `ivc2_pool_t2` | `d2a2e6a73362cf3e` |
+
+The C cases' fingerprints are those of your titan_firmware build; for the `blake/ivc` IVCBoard2 these were measured
+with (built in the Nix shell), `ivc_board2_c` is `ccb6914471f62e02` and `ivc2_pool_c`, `ivc2_pool_c_t2`
+`cd8b837e56f153aa`.
 
 Before comparing a change against these, check the images are that build (the bench prints the same fingerprints
 for the same images on any machine); when the pin moves, they change and this table with it.
 
-Measured on a shared 4-core machine (CPU time for 2 s of virtual time): template 0.03 s, ESC board 1.35 s,
-IVCBoard2 0.55 s, Talos 3.7 s, IVC2 pool 2.15 s. Talos on threads (wall time): 1.6-1.7 s on three or four
-(1.2-1.25x real time), 2.4 s on two (both ESC boards share a thread with others there); slice by slice on three it
-was 2.5 s.
+Measured on a 4-core machine (best wall time of three for 2 s of virtual time; CPU time is the same where one thread
+runs): template 0.03 s, ESC board 1.4 s, IVCBoard2 0.51-0.56 s (3.6-3.9x real time), the C IVCBoard2 0.65-0.68 s
+(about 3x; it was 1.4 s, 1.4x, while SysTick's reference ticks ended every batch and its bootloader ran from XIP
+SRAM through the general bus path: see the run loop), Talos 3.7-3.9 s, the IVC2 pool 1.44-1.52 s in turn (1.3-1.4x)
+and 0.97-1.02 s on two threads (about 2x; 2.17 s, 0.92x, when pools took turns and heard every silent path), the pool
+of C IVCBoard2s 1.65-1.70 s in turn and 1.17-1.20 s on two threads (1.7x; it was 3.82 s, 0.52x). Talos on threads
+(wall time): 1.7-1.8 s on three or four (1.1-1.2x real time), 2.4-2.5 s on two (both ESC boards share a thread
+with others there); slice by slice on three it was 2.5 s.
 The ESC board waits out each 400 µs DShot frame time on the timer (skipped across ticks up to its deadline, see
 the run loop), so what is left of its time is the frame itself: the control loop polling FSTAT while the PIO
 sends the frame and receives the replies. Per 100 µs slice an ESC board takes about 70 µs on average but its frames
