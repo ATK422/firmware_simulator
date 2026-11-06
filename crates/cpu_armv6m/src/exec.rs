@@ -68,9 +68,19 @@ impl CortexM0Plus {
         if cond & 1 == 1 && cond != 0xF { !r } else { r }
     }
 
-    /// Notes a taken branch in the edge map, if it is on.
+    /// Notes a taken branch in the edge map, if it is on. Only the check is inline: every taken branch in every
+    /// run passes here, and marking inline grew the interpreter's hot paths enough to cost about 10% on
+    /// branch-heavy firmware (IVCBoard2's DSP) while the map was off.
     #[inline(always)]
     pub(crate) fn note_edge(&mut self, from: u32, to: u32) {
+        if self.edges.is_some() {
+            self.mark_edge(from, to);
+        }
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn mark_edge(&mut self, from: u32, to: u32) {
         if let Some(e) = self.edges.as_deref_mut() {
             e.mark(from, to);
         }
