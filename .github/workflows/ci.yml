@@ -64,7 +64,10 @@ jobs:
           python3 scripts/gen_boards.py --check
 
       - name: Tests
-        run: cargo test --release --workspace -- --nocapture 2>&1 | tee test.log
+        # pipefail: the step's shell is `bash -e`, so without it tee's status would hide a failing test
+        run: |
+          set -o pipefail
+          cargo test --release --workspace --no-fail-fast -- --nocapture 2>&1 | tee test.log
 
       - name: Smoke test and sweep tables
         if: always()
@@ -119,7 +122,7 @@ jobs:
       - name: Lint
         run: cargo clippy --workspace --all-targets --release -- -D warnings
       - name: Tests
-        run: cargo test --release --workspace
+        run: cargo test --release --workspace --no-fail-fast
 
   c-firmware:
     # The C titan_firmware programs the emulator runs (basic_template, the Titan bootloader, the OTA test app),

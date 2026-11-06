@@ -12,6 +12,12 @@ pub struct Pty {
     /// Time travel: what was read is recorded, and given again (instead of reading) while recorded history is
     /// re-executed, when nothing is written either (see [`crate::timetravel`]).
     pub(crate) tap: Option<crate::timetravel::SharedTap<Vec<u8>>>,
+    /// macOS (and the other BSD-style ptys): the slave side, kept open in raw mode. There the terminal settings
+    /// belong to the slave and reset when it is last closed, so setting raw mode through the master (as on Linux)
+    /// leaves echo on for whoever opens it. Output written while nobody else has the pty open waits in its buffer
+    /// (up to the kernel's size) instead of being dropped.
+    #[cfg(not(target_os = "linux"))]
+    _slave: OwnedFd,
 }
 
 impl Pty {
@@ -33,9 +39,30 @@ impl Pty {
                 libc::cfmakeraw(&mut tio);
                 libc::tcsetattr(fd, libc::TCSANOW, &tio);
             }
+            #[cfg(not(target_os = "linux"))]
+            let slave = {
+                let c = std::ffi::CString::new(path.clone()).map_err(|_| io::Error::other("pty path with a NUL"))?;
+                let sfd = libc::open(c.as_ptr(), libc::O_RDWR | libc::O_NOCTTY);
+                if sfd < 0 {
+                    return Err(io::Error::last_os_error());
+                }
+                let slave = OwnedFd::from_raw_fd(sfd);
+                let mut tio: libc::termios = std::mem::zeroed();
+                if libc::tcgetattr(sfd, &mut tio) == 0 {
+                    libc::cfmakeraw(&mut tio);
+                    libc::tcsetattr(sfd, libc::TCSANOW, &tio);
+                }
+                slave
+            };
             let flags = libc::fcntl(fd, libc::F_GETFL);
             libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK);
-            Ok(Pty { master, path, tap: None })
+            Ok(Pty {
+                master,
+                path,
+                tap: None,
+                #[cfg(not(target_os = "linux"))]
+                _slave: slave,
+            })
         }
     }
 
@@ -53,7 +80,8 @@ impl Pty {
         Ok(pty)
     }
 
-    /// Writes UART output to the terminal. Bytes are dropped while nobody has the pty open.
+    /// Writes UART output to the terminal. Bytes are dropped while nobody has the pty open (on Linux; elsewhere they
+    /// wait in its buffer, see `_slave`).
     pub fn write(&self, data: &[u8]) {
         if self.tap.as_ref().is_some_and(|t| t.lock().unwrap().replaying_last()) {
             return;
