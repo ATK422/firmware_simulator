@@ -23,10 +23,12 @@ struct How {
     run_ahead: bool,
     /// `Robot::run_ahead_stress`: boards rolled back all the time.
     stress: Option<u64>,
+    /// Every hydrophone computes every tap, silent origins too (`Hydrophone::skip_quiet` off).
+    every_tap: bool,
 }
 
-const TURNS: How = How { threads: 1, run_ahead: true, stress: None };
-const AHEAD: How = How { threads: 2, run_ahead: true, stress: None };
+const TURNS: How = How { threads: 1, run_ahead: true, stress: None, every_tap: false };
+const AHEAD: How = How { threads: 2, run_ahead: true, stress: None, every_tap: false };
 
 #[derive(Debug, PartialEq)]
 struct Run {
@@ -61,6 +63,11 @@ fn run(mut r: Robot, bridges: &[MockBridge], how: How, send: Option<Time>, piece
     r.threads = how.threads;
     r.run_ahead = how.run_ahead;
     r.run_ahead_stress = how.stress;
+    for b in &mut r.boards {
+        for h in sim_host::acoustic::hydrophones(&mut b.machine) {
+            h.skip_quiet = !how.every_tap;
+        }
+    }
     let hooks = Arc::new(Mutex::new(Vec::new()));
     for (i, s) in r.boards.iter_mut().enumerate() {
         let h = hooks.clone();
@@ -156,12 +163,13 @@ fn a_pool_on_threads_gives_the_same_run_as_turns() {
         want.hooks.len(),
         want.frames.len()
     );
-    for how in [AHEAD, How { threads: 0, ..AHEAD }, How { run_ahead: false, ..AHEAD }] {
+    for how in [AHEAD, How { threads: 0, ..AHEAD }, How { run_ahead: false, ..AHEAD }, How { every_tap: true, ..TURNS }]
+    {
         let (r, b) = pool();
         let (got, r) = run(r, &b, how, Some(Time::from_ms(400)), &PIECES);
         same(&want, &got, &format!("{} threads, ahead {}", how.threads, how.run_ahead));
         let stats = r.run_ahead_stats;
-        if how.run_ahead {
+        if how.run_ahead && how.threads != 1 {
             // 5 m of water, 3.4 ms: windows of about 33 slices (fewer where a CAN frame ends one)
             assert!(stats.slices == 14_000 && stats.windows < stats.slices / 16, "{stats:?}");
         } else {

@@ -10,6 +10,12 @@
 //! Absorption and the transducer's sensitivity are applied at each source's nominal frequency (a narrowband
 //! approximation); ambient noise is white at the level the noise model gives at the chain's centre frequency.
 //!
+//! Each step sums every path of every origin (a source, another board's projector). An origin that gives exactly
+//! zero at every time its paths read over the steps being computed (a pinger between pulses, a projector whose
+//! samples there are all zero: one not driven, its ringing died away below the smallest `f32`) is left out of the
+//! sum, which changes nothing: the sum starts at +0 and is never -0, and adding a zero of either sign to it leaves
+//! it as it is (`Hydrophone::skip_quiet`; in a pool of IVC boards, which transmit now and then, most of the time).
+//!
 //! In a shared [`Medium`](crate::medium::Medium) the hydrophone also hears the other boards' projectors. When
 //! the hydrophone or a projector moves, every path is recomputed each [`BLOCK_STEPS`] and the delays and gains are
 //! interpolated in between, which produces Doppler shifts. Both ends' positions are taken at the time the sound
@@ -46,6 +52,8 @@ enum Origin {
 #[derive(Clone, Debug)]
 struct Tap {
     from: Origin,
+    /// Its origin's index in [`Hydrophone::spans`].
+    slot: usize,
     delay_s: [f64; 2],
     /// Volts at the hydrophone per µPa at 1 m from the source.
     volts_per_upa: [f64; 2],
@@ -68,6 +76,16 @@ pub struct Hydrophone {
     /// The state of each projector in the medium it hears (not its own board's), by index; refreshed from the
     /// medium at each [`Hydrophone::sample`].
     heard: Vec<Option<std::sync::Arc<ProjectorState>>>,
+    /// Per origin (the environment's sources, then the medium's projectors): the shortest and longest delay of its
+    /// taps in the block, and whether what it gives over the steps being computed is exactly zero (its taps are
+    /// then left out: adding a zero of either sign to the sum, which is never -0, leaves it as it is).
+    spans: Vec<(f64, f64)>,
+    quiet: Vec<bool>,
+    /// Leave out the taps of origins that give exactly zero (on by default; off only to check that it changes
+    /// nothing).
+    pub skip_quiet: bool,
+    /// Steps computed with some origin left out (statistics).
+    quiet_steps: u64,
     moves: bool,
     /// Centre of the receive chain's band, where the noise level is taken.
     centre_hz: f64,
@@ -123,6 +141,10 @@ impl Hydrophone {
             medium: None,
             block: None,
             heard: Vec::new(),
+            spans: Vec::new(),
+            quiet: Vec::new(),
+            skip_quiet: true,
+            quiet_steps: 0,
             moves: false,
             centre_hz: centre,
             noise_rms_v,
@@ -209,9 +231,17 @@ impl Hydrophone {
         let t0 = (block * BLOCK_STEPS) as f64 / self.rate;
         let t1 = ((block + 1) * BLOCK_STEPS) as f64 / self.rate;
         let mut taps = Vec::new();
+        let nsrc = self.env.sources.len();
+        let mut spans = vec![(f64::INFINITY, f64::NEG_INFINITY); nsrc + nproj];
         let mut add = |from: Origin, a: Vec<(f64, f64)>, b: Vec<(f64, f64)>| {
+            let slot = match from {
+                Origin::Source(i) => i,
+                Origin::Projector(i) => nsrc + i,
+            };
             for (pa, pb) in a.into_iter().zip(b) {
-                taps.push(Tap { from, delay_s: [pa.0, pb.0], volts_per_upa: [pa.1, pb.1] });
+                let s = &mut spans[slot];
+                *s = (s.0.min(pa.0).min(pb.0), s.1.max(pa.0).max(pb.0));
+                taps.push(Tap { from, slot, delay_s: [pa.0, pb.0], volts_per_upa: [pa.1, pb.1] });
             }
         };
         for (i, s) in self.env.sources.iter().enumerate() {
@@ -230,6 +260,7 @@ impl Hydrophone {
             }
         }
         self.taps = taps;
+        self.spans = spans;
         self.block = Some((block, nproj));
     }
 
@@ -237,6 +268,30 @@ impl Hydrophone {
     pub fn record(mut self) -> Self {
         self.recording = Some(Vec::new());
         self
+    }
+
+    /// Which origins give exactly zero at every step from `n0` to `n1` (all in one block of taps), from the
+    /// shortest and longest delays of their taps, with a margin for the rounding of the delays interpolated and of
+    /// the times (see [`Hydrophone::spans`]). Only where every path is well within the second a projector keeps
+    /// ([`crate::medium::HISTORY_S`]): reading a projector computes its samples, which may forget the oldest.
+    fn find_quiet(&mut self, n0: u64, n1: u64, heard: &mut [Option<WaveReader<'_>>]) {
+        const ROUNDING: f64 = 1e-9;
+        let (t0, t1) = (n0 as f64 / self.rate, n1 as f64 / self.rate);
+        let nsrc = self.env.sources.len();
+        self.quiet.clear();
+        if !self.skip_quiet {
+            return;
+        }
+        for (slot, &(short, long)) in self.spans.iter().enumerate() {
+            let quiet = short <= long && long < crate::medium::HISTORY_S - 0.01 && {
+                let (from, to) = (t0 - long - ROUNDING, t1 - short + ROUNDING);
+                match slot.checked_sub(nsrc) {
+                    None => self.env.sources[slot].silent(from, to),
+                    Some(i) => heard.get_mut(i).and_then(Option::as_mut).is_none_or(|w| w.silent(from, to)),
+                }
+            };
+            self.quiet.push(quiet);
+        }
     }
 
     /// Points [`Hydrophone::heard`] at the states of `med`'s projectors (other boards' ones).
@@ -254,11 +309,14 @@ impl Hydrophone {
 
     /// Hydrophone output (before the chain) at grid step `n`, with the taps for its block, reading the projectors
     /// it hears through `heard` (by projector index).
-    fn raw(&mut self, n: u64, heard: &mut [Option<WaveReader<'_>>]) -> f64 {
+    fn raw(&self, n: u64, heard: &mut [Option<WaveReader<'_>>]) -> f64 {
         let t = n as f64 / self.rate;
         let f = (n % BLOCK_STEPS) as f64 / BLOCK_STEPS as f64;
         let mut v = 0.0;
         for tap in &self.taps {
+            if self.quiet.get(tap.slot).copied().unwrap_or(false) {
+                continue;
+            }
             let delay = tap.delay_s[0] + (tap.delay_s[1] - tap.delay_s[0]) * f;
             let gain = tap.volts_per_upa[0] + (tap.volts_per_upa[1] - tap.volts_per_upa[0]) * f;
             let p = match tap.from {
@@ -351,6 +409,10 @@ impl Hydrophone {
                 many.extend(states.iter().map(|s| s.as_ref().map(|s| s.read())));
                 &mut many
             };
+            self.find_quiet(n, last, heard);
+            if self.quiet.contains(&true) {
+                self.quiet_steps += last - n + 1;
+            }
             for n in n..=last {
                 let raw = self.raw(n, heard);
                 self.last = self.chain.process(raw, pins);
@@ -562,6 +624,35 @@ mod tests {
         .unwrap();
         env.noise = crate::noise::Noise::None;
         env
+    }
+
+    #[test]
+    fn leaving_out_silent_origins_changes_no_sample() {
+        // A pinger (4 ms on every 200 ms) and another board's projector driven for the first 400 ms, both silent
+        // most of the time, heard over the pool's 63 paths, from a fixed and from a moving hydrophone, sampled at
+        // 500 kS/s with gaps (where the chain restarts from its preroll): bit for bit the same with every tap
+        let pinger = crate::source::Source {
+            position: [20.0, 6.0, 2.0],
+            waveform: crate::source::Waveform::Pinger { hz: 25_000.0, pulse: 4e-3, period: 0.2, start: 0.05 },
+            rms_upa: 1e9,
+        };
+        let moving = Trajectory::Linear { start_m: [5.0, 6.0, 1.5], velocity_mps: [0.5, 0.0, 0.0] };
+        for rx in [Trajectory::Fixed([5.0, 6.0, 1.5]), moving] {
+            let mut env = pool();
+            env.sources.push(pinger.clone());
+            let mut on = moving_link(env.clone(), Trajectory::Fixed([10.0, 6.0, 1.5]), rx.clone());
+            let mut off = moving_link(env, Trajectory::Fixed([10.0, 6.0, 1.5]), rx);
+            off.skip_quiet = false;
+            let mut t = Time::from_us(3);
+            for k in 0..600_000u64 {
+                let (a, b) = (on.sample(t, 0), off.sample(t, 0));
+                assert_eq!(a.to_bits(), b.to_bits(), "at {t}");
+                t += Time::from_us(if k % 50_000 == 49_999 { 3_001 } else { 2 });
+            }
+            // Most steps left some origin out: the projector after its drive, the pinger between pulses
+            assert!(on.quiet_steps > on.samples, "{} of {}", on.quiet_steps, on.samples);
+            assert_eq!(off.quiet_steps, 0);
+        }
     }
 
     #[test]

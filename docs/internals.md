@@ -239,7 +239,12 @@ to a second (`MEDIUM_PIECE`); a piece runs on threads where the bound is at leas
 ahead cuts each window to it (the pool's 5 m: 33 slices). Each board tells the medium how far it got after each of
 its slices, as taking turns does; a rollback point notes where its projectors' drives were (`Medium::mark`), and a
 rollback takes them back (`Medium::back_to`: the level changes since are forgotten; none can have been folded into
-samples). The board driving a projector and the hydrophones reading it hold different locks
+samples). A hydrophone leaves out of its sum, over the steps it computes at once, every origin that gives exactly
+zero at every time its paths read (`Source::silent`: a pinger between pulses; `WaveReader::silent`: a projector
+whose samples there are all zero, not driven or its ringing below the smallest `f32`): the sum starts at +0, is
+never -0, and adding ±0 leaves it as it is, so `Hydrophone::skip_quiet` changes no sample (tested bit for bit, and
+on the pool while a packet crosses). Between transmissions this takes away what hearing the other board's 63 paths
+costs, which was about as much as the board itself. The board driving a projector and the hydrophones reading it hold different locks
 (`medium::ProjectorState`), and a hydrophone holds the medium only to refresh its paths. Boards closer than a
 slice's sound (15 cm), paths longer than 0.4 s and transducers on a simulated vehicle (`Trajectory::Live`, known
 only as the vehicle moves) take turns. `crates/sim_host/tests/acoustic_threads.rs` compares the IVC pool on threads,

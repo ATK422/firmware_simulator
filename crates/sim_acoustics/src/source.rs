@@ -128,6 +128,29 @@ impl Source {
         }
     }
 
+    /// Whether [`Source::pressure`] is exactly zero at every time from `from` to `to` (s), as far as it can tell:
+    /// a pinger between pulses, a chirp between sweeps. (Only for a span shorter than a period: within one, the
+    /// remainder grows with the time, exactly, so the span's ends bound every time's.)
+    pub fn silent(&self, from: f64, to: f64) -> bool {
+        // Whether every `x` from `x0` to `x1` has `x < 0` or `x.rem_euclid(period) >= on`
+        let off = |x0: f64, x1: f64, period: f64, on: f64| {
+            if x1 < 0.0 {
+                return true;
+            }
+            if x0 < 0.0 || x1 - x0 >= period {
+                return false;
+            }
+            let (r0, r1) = (x0.rem_euclid(period), x1.rem_euclid(period));
+            r0 >= on && r1 >= r0
+        };
+        match &self.waveform {
+            // `local` is `t - start`, rounded: as `t` grows it does not shrink
+            Waveform::Pinger { pulse, period, start, .. } => off(from - start, to - start, *period, *pulse),
+            Waveform::Chirp { duration, period, .. } => off(from, to, *period, *duration),
+            Waveform::Tone { .. } | Waveform::Wav { .. } => false,
+        }
+    }
+
     /// The frequency the narrowband parts of the model use for this source.
     pub fn nominal_hz(&self) -> f64 {
         match &self.waveform {
@@ -145,6 +168,47 @@ mod tests {
     fn src(spec: &str) -> Source {
         let s: SourceSpec = toml::from_str(spec).unwrap();
         Source::from_spec(&s, std::path::Path::new(".")).unwrap()
+    }
+
+    #[test]
+    fn silence_is_only_claimed_where_every_time_gives_zero() {
+        let pinger = Source {
+            position: [0.0; 3],
+            waveform: Waveform::Pinger { hz: 25_000.0, pulse: 4e-3, period: 0.2, start: 0.05 },
+            rms_upa: 1e6,
+        };
+        let chirp = Source {
+            position: [0.0; 3],
+            waveform: Waveform::Chirp { f0: 20e3, f1: 30e3, duration: 0.01, period: 0.05 },
+            rms_upa: 1e6,
+        };
+        let tone = Source { position: [0.0; 3], waveform: Waveform::Tone { hz: 25e3 }, rms_upa: 1e6 };
+        let mut said = [0, 0];
+        let mut x = 12345u64;
+        for s in [&pinger, &chirp, &tone] {
+            for _ in 0..20_000 {
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                let from = (x % 1_000_000) as f64 * 1e-6 - 0.1;
+                let to = from + ((x >> 40) % 3_000) as f64 * 1e-6;
+                if s.silent(from, to) {
+                    said[0] += 1;
+                    let n = 200;
+                    for k in 0..=n {
+                        let t = from + (to - from) * k as f64 / n as f64;
+                        assert_eq!(s.pressure(t), 0.0, "{t} in {from}..{to}");
+                    }
+                    assert_eq!((s.pressure(from), s.pressure(to)), (0.0, 0.0));
+                } else {
+                    said[1] += 1;
+                }
+            }
+        }
+        // Most spans between pulses are silent, every one around a pulse or of the tone is not
+        assert!(said[0] > 10_000 && said[1] > 20_000, "{said:?}");
+        assert!(pinger.silent(0.06, 0.2) && !pinger.silent(0.04, 0.06) && pinger.silent(-1.0, 0.0499));
+        assert!(!pinger.silent(0.1, 0.26) && !tone.silent(-1.0, -0.5) && chirp.silent(-1.0, -0.1));
     }
 
     #[test]
