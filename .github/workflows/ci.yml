@@ -27,6 +27,9 @@ jobs:
       - name: Submodules
         run: |
           git submodule update --init external/titan_firmware
+          # gen_boards.py --check reads the CANmore client IDs from titan_firmware's titan_canmore submodule (not its
+          # pico-sdk, which only the c-firmware job needs)
+          git -C external/titan_firmware submodule update --init lib/titan_canmore
           git submodule update --init external/titan_firmware_rs
 
       - name: Rust

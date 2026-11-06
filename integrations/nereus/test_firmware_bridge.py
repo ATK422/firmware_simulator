@@ -359,7 +359,9 @@ class Packs(unittest.TestCase):
         out = Path("/tmp/run/scenarios/talos_firmware_robosub")
         sc = make_packs.firmware_scenario(up, nereus, Path("/tmp/run/bridges/uwrt_talos_firmware"), "robosub", out)
         self.assertEqual(sc["bridge"], "../../bridges/uwrt_talos_firmware")
-        self.assertEqual(sc["robot"], "../../../../opt/nereus/content/packs/robots/talos")
+        # As make_packs resolves them (on macOS /tmp is /private/tmp, one directory deeper)
+        robot = os.path.relpath(Path("/opt/nereus/content/packs/robots/talos").resolve(), out.resolve())
+        self.assertEqual(sc["robot"], Path(robot).as_posix())
         self.assertFalse(any(sc[r].startswith("/") for r in ("robot", "pool", "bridge")), "nereus wants relative paths")
         self.assertEqual(sc["initial"], up["initial"])
         p = sc["thruster_overrides"][-1]["parameters"]

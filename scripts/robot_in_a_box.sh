@@ -132,7 +132,8 @@ fi
 
 pids=()
 cleanup() {
-    for p in "${pids[@]}"; do
+    # ${a[@]+...}: bash 3.2 (macOS) calls an empty array unbound under set -u
+    for p in ${pids[@]+"${pids[@]}"}; do
         kill "$p" 2>/dev/null || true
     done
     wait 2>/dev/null || true
