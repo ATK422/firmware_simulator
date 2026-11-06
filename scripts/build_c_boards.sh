@@ -54,7 +54,7 @@ for p in "${projects[@]}"; do
         fi
         ;;
     esac
-    CFLAGS="$cflags" cmake -S "$tf/$p" -B "$tf/$p/build" "${extra[@]}"
+    CFLAGS="$cflags" cmake -S "$tf/$p" -B "$tf/$p/build" ${extra[@]+"${extra[@]}"}
     cmake --build "$tf/$p/build" -j "$(nproc 2>/dev/null || echo 4)"
     ls "$tf/$p/build/"*_with_bl.uf2
 done

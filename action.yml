@@ -1,0 +1,96 @@
+name: firmware_simulator
+description: >-
+  Installs the RP2040 emulator for UWRT's boards (a prebuilt release) and optionally runs YAML scenarios with JUnit
+  output. Runs on Linux (x86_64, arm64) and macOS runners.
+branding:
+  icon: cpu
+  color: blue
+
+inputs:
+  version:
+    description: >-
+      Release to install: a tag such as v0.1.0, or `nightly` (the newest master). Defaults to the ref the action is
+      used at when that is a version tag (`uses: ATK422/firmware_simulator@v0.1.0`), else `nightly`.
+    required: false
+    default: ""
+  scenarios:
+    description: >-
+      Scenario files or directories to run (space separated), as `firmware_simulator scenario` takes them. Leave
+      empty to only install.
+    required: false
+    default: ""
+  junit:
+    description: Where to write the scenarios' JUnit XML (with `scenarios`).
+    required: false
+    default: firmware_simulator-junit.xml
+  args:
+    description: More arguments for `firmware_simulator scenario`, e.g. `--quiet` or `--jobs 2`.
+    required: false
+    default: ""
+
+outputs:
+  home:
+    description: >-
+      The installed release's directory: bin/firmware_simulator and the boards/, robots/, environments/, vehicles/
+      and scenarios/ files (also set as FIRMWARE_SIMULATOR_HOME).
+    value: ${{ steps.install.outputs.home }}
+  version:
+    description: The release that was installed.
+    value: ${{ steps.install.outputs.version }}
+
+runs:
+  using: composite
+  steps:
+    - name: Install firmware_simulator
+      id: install
+      shell: bash
+      env:
+        VERSION: ${{ inputs.version }}
+        ACTION_REF: ${{ github.action_ref }}
+        RUNNER_OS_: ${{ runner.os }}
+        RUNNER_ARCH_: ${{ runner.arch }}
+      run: |
+        set -euo pipefail
+        version=$VERSION
+        if [ -z "$version" ]; then
+          case "$ACTION_REF" in
+            v[0-9]*) version=$ACTION_REF ;;
+            *) version=nightly ;;
+          esac
+        fi
+        case "$RUNNER_OS_/$RUNNER_ARCH_" in
+          Linux/X64) target=x86_64-unknown-linux-gnu ;;
+          Linux/ARM64) target=aarch64-unknown-linux-gnu ;;
+          macOS/ARM64) target=aarch64-apple-darwin ;;
+          macOS/X64) target=x86_64-apple-darwin ;;
+          *) echo "::error::firmware_simulator has no prebuilt release for $RUNNER_OS_/$RUNNER_ARCH_"; exit 1 ;;
+        esac
+        name=firmware_simulator-$target
+        url=https://github.com/ATK422/firmware_simulator/releases/download/$version/$name.tar.gz
+        dir=$RUNNER_TEMP/firmware_simulator-$version
+        mkdir -p "$dir"
+        echo "Downloading $url"
+        curl -fsSL --retry 3 -o "$dir/$name.tar.gz" "$url"
+        curl -fsSL --retry 3 -o "$dir/$name.tar.gz.sha256" "$url.sha256"
+        (cd "$dir" && shasum -a 256 -c "$name.tar.gz.sha256")
+        tar -C "$dir" -xzf "$dir/$name.tar.gz"
+        home=$dir/$name
+        echo "$home/bin" >> "$GITHUB_PATH"
+        echo "FIRMWARE_SIMULATOR_HOME=$home" >> "$GITHUB_ENV"
+        echo "home=$home" >> "$GITHUB_OUTPUT"
+        echo "version=$version" >> "$GITHUB_OUTPUT"
+        "$home/bin/firmware_simulator" --version
+        echo "commit $(cat "$home/COMMIT")"
+
+    - name: Run scenarios
+      if: inputs.scenarios != ''
+      shell: bash
+      env:
+        SCENARIOS: ${{ inputs.scenarios }}
+        JUNIT: ${{ inputs.junit }}
+        ARGS: ${{ inputs.args }}
+      run: |
+        set -euo pipefail
+        # Word splitting on purpose: several paths, and extra arguments
+        # shellcheck disable=SC2086
+        firmware_simulator scenario $SCENARIOS --junit "$JUNIT" $ARGS

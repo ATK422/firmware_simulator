@@ -164,8 +164,8 @@ case "$1 $2" in
         echo "1: $3: <NOARP,UP> mtu ${line#* } qdisc noqueue"
         ;;
     "link add") echo "$4 16" >> "$state" ;;
-    "link set") if [ "$5" = mtu ]; then sed -i "s/^$4 .*/$4 $6/" "$state"; fi ;;
-    "link delete") sed -i "/^$4 /d" "$state" ;;
+    "link set") if [ "$5" = mtu ]; then sed "s/^$4 .*/$4 $6/" "$state" > "$state.new" && mv "$state.new" "$state"; fi ;;
+    "link delete") sed "/^$4 /d" "$state" > "$state.new" && mv "$state.new" "$state" ;;
 esac
 "#;
     let modprobe =

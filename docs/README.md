@@ -16,6 +16,7 @@ their sensors, actuators, the water around them and the robot computer's side of
 | [nereus.md](nereus.md) | The firmware in nereus: the riptide stack's thruster commands through the emulated ESC boards move nereus's vehicle |
 | [testing.md](testing.md) | Writing firmware tests with `sim_test`, the test suites, CI |
 | [scenarios.md](scenarios.md) | Firmware tests in YAML without Rust (`scenario`: faults, inputs, checks on logs, statuses, frames and states; JUnit for CI), and firmware A/B comparisons (`compare`) |
+| [ci.md](ci.md) | Using the emulator in another repository's CI: the prebuilt releases, the GitHub Action, example workflows (a firmware repository, nano_ros) |
 | [fuzzing.md](fuzzing.md) | Fuzzing the firmware through the emulator: malformed CAN traffic, oracles, coverage feedback, minimised reproducers, CI |
 | [tools.md](tools.md) | Developer tools: the firmware profiler, VCD waveforms, the live dashboard and its API, the MCP server for coding agents, JSON logs, robot traces |
 | [nanoros.md](nanoros.md) | nano-ROS (early): what osu-uwrt/nano_ros is, the mock agent, its test board, findings, and which files to change when nano-ROS changes |
@@ -33,7 +34,7 @@ what still needs vcan, an agent, nereus or hardware.
 **1. Get the sources and toolchain.**
 
 ```bash
-git submodule update --init                 # external/titan_firmware_rs is private: ATK422/titan_firmware_rs
+git submodule update --init                 # external/titan_firmware_rs is ATK422/titan_firmware_rs
 rustup target add thumbv6m-none-eabi
 (cd external/titan_firmware_rs && rustup toolchain install)   # the firmware's pinned compiler (rust-toolchain.toml)
 ```

@@ -2,10 +2,8 @@
 # rust-toolchain.toml), then runs every test: the emulator's own, a smoke test for
 # every board image, the robot, IVC link and sweep tests, Puddles over UDP, and the YAML scenarios in scenarios/.
 #
-# external/titan_firmware_rs is the private repository ATK422/titan_firmware_rs: give the workflow a token that can
-# read it as the repository secret TITAN_FIRMWARE_RS_TOKEN (a fine-grained token with "Contents: read" on that
-# repository). Both jobs need it (the emulator's workspace uses its host crates). Without it the "firmware images"
-# step fails loudly and the C job can't build the tests.
+# Both submodules are public (osu-uwrt/titan_firmware, ATK422/titan_firmware_rs), so no secrets are needed. Every job
+# needs external/titan_firmware_rs: the emulator's workspace uses its host crates (canmore, titan_link).
 name: CI
 
 on:
@@ -15,6 +13,9 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
+  # The emulator's toolchain, pinned so that a new stable release (and its new clippy lints) can't turn CI red by
+  # itself; bump it on purpose. The firmware images use titan_firmware_rs's own pin (its rust-toolchain.toml).
+  RUST_TOOLCHAIN: "1.99.0"
 
 jobs:
   test:
@@ -24,18 +25,17 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Submodules
-        env:
-          TOKEN: ${{ secrets.TITAN_FIRMWARE_RS_TOKEN }}
         run: |
           git submodule update --init external/titan_firmware
-          if [ -n "$TOKEN" ]; then
-            git config --global url."https://x-access-token:${TOKEN}@github.com/".insteadOf "https://github.com/"
-          fi
-          git submodule update --init external/titan_firmware_rs || echo "::warning::could not fetch external/titan_firmware_rs (set the TITAN_FIRMWARE_RS_TOKEN secret)"
+          # gen_boards.py --check reads the CANmore client IDs from titan_firmware's titan_canmore submodule (not its
+          # pico-sdk, which only the c-firmware job needs)
+          git -C external/titan_firmware submodule update --init lib/titan_canmore
+          git submodule update --init external/titan_firmware_rs
 
       - name: Rust
         run: |
-          rustup toolchain install stable --profile minimal --component rustfmt,clippy
+          rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal --component rustfmt,clippy
+          rustup default "$RUST_TOOLCHAIN"
           rustup target add thumbv6m-none-eabi
           # The firmware builds with the compiler titan_firmware_rs pins (its rust-toolchain.toml, read by rustup in
           # that directory): install it and its target, so the images are the same build as everyone else's
@@ -64,7 +64,10 @@ jobs:
           python3 scripts/gen_boards.py --check
 
       - name: Tests
-        run: cargo test --release --workspace -- --nocapture 2>&1 | tee test.log
+        # pipefail: the step's shell is `bash -e`, so without it tee's status would hide a failing test
+        run: |
+          set -o pipefail
+          cargo test --release --workspace --no-fail-fast -- --nocapture 2>&1 | tee test.log
 
       - name: Smoke test and sweep tables
         if: always()
@@ -93,17 +96,13 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Submodules
-        env:
-          TOKEN: ${{ secrets.TITAN_FIRMWARE_RS_TOKEN }}
         run: |
           git submodule update --init external/titan_firmware
-          if [ -n "$TOKEN" ]; then
-            git config --global url."https://x-access-token:${TOKEN}@github.com/".insteadOf "https://github.com/"
-          fi
-          git submodule update --init external/titan_firmware_rs || echo "::warning::could not fetch external/titan_firmware_rs (set the TITAN_FIRMWARE_RS_TOKEN secret)"
+          git submodule update --init external/titan_firmware_rs
       - name: Rust
         run: |
-          rustup toolchain install stable --profile minimal --component clippy
+          rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal --component clippy
+          rustup default "$RUST_TOOLCHAIN"
           rustup target add thumbv6m-none-eabi
           # The firmware builds with the compiler titan_firmware_rs pins (its rust-toolchain.toml, read by rustup in
           # that directory): install it and its target, so the images are the same build as everyone else's
@@ -123,7 +122,7 @@ jobs:
       - name: Lint
         run: cargo clippy --workspace --all-targets --release -- -D warnings
       - name: Tests
-        run: cargo test --release --workspace
+        run: cargo test --release --workspace --no-fail-fast
 
   c-firmware:
     # The C titan_firmware programs the emulator runs (basic_template, the Titan bootloader, the OTA test app),
@@ -137,21 +136,24 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Submodules
-        env:
-          TOKEN: ${{ secrets.TITAN_FIRMWARE_RS_TOKEN }}
         run: |
           git submodule update --init external/titan_firmware
           git -C external/titan_firmware submodule update --init --recursive
           # The emulator's workspace uses titan_firmware_rs's host crates (canmore, titan_link), so the tests need it
           # too (not its firmware images)
-          if [ -n "$TOKEN" ]; then
-            git config --global url."https://x-access-token:${TOKEN}@github.com/".insteadOf "https://github.com/"
-          fi
-          git submodule update --init external/titan_firmware_rs || echo "::warning::could not fetch external/titan_firmware_rs (set the TITAN_FIRMWARE_RS_TOKEN secret)"
+          git submodule update --init external/titan_firmware_rs
+      # ARM GCC 13, as uwrt_nix pins it: the runners' apt package is GCC 14, which can't link the Titan bootloader
+      # ("dangerous relocation: unsupported relocation" in boot_app.c)
+      - uses: carlosperate/arm-none-eabi-gcc-action@v1
+        with:
+          release: "13.3.Rel1"
       - name: Toolchain
         run: |
           sudo apt-get update
-          sudo apt-get install -y gcc-arm-none-eabi libnewlib-arm-none-eabi cmake ninja-build
+          sudo apt-get install -y cmake ninja-build
+          arm-none-eabi-gcc --version | head -n 1
+          rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal
+          rustup default "$RUST_TOOLCHAIN"
       - uses: Swatinem/rust-cache@v2
       - name: Build C firmware
         run: sh scripts/build_c_firmware.sh

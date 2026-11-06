@@ -1164,9 +1164,14 @@ mod tests {
         let t0 = Instant::now();
         assert_eq!(p.pace(Time::ZERO), None, "the first call starts the clock");
         assert_eq!(p.pace(Time::from_ms(30)), None);
-        assert!(t0.elapsed() >= Duration::from_millis(28), "{:?}", t0.elapsed());
-        // A little behind is no reason for a warning
-        assert_eq!(p.pace(Time::from_ms(30)), None);
+        let slept = t0.elapsed();
+        assert!(slept >= Duration::from_millis(28), "{slept:?}");
+        // A little behind is no reason for a warning (unless the sleep itself overshot by more than the warning's
+        // threshold, as it can on a loaded machine: macOS runners overshoot 30 ms sleeps by 100 ms and more)
+        let behind = p.pace(Time::from_ms(30));
+        if slept < Duration::from_millis(30) + Pacing::WARN_BEHIND {
+            assert_eq!(behind, None, "after {slept:?}");
+        }
     }
 
     fn template() -> Option<Session> {

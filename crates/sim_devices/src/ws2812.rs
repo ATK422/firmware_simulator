@@ -62,8 +62,12 @@ impl Ws2812 {
         }
         let bits = std::mem::take(&mut self.bits);
         let byte = |c: &[bool]| c.iter().fold(0u8, |a, &b| a << 1 | b as u8);
-        let colours: Vec<Rgb> =
-            bits.chunks_exact(24).map(|c| Rgb { g: byte(&c[0..8]), r: byte(&c[8..16]), b: byte(&c[16..24]) }).collect();
+        let colours: Vec<Rgb> = bits
+            .as_chunks::<24>()
+            .0
+            .iter()
+            .map(|c| Rgb { g: byte(&c[0..8]), r: byte(&c[8..16]), b: byte(&c[16..24]) })
+            .collect();
         if !bits.len().is_multiple_of(24) {
             self.timing_errors += 1;
         }
