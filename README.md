@@ -358,6 +358,10 @@ Measured with `cargo run --release -p sim_test --example bench -- --time 2s --re
 | Talos on three threads, its bridge on a live endpoint (as on vcan) | 5.2 s (1.8 s wall) | about 1.1x (0.7x before) |
 | nereus setup (`robots/talos_nereus.toml`, live host sides, external vehicle), three threads | 4.8 s (1.8-2.1 s wall) | about 1.0x (0.7x before) |
 
+`cargo build --profile fast` (fat LTO) is a few percent faster than release, and `scripts/build_pgo.sh` (PGO on top,
+trained on the bench) 11-21 % faster; both take longer to build, and run exactly the same
+([internals.md](docs/internals.md#build-profiles)).
+
 So single boards run at or above real time. All of Talos keeps up with `--realtime` on three or more free cores:
 its boards run on threads by default (`--threads`) and ahead of each other between the slices where a CAN frame
 could reach them, which makes it about 2.2x faster than on one core (1.6-1.7 s for 2 s of virtual time, about

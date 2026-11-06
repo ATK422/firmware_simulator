@@ -500,3 +500,23 @@ ticking the receivers between their counted loops) and 5 % resolving pins. IVCBo
 interpreter with fewer instructions per op was slower on the wall clock). At boot, embassy's clock setup polls the
 XOSC status register for its 128 ms start-up delay (on the ring oscillator); that wait is skipped as a busy-wait
 (a three-instruction loop, so over three quanta).
+
+### Build profiles
+
+`release` (what the tests, CI and the commands above use) keeps cargo's 16 codegen units and no LTO, so that a
+change to one crate relinks quickly. Two optional builds are faster, and run exactly the same (same fingerprints):
+
+* `cargo build --profile fast` (binaries in `target/fast/`): whole-program (fat) LTO in one codegen unit. The bench
+  runs 3-7 % faster than release (IVCBoard2 0.55 to 0.51 s, the C IVCBoard2 0.665 to 0.635 s, the ESC board 1.42 to
+  1.37 s, Talos 3.87 to 3.75 s, the IVC2 pool 1.50 to 1.43 s); a clean build takes twice as long (`firmware_simulator`
+  about 125 s against 62 s on 4 cores, the bench another 66 s against 35 s) and every link redoes the LTO, which is
+  why the test suite's release profile does not use it. Thin LTO in one codegen unit gained 1-2 %,
+  `panic = "abort"` nothing on top of fat LTO (and the parallel runs and the scenario runner catch panics, so it is
+  not an option), `-C target-cpu=native` nothing (and is not portable: measure it on your machine if you like, with
+  `RUSTFLAGS="-C target-cpu=native" cargo build --profile fast`).
+* `scripts/build_pgo.sh` (needs `rustup component add llvm-tools` and the titan_firmware_rs images): the `fast`
+  profile with profile-guided optimisation, trained by running the bench for 1 s of virtual time per case. Against
+  release: IVCBoard2 0.46 s (16 % faster), the C IVCBoard2 0.525 s (21 %), the ESC board 1.25 s (12 %), Talos
+  3.39 s (12 %), the IVC2 pool 1.33 s (11 %). The script takes about 6 minutes (an instrumented build, the
+  training, the final build). The profile is only as good as the code it was trained on: rerun it after changing
+  the emulator.
