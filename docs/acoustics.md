@@ -169,8 +169,12 @@ Each board's drive pin feeds a projector: the pin's level changes are sampled on
 driver supply and run through the TVR (a band-pass resonator for a resonance TVR), giving the pressure it
 radiates. Every other board's hydrophone hears that over the environment's paths, plus the environment's own
 sources and noise. Boards run in 100 µs slices, so a projector's waveform is known up to the time its board has
-reached; any path longer than a slice (15 cm of water) reads exact values. Robots in a medium always run their
-boards in turn, even with `--threads`.
+reached; any path longer than a slice (15 cm of water) reads exact values. With `--threads` the boards run on
+threads, ahead of each other by up to the shortest delay between any hydrophone and another board's projector (less
+what moving vehicles can close), with the same results as taking turns; boards closer than 15 cm, or carried by a
+simulated vehicle, take turns ([internals.md](internals.md#sessions-and-robots)). A hydrophone leaves out sources
+and projectors that are exactly silent over what it computes (a pinger between pulses, a board not transmitting),
+which changes no sample.
 
 `robots/ivc_pool.toml` (two first-generation IVCBoards, 17/19 kHz FSK) and `robots/ivc2_pool.toml` (two
 IVCBoard2s) put one board on each of two vehicles' buses, 5 m apart in the pool:
