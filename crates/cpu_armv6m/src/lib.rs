@@ -823,7 +823,9 @@ impl CortexM0Plus {
                         if uses_bus {
                             c += bus.take_stall_cycles();
                         }
-                        if systick {
+                        // (A PPB access may have switched SysTick to or from the core clock: it counts this
+                        // instruction's cycles as it is set now, as after a step)
+                        if systick || self.batch_break {
                             self.tick(c);
                         }
                         cycles += c as u64;
@@ -858,7 +860,7 @@ impl CortexM0Plus {
             match self.execute::<B, false>(bus) {
                 Ok(c) => {
                     let c = c + bus.take_stall_cycles();
-                    if systick {
+                    if systick || self.batch_break {
                         self.tick(c);
                     }
                     cycles += c as u64;

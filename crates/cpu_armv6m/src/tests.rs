@@ -1780,3 +1780,28 @@ fn a_faulting_access_counts_its_stall_cycles_before_the_entry() {
         assert_eq!(rig.cpu.ipsr(), exception::HARD_FAULT);
     }
 }
+
+#[test]
+fn systick_counts_the_instruction_that_switches_it_as_a_step_does() {
+    // A store to SYST_CSR that starts SysTick on the core clock counts its own 2 cycles, and one that stops it does
+    // not: a batch, which ends after the access, does as a step
+    for (csr_before, csr_after, counted) in [(0b000, 0b101, 2), (0b101, 0b000, 0)] {
+        for mode in [None, Some(false), Some(true)] {
+            let mut rig = Rig::new(&[str_i(1, 0, 0), NOP]);
+            rig.cpu.r[0] = crate::ppb::SYST_CSR;
+            rig.cpu.r[1] = csr_after;
+            rig.cpu.systick.rvr = 1000;
+            rig.cpu.systick.cvr = 500;
+            rig.cpu.systick.csr = csr_before;
+            match mode {
+                None => {
+                    rig.run(1);
+                }
+                Some(blocks) => {
+                    assert_eq!(batch_on(&mut rig, blocks, 10, u64::MAX).steps, 1, "a PPB access ends the batch");
+                }
+            }
+            assert_eq!(rig.cpu.systick.cvr, 500 - counted, "{csr_before:#b} -> {csr_after:#b} {mode:?}");
+        }
+    }
+}
