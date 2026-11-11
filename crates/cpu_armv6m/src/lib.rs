@@ -978,10 +978,13 @@ impl Cpu for CortexM0Plus {
         let log = self.log_exceptions;
         // The edge map outlives a reset: what ran before it was still run
         let edges = self.edges.take();
+        // So do the engine switches (how the core runs, not what it does)
+        let decode_blocks = self.decode_blocks;
         *self = CortexM0Plus::new();
         self.cpuid = cpuid;
         self.log_exceptions = log;
         self.edges = edges;
+        self.decode_blocks = decode_blocks;
         self.scb.vtor = vtor;
         let sp = bus.read(vtor, Size::Word).unwrap_or(0);
         let pc = bus.read(vtor + 4, Size::Word).unwrap_or(0);

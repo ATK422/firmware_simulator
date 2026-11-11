@@ -290,6 +290,14 @@ const N: bool = true;
 const F: bool = false;
 
 #[test]
+fn engine_switches_outlive_a_reset() {
+    let mut rig = Rig::new(&[NOP]);
+    rig.cpu.decode_blocks = false;
+    rig.cpu.reset(&mut rig.bus, VECTORS);
+    assert!(!rig.cpu.decode_blocks);
+}
+
+#[test]
 fn reset_loads_sp_and_pc() {
     let rig = Rig::new(&[NOP]);
     assert_eq!(rig.r(13), STACK_TOP);
