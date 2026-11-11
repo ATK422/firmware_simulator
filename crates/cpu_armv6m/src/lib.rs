@@ -199,7 +199,7 @@ pub struct CortexM0Plus {
 }
 
 /// The default [`CortexM0Plus::jit_threshold`].
-pub const JIT_THRESHOLD: u32 = 100;
+pub const JIT_THRESHOLD: u32 = 300;
 
 static JIT_THRESHOLD_DEFAULT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(JIT_THRESHOLD);
 

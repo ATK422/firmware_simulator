@@ -6,9 +6,10 @@
 //! is known by its first block (address and code) and the shape of the bus's direct memory windows it was compiled
 //! for; whatever else it runs it checks before running it.
 //!
-//! Regions are compiled on a worker thread, while the core that asked goes on interpreting: compiled code does
-//! exactly what interpreting does, so when it starts being used changes nothing. Tests compile on the asking thread
-//! instead (`CortexM0Plus::jit_sync`), to run compiled code from the first moment it may run.
+//! Regions are compiled on worker threads (up to half the host's cores, at most [`WORKERS`], each with a compiler
+//! and a module of its own), while the core that asked goes on interpreting: compiled code does exactly what
+//! interpreting does, so when it starts being used changes nothing. Tests compile on the asking thread instead
+//! (`CortexM0Plus::jit_sync`), to run compiled code from the first moment it may run.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
@@ -89,12 +90,16 @@ struct Request {
     ticket: Arc<Ticket>,
 }
 
+/// Most worker threads compiling.
+const WORKERS: usize = 3;
+
 pub(crate) struct Service {
-    /// `None` where Cranelift has no code generator for the host.
+    /// The compiler requests made `sync` use (`None` where Cranelift has no code generator for the host).
     compiler: Mutex<Option<Compiler>>,
     trampoline: Option<Trampoline>,
     tickets: Mutex<HashMap<Key, Arc<Ticket>>>,
-    worker: Mutex<Option<mpsc::Sender<Request>>>,
+    /// Where requests for the workers go (`None` until the first).
+    workers: Mutex<Option<mpsc::Sender<Request>>>,
     regions: AtomicU64,
     blocks: AtomicU64,
     nanos: AtomicU64,
@@ -110,7 +115,7 @@ pub(crate) fn service() -> &'static Service {
             compiler: Mutex::new(compiler),
             trampoline,
             tickets: Mutex::new(HashMap::new()),
-            worker: Mutex::new(None),
+            workers: Mutex::new(None),
             regions: AtomicU64::new(0),
             blocks: AtomicU64::new(0),
             nanos: AtomicU64::new(0),
@@ -150,17 +155,28 @@ impl Service {
         };
         let request = Request { window, blocks, shapes, regs, ticket: ticket.clone() };
         if sync {
-            self.compile(request);
+            let mut compiler = self.compiler.lock().unwrap_or_else(|e| e.into_inner());
+            self.compile_with(compiler.as_mut(), request);
         } else {
-            let mut worker = self.worker.lock().unwrap_or_else(|e| e.into_inner());
-            let tx = worker.get_or_insert_with(|| {
+            let mut workers = self.workers.lock().unwrap_or_else(|e| e.into_inner());
+            let tx = workers.get_or_insert_with(|| {
                 let (tx, rx) = mpsc::channel::<Request>();
-                let spawned = std::thread::Builder::new().name("jit".into()).spawn(move || {
-                    for r in rx {
-                        service().compile(r);
-                    }
-                });
-                if spawned.is_err() {
+                let rx = Arc::new(Mutex::new(rx));
+                let n = std::thread::available_parallelism().map_or(1, |n| (n.get() / 2).clamp(1, WORKERS));
+                let mut spawned = 0;
+                for k in 0..n {
+                    let rx = rx.clone();
+                    let worker = move || {
+                        let mut compiler = Compiler::new();
+                        loop {
+                            let r = rx.lock().unwrap_or_else(|e| e.into_inner()).recv();
+                            let Ok(r) = r else { return };
+                            service().compile_with(compiler.as_mut(), r);
+                        }
+                    };
+                    spawned += std::thread::Builder::new().name(format!("jit{k}")).spawn(worker).is_ok() as usize;
+                }
+                if spawned == 0 {
                     log::warn!("no thread for the JIT: blocks run interpreted");
                 }
                 tx
@@ -172,17 +188,13 @@ impl Service {
         ticket
     }
 
-    fn compile(&self, r: Request) {
+    fn compile_with(&self, compiler: Option<&mut Compiler>, r: Request) {
         let start = Instant::now();
-        let code = {
-            let mut compiler = self.compiler.lock().unwrap_or_else(|e| e.into_inner());
-            let c = compiler.as_mut();
-            c.and_then(|c| {
-                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| c.compile(&r.blocks, &r.shapes, &r.regs)))
-                    .ok()
-                    .flatten()
-            })
-        };
+        let code = compiler.and_then(|c| {
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| c.compile(&r.blocks, &r.shapes, &r.regs)))
+                .ok()
+                .flatten()
+        });
         // The region as code going on to it finds it, made once and kept for ever (as its code is)
         let d = code.map(|code| {
             let e = &r.blocks[0].entry;

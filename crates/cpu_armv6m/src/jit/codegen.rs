@@ -279,6 +279,10 @@ struct Emit<'a> {
     /// Where each block's checks start (created on first use, when the block is to be emitted too: blocks nothing
     /// goes to are not, as unreachable loops would trouble the SSA construction).
     entries: Vec<Option<Block>>,
+    /// Accesses tried inline that leave the region at their op where the address is not in the window (filled in
+    /// at the end): the block, the steps at the start of the op's block, the ops there up to and with it, its PC, and
+    /// the flags there.
+    misses: Vec<(Block, Value, usize, u32, Flags)>,
     reached: Vec<usize>,
     /// Code a store may change: where blocks in writable memory are (`lo..hi`), if any.
     code: Option<(u32, u32)>,
@@ -302,6 +306,9 @@ enum Fl {
     Carry(Value, Value, Value),
     Over(Value, Value, Value),
 }
+
+/// What [`Emit::fl`] and [`Emit::sub`] say at a point.
+type Flags = ([Fl; 4], Option<(Value, Value)>);
 
 /// Registers read or written by `op` (bit 16 + flag for flags) and written by it.
 fn op_regs(op: Op) -> (u32, u32) {
@@ -440,6 +447,7 @@ impl<'a> Emit<'a> {
             slow_exit,
             blocks,
             entries: vec![None; blocks.len()],
+            misses: Vec::new(),
             reached: vec![0],
             code,
             windows: *windows,
@@ -461,6 +469,12 @@ impl<'a> Emit<'a> {
             if let Some(checks) = x.entries[j] {
                 x.fill_checks(j, checks, &starts);
             }
+        }
+        for (miss, start, ran, pc, (fl, sub)) in std::mem::take(&mut x.misses) {
+            x.enter(miss);
+            (x.fl, x.sub, x.pend) = (fl, sub, 0);
+            // (`ran` counts the op: it has not run)
+            x.exit_at(EXIT_NEXT, start, ran - 1, pc);
         }
         x.fill_slow_exit();
         if let Some(c) = x.chain_block {
@@ -862,27 +876,33 @@ impl<'a> Emit<'a> {
             2 => I16,
             _ => I32,
         };
-        let k = self.window_for(guess, write);
-        let (slow, join) = (self.b.create_block(), self.b.create_block());
-        // Direct: the access, with nothing for the checks after it (but a store into the region's code)
-        let at = self.direct(addr, bytes, bytes, write, k, slow);
-        match a {
-            Access::Load(_, rt, signed) => {
-                let v = self.b.ins().load(ty, guest(), at, 0);
-                let v = if ty == I32 { v } else { self.b.ins().uextend(I32, v) };
-                self.loaded(v, rt, signed);
+        // Inline where it went when the region was compiled was a window; leaving the region at the op if it is
+        // not (the batch then makes the access, and will find a block starting at the op to compile)
+        let usable = |w: &Shape| w.size != 0 && (!write || w.writable);
+        let w = &self.windows;
+        if let Some(k) = (0..DIRECT_REGIONS).find(|&k| usable(&w[k]) && guess.wrapping_sub(w[k].base) < w[k].size) {
+            debug_assert_eq!(self.pend, 0);
+            let miss = self.b.create_block();
+            self.misses.push((miss, start, ran, pc, (self.fl, self.sub)));
+            let at = self.direct(addr, bytes, bytes, write, Some(k), miss);
+            match a {
+                Access::Load(_, rt, signed) => {
+                    let v = self.b.ins().load(ty, guest(), at, 0);
+                    let v = if ty == I32 { v } else { self.b.ins().uextend(I32, v) };
+                    self.loaded(v, rt, signed);
+                }
+                Access::Store(_, v) => {
+                    let v = if ty == I32 { v } else { self.b.ins().ireduce(ty, v) };
+                    self.b.ins().store(guest(), v, at, 0);
+                }
             }
-            Access::Store(_, v) => {
-                let v = if ty == I32 { v } else { self.b.ins().ireduce(ty, v) };
-                self.b.ins().store(guest(), v, at, 0);
-            }
+            self.add_cycles_imm(2);
+            // (A store into the region's code leaves after it)
+            let leave = if write { self.code_check(addr, 4) } else { None };
+            self.leave_if(leave, start, ran, pc + 2);
+            return;
         }
-        self.add_cycles_imm(2);
-        let leave = if write { self.code_check(addr, 4) } else { None };
-        self.leave_if(leave, start, ran, pc + 2);
-        self.b.ins().jump(join, &[]);
-        // Through the bus: the register loaded unless it faulted, then the checks, which may leave
-        self.enter(slow);
+        // Else through the bus: the register loaded unless it faulted, then the checks, which may leave
         let mut how = self.imm(bytes | if write { WRITE } else { 0 });
         if let Some(l) = self.code_check(addr, 4) {
             let l = self.b.ins().ishl_imm_u(l, 9);
@@ -908,8 +928,6 @@ impl<'a> Emit<'a> {
         }
         let (next, two) = (self.imm(pc + 2), self.imm(2));
         self.after_thunk(r, start, ran, pc, next, two, false);
-        self.b.ins().jump(join, &[]);
-        self.enter(join);
     }
 
     /// The address a load or store with base `b` and offset `m` (a register) or `imm` would make with the registers

@@ -751,6 +751,9 @@ impl CortexM0Plus {
     ) -> (u64, u32, Exit) {
         let mut steps = 0;
         let mut ctx = jit.map(|_| jit::Ctx::new::<B>());
+        // Where compiled code last left at once (its first access was not where it was compiled for): the block
+        // executor runs the block there in this batch
+        let mut stuck = None;
         loop {
             let pc = self.r[15];
             if pc < trap_below {
@@ -769,6 +772,7 @@ impl CortexM0Plus {
             if let (Some((threshold, sync)), Some(ctx)) = (jit, ctx.as_mut())
                 && first == 0
                 && run_len == n
+                && stuck != Some(pc)
                 && let Some(f) = cache.hot(bus, &self.r, slot, (threshold, sync))
             {
                 let limits =
@@ -782,6 +786,10 @@ impl CortexM0Plus {
                         return (cycles, steps + ran, Exit::Fault(f, self.r[15]));
                     }
                     jit::EXIT_BATCH => return (cycles, steps + ran, Exit::Batch),
+                    _ if ran == 0 && self.r[15] == pc => {
+                        stuck = Some(pc);
+                        continue;
+                    }
                     _ => steps += ran,
                 }
                 if cycles >= budget {
