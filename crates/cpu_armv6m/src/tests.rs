@@ -1468,8 +1468,11 @@ fn every_16_bit_encoding_runs_compiled_as_decoded() {
         }
     }
     assert_eq!(decoded.bus.ram, jitted.bus.ram);
-    let (compiled, _, time) = CortexM0Plus::jit_stats();
-    eprintln!("{compiled} blocks compiled in {time:?}");
+    let stats = CortexM0Plus::jit_stats();
+    let compiled = stats.regions;
+    eprintln!("{compiled} regions compiled in {:?}, {} refused", stats.compile_time, stats.refused);
+    // (None refused for want of memory: they would run decoded, silently but for a warning)
+    assert_eq!(stats.refused, 0);
     // (Where Cranelift has no code generator nothing is compiled, and the blocks run decoded)
     assert!(
         compiled > 60_000 || !cfg!(all(feature = "jit", any(target_arch = "x86_64", target_arch = "aarch64"))),

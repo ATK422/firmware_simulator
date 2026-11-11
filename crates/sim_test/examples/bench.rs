@@ -380,8 +380,16 @@ fn run(
             }
             let (wall, cpu) = (wall.elapsed(), cpu_time().zip(cpu).map(|(b, a)| b - a));
             if STATS.load(std::sync::atomic::Ordering::Relaxed) {
-                let (n, k, t) = cpu_armv6m::CortexM0Plus::jit_stats();
-                eprintln!("{}: {n} regions ({k} blocks) compiled in {t:?}", case.name);
+                let s = cpu_armv6m::CortexM0Plus::jit_stats();
+                eprintln!(
+                    "{}: {} regions ({} blocks) compiled in {:?}, {} KiB of code, {} refused (in the process so far)",
+                    case.name,
+                    s.regions,
+                    s.blocks,
+                    s.compile_time,
+                    s.code_bytes >> 10,
+                    s.refused
+                );
             }
             hash_session(&mut h, &b.session);
             for (t, m) in b.messages() {

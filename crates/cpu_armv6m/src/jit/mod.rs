@@ -31,15 +31,17 @@
 
 pub(crate) mod service;
 
+pub use service::JitStats;
+
 #[cfg(all(feature = "jit", any(target_arch = "x86_64", target_arch = "aarch64")))]
 mod codegen;
 #[cfg(all(feature = "jit", any(target_arch = "x86_64", target_arch = "aarch64")))]
-pub(crate) use codegen::{Compiler, RegionBlock};
+pub(crate) use codegen::{Compiler, Defined, RegionBlock, code_taken};
 
 #[cfg(not(all(feature = "jit", any(target_arch = "x86_64", target_arch = "aarch64"))))]
 mod unsupported;
 #[cfg(not(all(feature = "jit", any(target_arch = "x86_64", target_arch = "aarch64"))))]
-pub(crate) use unsupported::{Compiler, RegionBlock};
+pub(crate) use unsupported::{Compiler, Defined, RegionBlock, code_taken};
 
 use std::any::Any;
 use std::panic::AssertUnwindSafe;

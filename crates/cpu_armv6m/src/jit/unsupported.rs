@@ -17,6 +17,12 @@ pub(crate) struct RegionBlock {
 
 pub(crate) enum Compiler {}
 
+pub(crate) struct Defined;
+
+pub(crate) fn code_taken() -> usize {
+    0
+}
+
 impl Compiler {
     pub(crate) fn new() -> Option<Compiler> {
         None
@@ -26,12 +32,15 @@ impl Compiler {
         match *self {}
     }
 
-    pub(crate) fn compile(
-        &mut self,
-        _: &[RegionBlock],
-        _: &[Shape; DIRECT_REGIONS],
-        _: &[u32; 16],
-    ) -> Option<*const u8> {
+    pub(crate) fn full(&self) -> bool {
+        match *self {}
+    }
+
+    pub(crate) fn define(&mut self, _: &[RegionBlock], _: &[Shape; DIRECT_REGIONS], _: &[u32; 16]) -> Option<Defined> {
+        match *self {}
+    }
+
+    pub(crate) fn finish(&mut self, _: &[Defined]) -> Option<Vec<*const u8>> {
         match *self {}
     }
 }

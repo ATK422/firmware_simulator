@@ -31,6 +31,7 @@ use sim_core::cpu::{Cpu, StepOutcome};
 
 pub use block::BlockCache;
 pub use edges::EdgeMap;
+pub use jit::JitStats;
 pub use ppb::{Mpu, Nvic, Scb, SysTick};
 pub use timer_wait::{TimerWait, WaitRead};
 
@@ -377,8 +378,9 @@ impl CortexM0Plus {
         }
     }
 
-    /// Regions the JIT compiled in this process, the blocks in them, and the time it took.
-    pub fn jit_stats() -> (u64, u64, std::time::Duration) {
+    /// What the JIT has done in this process: regions compiled, the blocks in them, the time it took, and regions
+    /// refused once compiled code had taken all the memory it may (a warning says so the first time).
+    pub fn jit_stats() -> JitStats {
         BlockCache::jit_stats()
     }
 

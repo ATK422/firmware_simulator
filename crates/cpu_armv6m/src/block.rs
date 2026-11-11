@@ -488,8 +488,8 @@ impl BlockCache {
         e.jit
     }
 
-    /// Regions compiled in the process, the blocks in them, and the time it took.
-    pub fn jit_stats() -> (u64, u64, std::time::Duration) {
+    /// What the JIT has done in the process.
+    pub fn jit_stats() -> jit::JitStats {
         service::service().stats()
     }
 }

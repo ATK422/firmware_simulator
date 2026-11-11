@@ -13,6 +13,7 @@
 //! on the RP2040) are made inline, with the bus's marks; the rest go through the thunks.
 
 use std::mem::offset_of;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use cranelift_codegen::Context;
 use cranelift_codegen::ir::condcodes::IntCC;
@@ -22,7 +23,7 @@ use cranelift_codegen::isa::{CallConv, TargetFrontendConfig};
 use cranelift_codegen::settings::{self, Configurable};
 use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext, Variable};
 use cranelift_jit::{JITBuilder, JITModule};
-use cranelift_module::{Module, default_libcall_names};
+use cranelift_module::{FuncId, Module, default_libcall_names};
 use sim_core::bus::{DIRECT_REGIONS, DirectMemory, DirectRegion};
 
 use super::service::Shape;
@@ -33,19 +34,34 @@ use super::{
 use crate::CortexM0Plus;
 use crate::block::{Entry, K, Op};
 
-/// Most memory compiled code may take (in the whole process; nothing is compiled after).
-const MODULE_BYTES: usize = 256 << 20;
+/// Most memory compiled code may take, in the whole process (code is never freed: cores everywhere may hold it).
+/// Nothing is compiled after ([`Compiler::full`]).
+///
+/// Code is made executable a batch of regions at a time (`Compiler::finish`), and memory made executable is never
+/// written again, so each batch takes whole pages: regions compiled together share them, one compiled alone (as
+/// tests compile, `jit_sync`) takes a page of its own, 16 KiB on Apple silicon. The limit leaves room for that: over
+/// 130,000 regions compiled one at a time there.
+const CODE_MEMORY: usize = 2 << 30;
 
-/// Compiles regions. One per process ([`super::service`]).
+/// The memory compiled code has taken in the process so far (whole pages).
+static CODE_TAKEN: AtomicUsize = AtomicUsize::new(0);
+
+/// [`CODE_TAKEN`].
+pub(crate) fn code_taken() -> usize {
+    CODE_TAKEN.load(Ordering::Relaxed)
+}
+
+/// Compiles regions ([`super::service`]): each with a module of its own.
 pub(crate) struct Compiler {
     module: Option<JITModule>,
     ctx: Context,
     fctx: FunctionBuilderContext,
-    /// Memory the current module holds (at least a page per function).
-    bytes: usize,
     page: usize,
     trampoline: Trampoline,
 }
+
+/// A region defined in a compiler's module, not yet executable: its function and its code's size.
+pub(crate) struct Defined(FuncId, usize);
 
 fn module() -> Option<JITModule> {
     let mut flags = settings::builder();
@@ -106,7 +122,7 @@ impl Compiler {
         // SAFETY: the finalized code of the function just defined, `extern "C" fn(*mut Ctx, *const u8) -> u32` in
         // the module's default calling convention, the host's C ABI (two pointer-sized parameters, a 32-bit result)
         let trampoline = unsafe { std::mem::transmute::<*const u8, Trampoline>(module.get_finalized_function(id)) };
-        Some(Compiler { module: Some(module), ctx, fctx, bytes: 0, page: region_page(), trampoline })
+        Some(Compiler { module: Some(module), ctx, fctx, page: region_page(), trampoline })
     }
 
     /// How Rust calls a region.
@@ -114,19 +130,21 @@ impl Compiler {
         self.trampoline
     }
 
-    /// Compiles the region `blocks` (the first is where it is entered), `None` once the module holds
-    /// [`MODULE_BYTES`] (code is never freed: cores everywhere may hold it). `windows`: the shapes of the direct
-    /// memory windows the bus had, and `regs` the core's registers: each access is tried inline in the window that has
-    /// the address it would make now (a guess for later blocks: where it goes, if not there, is the thunk's).
-    pub(crate) fn compile(
+    /// Whether the process's compiled code has taken all the memory it may ([`CODE_MEMORY`]).
+    pub(crate) fn full(&self) -> bool {
+        CODE_TAKEN.load(Ordering::Relaxed) >= CODE_MEMORY
+    }
+
+    /// Compiles the region `blocks` (the first is where it is entered) into the module, to be made executable with
+    /// others by [`Compiler::finish`]. `windows`: the shapes of the direct memory windows the bus had, and `regs`
+    /// the core's registers: each access is tried inline in the window that has the address it would make now (a
+    /// guess for later blocks: where it goes, if not there, is the thunk's).
+    pub(crate) fn define(
         &mut self,
         blocks: &[RegionBlock],
         windows: &[Shape; DIRECT_REGIONS],
         regs: &[u32; 16],
-    ) -> Option<*const u8> {
-        if self.bytes >= MODULE_BYTES {
-            return None;
-        }
+    ) -> Option<Defined> {
         // (Whatever a compile that panicked left)
         self.ctx.clear();
         self.fctx = FunctionBuilderContext::new();
@@ -151,11 +169,18 @@ impl Compiler {
         let size = self.ctx.compiled_code().map_or(0, |c| c.code_info().total_size as usize);
         module.clear_context(&mut self.ctx);
         defined.ok()?;
+        Some(Defined(id, size))
+    }
+
+    /// Makes the regions `defined` since the last call executable, together: their code, to be called through the
+    /// trampoline or by other regions (`None`: none can run).
+    pub(crate) fn finish(&mut self, defined: &[Defined]) -> Option<Vec<*const u8>> {
+        let module = self.module.as_mut()?;
         module.finalize_definitions().ok()?;
-        let code = module.get_finalized_function(id);
-        self.bytes += size.div_ceil(self.page).max(1) * self.page;
-        // (Called through the trampoline, or by other regions)
-        Some(code)
+        // (They share pages: a batch takes the pages its code fills)
+        let bytes: usize = defined.iter().map(|d| d.1).sum();
+        CODE_TAKEN.fetch_add(bytes.div_ceil(self.page).max(1) * self.page, Ordering::Relaxed);
+        Some(defined.iter().map(|d| module.get_finalized_function(d.0)).collect())
     }
 }
 
@@ -169,7 +194,7 @@ fn region_signature(module: &JITModule) -> Signature {
     sig
 }
 
-/// The host's page size (each compiled function takes at least one).
+/// The host's page size (each batch of compiled functions takes at least one).
 fn region_page() -> usize {
     if cfg!(all(target_arch = "aarch64", target_os = "macos")) { 16 << 10 } else { 4 << 10 }
 }
