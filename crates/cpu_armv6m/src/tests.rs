@@ -1719,3 +1719,64 @@ fn edge_map_records_taken_branches_in_every_mode() {
     rig.run(20);
     assert!(rig.cpu.edges.is_none());
 }
+
+/// A [`CodeBus`] whose reads above `0x3000_0000` stall for 3 cycles and fault, as a slow bus that errors.
+struct StallBus<'a>(CodeBus<'a>, u32);
+
+impl Bus for StallBus<'_> {
+    fn read(&mut self, addr: u32, size: Size) -> Result<u32, BusFault> {
+        if addr >= 0x3000_0000 {
+            self.1 += 3;
+            return Err(BusFault::Unmapped(addr));
+        }
+        self.0.read(addr, size)
+    }
+    fn write(&mut self, addr: u32, size: Size, value: u32) -> Result<(), BusFault> {
+        self.0.write(addr, size, value)
+    }
+    fn fetch16_fast(&mut self, addr: u32) -> Option<u16> {
+        self.0.fetch16_fast(addr)
+    }
+    fn code_at(&mut self, addr: u32) -> Option<&[u8]> {
+        self.0.code_at(addr)
+    }
+    fn take_slow_access(&mut self) -> bool {
+        false
+    }
+    fn take_attention(&mut self) -> bool {
+        false
+    }
+    fn take_stall_cycles(&mut self) -> u32 {
+        std::mem::take(&mut self.1)
+    }
+}
+
+#[test]
+fn a_faulting_access_counts_its_stall_cycles_before_the_entry() {
+    // LDR from a slow address that faults: its 3 stall cycles count before the 15 of the HardFault entry, in the step
+    // that faults, not in whichever instruction next collects stall cycles; the same in batches
+    for mode in [None, Some(false), Some(true)] {
+        let mut rig = Rig::new(&[ldr_i(1, 0, 0), NOP]);
+        rig.handler(exception::HARD_FAULT, HANDLER, &[NOP, NOP]);
+        rig.cpu.r[0] = 0x3000_0000;
+        let mut bus = StallBus(CodeBus(&mut rig.bus), 0);
+        let cycles = match mode {
+            None => {
+                let first = rig.cpu.step_on(&mut bus);
+                assert_eq!(first, StepOutcome::Ran(3 + 15));
+                assert_eq!(rig.cpu.step_on(&mut bus), StepOutcome::Ran(1), "the handler's NOP stalls for nothing");
+                rig.cpu.cycles()
+            }
+            Some(blocks) => {
+                rig.cpu.decode_blocks = blocks;
+                let b = rig.cpu.run_batch(&mut bus, 1, u64::MAX, 0);
+                assert_eq!((b.steps, b.cycles), (1, 18), "{mode:?}");
+                let b = rig.cpu.run_batch(&mut bus, 1, u64::MAX, 0);
+                assert_eq!((b.steps, b.cycles), (1, 1), "{mode:?}");
+                rig.cpu.cycles()
+            }
+        };
+        assert_eq!(cycles, 19, "{mode:?}");
+        assert_eq!(rig.cpu.ipsr(), exception::HARD_FAULT);
+    }
+}

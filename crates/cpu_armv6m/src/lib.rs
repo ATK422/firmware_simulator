@@ -740,6 +740,9 @@ impl CortexM0Plus {
         macro_rules! fault {
             ($f:expr, $pc:expr) => {{
                 let pc = $pc;
+                // The faulting instruction's accesses (its fetch included) may have stalled: those cycles are its
+                // own, before the entry; a `BKPT`, which stops before it executes, takes none
+                let stall = bus.take_stall_cycles();
                 match $f {
                     Fault::Breakpoint(imm) => {
                         self.r[15] = pc;
@@ -753,6 +756,8 @@ impl CortexM0Plus {
                         return Batch { steps: steps + 1, cycles, stop };
                     }
                     f => {
+                        self.tick(stall);
+                        cycles += stall as u64;
                         self.r[15] = f.faulting_pc(pc);
                         self.cycles += cycles;
                         self.instructions += steps as u64 - 1;
@@ -927,12 +932,22 @@ impl CortexM0Plus {
                 StepOutcome::Ran(cycles)
             }
             Err(Fault::Breakpoint(imm)) => {
+                // (It stops before it executes: what its fetch stalled is not counted, as in a batch)
+                bus.take_stall_cycles();
                 self.r[15] = pc;
                 StepOutcome::Breakpoint(imm)
             }
             Err(f) => {
+                // As in a batch: what the faulting instruction's accesses (its fetch included) stalled counts before
+                // the entry
+                let stall = bus.take_stall_cycles();
+                self.cycles += stall as u64;
+                self.tick(stall);
                 self.r[15] = f.faulting_pc(pc);
-                self.take_fault(bus, f)
+                match self.take_fault(bus, f) {
+                    StepOutcome::Ran(c) => StepOutcome::Ran(c + stall),
+                    other => other,
+                }
             }
         }
     }
