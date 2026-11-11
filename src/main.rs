@@ -26,10 +26,10 @@ struct Cli {
     #[command(subcommand)]
     command: Command,
     /// Runs the CPU cores' hot code compiled to native code (the JIT, on x86-64 and aarch64 hosts; elsewhere the
-    /// cores interpret). Off by default; runs are the same either way. `SIM_JIT=1` turns it on too
+    /// cores interpret). The default, unless `SIM_JIT=0`; runs are the same either way
     #[arg(long, global = true, conflicts_with = "no_jit")]
     jit: bool,
-    /// Interprets every instruction, whatever `SIM_JIT` says
+    /// Interprets every instruction (as `SIM_JIT=0` does)
     #[arg(long, global = true)]
     no_jit: bool,
 }

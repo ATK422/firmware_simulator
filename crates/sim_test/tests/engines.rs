@@ -15,7 +15,7 @@ use sim_test::{Bench, Time};
 type Engine = (&'static str, fn(&mut Machine));
 
 const INTERPRETER: Engine = ("interpreter", |m| m.cores.iter_mut().for_each(|c| c.decode_blocks = false));
-const BLOCKS: Engine = ("blocks", |m| m.cores.iter_mut().for_each(|c| c.decode_blocks = true));
+const BLOCKS: Engine = ("blocks", |m| m.cores.iter_mut().for_each(|c| (c.decode_blocks, c.jit) = (true, false)));
 const COMPILED: Engine = ("compiled", |m| {
     for c in &mut m.cores {
         // (Early, so that nearly every block runs compiled)

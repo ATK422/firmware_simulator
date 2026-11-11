@@ -10,7 +10,7 @@
 //! `--stats` prints what running ahead did in each robot case (windows, slices, rollbacks, cuts), and the blocks the
 //! JIT compiled in each board case.
 //!
-//! `--jit` and `--no-jit` run every core with the JIT on or off (`CortexM0Plus::jit`; else as `SIM_JIT` says), and
+//! `--jit` and `--no-jit` run every core with the JIT on or off (`CortexM0Plus::jit`; else on unless `SIM_JIT=0`), and
 //! `--jit-threshold` sets how often a block runs before it is compiled: the fingerprints must not change.
 //!
 //! `--no-lanes` has the hydrophones of robots in water sum their paths one at a time (`Hydrophone::lanes` off, the
