@@ -61,6 +61,18 @@ scheduled. Counters (timer, PWM, watchdog) are computed lazily from virtual time
    access, `SEV`, sleep, `BKPT`, a fault, a pending exception, the quantum or the time limit. Batching is off
    while anything needs to see each instruction (breakpoints, `instr`/`exc` tracing), which is also how tests get
    a reference run.
+   **Decoded blocks and the JIT.** A batch runs instructions from a per-core cache of decoded blocks
+   (`crates/cpu_armv6m/src/block.rs`, `CortexM0Plus::decode_blocks`): runs of up to 16 instructions decoded once
+   from the memory the bus serves code from, and used while memory still holds the bytes they were decoded from
+   (checked at each lookup; a store into the running block ends it). With `CortexM0Plus::jit` (`--jit`, `SIM_JIT=1`;
+   off by default) a block that has run whole `jit_threshold` times (50) is compiled to native code with Cranelift
+   (`crates/cpu_armv6m/src/jit`, on x86-64 and aarch64; elsewhere blocks stay interpreted). Compiled code does what
+   the block executor does op for op: register and flag operations inline, every access, multi-word transfer,
+   interworking branch and the instructions the block executor leaves to the interpreter through thunks that run
+   the same Rust code, the same checks after each access and the same exits. Its code is dropped when its entry is
+   decoded again. With the edge map on, blocks run interpreted. The differential tests (`src/difftest`, random
+   programs against single steps) and `crates/sim_test/tests/engines.rs` (IVCBoard2 in lockstep) compare every way
+   of running.
 3. **Busy-wait skipping** (`Machine::skip_spin`). A quantum in which a core only read memory and the timer (seeing
    the same tick each time), wrote nothing and ended in the state it started in would repeat exactly until the
    timer ticks; such quanta are skipped up to the next event, tick or the end of the run, while the other core
@@ -134,7 +146,8 @@ scheduled. Counters (timer, PWM, watchdog) are computed lazily from virtual time
    time through a bus that checks every data access, and stop the core before its next step. Code coverage
    (`Machine::coverage`) does too, marking each executed instruction.
 
-`Machine::skip_spins`, `Machine::skip_timer_waits`, `Machine::fuse_quanta`, `Pio::skip_loops`,
+`CortexM0Plus::decode_blocks` and `CortexM0Plus::jit` (`--jit`/`--no-jit`, `SIM_JIT`, the bench's `--jit`/`--no-jit`)
+choose how a core's batches run; `Machine::skip_spins`, `Machine::skip_timer_waits`, `Machine::fuse_quanta`, `Pio::skip_loops`,
 `Pio::skip_counted`, `Pio::loop_inputs` and `Pio::fast_run` switch the skips and the fusing off (and in the water
 `Hydrophone::skip_quiet` and `Hydrophone::lanes` theirs, see *Acoustic media* below: the hydrophone unit tests and
 `crates/sim_host/tests/acoustic_threads.rs` compare runs with them on and off);

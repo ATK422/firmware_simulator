@@ -22,6 +22,7 @@
 use sim_core::bus::{Bus, Size};
 
 use crate::exec::{Next, sext};
+use crate::jit::{self, JitFn};
 use crate::{CortexM0Plus, Fault};
 
 /// Most instructions in a block.
@@ -194,6 +195,9 @@ pub(crate) struct Entry {
     code: [u64; MAX_BYTES / 8],
     mask: [u64; MAX_BYTES / 8],
     pub(crate) ops: [Op; MAX_OPS],
+    /// The block compiled ([`crate::jit`]), and how often it ran whole before (`u32::MAX`: it cannot be compiled).
+    jit: Option<JitFn>,
+    hits: u32,
 }
 
 impl Entry {
@@ -205,6 +209,8 @@ impl Entry {
         code: [0; MAX_BYTES / 8],
         mask: [0; MAX_BYTES / 8],
         ops: [Op::new(K::Nop, 0, 0, 0); MAX_OPS],
+        jit: None,
+        hits: 0,
     };
 
     #[inline(always)]
@@ -237,6 +243,9 @@ pub struct BlockCache {
     /// Where the last batch stopped in the middle of a block (at its step limit): the PC, the entry and the op
     /// there, so that the next batch goes on with that block rather than decode a new one from there.
     resume: (u32, usize, usize),
+    /// The JIT compiler, made when a block first gets hot; `no_jit` once it turned out the host has none.
+    compiler: Option<Box<jit::Compiler>>,
+    no_jit: bool,
 }
 
 impl Clone for BlockCache {
@@ -253,7 +262,7 @@ impl std::fmt::Debug for BlockCache {
 
 impl Default for BlockCache {
     fn default() -> Self {
-        BlockCache { entries: None, resume: (1, 0, 0) }
+        BlockCache { entries: None, resume: (1, 0, 0), compiler: None, no_jit: false }
     }
 }
 
@@ -298,6 +307,53 @@ impl BlockCache {
     pub(crate) fn stop_at(&mut self, pc: u32, slot: usize, i: usize) {
         self.resume = (pc, slot, i);
     }
+
+    /// The compiled code of the block in `slot`, about to run whole: compiled now if it has run whole `threshold`
+    /// times before; `None` while it is not hot (or cannot be compiled).
+    #[inline(always)]
+    pub(crate) fn hot(&mut self, slot: usize, threshold: u32) -> Option<JitFn> {
+        let e = &mut self.entries.as_mut()?[slot];
+        if e.jit.is_some() {
+            return e.jit;
+        }
+        if e.hits < threshold {
+            e.hits += 1;
+            return None;
+        }
+        if e.hits == u32::MAX || self.no_jit {
+            return None;
+        }
+        self.compile(slot)
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn compile(&mut self, slot: usize) -> Option<JitFn> {
+        let entries = self.entries.as_mut()?;
+        if self.compiler.is_none() {
+            self.compiler = jit::Compiler::new().map(Box::new);
+            self.no_jit = self.compiler.is_none();
+        }
+        let compiler = self.compiler.as_mut()?;
+        if compiler.full() {
+            for e in entries.iter_mut() {
+                e.jit = None;
+            }
+            // SAFETY: no entry holds compiled code any more, and none runs: this is called between blocks
+            unsafe { compiler.reset() };
+        }
+        let e = &mut entries[slot];
+        e.jit = compiler.compile(e);
+        if e.jit.is_none() {
+            e.hits = u32::MAX;
+        }
+        e.jit
+    }
+
+    /// Blocks compiled, and the time it took.
+    pub fn jit_stats(&self) -> (u64, std::time::Duration) {
+        self.compiler.as_ref().map_or((0, std::time::Duration::ZERO), |c| (c.compiled, c.time))
+    }
 }
 
 impl Entry {
@@ -337,6 +393,9 @@ fn words(code: &[u8], n: usize) -> ([u64; MAX_BYTES / 8], [u64; MAX_BYTES / 8]) 
 #[inline(never)]
 fn decode_block(e: &mut Entry, pc: u32, code: &[u8]) {
     e.pc = pc;
+    // (Its compiled code, of what was decoded before, is no longer this block's)
+    e.jit = None;
+    e.hits = 0;
     let mut n = 0;
     let mut at = 0;
     let half = |at: usize| code.get(at..at + 2).map(|b| u16::from_le_bytes([b[0], b[1]]) as u32);
@@ -535,9 +594,12 @@ impl CortexM0Plus {
     /// an instruction: no step limit or budget can end the batch before the last op of a block run, the exception
     /// state did not change and the PC is not below `trap_below`. Not with SysTick counting the core clock.
     ///
+    /// With `jit` (a threshold), blocks that have run whole that many times run compiled ([`crate::jit`]).
+    ///
     /// Returns the cycles the batch has then taken, the steps run (with the one that faulted) and why it stopped,
     /// with the PC at the next instruction (or the one that faulted).
     #[inline(never)]
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn run_blocks<B: Bus + ?Sized>(
         &mut self,
         bus: &mut B,
@@ -546,8 +608,10 @@ impl CortexM0Plus {
         mut cycles: u64,
         budget: u64,
         trap_below: u32,
+        jit: Option<u32>,
     ) -> (u64, u32, Exit) {
         let mut steps = 0;
+        let mut ctx = jit.map(|_| jit::Ctx::new::<B>());
         loop {
             let pc = self.r[15];
             if pc < trap_below {
@@ -557,13 +621,39 @@ impl CortexM0Plus {
                 return (cycles, steps, Exit::Next);
             };
             let block = cache.entry(slot);
-            let (lo, len) = (block.start(), block.len());
-            let ops = &block.ops()[first..];
-            let run = &ops[..ops.len().min((max_steps - steps) as usize)];
-            if run.is_empty() || cycles + block.lead_cycles(first + run.len() - 1) - block.lead_cycles(first) >= budget
-            {
+            let (lo, len, n) = (block.start(), block.len(), block.ops().len());
+            let run_len = (n - first).min((max_steps - steps) as usize);
+            if run_len == 0 || cycles + block.lead_cycles(first + run_len - 1) - block.lead_cycles(first) >= budget {
                 return (cycles, steps, Exit::Next);
             }
+            // The whole block, compiled once it is hot: it does what the loop below would
+            if let (Some(threshold), Some(ctx)) = (jit, ctx.as_mut())
+                && first == 0
+                && run_len == n
+                && let Some(f) = cache.hot(slot, threshold)
+            {
+                let (c, ran, kind) = jit::call(self, bus, ctx, f, cycles);
+                cycles = c;
+                match kind {
+                    jit::EXIT_FAULT => {
+                        let at = lo.wrapping_add(cache.entry(slot).ops[ran as usize - 1].off as u32);
+                        let f = ctx.fault.take().expect("a compiled block's fault");
+                        return (cycles, steps + ran, Exit::Fault(f, at));
+                    }
+                    jit::EXIT_BATCH => return (cycles, steps + ran, Exit::Batch),
+                    _ => steps += ran,
+                }
+                if cycles >= budget {
+                    return (cycles, steps, Exit::Batch);
+                }
+                if steps == max_steps || self.exc_changed {
+                    return (cycles, steps, Exit::Next);
+                }
+                continue;
+            }
+            let block = cache.entry(slot);
+            let ops = &block.ops()[first..];
+            let run = &ops[..run_len];
             let cut = run.len() < ops.len();
             let mut leave = false;
             let mut last = run[run.len() - 1];
@@ -619,7 +709,7 @@ impl CortexM0Plus {
     // Multi-word transfers go straight to plain RAM where the bus allows (`Bus::ram`), else word by word
 
     #[inline(never)]
-    fn op_stm<B: Bus + ?Sized>(&mut self, bus: &mut B, rn: u32, list: u32) -> Result<u32, Fault> {
+    pub(crate) fn op_stm<B: Bus + ?Sized>(&mut self, bus: &mut B, rn: u32, list: u32) -> Result<u32, Fault> {
         let count = list.count_ones();
         let start = self.r[rn as usize & 7];
         if start & 3 == 0
@@ -640,7 +730,7 @@ impl CortexM0Plus {
     }
 
     #[inline(never)]
-    fn op_ldm<B: Bus + ?Sized>(&mut self, bus: &mut B, rn: u32, list: u32) -> Result<u32, Fault> {
+    pub(crate) fn op_ldm<B: Bus + ?Sized>(&mut self, bus: &mut B, rn: u32, list: u32) -> Result<u32, Fault> {
         let count = list.count_ones();
         let start = self.r[rn as usize & 7];
         if start & 3 == 0
@@ -663,7 +753,7 @@ impl CortexM0Plus {
     }
 
     #[inline(never)]
-    fn op_push<B: Bus + ?Sized>(&mut self, bus: &mut B, list: u32) -> Result<u32, Fault> {
+    pub(crate) fn op_push<B: Bus + ?Sized>(&mut self, bus: &mut B, list: u32) -> Result<u32, Fault> {
         let count = list.count_ones();
         let start = self.r[13].wrapping_sub(4 * count);
         if start & 3 == 0
@@ -707,7 +797,7 @@ impl CortexM0Plus {
     }
 
     #[inline(never)]
-    fn op_pop<B: Bus + ?Sized>(&mut self, bus: &mut B, list: u32) -> Result<u32, Fault> {
+    pub(crate) fn op_pop<B: Bus + ?Sized>(&mut self, bus: &mut B, list: u32) -> Result<u32, Fault> {
         match self.pop_ram(bus, list) {
             Some((c, _)) => Ok(c),
             None => self.pop(bus, list).map(|(_, c)| c),
@@ -715,7 +805,7 @@ impl CortexM0Plus {
     }
 
     #[inline(never)]
-    fn op_pop_pc<B: Bus + ?Sized>(&mut self, bus: &mut B, list: u32, at: u32) -> Result<u32, Fault> {
+    pub(crate) fn op_pop_pc<B: Bus + ?Sized>(&mut self, bus: &mut B, list: u32, at: u32) -> Result<u32, Fault> {
         let (n, c) = match self.pop_ram(bus, list) {
             Some((c, Some(pc))) => {
                 let (n, extra) = self.bx_write_pc(bus, pc)?;
@@ -731,7 +821,7 @@ impl CortexM0Plus {
     }
 
     #[inline(never)]
-    fn op_bx<B: Bus + ?Sized>(&mut self, bus: &mut B, target: u32, at: u32) -> Result<u32, Fault> {
+    pub(crate) fn op_bx<B: Bus + ?Sized>(&mut self, bus: &mut B, target: u32, at: u32) -> Result<u32, Fault> {
         let (n, c) = self.bx_write_pc(bus, target)?;
         if let Next::Branch(t) = n {
             self.r[15] = t;
@@ -741,7 +831,7 @@ impl CortexM0Plus {
     }
 
     #[inline(never)]
-    fn op_step<B: Bus + ?Sized>(&mut self, bus: &mut B, pc: u32) -> Result<u32, Fault> {
+    pub(crate) fn op_step<B: Bus + ?Sized>(&mut self, bus: &mut B, pc: u32) -> Result<u32, Fault> {
         self.r[15] = pc;
         self.execute::<B, false>(bus)
     }

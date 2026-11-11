@@ -8,3 +8,11 @@ license.workspace = true
 [dependencies]
 sim_core.workspace = true
 log.workspace = true
+
+# The JIT (`jit` module): only where Cranelift generates code; elsewhere the core interprets
+[target.'cfg(any(target_arch = "x86_64", target_arch = "aarch64"))'.dependencies]
+cranelift-codegen = "0.137.1"
+cranelift-frontend = "0.137.1"
+cranelift-jit = "0.137.1"
+cranelift-module = "0.137.1"
+cranelift-native = "0.137.1"

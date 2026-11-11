@@ -6,7 +6,7 @@ members = [".", "crates/*"]
 edition = "2024"
 version = "0.1.0"
 license = "MIT"
-rust-version = "1.88"
+rust-version = "1.97"
 
 [workspace.dependencies]
 sim_core = { path = "crates/sim_core" }
@@ -32,6 +32,7 @@ license.workspace = true
 
 [dependencies]
 sim_core.workspace = true
+cpu_armv6m.workspace = true
 rp2040.workspace = true
 sim_host.workspace = true
 sim_devices.workspace = true

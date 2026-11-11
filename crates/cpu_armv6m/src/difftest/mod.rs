@@ -32,11 +32,18 @@ pub(crate) enum Engine {
     Interpreter,
     /// Batches running decoded blocks.
     Blocks,
+    /// Batches running decoded blocks compiled to native code as soon as they run whole ([`crate::jit`]).
+    Jit,
+    /// The same, compiling blocks after they ran whole three times (so that blocks also run interpreted, and
+    /// compiled ones are entered from interpreted ones and the other way round).
+    JitWarm,
 }
 
 impl Engine {
     fn configure(self, cpu: &mut CortexM0Plus) {
-        cpu.decode_blocks = self == Engine::Blocks;
+        cpu.decode_blocks = matches!(self, Engine::Blocks | Engine::Jit | Engine::JitWarm);
+        cpu.jit = matches!(self, Engine::Jit | Engine::JitWarm);
+        cpu.jit_threshold = if self == Engine::JitWarm { 3 } else { 0 };
     }
 
     fn batched(self) -> bool {
@@ -325,6 +332,16 @@ fn interpreted_batches_run_as_single_steps() {
 #[test]
 fn blocks_run_as_interpreted_batches() {
     compare_engines(0xB1A7_C400, 600, Engine::Interpreter, Engine::Blocks);
+}
+
+#[test]
+fn compiled_blocks_run_as_single_steps() {
+    compare_engines(0x717_5000, 1500, Engine::Step, Engine::Jit);
+}
+
+#[test]
+fn compiled_blocks_run_as_decoded_blocks() {
+    compare_engines(0x717_B10C, 1500, Engine::Blocks, Engine::JitWarm);
 }
 
 #[test]

@@ -25,6 +25,13 @@ mod scenario_cli;
 struct Cli {
     #[command(subcommand)]
     command: Command,
+    /// Runs the CPU cores' hot code compiled to native code (the JIT, on x86-64 and aarch64 hosts; elsewhere the
+    /// cores interpret). Off by default; runs are the same either way. `SIM_JIT=1` turns it on too
+    #[arg(long, global = true, conflicts_with = "no_jit")]
+    jit: bool,
+    /// Interprets every instruction, whatever `SIM_JIT` says
+    #[arg(long, global = true)]
+    no_jit: bool,
 }
 
 // Parsed once; the size difference between the subcommands' arguments doesn't matter
@@ -1699,6 +1706,9 @@ fn main() -> Result<()> {
     if matches!(cli.command, Command::Run(_) | Command::Robot(_) | Command::Picoboot(_)) {
         // SIGINT and SIGTERM end a run the way reaching its time does (flash file saved, logs and trailers written)
         sim_host::signal::install().context("catching SIGINT and SIGTERM")?;
+    }
+    if cli.jit || cli.no_jit {
+        cpu_armv6m::set_jit_default(cli.jit);
     }
     let result = run_command(cli.command);
     if result.is_ok()
