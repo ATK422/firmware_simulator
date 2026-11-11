@@ -19,7 +19,7 @@ const BLOCKS: Engine = ("blocks", |m| m.cores.iter_mut().for_each(|c| c.decode_b
 const COMPILED: Engine = ("compiled", |m| {
     for c in &mut m.cores {
         // (Early, so that nearly every block runs compiled)
-        (c.decode_blocks, c.jit, c.jit_threshold) = (true, true, 2);
+        (c.decode_blocks, c.jit, c.jit_threshold, c.jit_sync) = (true, true, 2, true);
     }
 });
 const STEPPED: Engine = ("stepped", |m| {

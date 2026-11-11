@@ -190,13 +190,16 @@ pub struct CortexM0Plus {
     pub jit: bool,
     /// How many times a block runs whole before it is compiled.
     pub jit_threshold: u32,
+    /// Compile on the core's own thread, and run the code at once, rather than go on interpreting while the JIT's
+    /// thread compiles it (for tests, which want compiled code to run as soon as it may; runs are the same).
+    pub jit_sync: bool,
     pub(crate) blocks: BlockCache,
     /// Branch edge coverage (see [`edges`]), when on. It costs a check per taken branch while off.
     pub edges: Option<Box<EdgeMap>>,
 }
 
 /// The default [`CortexM0Plus::jit_threshold`].
-pub const JIT_THRESHOLD: u32 = 50;
+pub const JIT_THRESHOLD: u32 = 100;
 
 static JIT_THRESHOLD_DEFAULT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(JIT_THRESHOLD);
 
@@ -214,6 +217,12 @@ fn jit_threshold_default() -> u32 {
         return set;
     }
     ENV.get_or_init(|| std::env::var("SIM_JIT_THRESHOLD").ok().and_then(|v| v.parse().ok())).unwrap_or(set)
+}
+
+/// Whether new cores compile synchronously ([`CortexM0Plus::jit_sync`]): `SIM_JIT_SYNC=1` in the environment.
+fn jit_sync_default() -> bool {
+    static ENV: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENV.get_or_init(|| std::env::var("SIM_JIT_SYNC").is_ok_and(|v| matches!(v.as_str(), "1" | "on" | "true")))
 }
 
 /// [`set_jit_default`]: unset (0), off (1), on (2).
@@ -277,6 +286,7 @@ impl CortexM0Plus {
             decode_blocks: true,
             jit: jit_default(),
             jit_threshold: jit_threshold_default(),
+            jit_sync: jit_sync_default(),
             blocks: BlockCache::default(),
             edges: None,
         }
@@ -367,9 +377,9 @@ impl CortexM0Plus {
         }
     }
 
-    /// Blocks the JIT compiled for this core, and the time it took (since the core was made or copied).
-    pub fn jit_stats(&self) -> (u64, std::time::Duration) {
-        self.blocks.jit_stats()
+    /// Regions the JIT compiled in this process, the blocks in them, and the time it took.
+    pub fn jit_stats() -> (u64, u64, std::time::Duration) {
+        BlockCache::jit_stats()
     }
 
     /// Instructions executed since reset (exception entries not counted).
@@ -396,7 +406,7 @@ impl CortexM0Plus {
     /// for tracing (`last_pc`, `last_opcode`). Two engines that agree give the same text after the same steps.
     pub fn comparable_state(&self) -> String {
         let mut c = self.clone();
-        (c.decode_blocks, c.jit, c.jit_threshold) = (true, false, JIT_THRESHOLD);
+        (c.decode_blocks, c.jit, c.jit_threshold, c.jit_sync) = (true, false, JIT_THRESHOLD, false);
         (c.last_pc, c.last_opcode) = (0, 0);
         (c.exc_changed, c.batch_break) = (false, false);
         format!("{c:?}")
@@ -799,7 +809,7 @@ impl CortexM0Plus {
         // batch and PPB accesses end it
         self.exc_changed = true;
         // (Compiled code does not mark branch edges: with the edge map on, blocks run interpreted)
-        let jit = (self.jit && self.edges.is_none()).then_some(self.jit_threshold);
+        let jit = (self.jit && self.edges.is_none()).then_some((self.jit_threshold, self.jit_sync));
         self.batch_break = false;
         // Counted in locals (registers) and stored once at the end
         let (mut steps, mut cycles, mut stop) = (0u32, 0u64, None);
@@ -1049,13 +1059,15 @@ impl Cpu for CortexM0Plus {
         // The edge map outlives a reset: what ran before it was still run
         let edges = self.edges.take();
         // So do the engine switches (how the core runs, not what it does), and the compiled code
-        let (decode_blocks, jit, jit_threshold) = (self.decode_blocks, self.jit, self.jit_threshold);
+        let (decode_blocks, jit, jit_threshold, jit_sync) =
+            (self.decode_blocks, self.jit, self.jit_threshold, self.jit_sync);
         let blocks = std::mem::take(&mut self.blocks);
         *self = CortexM0Plus::new();
         self.cpuid = cpuid;
         self.log_exceptions = log;
         self.edges = edges;
-        (self.decode_blocks, self.jit, self.jit_threshold) = (decode_blocks, jit, jit_threshold);
+        (self.decode_blocks, self.jit, self.jit_threshold, self.jit_sync) =
+            (decode_blocks, jit, jit_threshold, jit_sync);
         self.blocks = blocks;
         self.scb.vtor = vtor;
         let sp = bus.read(vtor, Size::Word).unwrap_or(0);

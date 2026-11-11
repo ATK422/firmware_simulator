@@ -65,14 +65,24 @@ scheduled. Counters (timer, PWM, watchdog) are computed lazily from virtual time
    (`crates/cpu_armv6m/src/block.rs`, `CortexM0Plus::decode_blocks`): runs of up to 16 instructions decoded once
    from the memory the bus serves code from, and used while memory still holds the bytes they were decoded from
    (checked at each lookup; a store into the running block ends it). With `CortexM0Plus::jit` (`--jit`, `SIM_JIT=1`;
-   off by default) a block that has run whole `jit_threshold` times (50) is compiled to native code with Cranelift
-   (`crates/cpu_armv6m/src/jit`, on x86-64 and aarch64; elsewhere blocks stay interpreted). Compiled code does what
-   the block executor does op for op: register and flag operations inline, every access, multi-word transfer,
-   interworking branch and the instructions the block executor leaves to the interpreter through thunks that run
-   the same Rust code, the same checks after each access and the same exits. Its code is dropped when its entry is
-   decoded again. With the edge map on, blocks run interpreted. The differential tests (`src/difftest`, random
-   programs against single steps) and `crates/sim_test/tests/engines.rs` (IVCBoard2 in lockstep) compare every way
-   of running.
+   off by default) a block that has run whole `jit_threshold` times (100) is compiled to native code with Cranelift
+   (`crates/cpu_armv6m/src/jit`; the `jit` cargo feature, on by default, on x86-64 and aarch64; otherwise blocks
+   stay interpreted), as a **region**: the block and up to one block it branches or returns to. Compiled code does
+   what the block executor does op for op: register and flag operations inline (registers written through to the
+   core, flags kept lazily as the comparison that set them); SRAM, flash, ROM and XIP SRAM accesses inline through
+   the bus's direct memory windows (`Bus::direct_memory`, with the marks the bus keeps for them: SRAM writes,
+   flash reads through the XIP cache), every other access, multi-word transfer, interworking branch and the
+   instructions the block executor leaves to the interpreter through thunks that run the same Rust code; the same
+   checks after each access and the same exits. Leaving compiled code at any instruction boundary is invisible:
+   the batch goes on exactly there. A region goes on to the next one directly (a tail call through a per-site
+   cache) after the checks `run_blocks` makes before running a block whole (steps, budget, trapped addresses) and
+   a comparison of the code in memory with what the next region was compiled from. Regions are compiled on a
+   worker thread while the core goes on interpreting, and kept for the life of the process in one module shared by
+   every core (`jit/service.rs`), keyed by the code they were compiled from and the shape of the bus's windows:
+   copies of a core (snapshots, a robot's boards rolled back) and boards running the same firmware compile a region
+   once. With the edge map on, blocks run interpreted. The differential tests (`src/difftest`, random programs
+   against single steps and decoded blocks, compiled on the first run or after three) and
+   `crates/sim_test/tests/engines.rs` (IVCBoard2 in lockstep) compare every way of running.
 3. **Busy-wait skipping** (`Machine::skip_spin`). A quantum in which a core only read memory and the timer (seeing
    the same tick each time), wrote nothing and ended in the state it started in would repeat exactly until the
    timer ticks; such quanta are skipped up to the next event, tick or the end of the run, while the other core

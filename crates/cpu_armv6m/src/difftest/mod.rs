@@ -32,10 +32,11 @@ pub(crate) enum Engine {
     Interpreter,
     /// Batches running decoded blocks.
     Blocks,
-    /// Batches running decoded blocks compiled to native code as soon as they run whole ([`crate::jit`]).
+    /// Batches running regions of decoded blocks compiled to native code as soon as their first block runs whole
+    /// ([`crate::jit`]), accessing SRAM, flash and ROM directly ([`sim_core::Bus::direct_memory`]).
     Jit,
-    /// The same, compiling blocks after they ran whole three times (so that blocks also run interpreted, and
-    /// compiled ones are entered from interpreted ones and the other way round).
+    /// The same, compiling after a region's first block ran whole three times (so that blocks also run interpreted,
+    /// and compiled code is entered from interpreted code and the other way round), every access through the bus.
     JitWarm,
 }
 
@@ -44,11 +45,23 @@ impl Engine {
         cpu.decode_blocks = matches!(self, Engine::Blocks | Engine::Jit | Engine::JitWarm);
         cpu.jit = matches!(self, Engine::Jit | Engine::JitWarm);
         cpu.jit_threshold = if self == Engine::JitWarm { 3 } else { 0 };
+        cpu.jit_sync = true;
     }
 
     fn batched(self) -> bool {
         self != Engine::Step
     }
+
+    /// Whether compiled code accesses memory directly: its accesses there are not logged.
+    fn direct(self) -> bool {
+        self == Engine::Jit
+    }
+}
+
+/// Whether an access is to memory a bus may let compiled code access directly (not logged then).
+fn plain_memory(a: &bus::Access) -> bool {
+    let in_ = |base: u32, size: u32| a.addr.wrapping_sub(base) < size;
+    in_(bus::SRAM_BASE, bus::SRAM_SIZE) || in_(bus::ROM_BASE, bus::ROM_SIZE) || in_(bus::FLASH_BASE, bus::FLASH_SIZE)
 }
 
 /// A core and its bus, run as the machine runs a core.
@@ -72,9 +85,11 @@ impl Sim {
     pub fn new(p: &programs::Program, engine: Engine) -> Sim {
         let mut cpu = p.cpu.clone();
         engine.configure(&mut cpu);
+        let mut bus = p.bus.clone();
+        bus.direct = engine.direct();
         Sim {
             cpu,
-            bus: p.bus.clone(),
+            bus,
             engine,
             quantum: p.quantum,
             trap_below: p.trap_below,
@@ -267,7 +282,13 @@ pub(crate) fn compare_program(seed: u64, a: Engine, b: Engine) -> u64 {
         y.quantum();
         let (sx, sy) = (x.core_state(), y.core_state());
         let (bx, by) = (x.bus.state(), y.bus.state());
-        let same = sx == sy && bx == by && x.bus.log == y.bus.log && x.steps == y.steps && x.done == y.done;
+        if a.direct() || b.direct() {
+            // What compiled code reads and writes directly goes unlogged: memory is compared instead
+            x.bus.log.retain(|a| !plain_memory(a));
+            y.bus.log.retain(|a| !plain_memory(a));
+        }
+        let memory = (a.direct() || b.direct()) && x.bus.sram != y.bus.sram;
+        let same = !memory && sx == sy && bx == by && x.bus.log == y.bus.log && x.steps == y.steps && x.done == y.done;
         if !same {
             let log_diff = x
                 .bus
@@ -283,7 +304,7 @@ pub(crate) fn compare_program(seed: u64, a: Engine, b: Engine) -> u64 {
             panic!(
                 "program {seed:#x} (main loop at {:#x}..{:#x}, quantum {}, trap below {:#x}): {a:?} and {b:?} differ \
                  after quantum {} ({} / {} steps), which started at pc {pc:#x} (quanta before at {})\n\
-                 core: {}\nbus: {}\nlog: {log_diff}\nsteps {} vs {}, done {} vs {}\n\
+                 core: {}\nbus: {}\nlog: {log_diff}\nSRAM differs: {memory}\nsteps {} vs {}, done {} vs {}\n\
                  {a:?}:\n  {sx}\n{b:?}:\n  {sy}\ncode at the start of the quantum:\n{}",
                 p.code.0,
                 p.code.1,

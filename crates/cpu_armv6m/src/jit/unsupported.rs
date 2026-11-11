@@ -1,30 +1,37 @@
-//! Hosts Cranelift does not generate code for: nothing is compiled, and the core runs decoded blocks.
+//! Builds without the `jit` feature, and hosts Cranelift does not generate code for: nothing is compiled, and the
+//! core runs decoded blocks.
 
-use std::time::Duration;
+use sim_core::bus::DIRECT_REGIONS;
 
-use super::JitFn;
+use super::Trampoline;
+use super::service::Shape;
 use crate::block::Entry;
 
-pub(crate) struct Compiler {
-    pub compiled: u64,
-    pub time: Duration,
+/// A block of a region.
+#[derive(Clone, Copy)]
+pub(crate) struct RegionBlock {
+    pub entry: Entry,
+    pub writable: bool,
+    pub return_site: bool,
 }
+
+pub(crate) enum Compiler {}
 
 impl Compiler {
     pub(crate) fn new() -> Option<Compiler> {
         None
     }
 
-    pub(crate) fn full(&self) -> bool {
-        false
+    pub(crate) fn trampoline(&self) -> Trampoline {
+        match *self {}
     }
 
-    /// # Safety
-    ///
-    /// Nothing to free.
-    pub(crate) unsafe fn reset(&mut self) {}
-
-    pub(crate) fn compile(&mut self, _: &Entry) -> Option<JitFn> {
-        None
+    pub(crate) fn compile(
+        &mut self,
+        _: &[RegionBlock],
+        _: &[Shape; DIRECT_REGIONS],
+        _: &[u32; 16],
+    ) -> Option<*const u8> {
+        match *self {}
     }
 }

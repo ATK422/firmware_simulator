@@ -19,10 +19,11 @@
 //! Executing an op does exactly what [`CortexM0Plus::execute`] does for its encoding: same results, flags, cycles,
 //! accesses in the same order, faults (the `tests` module checks every 16-bit encoding against it).
 
-use sim_core::bus::{Bus, Size};
+use sim_core::bus::{Bus, DirectMemory, Size};
 
 use crate::exec::{Next, sext};
-use crate::jit::{self, JitFn};
+use crate::jit::service::{self, State, Ticket};
+use crate::jit::{self, Region};
 use crate::{CortexM0Plus, Fault};
 
 /// Most instructions in a block.
@@ -196,7 +197,7 @@ pub(crate) struct Entry {
     mask: [u64; MAX_BYTES / 8],
     pub(crate) ops: [Op; MAX_OPS],
     /// The block compiled ([`crate::jit`]), and how often it ran whole before (`u32::MAX`: it cannot be compiled).
-    jit: Option<JitFn>,
+    jit: Option<Region>,
     hits: u32,
 }
 
@@ -235,6 +236,96 @@ impl Entry {
     pub(crate) fn len(&self) -> u32 {
         self.bytes as u32
     }
+
+    /// The code the block was decoded from, as little endian words masked to its first `len()` bytes, and the masks.
+    pub(crate) fn code_words(&self) -> ([u64; MAX_BYTES / 8], [u64; MAX_BYTES / 8]) {
+        (self.code, self.mask)
+    }
+
+    /// The code the block was decoded from (its first `len()` bytes).
+    pub(crate) fn code_bytes(&self) -> [u8; MAX_BYTES] {
+        let mut b = [0; MAX_BYTES];
+        for (k, w) in self.code.iter().enumerate() {
+            b[8 * k..8 * k + 8].copy_from_slice(&w.to_le_bytes());
+        }
+        b
+    }
+
+    /// Where the block goes from its ops: the targets of its conditional branches and of its last op (a branch, a
+    /// call, or the next instruction), and the addresses its calls return to (`true`). Indirect branches go nowhere
+    /// known.
+    fn successors(&self) -> impl Iterator<Item = (u32, bool)> + '_ {
+        let ops = self.ops();
+        let last = ops.last().copied();
+        let next = last.map(|l| self.pc.wrapping_add(l.off as u32 + 2));
+        let taken = ops.iter().filter(|o| o.kind == K::BCond).map(|o| (o.imm, false));
+        let end: [Option<(u32, bool)>; 2] = match last.map(|l| l.kind) {
+            Some(K::B) => [Some((last.unwrap().imm, false)), None],
+            Some(K::Bl) => {
+                [Some((last.unwrap().imm, false)), Some((self.pc.wrapping_add(last.unwrap().off as u32 + 4), true))]
+            }
+            Some(K::Blx) => [next.map(|n| (n, true)), None],
+            Some(K::Bx | K::PopPc | K::Step) | None => [None, None],
+            Some(_) => [next.map(|n| (n, false)), None],
+        };
+        taken.chain(end.into_iter().flatten())
+    }
+}
+
+/// Most blocks in a compiled region.
+const MAX_REGION: usize = 2;
+/// [`Entry::hits`] of a block whose region is being compiled (and how many runs since it was last looked at), or
+/// cannot be.
+const PENDING: u32 = u32::MAX - 64;
+const FAILED: u32 = u32::MAX;
+
+/// The code at `pc` in a direct memory window, if one has it: the window's index and the bytes from `pc` to the end
+/// of its memory.
+fn direct_code(mem: &DirectMemory, pc: u32) -> Option<(usize, &[u8])> {
+    mem.regions.iter().enumerate().find_map(|(k, w)| {
+        let off = pc.wrapping_sub(w.base);
+        if off >= w.size || w.ptr.is_null() {
+            return None;
+        }
+        let at = (off & w.mask) as usize;
+        let len = (w.len as usize).checked_sub(at)?;
+        // SAFETY: the window's memory is `w.len` bytes at `w.ptr`, valid while the bus is held and not called
+        // (`Bus::direct_memory`), which it is not while the slice is used (only to decode a block now)
+        Some((k, unsafe { std::slice::from_raw_parts(w.ptr.add(at), len) }))
+    })
+}
+
+/// The region a hot block heads: it, and the blocks direct branches, calls and returns from those calls reach from
+/// it (breadth first, up to [`MAX_REGION`]) that have run (`warm`), decoded from the bus's direct memory `mem`
+/// (blocks elsewhere end the region).
+fn region(mem: &DirectMemory, head: &Entry, warm: impl Fn(u32) -> bool) -> Vec<jit::RegionBlock> {
+    let mem = *mem;
+    // Whether code at `pc` is where the compiled code might store (not a window it may only read: there only slow
+    // accesses, which leave the region, can change it)
+    let writable = |pc: u32| direct_code(&mem, pc).is_none_or(|(k, _)| mem.regions[k].writable != 0);
+    let mut blocks = vec![jit::RegionBlock { entry: *head, writable: writable(head.pc), return_site: false }];
+    let mut k = 0;
+    while k < blocks.len() {
+        let e = blocks[k].entry;
+        for (t, ret) in e.successors() {
+            if let Some(b) = blocks.iter_mut().find(|b| b.entry.pc == t) {
+                b.return_site |= ret;
+                continue;
+            }
+            if blocks.len() >= MAX_REGION || !warm(t) {
+                continue;
+            }
+            if let Some((_, code)) = direct_code(&mem, t).filter(|(_, c)| c.len() >= 2) {
+                let mut entry = Entry::EMPTY;
+                decode_block(&mut entry, t, code);
+                if entry.n > 0 {
+                    blocks.push(jit::RegionBlock { entry, writable: writable(t), return_site: ret });
+                }
+            }
+        }
+        k += 1;
+    }
+    blocks
 }
 
 /// The decoded block cache of one core. Cloning gives an empty cache (it is only a cache).
@@ -243,9 +334,8 @@ pub struct BlockCache {
     /// Where the last batch stopped in the middle of a block (at its step limit): the PC, the entry and the op
     /// there, so that the next batch goes on with that block rather than decode a new one from there.
     resume: (u32, usize, usize),
-    /// The JIT compiler, made when a block first gets hot; `no_jit` once it turned out the host has none.
-    compiler: Option<Box<jit::Compiler>>,
-    no_jit: bool,
+    /// Entries whose region is being compiled ([`jit::service`]), with their block's address and the ticket.
+    pending: std::collections::HashMap<usize, (u32, std::sync::Arc<Ticket>)>,
 }
 
 impl Clone for BlockCache {
@@ -262,8 +352,14 @@ impl std::fmt::Debug for BlockCache {
 
 impl Default for BlockCache {
     fn default() -> Self {
-        BlockCache { entries: None, resume: (1, 0, 0), compiler: None, no_jit: false }
+        BlockCache { entries: None, resume: (1, 0, 0), pending: Default::default() }
     }
+}
+
+/// The cache entry for a block at `pc`.
+#[inline(always)]
+fn slot_of(pc: u32) -> usize {
+    (pc.wrapping_mul(0x9E37_79B1) >> (32 - ENTRIES.trailing_zeros())) as usize
 }
 
 impl BlockCache {
@@ -285,7 +381,7 @@ impl BlockCache {
             }
         }
         let code = bus.code_at(pc)?;
-        let slot = (pc.wrapping_mul(0x9E37_79B1) >> (32 - ENTRIES.trailing_zeros())) as usize;
+        let slot = slot_of(pc);
         let e = &mut entries[slot];
         if e.pc != pc || !e.same_code(code) {
             decode_block(e, pc, code);
@@ -295,6 +391,13 @@ impl BlockCache {
 
     /// A block [`BlockCache::lookup`] returned.
     #[inline(always)]
+    /// The region compiled for the block at `pc`, if this cache has one (tests).
+    #[cfg(test)]
+    pub(crate) fn compiled_at(&self, pc: u32) -> Option<*const jit::Desc> {
+        let e = &self.entries.as_ref()?[slot_of(pc)];
+        (e.pc == pc).then_some(e.jit?).map(|d| d as *const jit::Desc)
+    }
+
     pub(crate) fn entry(&self, slot: usize) -> &Entry {
         match &self.entries {
             Some(e) => &e[slot],
@@ -308,10 +411,17 @@ impl BlockCache {
         self.resume = (pc, slot, i);
     }
 
-    /// The compiled code of the block in `slot`, about to run whole: compiled now if it has run whole `threshold`
-    /// times before; `None` while it is not hot (or cannot be compiled).
+    /// The compiled code of the region the block in `slot` heads, the block about to run whole: asked for once it has
+    /// run whole `threshold` times (compiled now with `sync`, else on the JIT's thread), or found compiled already
+    /// (by this core before a copy was made of it, or by another); `None` until there is some.
     #[inline(always)]
-    pub(crate) fn hot(&mut self, slot: usize, threshold: u32) -> Option<JitFn> {
+    pub(crate) fn hot<B: Bus + ?Sized>(
+        &mut self,
+        bus: &mut B,
+        regs: &[u32; 16],
+        slot: usize,
+        (threshold, sync): (u32, bool),
+    ) -> Option<Region> {
         let e = &mut self.entries.as_mut()?[slot];
         if e.jit.is_some() {
             return e.jit;
@@ -320,39 +430,67 @@ impl BlockCache {
             e.hits += 1;
             return None;
         }
-        if e.hits == u32::MAX || self.no_jit {
+        // Waiting for the region: looked at every so many runs
+        if (PENDING..PENDING + 63).contains(&e.hits) {
+            e.hits += 1;
             return None;
         }
-        self.compile(slot)
+        self.ask(bus, regs, slot, sync)
     }
 
     #[cold]
     #[inline(never)]
-    fn compile(&mut self, slot: usize) -> Option<JitFn> {
+    fn ask<B: Bus + ?Sized>(&mut self, bus: &mut B, regs: &[u32; 16], slot: usize, sync: bool) -> Option<Region> {
         let entries = self.entries.as_mut()?;
-        if self.compiler.is_none() {
-            self.compiler = jit::Compiler::new().map(Box::new);
-            self.no_jit = self.compiler.is_none();
-        }
-        let compiler = self.compiler.as_mut()?;
-        if compiler.full() {
-            for e in entries.iter_mut() {
-                e.jit = None;
+        let e = &entries[slot];
+        let ticket = match e.hits {
+            FAILED => return None,
+            PENDING.. => {
+                let (pc, t) = self.pending.get(&slot)?;
+                (*pc == e.pc).then(|| t.clone())?
             }
-            // SAFETY: no entry holds compiled code any more, and none runs: this is called between blocks
-            unsafe { compiler.reset() };
-        }
+            _ => {
+                let mem = bus.direct_memory().copied().unwrap_or(DirectMemory::NONE);
+                let shapes = service::shapes(&mem);
+                let key = service::Key { pc: e.pc, len: e.bytes, code: e.code_bytes(), shapes };
+                let s = service::service();
+                match s.find(&key) {
+                    Some(t) => t,
+                    None => {
+                        // (Blocks that have run whole, or head a region of their own)
+                        let warm = |pc: u32| {
+                            let e = &entries[slot_of(pc)];
+                            e.pc == pc && (e.hits >= 1 || e.jit.is_some())
+                        };
+                        let blocks = region(&mem, &entries[slot], warm);
+                        // Where its code can be read whole, so that regions can go on to this one
+                        let window = direct_code(&mem, e.pc)
+                            .filter(|(_, code)| code.len() >= MAX_BYTES)
+                            .map_or(u32::MAX, |(k, _)| k as u32);
+                        s.request(key, window, blocks, shapes, *regs, sync)
+                    }
+                }
+            }
+        };
         let e = &mut entries[slot];
-        e.jit = compiler.compile(e);
-        if e.jit.is_none() {
-            e.hits = u32::MAX;
+        self.pending.remove(&slot);
+        match ticket.state() {
+            State::Ready(f) => {
+                e.jit = Some(f);
+                e.hits = 0;
+            }
+            State::Failed => e.hits = FAILED,
+            State::Pending => {
+                e.hits = PENDING;
+                self.pending.insert(slot, (e.pc, ticket));
+            }
         }
         e.jit
     }
 
-    /// Blocks compiled, and the time it took.
-    pub fn jit_stats(&self) -> (u64, std::time::Duration) {
-        self.compiler.as_ref().map_or((0, std::time::Duration::ZERO), |c| (c.compiled, c.time))
+    /// Regions compiled in the process, the blocks in them, and the time it took.
+    pub fn jit_stats() -> (u64, u64, std::time::Duration) {
+        service::service().stats()
     }
 }
 
@@ -594,7 +732,8 @@ impl CortexM0Plus {
     /// an instruction: no step limit or budget can end the batch before the last op of a block run, the exception
     /// state did not change and the PC is not below `trap_below`. Not with SysTick counting the core clock.
     ///
-    /// With `jit` (a threshold), blocks that have run whole that many times run compiled ([`crate::jit`]).
+    /// With `jit` (a threshold, and whether to compile synchronously), blocks that have run whole that many times
+    /// run compiled ([`crate::jit`]) once their region is.
     ///
     /// Returns the cycles the batch has then taken, the steps run (with the one that faulted) and why it stopped,
     /// with the PC at the next instruction (or the one that faulted).
@@ -608,7 +747,7 @@ impl CortexM0Plus {
         mut cycles: u64,
         budget: u64,
         trap_below: u32,
-        jit: Option<u32>,
+        jit: Option<(u32, bool)>,
     ) -> (u64, u32, Exit) {
         let mut steps = 0;
         let mut ctx = jit.map(|_| jit::Ctx::new::<B>());
@@ -626,19 +765,21 @@ impl CortexM0Plus {
             if run_len == 0 || cycles + block.lead_cycles(first + run_len - 1) - block.lead_cycles(first) >= budget {
                 return (cycles, steps, Exit::Next);
             }
-            // The whole block, compiled once it is hot: it does what the loop below would
-            if let (Some(threshold), Some(ctx)) = (jit, ctx.as_mut())
+            // The whole block, compiled once it is hot, with the region it heads: it does what this loop would
+            if let (Some((threshold, sync)), Some(ctx)) = (jit, ctx.as_mut())
                 && first == 0
                 && run_len == n
-                && let Some(f) = cache.hot(slot, threshold)
+                && let Some(f) = cache.hot(bus, &self.r, slot, (threshold, sync))
             {
-                let (c, ran, kind) = jit::call(self, bus, ctx, f, cycles);
+                let limits =
+                    jit::Limits { budget, steps_left: max_steps - steps, trap_below, cache, jit: (threshold, sync) };
+                let (c, ran, kind) = jit::call(self, bus, ctx, f, cycles, limits);
                 cycles = c;
                 match kind {
                     jit::EXIT_FAULT => {
-                        let at = lo.wrapping_add(cache.entry(slot).ops[ran as usize - 1].off as u32);
+                        // (The PC is at the op that faulted)
                         let f = ctx.fault.take().expect("a compiled block's fault");
-                        return (cycles, steps + ran, Exit::Fault(f, at));
+                        return (cycles, steps + ran, Exit::Fault(f, self.r[15]));
                     }
                     jit::EXIT_BATCH => return (cycles, steps + ran, Exit::Batch),
                     _ => steps += ran,

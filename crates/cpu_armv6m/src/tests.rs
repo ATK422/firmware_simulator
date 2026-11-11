@@ -258,7 +258,8 @@ impl Rig {
                 other => panic!("unexpected {other:?} at {:#x}", self.cpu.pc()),
             }
         }
-        (jitted.cpu.jit, jitted.cpu.jit_threshold, jitted.cpu.decode_blocks) = (true, 0, true);
+        (jitted.cpu.jit, jitted.cpu.jit_threshold, jitted.cpu.decode_blocks, jitted.cpu.jit_sync) =
+            (true, 0, true, true);
         let mut left = n as u32;
         while left > 0 {
             let mut bus = CodeBus(&mut jitted.bus);
@@ -1342,7 +1343,7 @@ fn batch_on(rig: &mut Rig, blocks: bool, max_steps: u32, budget: u64) -> crate::
 
 /// Runs a batch on `rig` with decoded blocks compiled once they ran whole `threshold` times.
 fn batch_jit(rig: &mut Rig, threshold: u32, max_steps: u32, budget: u64) -> crate::Batch {
-    (rig.cpu.decode_blocks, rig.cpu.jit, rig.cpu.jit_threshold) = (true, true, threshold);
+    (rig.cpu.decode_blocks, rig.cpu.jit, rig.cpu.jit_threshold, rig.cpu.jit_sync) = (true, true, threshold, true);
     rig.cpu.run_batch(&mut CodeBus(&mut rig.bus), max_steps, budget, 0)
 }
 
@@ -1467,10 +1468,13 @@ fn every_16_bit_encoding_runs_compiled_as_decoded() {
         }
     }
     assert_eq!(decoded.bus.ram, jitted.bus.ram);
-    let (compiled, time) = jitted.cpu.jit_stats();
+    let (compiled, _, time) = CortexM0Plus::jit_stats();
     eprintln!("{compiled} blocks compiled in {time:?}");
     // (Where Cranelift has no code generator nothing is compiled, and the blocks run decoded)
-    assert!(compiled > 60_000 || !cfg!(any(target_arch = "x86_64", target_arch = "aarch64")), "{compiled} compiled");
+    assert!(
+        compiled > 60_000 || !cfg!(all(feature = "jit", any(target_arch = "x86_64", target_arch = "aarch64"))),
+        "{compiled} compiled"
+    );
 }
 
 #[test]
@@ -1874,7 +1878,7 @@ fn a_faulting_access_counts_its_stall_cycles_before_the_entry() {
             Some(blocks) => {
                 rig.cpu.decode_blocks = blocks;
                 // (The last time compiled: the fault ends the batch, however long it may be)
-                (rig.cpu.jit, rig.cpu.jit_threshold) = (k == 3, 0);
+                (rig.cpu.jit, rig.cpu.jit_threshold, rig.cpu.jit_sync) = (k == 3, 0, true);
                 let b = rig.cpu.run_batch(&mut bus, if k == 3 { 10 } else { 1 }, u64::MAX, 0);
                 assert_eq!((b.steps, b.cycles), (1, 18), "{mode:?}");
                 let b = rig.cpu.run_batch(&mut bus, 1, u64::MAX, 0);
@@ -1904,4 +1908,27 @@ fn systick_counts_the_instruction_that_switches_it_as_a_step_does() {
             assert_eq!(rig.cpu.systick.cvr, 500 - counted, "{csr_before:#b} -> {csr_after:#b} {mode:?}");
         }
     }
+}
+
+/// Copies of a core (snapshots, the boards of a robot running ahead after a rollback) start with an empty block
+/// cache, but find the code compiled for the original rather than compile it again: the same function runs.
+#[test]
+fn copies_of_a_core_share_its_compiled_code() {
+    // (A loop no other test has, so that its region is compiled here first)
+    let code = [movs(3, 0x5A), adds_i8(3, 7), adds_i8(3, 9), b(-4)];
+    let mut rig = Rig::new(&code);
+    let copy = rig.cpu.clone();
+    let mut rig2 = Rig::new(&code);
+    batch_jit(&mut rig, 0, 1000, u64::MAX);
+    let compiled = rig.cpu.blocks.compiled_at(CODE + 2);
+    // (Without a code generator nothing is compiled, and nothing shared)
+    let generator = cfg!(all(feature = "jit", any(target_arch = "x86_64", target_arch = "aarch64")));
+    assert_eq!(compiled.is_some(), generator);
+    rig2.cpu = copy;
+    assert!(rig2.cpu.blocks.compiled_at(CODE + 2).is_none());
+    // (Without compiling: `jit_sync` off, a region not yet compiled would only be asked for)
+    (rig2.cpu.decode_blocks, rig2.cpu.jit, rig2.cpu.jit_threshold, rig2.cpu.jit_sync) = (true, true, 0, false);
+    rig2.cpu.run_batch(&mut CodeBus(&mut rig2.bus), 1000, u64::MAX, 0);
+    assert_eq!(rig2.cpu.blocks.compiled_at(CODE + 2), compiled);
+    assert_eq!(core_state(&rig.cpu), core_state(&rig2.cpu));
 }

@@ -380,14 +380,8 @@ fn run(
             }
             let (wall, cpu) = (wall.elapsed(), cpu_time().zip(cpu).map(|(b, a)| b - a));
             if STATS.load(std::sync::atomic::Ordering::Relaxed) {
-                let (n, t) = b
-                    .session
-                    .machine
-                    .cores
-                    .iter()
-                    .map(|c| c.jit_stats())
-                    .fold((0, Duration::ZERO), |a, s| (a.0 + s.0, a.1 + s.1));
-                eprintln!("{}: {n} blocks compiled in {t:?}", case.name);
+                let (n, k, t) = cpu_armv6m::CortexM0Plus::jit_stats();
+                eprintln!("{}: {n} regions ({k} blocks) compiled in {t:?}", case.name);
             }
             hash_session(&mut h, &b.session);
             for (t, m) in b.messages() {
