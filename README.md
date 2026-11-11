@@ -32,7 +32,7 @@ Every run is repeatable: the same firmware and inputs give exactly the same resu
 ## Quick start
 
 **Prerequisites:** Linux, macOS or Windows through WSL2 (the robot computer's tools reach the emulated buses over
-vcan on Linux, and over UDP anywhere: [robots.md](docs/robots.md#without-vcan-udp)), Rust (stable, 1.88 or newer) with the `thumbv6m-none-eabi` target, and git. The firmware images build with the compiler titan_firmware_rs pins in
+vcan on Linux, and over UDP anywhere: [robots.md](docs/robots.md#without-vcan-udp)), Rust (stable, 1.97 or newer) with the `thumbv6m-none-eabi` target, and git. The firmware images build with the compiler titan_firmware_rs pins in
 its `rust-toolchain.toml` (rustc 1.99.0 at the pinned commit): rustup picks it up in that directory, and
 `rustup toolchain install` there installs it with its `thumbv6m-none-eabi` target. The C firmware additionally needs `gcc-arm-none-eabi`, `cmake` and
 `ninja` (optional; only the C tests use it).
@@ -354,19 +354,26 @@ and deliver, devices update their pins, vehicles step and the acoustic medium he
 ## Performance and determinism
 
 Measured with `cargo run --release -p sim_test --example bench -- --time 2s --repeat 3` on a shared 4-core machine
-(CPU time for 2 s of virtual time; above 1x keeps up with `--realtime`):
+(CPU time for 2 s of virtual time; above 1x keeps up with `--realtime`), with the JIT (the default) and with
+`--no-jit` (the decoded-block interpreter):
 
-| Run | CPU time | Speed vs real time |
-|---|---|---|
-| `template` (power board) | 0.02 s | about 90x |
-| IVCBoard2 | 0.50 s | about 4x |
-| IVCBoard2, titan_firmware's C app | 0.51 s | about 3.9x |
-| ESC board (four DShot ESCs on PIO) | 1.29 s | about 1.55x |
-| IVC2 pool (two boards in the water) | 1.41 s (0.95 s wall on two threads) | about 1.4x (2.1x) |
-| Talos (nine boards), one thread | 3.5 s | about 0.57x |
-| Talos on three or four threads | 4.7-5.5 s (1.6 s wall) | about 1.25x |
-| Talos on three threads, its bridge on a live endpoint (as on vcan) | 4.9 s (1.66 s wall) | about 1.2x (0.7x before) |
-| nereus setup (`robots/talos_nereus.toml`, live host sides, external vehicle), three threads | 4.5 s (1.7 s wall) | about 1.17x (0.7x before) |
+| Run | CPU time | Speed vs real time | `--no-jit` |
+|---|---|---|---|
+| `template` (power board) | 0.03 s | about 85x | 0.02 s |
+| IVCBoard2 | 0.27 s | about 7.5x | 0.61 s (3.3x) |
+| IVCBoard2, titan_firmware's C app | 0.40 s | about 5x | 0.58 s (3.4x) |
+| ESC board (four DShot ESCs on PIO) | 1.37 s | about 1.46x | 1.38 s |
+| IVC2 pool (two boards in the water) | 0.89 s (0.80 s wall on two threads) | about 2.2x (2.5x) | 1.58 s (1.04 s wall) |
+| Talos (nine boards), one thread | 3.7 s | about 0.54x | 3.8 s |
+| Talos on three or four threads | 5.0-5.7 s (1.6-1.7 s wall) | about 1.2x | 5.2-5.9 s (1.65-1.8 s wall) |
+| Talos on three threads, its bridge on a live endpoint (as on vcan) | 5.2 s (1.73 s wall) | about 1.15x | 5.2 s (1.75 s wall) |
+| nereus setup (`robots/talos_nereus.toml`, live host sides, external vehicle), three threads | 4.8 s (1.87 s wall) | about 1.1x | 4.7 s (1.81 s wall) |
+
+The JIT compiles the cores' hot code to native code with Cranelift (x86-64 and aarch64 hosts; `--no-jit` or
+`SIM_JIT=0` turn it off, and runs are the same either way): boards that spend their time executing instructions,
+such as the IVC boards, run 1.4-2.4x faster (IVCBoard2 at about 490 emulated MIPS, against 210); the ESC board,
+and so Talos, spends its time in the PIO and in starting batches between its polls, and gains nothing
+([internals.md](docs/internals.md#performance)).
 
 `cargo build --profile fast` (fat LTO) is a few percent faster than release, and `scripts/build_pgo.sh` (PGO on top,
 trained on the bench) 11-21 % faster; both take longer to build, and run exactly the same
@@ -444,7 +451,7 @@ message classes ([calibration.md](docs/calibration.md)), and a Fast DDS discover
 titan_firmware_rs images, runs `cargo fmt --all --check`, `cargo clippy --workspace --all-targets --release -- -D warnings`,
 `python3 scripts/gen_boards.py --check` and every test, then prints the smoke and sweep tables; **c-firmware**
 builds the C programs and runs the tests that boot them; **macos** builds and tests the emulator natively on
-macOS; none needs a secret ([testing.md](docs/testing.md#ci)). **Release**
+macOS. **test** and **macos** run with the JIT on and off; none needs a secret ([testing.md](docs/testing.md#ci)). **Release**
 ([`.github/workflows/release.yml`](.github/workflows/release.yml)) publishes the prebuilt binaries other
 repositories' CI installs with the action ([ci.md](docs/ci.md)).
 

@@ -19,8 +19,16 @@ env:
 
 jobs:
   test:
+    # Every test with the JIT on (the default) and off (SIM_JIT=0): runs must be the same either way
+    name: test (Linux, JIT ${{ matrix.jit }})
     runs-on: ubuntu-latest
     timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        jit: ["on", "off"]
+    env:
+      SIM_JIT: ${{ matrix.jit == 'on' && '1' || '0' }}
     steps:
       - uses: actions/checkout@v4
 
@@ -58,9 +66,12 @@ jobs:
           cd external/titan_firmware_rs/firmware && cargo build --workspace --release
 
       - name: Format and lint
+        if: matrix.jit == 'on'
         run: |
           cargo fmt --all --check
           cargo clippy --workspace --all-targets --release -- -D warnings
+          # Without the `jit` feature (no Cranelift), the core and the command line still build clean
+          cargo clippy -p cpu_armv6m -p firmware_simulator --all-targets --release --no-default-features -- -D warnings
           python3 scripts/gen_boards.py --check
 
       - name: Tests
@@ -84,15 +95,23 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: scenarios-junit
+          name: scenarios-junit-jit-${{ matrix.jit }}
           path: scenarios.xml
           if-no-files-found: ignore
 
   macos:
     # The emulator also builds and runs natively on macOS (Apple silicon). SocketCAN (vcan, titan_bridge) is Linux
-    # only: there, opening an interface reports that, and CAN reaches a Linux machine through `can-tunnel`.
+    # only: there, opening an interface reports that, and CAN reaches a Linux machine through `can-tunnel`. The JIT
+    # on (the default, aarch64 code) and off, as on Linux.
+    name: macos (JIT ${{ matrix.jit }})
     runs-on: macos-latest
     timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        jit: ["on", "off"]
+    env:
+      SIM_JIT: ${{ matrix.jit == 'on' && '1' || '0' }}
     steps:
       - uses: actions/checkout@v4
       - name: Submodules
@@ -120,6 +139,7 @@ jobs:
       - name: Firmware images
         run: cd external/titan_firmware_rs/firmware && cargo build --workspace --release
       - name: Lint
+        if: matrix.jit == 'on'
         run: cargo clippy --workspace --all-targets --release -- -D warnings
       - name: Tests
         run: cargo test --release --workspace --no-fail-fast

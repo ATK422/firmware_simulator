@@ -186,8 +186,8 @@ pub struct CortexM0Plus {
     /// Either way they do the same.
     pub decode_blocks: bool,
     /// Whether batches run hot decoded blocks compiled to native code ([`jit`]; with `decode_blocks`, on hosts
-    /// Cranelift supports, x86-64 and aarch64). Either way they do the same. Off by default (`SIM_JIT=1` turns it on
-    /// for every core made after).
+    /// Cranelift supports, x86-64 and aarch64, in builds with the `jit` feature). Either way they do the same. On by
+    /// default (`SIM_JIT=0` turns it off for every core made after).
     pub jit: bool,
     /// How many times a block runs whole before it is compiled.
     pub jit_threshold: u32,
@@ -235,13 +235,14 @@ pub fn set_jit_default(on: bool) {
     JIT_DEFAULT.store(if on { 2 } else { 1 }, std::sync::atomic::Ordering::Relaxed);
 }
 
-/// Whether new cores run the JIT: as [`set_jit_default`] set it, else `SIM_JIT=1` (or `on`) in the environment.
+/// Whether new cores run the JIT: as [`set_jit_default`] set it, else on unless `SIM_JIT=0` (or `off`, `false`) is in
+/// the environment.
 pub fn jit_default() -> bool {
     static ENV: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     match JIT_DEFAULT.load(std::sync::atomic::Ordering::Relaxed) {
         1 => false,
         2 => true,
-        _ => *ENV.get_or_init(|| std::env::var("SIM_JIT").is_ok_and(|v| matches!(v.as_str(), "1" | "on" | "true"))),
+        _ => *ENV.get_or_init(|| !std::env::var("SIM_JIT").is_ok_and(|v| matches!(v.as_str(), "0" | "off" | "false"))),
     }
 }
 

@@ -62,28 +62,31 @@ scheduled. Counters (timer, PWM, watchdog) are computed lazily from virtual time
    while anything needs to see each instruction (breakpoints, `instr`/`exc` tracing), which is also how tests get
    a reference run.
    **Decoded blocks and the JIT.** A batch runs instructions from a per-core cache of decoded blocks
-   (`crates/cpu_armv6m/src/block.rs`, `CortexM0Plus::decode_blocks`): runs of up to 16 instructions decoded once
-   from the memory the bus serves code from, and used while memory still holds the bytes they were decoded from
-   (checked at each lookup; a store into the running block ends it). With `CortexM0Plus::jit` (`--jit`, `SIM_JIT=1`;
-   off by default) a block that has run whole `jit_threshold` times (300) is compiled to native code with Cranelift
-   (`crates/cpu_armv6m/src/jit`; the `jit` cargo feature, on by default, on x86-64 and aarch64; otherwise blocks
-   stay interpreted), as a **region**: the block and up to one block it branches or returns to. Compiled code does
-   what the block executor does op for op: register and flag operations inline (registers written through to the
+   (`crates/cpu_armv6m/src/block.rs`, `CortexM0Plus::decode_blocks`): runs of up to 16 instructions decoded once from
+   the memory the bus serves code from, and used while memory still holds the bytes they were decoded from (checked
+   at each lookup; a store into the running block ends it). With `CortexM0Plus::jit` (on by default; `--no-jit` or
+   `SIM_JIT=0` turn it off) a block that has run whole `jit_threshold` times (300) is compiled to native code with
+   Cranelift (`crates/cpu_armv6m/src/jit`; the `jit` cargo feature, on by default, on x86-64 and aarch64; otherwise
+   blocks stay interpreted), as a **region**: the block and up to one block it branches or returns to. Compiled code
+   does what the block executor does op for op: register and flag operations inline (registers written through to the
    core, flags kept lazily as the comparison that set them); SRAM, flash, ROM and XIP SRAM accesses inline through
    the bus's direct memory windows (an access that went elsewhere when the region was compiled goes through a thunk;
-   one that went into a window and no longer does leaves the region at its instruction) (`Bus::direct_memory`, with the marks the bus keeps for them: SRAM writes,
-   flash reads through the XIP cache), every other access, multi-word transfer, interworking branch and the
-   instructions the block executor leaves to the interpreter through thunks that run the same Rust code; the same
-   checks after each access and the same exits. Leaving compiled code at any instruction boundary is invisible:
-   the batch goes on exactly there. A region goes on to the next one directly (a tail call through a per-site
-   cache) after the checks `run_blocks` makes before running a block whole (steps, budget, trapped addresses) and
-   a comparison of the code in memory with what the next region was compiled from. Regions are compiled on
-   worker threads (up to three, half the host's cores) while the core goes on interpreting, and kept for the life of
-   the process, shared by every core (`jit/service.rs`), keyed by the code they were compiled from and the shape of the bus's windows:
-   copies of a core (snapshots, a robot's boards rolled back) and boards running the same firmware compile a region
-   once. With the edge map on, blocks run interpreted. The differential tests (`src/difftest`, random programs
-   against single steps and decoded blocks, compiled on the first run or after three) and
-   `crates/sim_test/tests/engines.rs` (IVCBoard2 in lockstep) compare every way of running.
+   one that went into a window and no longer does leaves the region at its instruction) (`Bus::direct_memory`, with
+   the marks the bus keeps for them: SRAM writes, flash reads through the XIP cache), every other access, multi-word
+   transfer, interworking branch and the instructions the block executor leaves to the interpreter through thunks
+   that run the same Rust code; the same checks after each access and the same exits. Leaving compiled code at any
+   instruction boundary is invisible: the batch goes on exactly there. A region goes on to the next one directly (a
+   tail call through a per-site cache) after the checks `run_blocks` makes before running a block whole (steps,
+   budget, trapped addresses) and a comparison of the code in memory with what the next region was compiled from.
+   Regions are compiled on worker threads (up to three, half the host's cores) while the core goes on interpreting,
+   and kept for the life of the process, shared by every core (`jit/service.rs`), keyed by the code they were
+   compiled from and the shape of the bus's windows: copies of a core (snapshots, a robot's boards rolled back) and
+   boards running the same firmware compile a region once. A worker makes the regions it compiled together executable
+   at once, so they share pages; compiled code may take 2 GiB in the process (pages, never freed), after which
+   nothing more is compiled, a warning says so and `CortexM0Plus::jit_stats()` counts the regions refused (the
+   bench's `--stats` prints it). With the edge map on, blocks run interpreted. The differential tests
+   (`src/difftest`, random programs against single steps and decoded blocks, compiled on the first run or after
+   three) and `crates/sim_test/tests/engines.rs` (IVCBoard2 in lockstep) compare every way of running.
 3. **Busy-wait skipping** (`Machine::skip_spin`). A quantum in which a core only read memory and the timer (seeing
    the same tick each time), wrote nothing and ended in the state it started in would repeat exactly until the
    timer ticks; such quanta are skipped up to the next event, tick or the end of the run, while the other core
@@ -533,7 +536,8 @@ otherwise) for 2 s of virtual time, and prints the best wall time, virtual/wall 
 of everything the run produced (log lines and their times, bridge messages, UART/RTT text, CPU registers, cycle
 counts, SRAM). The fingerprint must not change when the emulator is made faster. Wall time is noisy on a shared
 machine: compare the best of several repeats, or the instruction counts under `valgrind --tool=callgrind` with
-`--repeat 1`. `--stats` prints what running ahead did in each robot case; `--no-lanes` has the hydrophones sum
+`--repeat 1`. `--stats` prints what running ahead did in each robot case, and what the JIT compiled in the
+process so far (regions, blocks, compile time, code memory, regions refused); `--no-lanes` has the hydrophones sum
 their paths one at a time (the fingerprints must not change).
 
 Fingerprints are per firmware build: new images, or the same source built by another compiler, give new ones
@@ -590,6 +594,17 @@ such accesses (see the run loop): 12.1 G host instructions for 2 s became 9.8 G,
 (boot, mostly) against 5,178 M. At boot, embassy's clock setup polls the
 XOSC status register for its 128 ms start-up delay (on the ring oscillator); that wait is skipped as a busy-wait
 (a three-instruction loop, so over three quanta).
+
+The numbers above are the interpreter's (`--no-jit`). With the JIT (the default), on the same machine:
+IVCBoard2 0.26 s (7.7x real time, 490 emulated MIPS against 210; over 10 s of virtual time 1.45 s against 3.26 s,
+465 MIPS against 206), the C IVCBoard2 0.40 s (5x; 10 s in 2.97 s against 4.83 s), the IVC2 pool 0.90 s in turn
+and 0.80 s on two threads (1.58 s and 1.04 s interpreted), the C pool on two threads 0.86-0.89 s (1.07 s); the
+ESC board, Talos and nereus are unchanged within noise. Compiling costs about 0.7 ms a region on a worker thread
+(about 600 regions, 0.43 s, for IVCBoard2's first 10 s), so a fresh process is a little slower than these warm
+repeats (IVCBoard2 0.31 s for its first 2 s). Once code is compiled it runs nearly all of IVCBoard2's
+instructions (about 95 % over 10 s); the ESC board's batches end at a PIO access about every 11 instructions, so the run loop and the PIO, not the instructions, set
+its pace. Larger regions (up to 24 blocks) and Cranelift's optimiser made the code no faster for far more compile
+time; `single_pass` register allocation halved compile time but made the code as slow as the interpreter.
 
 ### Build profiles
 

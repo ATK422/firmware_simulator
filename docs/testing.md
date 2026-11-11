@@ -274,15 +274,18 @@ When the firmware rather than the emulator looks wrong, write a test that assert
 
 ## CI
 
-`.github/workflows/ci.yml` has three jobs:
+`.github/workflows/ci.yml` has three jobs. **test** and **macos** each run twice, with the JIT on (the default,
+`SIM_JIT=1`) and off (`SIM_JIT=0`): the whole suite must pass both ways, as runs are the same either way.
 
 * **test**: checks out the submodules, installs the firmware's pinned compiler (`rustup toolchain install` in
   `external/titan_firmware_rs`, which reads its `rust-toolchain.toml`), builds the titan_firmware_rs images
   (`cargo build --workspace --release`),
-  runs `cargo fmt --all --check`, `cargo clippy --workspace --all-targets --release -- -D warnings` and
-  `python3 scripts/gen_boards.py --check`, then `cargo test --release --workspace -- --nocapture`, and prints the
+  runs `cargo fmt --all --check`, `cargo clippy --workspace --all-targets --release -- -D warnings` (and, without
+  the `jit` feature, for `cpu_armv6m` and the command line) and `python3 scripts/gen_boards.py --check` (with the
+  JIT on only), then `cargo test --release --workspace -- --nocapture`, and prints the
   smoke test and sweep tables from the log. It then runs the YAML scenarios with the command
-  (`firmware_simulator scenario scenarios/ --junit scenarios.xml`) and keeps the JUnit XML as an artifact
+  (`firmware_simulator scenario scenarios/ --junit scenarios.xml`) and keeps the JUnit XML as an artifact (one
+  per JIT setting)
   ([scenarios.md](scenarios.md#in-cargo-test-and-ci)).
 * **c-firmware**: installs `gcc-arm-none-eabi`, builds the C programs with `scripts/build_c_firmware.sh` and runs
   the tests that boot them (`sim_host`'s `pico_sdk`, `flash`, `can`). It sets `CMAKE_POLICY_VERSION_MINIMUM=3.5`
@@ -291,7 +294,7 @@ When the firmware rather than the emulator looks wrong, write a test that assert
   apps' tests (`c_boards.rs`, the real C IVCBoard2 in `ivc_link.rs`) are not in CI: they need titan_firmware's
   micro-ROS library; run them with `TITAN_FIRMWARE_DIR` set after `scripts/build_c_boards.sh`.
 * **macos**: installs the firmware's pinned compiler, builds the titan_firmware_rs images and runs clippy and the whole suite natively on macOS (Apple
-  silicon). SocketCAN is Linux only; on macOS `SocketCan::open` fails with a clear error and CAN reaches a Linux
+  silicon: the JIT's aarch64 code). SocketCAN is Linux only; on macOS `SocketCan::open` fails with a clear error and CAN reaches a Linux
   machine through `can-tunnel` instead.
 
 Both submodules are public, so the workflow needs no secrets. Every job fetches `external/titan_firmware_rs`:
