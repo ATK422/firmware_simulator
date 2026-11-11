@@ -6,7 +6,7 @@
 //! [`Unmodelled`] fallback, which names them from the SVD.
 
 use sim_core::analog::{AnalogSource, Signal};
-use sim_core::bus::{Bus, BusFault, Size, WriteMode, mem};
+use sim_core::bus::{Bus, BusFault, DirectMemory, DirectRegion, Size, WriteMode, mem};
 use sim_core::sched::Scheduler;
 use sim_core::time::{ClockPeriod, CycleClock, Time};
 use sim_core::trace::{Category, TraceEvent, TraceSink};
@@ -2129,6 +2129,10 @@ pub struct BatchBus<'a> {
     fused_next_event: Time,
     fused_limit: Time,
     other_lines: u32,
+    /// The memory compiled code may access directly ([`Bus::direct_memory`]), and the XIP state it was made for
+    /// (`None`: not made yet).
+    direct: DirectMemory,
+    direct_xip: Option<bool>,
 }
 
 /// What a batch touched, for busy-wait skipping (see `Machine::run_until`).
@@ -2185,6 +2189,8 @@ impl<'a> BatchBus<'a> {
             fused_next_event: Time::MAX,
             fused_limit: Time::MAX,
             other_lines: 0,
+            direct: DirectMemory::NONE,
+            direct_xip: None,
         }
     }
 
@@ -2453,6 +2459,47 @@ impl<'a> BatchBus<'a> {
     }
 }
 
+impl BatchBus<'_> {
+    /// The windows of [`Bus::direct_memory`], for the XIP state now.
+    #[cold]
+    fn make_direct(&mut self) {
+        let noisy = (&raw mut self.noisy).cast::<u8>();
+        let window = |base: u32, size: usize, ptr: *mut u8, len: usize| DirectRegion {
+            base,
+            size: size as u32,
+            mask: u32::MAX,
+            len: len as u32,
+            ptr,
+            ..DirectRegion::NONE
+        };
+        let sram = DirectRegion {
+            writable: 1,
+            write_mark: noisy,
+            write_value: 1,
+            ..window(SRAM_BASE, SRAM_SIZE, self.sys.sram.as_mut_ptr(), self.sys.sram.len())
+        };
+        let xip_sram = DirectRegion {
+            writable: 1,
+            write_mark: noisy,
+            write_value: 1,
+            ..window(XIP_SRAM_BASE, XIP_SRAM_SIZE, self.sys.xip_sram.as_mut_ptr(), self.sys.xip_sram.len())
+        };
+        // (Never written through: not writable; the shared borrow leaves the flash's version alone)
+        let rom = window(0, ROM_SIZE, self.sys.rom.as_ptr().cast_mut(), self.sys.rom.len());
+        let flash = match self.flash_mask.filter(|_| self.xip_ok) {
+            Some(mask) => DirectRegion {
+                mask: mask as u32,
+                read_mark: (&raw mut self.sys.xip_failed).cast::<u8>(),
+                read_value: 0,
+                ..window(XIP_BASE, 1 << 26, self.sys.flash.as_ptr().cast_mut(), self.sys.flash.len())
+            },
+            None => DirectRegion::NONE,
+        };
+        self.direct = DirectMemory { regions: [sram, flash, rom, xip_sram] };
+        self.direct_xip = Some(self.xip_ok);
+    }
+}
+
 impl Bus for BatchBus<'_> {
     #[inline(always)]
     fn read(&mut self, addr: u32, size: Size) -> Result<u32, BusFault> {
@@ -2597,6 +2644,18 @@ impl Bus for BatchBus<'_> {
     #[inline]
     fn take_attention(&mut self) -> bool {
         self.after != 0 && self.settle()
+    }
+
+    /// SRAM and XIP SRAM (writes set `noisy`, as `write` does), ROM, and flash while XIP works and its size is a
+    /// power of two (reads clear `xip_failed`, as `flash` does): exactly where `read` and `write` serve memory
+    /// themselves, and where `code_at` serves code. They change only with XIP, after a slow access.
+    #[inline]
+    fn direct_memory(&mut self) -> Option<&DirectMemory> {
+        // Made again only when XIP starts or stops working (after a slow access)
+        if self.direct_xip != Some(self.xip_ok) {
+            self.make_direct();
+        }
+        Some(&self.direct)
     }
 
     fn take_reference_ticks(&mut self) -> u64 {
@@ -2755,6 +2814,55 @@ mod tests {
             let (_, (q, _, _, _)) = batch(stable, &[(XOSC_BASE + 0x40, Size::Word)]);
             assert_eq!(q, None);
         }
+    }
+
+    /// The memory a batch lets compiled code access directly (`Bus::direct_memory`) is what its `read` serves, at
+    /// addresses across every window (the flash's mirrors included), and its marks are those `read` and `write` set.
+    #[test]
+    fn batch_direct_memory_is_what_the_bus_serves() {
+        let image: Vec<u8> = (0..4096u32).map(|i| (i * 13 + 5) as u8).collect();
+        let mut sys = System::new(2 * 1024 * 1024, Some(&image));
+        sys.unmodelled.log_mode = crate::unmodelled::LogMode::Off;
+        for (i, b) in sys.sram.iter_mut().enumerate() {
+            *b = (i * 7 + 3) as u8;
+        }
+        for (i, b) in sys.xip_sram.iter_mut().enumerate() {
+            *b = (i * 5 + 1) as u8;
+        }
+        // (As once the boot stage 2 has set the SSI up for XIP)
+        sys.xip_config = Ok(());
+        let mut t = NullSink;
+        let mut bus =
+            BatchBus::new(&mut sys, &mut t, 0, CycleClock::new(Time::ZERO), ClockPeriod::from_hz(125_000_000), 0);
+        let m = *bus.direct_memory().expect("windows");
+        let mut bases = Vec::new();
+        for w in m.regions.iter().filter(|w| w.size != 0) {
+            bases.push(w.base);
+            let step = (w.size / 1024).max(4) & !3;
+            for off in (0..w.size).step_by(step as usize).chain([w.size - 4]) {
+                let at = (off & w.mask) as usize;
+                assert!(at + 4 <= w.len as usize);
+                // SAFETY: within the window's memory (checked above), while the bus is not called
+                let direct = u32::from_le_bytes(unsafe { std::ptr::read_unaligned(w.ptr.add(at).cast::<[u8; 4]>()) });
+                assert_eq!(bus.read(w.base + off, Size::Word), Ok(direct), "{:#x}", w.base + off);
+            }
+        }
+        bases.sort();
+        assert_eq!(bases, [0, XIP_BASE, XIP_SRAM_BASE, SRAM_BASE], "ROM, flash, XIP SRAM, SRAM");
+        let window = |base: u32| *m.regions.iter().find(|w| w.base == base).unwrap();
+        // SRAM writes are noisy, as `write` makes them; flash reads clear `xip_failed`, as `read` does
+        for base in [SRAM_BASE, XIP_SRAM_BASE] {
+            let w = window(base);
+            assert!(w.writable != 0 && w.read_mark.is_null());
+            assert_eq!((w.write_mark, w.write_value), ((&raw mut bus.noisy).cast::<u8>(), 1));
+        }
+        let (rom, flash) = (window(0), window(XIP_BASE));
+        assert!(rom.writable == 0 && rom.read_mark.is_null() && rom.write_mark.is_null());
+        assert!(flash.writable == 0 && flash.write_mark.is_null());
+        assert_eq!((flash.read_mark, flash.read_value), ((&raw mut bus.sys.xip_failed).cast::<u8>(), 0));
+        bus.noisy = false;
+        bus.write(SRAM_BASE + 8, Size::Word, 1).unwrap();
+        assert!(bus.noisy);
     }
 
     #[test]

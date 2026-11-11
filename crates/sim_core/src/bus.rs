@@ -45,6 +45,59 @@ impl fmt::Display for BusFault {
 
 impl std::error::Error for BusFault {}
 
+/// How many windows [`DirectMemory`] has.
+pub const DIRECT_REGIONS: usize = 4;
+
+/// A window of the address space that a CPU's compiled code may read (and, if `writable`, write) directly as plain
+/// memory, see [`Bus::direct_memory`].
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct DirectRegion {
+    /// The window: addresses `base..base + size` (`size` 0: no window).
+    pub base: u32,
+    pub size: u32,
+    /// The byte at `addr` is the one at `ptr + ((addr - base) & mask)`.
+    pub mask: u32,
+    /// Writes may go there too (non-zero).
+    pub writable: u32,
+    /// The memory: `len` bytes at `ptr`.
+    pub len: u32,
+    pub ptr: *mut u8,
+    /// Bytes of the bus's own that an access there sets, to `read_value` after a read and `write_value` after a write,
+    /// as the bus's `read` or `write` would (null: none).
+    pub read_mark: *mut u8,
+    pub write_mark: *mut u8,
+    pub read_value: u32,
+    pub write_value: u32,
+}
+
+impl DirectRegion {
+    /// No window.
+    pub const NONE: DirectRegion = DirectRegion {
+        base: 0,
+        size: 0,
+        mask: 0,
+        writable: 0,
+        len: 0,
+        ptr: std::ptr::null_mut(),
+        read_mark: std::ptr::null_mut(),
+        write_mark: std::ptr::null_mut(),
+        read_value: 0,
+        write_value: 0,
+    };
+}
+
+/// The windows of memory a bus lets compiled code access directly ([`Bus::direct_memory`]).
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct DirectMemory {
+    pub regions: [DirectRegion; DIRECT_REGIONS],
+}
+
+impl DirectMemory {
+    pub const NONE: DirectMemory = DirectMemory { regions: [DirectRegion::NONE; DIRECT_REGIONS] };
+}
+
 /// What a CPU sees: byte addressed, little endian, 32-bit address space.
 ///
 /// Implementations attach the accessing core's identity and current time; the CPU does not need to know about
@@ -123,6 +176,22 @@ pub trait Bus {
     #[inline]
     fn take_reference_ticks(&mut self) -> u64 {
         0
+    }
+
+    /// Memory that a CPU's compiled code may access without calling the bus, for a JIT (`None`: every access goes
+    /// through it). Within a window, an aligned access of any size made to its memory, with its mark set, must be
+    /// exactly what [`Bus::read`] or [`Bus::write`] would do there, and nothing else: no stall cycles, nothing for
+    /// [`Bus::take_attention`] or [`Bus::take_slow_access`] to report, no other side effect. Where the bus also serves
+    /// code ([`Bus::code_at`]) the window holds the same bytes. Every word-aligned offset `o < size` has
+    /// `(o & mask) + 4 <= len`, and windows do not overlap.
+    ///
+    /// The windows describe the bus as it is when asked, and stay so until an access the bus reports as slow (which
+    /// may change them, in place: a CPU keeps the reference and reads the windows again after one). The pointers
+    /// stay valid, and the memory is accessed through nothing else, while the CPU holds the bus and is not calling
+    /// it.
+    #[inline]
+    fn direct_memory(&mut self) -> Option<&DirectMemory> {
+        None
     }
 
     /// Reads without side effects, for debuggers and tracing. `None` if the location cannot be peeked.
