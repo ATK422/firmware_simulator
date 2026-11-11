@@ -244,11 +244,12 @@ pass) without them.
 
 | Where | What |
 |---|---|
-| `crates/cpu_armv6m` unit tests | Every Thumb instruction and flag case, exceptions, batching against single steps |
+| `crates/cpu_armv6m` unit tests | Every Thumb instruction and flag case, exceptions, batching against single steps; differential tests (`src/difftest`): random programs from every instruction class (faults, interrupts arriving mid-block at chosen cycles, stores into the running code, slow and stalling accesses) run on two engines, single steps, interpreted batches and decoded blocks, compared after every quantum, every access with its time (`SIM_DIFF_PROGRAMS=<n>` runs more; `replay_program` traces one) |
 | `crates/rp2040` unit tests (`src/periph/*`) | Register-level peripheral behaviour from the datasheet |
 | `crates/rp2040/tests/` | Hand-written programs (`m0_blink`, `m1_watchdog`, `m6_resets`), pioasm-assembled PIO programs (`pio_programs`), the bootrom's USB boot (`usb_boot`), and the performance work's equivalence checks (`batching`, `busy_wait`, `systick_reference`) |
 | `crates/sim_devices`, `sim_acoustics`, `sim_physics` unit tests | Each device model, the acoustic channel, the vehicle physics |
 | `crates/sim_host/tests/` | Firmware on boards built by hand, per milestone: `template`, `embassy_blinky`, `gdb` (the real GDB too: `$GDB`, `gdb-multiarch` or `arm-none-eabi-gdb`), `pico_sdk`, `can`, `sensors`, `pio`, `flash`, `hle` (`--hle-flash` leaves the flash as the ROM does), `acoustics`, `ivc_link` (also the C IVCBoard2 modem against the Rust one, and the real C IVCBoard2 from `$TITAN_FIRMWARE_DIR` on `blake/ivc`), `usb`, `robot_usb` (USB on robot boards, images from environment variable paths), `vehicle`, `parallel` (threaded robots run as in turn), `acoustic_threads` (boards in water on threads run as in turn) |
+| `crates/sim_test/tests/engines.rs` | The Rust and C IVCBoard2 run alike on each of the CPU's engines: two machines in lockstep, compared every half millisecond |
 | `crates/sim_test/tests/smoke.rs` | Every titan_firmware_rs board image on its board: connects, reports its identity, no link errors, no panic |
 | `crates/sim_test/tests/robot.rs` | All of Talos on its two buses |
 | `crates/sim_test/tests/puddles.rs` | Puddles over Ethernet/UDP |

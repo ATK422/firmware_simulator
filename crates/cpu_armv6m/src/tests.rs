@@ -64,7 +64,7 @@ impl Bus for TestBus {
 }
 
 /// Instruction encoders for the tests.
-mod enc {
+pub(crate) mod enc {
     pub fn lsls_i(rd: u16, rm: u16, imm: u16) -> u16 {
         imm << 6 | rm << 3 | rd
     }

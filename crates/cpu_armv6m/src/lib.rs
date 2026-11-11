@@ -21,6 +21,8 @@ pub mod ppb;
 mod timer_wait;
 
 #[cfg(test)]
+mod difftest;
+#[cfg(test)]
 mod tests;
 
 use sim_core::bus::{Bus, BusFault, Size};
@@ -333,6 +335,17 @@ impl CortexM0Plus {
             event_reg: self.event_reg,
             pending: self.nvic.pending,
         }
+    }
+
+    /// Everything about the core that running it determines, as text, for comparing two runs: not how it ran (the
+    /// engine switches, its caches, what batches keep to know when to look again) nor what only single steps keep
+    /// for tracing (`last_pc`, `last_opcode`). Two engines that agree give the same text after the same steps.
+    pub fn comparable_state(&self) -> String {
+        let mut c = self.clone();
+        c.decode_blocks = true;
+        (c.last_pc, c.last_opcode) = (0, 0);
+        (c.exc_changed, c.batch_break) = (false, false);
+        format!("{c:?}")
     }
 
     /// Counts `instructions` taking `cycles` that a machine skipped because they would have repeated the state the
