@@ -64,7 +64,7 @@ impl Bus for TestBus {
 }
 
 /// Instruction encoders for the tests.
-mod enc {
+pub(crate) mod enc {
     pub fn lsls_i(rd: u16, rm: u16, imm: u16) -> u16 {
         imm << 6 | rm << 3 | rd
     }
@@ -288,6 +288,14 @@ fn one_with_c(ins: u16, regs: &[(usize, u32)], carry: bool) -> Rig {
 
 const N: bool = true;
 const F: bool = false;
+
+#[test]
+fn engine_switches_outlive_a_reset() {
+    let mut rig = Rig::new(&[NOP]);
+    rig.cpu.decode_blocks = false;
+    rig.cpu.reset(&mut rig.bus, VECTORS);
+    assert!(!rig.cpu.decode_blocks);
+}
 
 #[test]
 fn reset_loads_sp_and_pc() {
@@ -1718,4 +1726,90 @@ fn edge_map_records_taken_branches_in_every_mode() {
     let mut rig = Rig::new(&program);
     rig.run(20);
     assert!(rig.cpu.edges.is_none());
+}
+
+/// A [`CodeBus`] whose reads above `0x3000_0000` stall for 3 cycles and fault, as a slow bus that errors.
+struct StallBus<'a>(CodeBus<'a>, u32);
+
+impl Bus for StallBus<'_> {
+    fn read(&mut self, addr: u32, size: Size) -> Result<u32, BusFault> {
+        if addr >= 0x3000_0000 {
+            self.1 += 3;
+            return Err(BusFault::Unmapped(addr));
+        }
+        self.0.read(addr, size)
+    }
+    fn write(&mut self, addr: u32, size: Size, value: u32) -> Result<(), BusFault> {
+        self.0.write(addr, size, value)
+    }
+    fn fetch16_fast(&mut self, addr: u32) -> Option<u16> {
+        self.0.fetch16_fast(addr)
+    }
+    fn code_at(&mut self, addr: u32) -> Option<&[u8]> {
+        self.0.code_at(addr)
+    }
+    fn take_slow_access(&mut self) -> bool {
+        false
+    }
+    fn take_attention(&mut self) -> bool {
+        false
+    }
+    fn take_stall_cycles(&mut self) -> u32 {
+        std::mem::take(&mut self.1)
+    }
+}
+
+#[test]
+fn a_faulting_access_counts_its_stall_cycles_before_the_entry() {
+    // LDR from a slow address that faults: its 3 stall cycles count before the 15 of the HardFault entry, in the step
+    // that faults, not in whichever instruction next collects stall cycles; the same in batches
+    for mode in [None, Some(false), Some(true)] {
+        let mut rig = Rig::new(&[ldr_i(1, 0, 0), NOP]);
+        rig.handler(exception::HARD_FAULT, HANDLER, &[NOP, NOP]);
+        rig.cpu.r[0] = 0x3000_0000;
+        let mut bus = StallBus(CodeBus(&mut rig.bus), 0);
+        let cycles = match mode {
+            None => {
+                let first = rig.cpu.step_on(&mut bus);
+                assert_eq!(first, StepOutcome::Ran(3 + 15));
+                assert_eq!(rig.cpu.step_on(&mut bus), StepOutcome::Ran(1), "the handler's NOP stalls for nothing");
+                rig.cpu.cycles()
+            }
+            Some(blocks) => {
+                rig.cpu.decode_blocks = blocks;
+                let b = rig.cpu.run_batch(&mut bus, 1, u64::MAX, 0);
+                assert_eq!((b.steps, b.cycles), (1, 18), "{mode:?}");
+                let b = rig.cpu.run_batch(&mut bus, 1, u64::MAX, 0);
+                assert_eq!((b.steps, b.cycles), (1, 1), "{mode:?}");
+                rig.cpu.cycles()
+            }
+        };
+        assert_eq!(cycles, 19, "{mode:?}");
+        assert_eq!(rig.cpu.ipsr(), exception::HARD_FAULT);
+    }
+}
+
+#[test]
+fn systick_counts_the_instruction_that_switches_it_as_a_step_does() {
+    // A store to SYST_CSR that starts SysTick on the core clock counts its own 2 cycles, and one that stops it does
+    // not: a batch, which ends after the access, does as a step
+    for (csr_before, csr_after, counted) in [(0b000, 0b101, 2), (0b101, 0b000, 0)] {
+        for mode in [None, Some(false), Some(true)] {
+            let mut rig = Rig::new(&[str_i(1, 0, 0), NOP]);
+            rig.cpu.r[0] = crate::ppb::SYST_CSR;
+            rig.cpu.r[1] = csr_after;
+            rig.cpu.systick.rvr = 1000;
+            rig.cpu.systick.cvr = 500;
+            rig.cpu.systick.csr = csr_before;
+            match mode {
+                None => {
+                    rig.run(1);
+                }
+                Some(blocks) => {
+                    assert_eq!(batch_on(&mut rig, blocks, 10, u64::MAX).steps, 1, "a PPB access ends the batch");
+                }
+            }
+            assert_eq!(rig.cpu.systick.cvr, 500 - counted, "{csr_before:#b} -> {csr_after:#b} {mode:?}");
+        }
+    }
 }

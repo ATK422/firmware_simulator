@@ -21,6 +21,8 @@ pub mod ppb;
 mod timer_wait;
 
 #[cfg(test)]
+mod difftest;
+#[cfg(test)]
 mod tests;
 
 use sim_core::bus::{Bus, BusFault, Size};
@@ -333,6 +335,17 @@ impl CortexM0Plus {
             event_reg: self.event_reg,
             pending: self.nvic.pending,
         }
+    }
+
+    /// Everything about the core that running it determines, as text, for comparing two runs: not how it ran (the
+    /// engine switches, its caches, what batches keep to know when to look again) nor what only single steps keep
+    /// for tracing (`last_pc`, `last_opcode`). Two engines that agree give the same text after the same steps.
+    pub fn comparable_state(&self) -> String {
+        let mut c = self.clone();
+        c.decode_blocks = true;
+        (c.last_pc, c.last_opcode) = (0, 0);
+        (c.exc_changed, c.batch_break) = (false, false);
+        format!("{c:?}")
     }
 
     /// Counts `instructions` taking `cycles` that a machine skipped because they would have repeated the state the
@@ -740,6 +753,9 @@ impl CortexM0Plus {
         macro_rules! fault {
             ($f:expr, $pc:expr) => {{
                 let pc = $pc;
+                // The faulting instruction's accesses (its fetch included) may have stalled: those cycles are its
+                // own, before the entry; a `BKPT`, which stops before it executes, takes none
+                let stall = bus.take_stall_cycles();
                 match $f {
                     Fault::Breakpoint(imm) => {
                         self.r[15] = pc;
@@ -753,6 +769,8 @@ impl CortexM0Plus {
                         return Batch { steps: steps + 1, cycles, stop };
                     }
                     f => {
+                        self.tick(stall);
+                        cycles += stall as u64;
                         self.r[15] = f.faulting_pc(pc);
                         self.cycles += cycles;
                         self.instructions += steps as u64 - 1;
@@ -818,7 +836,9 @@ impl CortexM0Plus {
                         if uses_bus {
                             c += bus.take_stall_cycles();
                         }
-                        if systick {
+                        // (A PPB access may have switched SysTick to or from the core clock: it counts this
+                        // instruction's cycles as it is set now, as after a step)
+                        if systick || self.batch_break {
                             self.tick(c);
                         }
                         cycles += c as u64;
@@ -853,7 +873,7 @@ impl CortexM0Plus {
             match self.execute::<B, false>(bus) {
                 Ok(c) => {
                     let c = c + bus.take_stall_cycles();
-                    if systick {
+                    if systick || self.batch_break {
                         self.tick(c);
                     }
                     cycles += c as u64;
@@ -927,12 +947,22 @@ impl CortexM0Plus {
                 StepOutcome::Ran(cycles)
             }
             Err(Fault::Breakpoint(imm)) => {
+                // (It stops before it executes: what its fetch stalled is not counted, as in a batch)
+                bus.take_stall_cycles();
                 self.r[15] = pc;
                 StepOutcome::Breakpoint(imm)
             }
             Err(f) => {
+                // As in a batch: what the faulting instruction's accesses (its fetch included) stalled counts before
+                // the entry
+                let stall = bus.take_stall_cycles();
+                self.cycles += stall as u64;
+                self.tick(stall);
                 self.r[15] = f.faulting_pc(pc);
-                self.take_fault(bus, f)
+                match self.take_fault(bus, f) {
+                    StepOutcome::Ran(c) => StepOutcome::Ran(c + stall),
+                    other => other,
+                }
             }
         }
     }
@@ -961,10 +991,13 @@ impl Cpu for CortexM0Plus {
         let log = self.log_exceptions;
         // The edge map outlives a reset: what ran before it was still run
         let edges = self.edges.take();
+        // So do the engine switches (how the core runs, not what it does)
+        let decode_blocks = self.decode_blocks;
         *self = CortexM0Plus::new();
         self.cpuid = cpuid;
         self.log_exceptions = log;
         self.edges = edges;
+        self.decode_blocks = decode_blocks;
         self.scb.vtor = vtor;
         let sp = bus.read(vtor, Size::Word).unwrap_or(0);
         let pc = bus.read(vtor + 4, Size::Word).unwrap_or(0);

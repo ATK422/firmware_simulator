@@ -572,13 +572,19 @@ impl CortexM0Plus {
             while let Some(&op) = ops.next() {
                 // Ops run so far, this one included
                 let i = run.len() - ops.len() - 1;
-                match self.exec_op(bus, op, lo, len, cycles, &mut leave) {
-                    Ok(c) => cycles += c as u64,
+                let c = match self.exec_op(bus, op, lo, len, cycles, &mut leave) {
+                    Ok(c) => c,
                     Err(f) => return (cycles, steps + i as u32 + 1, Exit::Fault(f, lo.wrapping_add(op.off as u32))),
-                }
+                };
+                cycles += c as u64;
                 if op.kind.uses_bus() {
                     let stall = bus.take_stall_cycles();
                     cycles += stall as u64;
+                    // A PPB access (which ends the batch) may have switched SysTick to the core clock: it counts
+                    // this instruction's cycles, as after a step
+                    if self.batch_break {
+                        self.tick(c + stall);
+                    }
                     let attention = bus.take_attention() || std::mem::take(&mut self.batch_break);
                     if attention || bus.take_slow_access() || leave || stall != 0 {
                         if !op.kind.sets_pc() {
