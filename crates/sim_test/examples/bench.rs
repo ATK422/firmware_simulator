@@ -3,10 +3,15 @@
 //!
 //! ```text
 //! cargo run --release -p sim_test --example bench -- [--time 2s] [--repeat 3] [--only esc_board,talos] [--threads N]
-//!     [--checkpoint-every 10ms] [--checkpoint-memory 512] [--coverage] [--stats]
+//!     [--checkpoint-every 10ms] [--checkpoint-memory 512] [--coverage] [--stats] [--jit | --no-jit]
+//!     [--jit-threshold N]
 //! ```
 //!
-//! `--stats` prints what running ahead did in each robot case (windows, slices, rollbacks, cuts).
+//! `--stats` prints what running ahead did in each robot case (windows, slices, rollbacks, cuts), and the blocks the
+//! JIT compiled in each board case.
+//!
+//! `--jit` and `--no-jit` run every core with the JIT on or off (`CortexM0Plus::jit`; else as `SIM_JIT` says), and
+//! `--jit-threshold` sets how often a block runs before it is compiled: the fingerprints must not change.
 //!
 //! `--no-lanes` has the hydrophones of robots in water sum their paths one at a time (`Hydrophone::lanes` off, the
 //! reference): the fingerprints must not change.
@@ -374,6 +379,18 @@ fn run(
                 }
             }
             let (wall, cpu) = (wall.elapsed(), cpu_time().zip(cpu).map(|(b, a)| b - a));
+            if STATS.load(std::sync::atomic::Ordering::Relaxed) {
+                let s = cpu_armv6m::CortexM0Plus::jit_stats();
+                eprintln!(
+                    "{}: {} regions ({} blocks) compiled in {:?}, {} KiB of code, {} refused (in the process so far)",
+                    case.name,
+                    s.regions,
+                    s.blocks,
+                    s.compile_time,
+                    s.code_bytes >> 10,
+                    s.refused
+                );
+            }
             hash_session(&mut h, &b.session);
             for (t, m) in b.messages() {
                 t.hash(&mut h);
@@ -612,6 +629,9 @@ fn main() {
             "--coverage" => coverage = true,
             "--stats" => STATS.store(true, std::sync::atomic::Ordering::Relaxed),
             "--no-lanes" => NO_LANES.store(true, std::sync::atomic::Ordering::Relaxed),
+            "--jit" => cpu_armv6m::set_jit_default(true),
+            "--no-jit" => cpu_armv6m::set_jit_default(false),
+            "--jit-threshold" => cpu_armv6m::set_jit_threshold_default(value().parse().expect("--jit-threshold N")),
             "--checkpoint-memory" => budget = value().parse::<usize>().expect("--checkpoint-memory MB") << 20,
             "--bench" => {} // passed by `cargo bench`-style runners
             other => panic!("unknown argument {other} (--time T, --repeat N, --only a,b, --threads N)"),

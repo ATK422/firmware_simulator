@@ -6,17 +6,18 @@ members = [".", "crates/*"]
 edition = "2024"
 version = "0.1.0"
 license = "MIT"
-rust-version = "1.88"
+rust-version = "1.97"
 
 [workspace.dependencies]
 sim_core = { path = "crates/sim_core" }
-cpu_armv6m = { path = "crates/cpu_armv6m" }
+# (The JIT is the root package's and sim_test's `jit` feature, on by default: a build without it leaves Cranelift out)
+cpu_armv6m = { path = "crates/cpu_armv6m", default-features = false }
 rp2040 = { path = "crates/rp2040" }
 sim_devices = { path = "crates/sim_devices" }
 sim_acoustics = { path = "crates/sim_acoustics" }
 sim_physics = { path = "crates/sim_physics" }
 sim_host = { path = "crates/sim_host" }
-sim_test = { path = "crates/sim_test" }
+sim_test = { path = "crates/sim_test", default-features = false }
 sim_calib = { path = "crates/sim_calib" }
 log = "0.4"
 object = { version = "0.36", default-features = false, features = ["read_core", "elf", "std"] }
@@ -30,8 +31,14 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
+[features]
+default = ["jit"]
+# The Cranelift JIT for the Cortex-M0+ cores (`--jit`); `--no-default-features` builds without Cranelift
+jit = ["cpu_armv6m/jit", "sim_test/jit"]
+
 [dependencies]
 sim_core.workspace = true
+cpu_armv6m.workspace = true
 rp2040.workspace = true
 sim_host.workspace = true
 sim_devices.workspace = true

@@ -1,8 +1,9 @@
 //! The CPU's engines run real firmware alike: board images run on two machines in lockstep, one with each engine,
 //! and the machines are compared every half millisecond of virtual time: every core register, the exception, NVIC,
 //! SysTick and SCB state, cycle and instruction counts, each core's clock, SRAM, and what the board logged and
-//! printed. Engines: the interpreter in batches, decoded blocks in batches (the default), and single steps (a
-//! breakpoint that is never reached turns batching off, see `crates/rp2040/tests/batching.rs`).
+//! printed. Engines: the interpreter in batches, decoded blocks in batches (the default), decoded blocks compiled by
+//! the JIT, and single steps (a breakpoint that is never reached turns batching off, see
+//! `crates/rp2040/tests/batching.rs`).
 //!
 //! The Rust IVCBoard2 (titan_firmware_rs) and, with `TITAN_FIRMWARE_DIR` set, titan_firmware's C IVCBoard2 booted
 //! through the bootrom and its bootloader.
@@ -15,6 +16,12 @@ type Engine = (&'static str, fn(&mut Machine));
 
 const INTERPRETER: Engine = ("interpreter", |m| m.cores.iter_mut().for_each(|c| c.decode_blocks = false));
 const BLOCKS: Engine = ("blocks", |m| m.cores.iter_mut().for_each(|c| c.decode_blocks = true));
+const COMPILED: Engine = ("compiled", |m| {
+    for c in &mut m.cores {
+        // (Early, so that nearly every block runs compiled)
+        (c.decode_blocks, c.jit, c.jit_threshold, c.jit_sync) = (true, true, 2, true);
+    }
+});
 const STEPPED: Engine = ("stepped", |m| {
     // Never reached (instructions are halfword aligned), but makes the run loop step every instruction
     m.breakpoints.insert(0xFFFF_FFF1);
@@ -95,4 +102,22 @@ fn c_ivc_board2_runs_alike_interpreted_and_decoded() {
 fn c_ivc_board2_runs_alike_stepped_and_decoded() {
     let Some(make) = c_ivc() else { return };
     lockstep("IVCBoard2 (C)", &make, STEPPED, BLOCKS, Time::from_ms(150), HALF_MS);
+}
+
+#[test]
+fn rust_ivc_board2_runs_alike_decoded_and_compiled() {
+    let Some(make) = rust_ivc() else { return };
+    lockstep("IVCBoard2", &make, BLOCKS, COMPILED, Time::from_ms(1000), HALF_MS);
+}
+
+#[test]
+fn c_ivc_board2_runs_alike_decoded_and_compiled() {
+    let Some(make) = c_ivc() else { return };
+    lockstep("IVCBoard2 (C)", &make, BLOCKS, COMPILED, Time::from_ms(1300), HALF_MS);
+}
+
+#[test]
+fn rust_ivc_board2_runs_alike_stepped_and_compiled() {
+    let Some(make) = rust_ivc() else { return };
+    lockstep("IVCBoard2", &make, STEPPED, COMPILED, Time::from_ms(150), HALF_MS);
 }

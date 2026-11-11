@@ -3,7 +3,7 @@
 //! time), read the time, stall, switch the flash's fast path off and ask for the machine's attention. Every data
 //! access is logged with its time, so that two engines can be compared access by access.
 
-use sim_core::bus::{Bus, BusFault, Size, mem};
+use sim_core::bus::{Bus, BusFault, DirectMemory, DirectRegion, Size, mem};
 
 pub(crate) const ROM_BASE: u32 = 0x0000_0000;
 pub(crate) const ROM_SIZE: u32 = 0x4000;
@@ -77,6 +77,13 @@ pub(crate) struct DiffBus {
     pub ref_seen: Option<u64>,
     /// SRAM handed out for writing ([`Bus::ram`]) and not yet logged: logged before the next access.
     pending: Option<(u32, u32, u64)>,
+    /// Marks as a machine's bus keeps them (the RP2040's `noisy` and `xip_failed`): set by an SRAM write and by a
+    /// flash read or fetch, cleared by any access to the test registers.
+    pub noisy: u8,
+    pub flash_seen: u8,
+    /// Whether compiled code may access SRAM, ROM and flash directly ([`Bus::direct_memory`]), and the windows.
+    pub direct: bool,
+    windows: DirectMemory,
 }
 
 impl DiffBus {
@@ -98,6 +105,10 @@ impl DiffBus {
             tick_period: 0,
             ref_seen: None,
             pending: None,
+            noisy: 0,
+            flash_seen: 0,
+            direct: true,
+            windows: DirectMemory::NONE,
         }
     }
 
@@ -150,8 +161,8 @@ impl DiffBus {
     /// Everything about the bus but its memory and log, for comparing two runs.
     pub fn state(&self) -> String {
         format!(
-            "lines {:#x} events {:?} regs {:x?} xip {} ref {:?} stall {}",
-            self.lines, self.events, self.regs, self.xip, self.ref_seen, self.stall
+            "lines {:#x} events {:?} regs {:x?} xip {} ref {:?} stall {} noisy {} flash {}",
+            self.lines, self.events, self.regs, self.xip, self.ref_seen, self.stall, self.noisy, self.flash_seen
         )
     }
 
@@ -170,8 +181,11 @@ impl DiffBus {
 
     /// Where code is fetched from without checks: ROM, SRAM, and flash while its fast path is on.
     fn code(&mut self, addr: u32) -> Option<&mut [u8]> {
-        if addr.wrapping_sub(FLASH_BASE) < FLASH_SIZE && !self.xip {
-            return None;
+        if addr.wrapping_sub(FLASH_BASE) < FLASH_SIZE {
+            if !self.xip {
+                return None;
+            }
+            self.flash_seen = 1;
         }
         self.region(addr).map(|(b, o)| &mut b[o..]).filter(|b| b.len() >= 2)
     }
@@ -194,6 +208,7 @@ impl DiffBus {
 
     fn reg_read(&mut self, addr: u32, size: Size) -> u32 {
         self.slow = true;
+        (self.noisy, self.flash_seen) = (0, 0);
         let off = addr & (REGS_SIZE - 4);
         let word = match off {
             reg::IRQ_SET => self.lines,
@@ -213,6 +228,7 @@ impl DiffBus {
 
     fn reg_write(&mut self, addr: u32, size: Size, value: u32) {
         self.slow = true;
+        (self.noisy, self.flash_seen) = (0, 0);
         let off = addr & (REGS_SIZE - 4);
         let v = mem::replicate(value, size);
         match off {
@@ -240,9 +256,12 @@ impl Bus for DiffBus {
         let value = if addr.wrapping_sub(REGS_BASE) < REGS_SIZE {
             self.reg_read(addr, size)
         } else {
-            if addr.wrapping_sub(FLASH_BASE) < FLASH_SIZE && !self.xip {
-                self.slow = true;
-                self.stall += 1;
+            if addr.wrapping_sub(FLASH_BASE) < FLASH_SIZE {
+                self.flash_seen = 1;
+                if !self.xip {
+                    self.slow = true;
+                    self.stall += 1;
+                }
             }
             let (b, o) = self.region(addr).ok_or(BusFault::Unmapped(addr))?;
             mem::read(b, o, size)
@@ -263,6 +282,7 @@ impl Bus for DiffBus {
             // ROM and flash reject writes
             return Err(if self.region(addr).is_some() { BusFault::Rejected(addr) } else { BusFault::Unmapped(addr) });
         }
+        self.noisy = 1;
         let (b, o) = self.region(addr).ok_or(BusFault::Unmapped(addr))?;
         mem::write(b, o, size, value);
         Ok(())
@@ -270,9 +290,12 @@ impl Bus for DiffBus {
 
     fn fetch16(&mut self, addr: u32) -> Result<u16, BusFault> {
         self.flush();
-        if addr.wrapping_sub(FLASH_BASE) < FLASH_SIZE && !self.xip {
-            self.slow = true;
-            self.stall += 1;
+        if addr.wrapping_sub(FLASH_BASE) < FLASH_SIZE {
+            self.flash_seen = 1;
+            if !self.xip {
+                self.slow = true;
+                self.stall += 1;
+            }
         }
         let (b, o) = self.region(addr).ok_or(BusFault::Unmapped(addr))?;
         b.get(o..o + 2).map(|h| u16::from_le_bytes([h[0], h[1]])).ok_or(BusFault::Unmapped(addr))
@@ -300,6 +323,7 @@ impl Bus for DiffBus {
         }
         let at = self.now();
         if write {
+            self.noisy = 1;
             self.pending = Some((addr, len, at));
         } else {
             for k in 0..len / 4 {
@@ -320,6 +344,41 @@ impl Bus for DiffBus {
 
     fn take_attention(&mut self) -> bool {
         std::mem::take(&mut self.attention)
+    }
+
+    /// SRAM (writes set `noisy`), ROM, and flash while its fast path is on (reads set `flash_seen`), unless switched
+    /// off. (Logging what compiled code reads and writes there is the CPU's business: see the tests' `Sim`, which
+    /// turns them off where the access log is compared.)
+    fn direct_memory(&mut self) -> Option<&DirectMemory> {
+        if !self.direct {
+            return None;
+        }
+        let window = |base: u32, size: u32, mem: &mut Vec<u8>| DirectRegion {
+            base,
+            size,
+            mask: u32::MAX,
+            len: mem.len() as u32,
+            ptr: mem.as_mut_ptr(),
+            ..DirectRegion::NONE
+        };
+        let sram = DirectRegion {
+            writable: 1,
+            write_mark: &raw mut self.noisy,
+            write_value: 1,
+            ..window(SRAM_BASE, SRAM_SIZE, &mut self.sram)
+        };
+        let rom = window(ROM_BASE, ROM_SIZE, &mut self.rom);
+        let flash = if self.xip {
+            DirectRegion {
+                read_mark: &raw mut self.flash_seen,
+                read_value: 1,
+                ..window(FLASH_BASE, FLASH_SIZE, &mut self.flash)
+            }
+        } else {
+            DirectRegion::NONE
+        };
+        self.windows = DirectMemory { regions: [sram, flash, rom, DirectRegion::NONE] };
+        Some(&self.windows)
     }
 
     fn take_reference_ticks(&mut self) -> u64 {

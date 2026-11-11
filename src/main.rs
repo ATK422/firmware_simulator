@@ -25,6 +25,13 @@ mod scenario_cli;
 struct Cli {
     #[command(subcommand)]
     command: Command,
+    /// Runs the CPU cores' hot code compiled to native code (the JIT, on x86-64 and aarch64 hosts; elsewhere the
+    /// cores interpret). Off by default; runs are the same either way. `SIM_JIT=1` turns it on too
+    #[arg(long, global = true, conflicts_with = "no_jit")]
+    jit: bool,
+    /// Interprets every instruction, whatever `SIM_JIT` says
+    #[arg(long, global = true)]
+    no_jit: bool,
 }
 
 // Parsed once; the size difference between the subcommands' arguments doesn't matter
@@ -1695,10 +1702,15 @@ fn main() -> Result<()> {
     // Scenario runs print their own report; the emulator's notes (faults applied, ...) would only interleave with it
     let quiet = matches!(cli.command, Command::Scenario(_) | Command::Compare(_) | Command::Fuzz(_));
     let level = if quiet { "error" } else { "info" };
-    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or(level)).format_timestamp(None).init();
+    // (Cranelift, the JIT's code generator, logs each function it compiles at info)
+    let filter = format!("{level},cranelift_jit=warn,cranelift_codegen=warn,cranelift_frontend=warn");
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or(filter)).format_timestamp(None).init();
     if matches!(cli.command, Command::Run(_) | Command::Robot(_) | Command::Picoboot(_)) {
         // SIGINT and SIGTERM end a run the way reaching its time does (flash file saved, logs and trailers written)
         sim_host::signal::install().context("catching SIGINT and SIGTERM")?;
+    }
+    if cli.jit || cli.no_jit {
+        cpu_armv6m::set_jit_default(cli.jit);
     }
     let result = run_command(cli.command);
     if result.is_ok()

@@ -103,6 +103,7 @@ differ by roughly the boot time.
 | `--dashboard ADDR`, `--dashboard-hold`, `--dashboard-pause-at T` | | Serves a live dashboard with fault, input and pause controls |
 | `--log-json FILE` | | Writes every log line, UART and USB line, CAN frame and fault as JSON lines |
 | `--unmodelled MODE` | `summary` | Logging of registers the emulator does not model: `summary` (one note at the first access, the table at the end), `first` (a warning at the first access to each, and the table), `every` (a warning at every access) or `off` (nothing) |
+| `--jit`, `--no-jit` | off (`SIM_JIT=1`: on) | Runs the cores' hot code compiled to native code (x86-64 and aarch64 hosts; elsewhere they interpret), or interprets every instruction. Runs are the same either way ([internals.md](internals.md#the-run-loop)); any subcommand takes them |
 | `--quantum N` | 16 | Instructions a core runs before the other gets a turn (1 for lockstep debugging) |
 | `--stop-on-bkpt` | off | A `BKPT` stops the run instead of escalating to HardFault |
 | `--stop-on-lockup` | off | A lockup stops the run, instead of the board running on (locked up) until the watchdog resets it ([faults.md](faults.md#what-the-models-do)) |

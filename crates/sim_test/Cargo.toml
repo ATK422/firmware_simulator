@@ -5,6 +5,11 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
+[features]
+default = ["jit"]
+# The Cranelift JIT for the cores (the bench's `--jit`)
+jit = ["cpu_armv6m/jit"]
+
 [dependencies]
 sim_core.workspace = true
 rp2040.workspace = true

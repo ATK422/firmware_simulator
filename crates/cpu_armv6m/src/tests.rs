@@ -15,6 +15,7 @@ const STACK_TOP: u32 = RAM + 0x8000;
 const VECTORS: u32 = 0x0000_0000;
 const HANDLER: u32 = 0x0000_1000;
 
+#[derive(Clone)]
 struct TestBus {
     rom: Vec<u8>,
     ram: Vec<u8>,
@@ -245,8 +246,11 @@ impl Rig {
         self.cpu.step(&mut self.bus)
     }
 
-    /// Runs `n` steps, asserting each executes.
+    /// Runs `n` steps, asserting each executes. The same steps also run on a copy in batches of compiled blocks
+    /// ([`crate::jit`]), which must end in the same state: every test that runs instructions this way checks the
+    /// JIT too.
     fn run(&mut self, n: usize) -> u32 {
+        let mut jitted = Rig { cpu: self.cpu.clone(), bus: self.bus.clone() };
         let mut total = 0;
         for _ in 0..n {
             match self.step() {
@@ -254,6 +258,24 @@ impl Rig {
                 other => panic!("unexpected {other:?} at {:#x}", self.cpu.pc()),
             }
         }
+        (jitted.cpu.jit, jitted.cpu.jit_threshold, jitted.cpu.decode_blocks, jitted.cpu.jit_sync) =
+            (true, 0, true, true);
+        let mut left = n as u32;
+        while left > 0 {
+            let mut bus = CodeBus(&mut jitted.bus);
+            let b = jitted.cpu.run_batch(&mut bus, left, u64::MAX, 0);
+            assert_eq!(b.stop, None, "compiled at {:#x}", jitted.cpu.pc());
+            if b.steps > 0 {
+                left -= b.steps;
+            } else {
+                // An exception entry (a batch stops before one)
+                let out = jitted.cpu.step_on(&mut bus);
+                assert!(matches!(out, StepOutcome::Ran(_)), "compiled: {out:?} at {:#x}", jitted.cpu.pc());
+                left -= 1;
+            }
+        }
+        assert_eq!(core_state(&jitted.cpu), core_state(&self.cpu), "compiled, after {n} steps");
+        assert_eq!((&jitted.bus.ram, &jitted.bus.writes), (&self.bus.ram, &self.bus.writes), "compiled");
         total
     }
 
@@ -1309,15 +1331,51 @@ impl XorShift {
 
 /// Everything about a core but its block cache.
 fn core_state(cpu: &CortexM0Plus) -> String {
-    let mut c = cpu.clone();
-    c.decode_blocks = true;
-    format!("{c:?}")
+    cpu.comparable_state()
 }
 
 /// Runs a batch on `rig` with or without decoded blocks.
 fn batch_on(rig: &mut Rig, blocks: bool, max_steps: u32, budget: u64) -> crate::Batch {
     rig.cpu.decode_blocks = blocks;
+    rig.cpu.jit = false;
     rig.cpu.run_batch(&mut CodeBus(&mut rig.bus), max_steps, budget, 0)
+}
+
+/// Runs a batch on `rig` with decoded blocks compiled once they ran whole `threshold` times.
+fn batch_jit(rig: &mut Rig, threshold: u32, max_steps: u32, budget: u64) -> crate::Batch {
+    (rig.cpu.decode_blocks, rig.cpu.jit, rig.cpu.jit_threshold, rig.cpu.jit_sync) = (true, true, threshold, true);
+    rig.cpu.run_batch(&mut CodeBus(&mut rig.bus), max_steps, budget, 0)
+}
+
+/// A way of running the instructions of a test.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Mode {
+    /// `steps` single steps ([`Rig::run`], which also checks the compiled run).
+    Step,
+    /// One batch of `max_steps` and `budget`, interpreted, decoded or compiled from the first time.
+    Interpreted,
+    Decoded,
+    Compiled,
+}
+
+impl Mode {
+    /// Runs `rig` this way; returns the cycles taken.
+    fn run(self, rig: &mut Rig, steps: usize, max_steps: u32, budget: u64) -> u64 {
+        match self {
+            Mode::Step => rig.run(steps) as u64,
+            Mode::Interpreted => batch_on(rig, false, max_steps, budget).cycles,
+            Mode::Decoded => batch_on(rig, true, max_steps, budget).cycles,
+            Mode::Compiled => batch_jit(rig, 0, max_steps, budget).cycles,
+        }
+    }
+}
+
+/// `batch_on` for a mode: interpreted (`Some(false)`), decoded (`Some(true)`) or compiled (`None`).
+fn batch_mode(rig: &mut Rig, mode: Option<bool>, max_steps: u32, budget: u64) -> crate::Batch {
+    match mode {
+        Some(blocks) => batch_on(rig, blocks, max_steps, budget),
+        None => batch_jit(rig, 0, max_steps, budget),
+    }
 }
 
 /// Random register state: plain random values, or (`mem`) addresses in RAM for loads, stores and the stack.
@@ -1370,6 +1428,56 @@ fn every_16_bit_encoding_runs_as_decoded_as_interpreted() {
         }
     }
     assert_eq!(interp.bus.ram, decoded.bus.ram);
+}
+
+#[test]
+fn every_16_bit_encoding_runs_compiled_as_decoded() {
+    // Each encoding at the start of a block that runs whole (the instruction, a second halfword for 32-bit
+    // encodings, two more instructions and a branch to itself), compiled from its first run, against the block
+    // executor, from random states: in RAM or not, in thread and in handler mode
+    let mut decoded = Rig::new(&[NOP]);
+    let mut jitted = Rig::new(&[NOP]);
+    decoded.handler(exception::SVCALL, HANDLER, &[NOP]);
+    jitted.handler(exception::SVCALL, HANDLER, &[NOP]);
+    let start = decoded.cpu.clone();
+    let mut rng = XorShift(0x0717_C0DE_5EED_0001);
+    for ins in 0..=0xFFFFu32 {
+        let code = [ins as u16, (ins.wrapping_mul(0x9E37) >> 3) as u16, movs(0, 1), adds_i8(0, 1), b(-2)];
+        for trial in 0..3 {
+            let mut cpu = start.clone();
+            random_state(&mut cpu, &mut rng, trial != 1);
+            if trial == 2 {
+                cpu.ipsr = 16;
+                cpu.active |= 1 << 16;
+                cpu.r[1] = 0xFFFF_FFF9;
+            }
+            for rig in [&mut decoded, &mut jitted] {
+                rig.bus.load_code(CODE, &code);
+                // (The compiled code of the block is kept from one trial to the next)
+                let blocks = std::mem::take(&mut rig.cpu.blocks);
+                rig.cpu = cpu.clone();
+                rig.cpu.blocks = blocks;
+                rig.cpu.r[15] = CODE;
+                rig.bus.writes.clear();
+            }
+            let a = batch_on(&mut decoded, true, 5, u64::MAX);
+            let b = batch_jit(&mut jitted, 0, 5, u64::MAX);
+            assert_eq!(a, b, "{ins:#06x} trial {trial}");
+            assert_eq!(core_state(&decoded.cpu), core_state(&jitted.cpu), "{ins:#06x} trial {trial}");
+            assert_eq!(decoded.bus.writes, jitted.bus.writes, "{ins:#06x} trial {trial}");
+        }
+    }
+    assert_eq!(decoded.bus.ram, jitted.bus.ram);
+    let stats = CortexM0Plus::jit_stats();
+    let compiled = stats.regions;
+    eprintln!("{compiled} regions compiled in {:?}, {} refused", stats.compile_time, stats.refused);
+    // (None refused for want of memory: they would run decoded, silently but for a warning)
+    assert_eq!(stats.refused, 0);
+    // (Where Cranelift has no code generator nothing is compiled, and the blocks run decoded)
+    assert!(
+        compiled > 60_000 || !cfg!(all(feature = "jit", any(target_arch = "x86_64", target_arch = "aarch64"))),
+        "{compiled} compiled"
+    );
 }
 
 #[test]
@@ -1445,19 +1553,25 @@ fn random_programs_run_as_decoded_as_interpreted() {
         let mut decoded = Rig { cpu: interp.cpu.clone(), bus: TestBus::new() };
         decoded.bus.rom = interp.bus.rom.clone();
         decoded.bus.ram = interp.bus.ram.clone();
+        let mut jitted = Rig { cpu: interp.cpu.clone(), bus: decoded.bus.clone() };
         for batch in 0..60 {
             let max_steps = 1 + rng.next() % 24;
             let budget = (rng.next() % 40) as u64;
             let x = batch_on(&mut interp, false, max_steps, budget);
             let y = batch_on(&mut decoded, true, max_steps, budget);
+            let z = batch_jit(&mut jitted, 1, max_steps, budget);
             assert_eq!(x, y, "program {program} batch {batch}");
+            assert_eq!(x, z, "program {program} batch {batch} compiled");
             assert_eq!(core_state(&interp.cpu), core_state(&decoded.cpu), "program {program} batch {batch}");
+            assert_eq!(core_state(&interp.cpu), core_state(&jitted.cpu), "program {program} batch {batch} compiled");
             assert_eq!(interp.bus.writes, decoded.bus.writes, "program {program} batch {batch}");
+            assert_eq!(interp.bus.writes, jitted.bus.writes, "program {program} batch {batch} compiled");
             if interp.cpu.ipsr() != 0 {
                 break;
             }
         }
         assert_eq!(interp.bus.ram, decoded.bus.ram, "program {program}");
+        assert_eq!(interp.bus.ram, jitted.bus.ram, "program {program} compiled");
     }
 }
 
@@ -1504,19 +1618,25 @@ fn loops_within_a_block_run_as_decoded_as_interpreted() {
         let mut decoded = Rig { cpu: interp.cpu.clone(), bus: TestBus::new() };
         decoded.bus.rom = interp.bus.rom.clone();
         decoded.bus.ram = interp.bus.ram.clone();
+        let mut jitted = Rig { cpu: interp.cpu.clone(), bus: decoded.bus.clone() };
         for batch in 0..4 {
             let max_steps = 1 + rng.next() % 400;
             let budget = 1 + (rng.next() % 800) as u64;
             let x = batch_on(&mut interp, false, max_steps, budget);
             let y = batch_on(&mut decoded, true, max_steps, budget);
+            let z = batch_jit(&mut jitted, 2, max_steps, budget);
             assert_eq!(x, y, "program {program} batch {batch}");
+            assert_eq!(x, z, "program {program} batch {batch} compiled");
             assert_eq!(core_state(&interp.cpu), core_state(&decoded.cpu), "program {program} batch {batch}");
+            assert_eq!(core_state(&interp.cpu), core_state(&jitted.cpu), "program {program} batch {batch} compiled");
             assert_eq!(interp.bus.writes, decoded.bus.writes, "program {program} batch {batch}");
+            assert_eq!(interp.bus.writes, jitted.bus.writes, "program {program} batch {batch} compiled");
             if interp.cpu.ipsr() != 0 {
                 break;
             }
         }
         assert_eq!(interp.bus.ram, decoded.bus.ram, "program {program}");
+        assert_eq!(interp.bus.ram, jitted.bus.ram, "program {program} compiled");
     }
 }
 
@@ -1524,7 +1644,7 @@ fn loops_within_a_block_run_as_decoded_as_interpreted() {
 fn a_store_into_the_running_block_takes_effect() {
     // In RAM: r0 points at the MOVS r2, #1 two instructions on; r1 holds MOVS r2, #7
     let code = [strh_i(1, 0, 0), NOP, movs(2, 1), adds_i8(2, 1), b(-2)];
-    for blocks in [false, true] {
+    for mode in [Some(false), Some(true), None] {
         let mut rig = Rig::new(&[NOP]);
         for (i, hw) in code.iter().enumerate() {
             let (buf, off) = rig.bus.region(RAM + 2 * i as u32).unwrap();
@@ -1534,13 +1654,13 @@ fn a_store_into_the_running_block_takes_effect() {
         rig.cpu.r[0] = RAM + 4;
         // First a run that stores what is already there, so that the block is decoded and cached
         rig.cpu.r[1] = movs(2, 1) as u32;
-        assert_eq!(batch_on(&mut rig, blocks, 4, u64::MAX).steps, 4);
+        assert_eq!(batch_mode(&mut rig, mode, 4, u64::MAX).steps, 4);
         assert_eq!(rig.r(2), 2);
         rig.cpu.r[15] = RAM;
         rig.cpu.r[1] = movs(2, 7) as u32;
-        let b = batch_on(&mut rig, blocks, 4, u64::MAX);
+        let b = batch_mode(&mut rig, mode, 4, u64::MAX);
         assert_eq!(b.steps, 4);
-        assert_eq!(rig.r(2), 8, "blocks {blocks}");
+        assert_eq!(rig.r(2), 8, "{mode:?}");
     }
 }
 
@@ -1629,32 +1749,18 @@ fn branch_to_an_even_address_faults_at_the_target() {
         assert_eq!(rig.bus.word(sp + 24), target, "stacked PC");
         assert_eq!(rig.bus.word(sp + 20), lr, "stacked LR");
     };
-    for blocks in [None, Some(false), Some(true)] {
+    for mode in [Mode::Step, Mode::Interpreted, Mode::Decoded, Mode::Compiled] {
         let mut rig = Rig::new(&[NOP, blx(1)]);
         rig.cpu.r[1] = target;
         rig.cpu.r[14] = 0x1234_5679;
-        match blocks {
-            None => {
-                rig.run(2);
-            }
-            Some(b) => {
-                batch_on(&mut rig, b, 10, 1000);
-            }
-        }
+        mode.run(&mut rig, 2, 10, 1000);
         check(&mut rig, (CODE + 4) | 1);
 
         let mut rig = Rig::new(&[NOP, pop(0b1, true)]);
         rig.cpu.r[13] = STACK_TOP - 8;
         rig.bus.set_word(STACK_TOP - 8, 7);
         rig.bus.set_word(STACK_TOP - 4, target);
-        match blocks {
-            None => {
-                rig.run(2);
-            }
-            Some(b) => {
-                batch_on(&mut rig, b, 10, 1000);
-            }
-        }
+        mode.run(&mut rig, 2, 10, 1000);
         check(&mut rig, 0xFFFF_FFFF);
         assert_eq!(rig.r(0), 7, "the POP completed");
         assert_eq!(rig.r(13), (STACK_TOP - 32) & !7, "frame pushed below the popped SP");
@@ -1664,19 +1770,16 @@ fn branch_to_an_even_address_faults_at_the_target() {
 #[test]
 fn systick_counts_the_cycles_of_a_hardfault_entry() {
     // SysTick on the core clock counts every cycle, the 15 of a fault's exception entry as those of an interrupt's
-    for blocks in [None, Some(false), Some(true)] {
+    for mode in [Mode::Step, Mode::Interpreted, Mode::Decoded, Mode::Compiled] {
         let mut rig = Rig::new(&[0xDE00, NOP]);
         rig.handler(exception::HARD_FAULT, HANDLER, &[NOP; 4]);
         rig.cpu.systick.rvr = 1000;
         rig.cpu.systick.cvr = 100;
         rig.cpu.systick.csr = 0b101;
-        let cycles = match blocks {
-            None => rig.run(1) as u64,
-            Some(b) => batch_on(&mut rig, b, 1, 1000).cycles,
-        };
+        let cycles = mode.run(&mut rig, 1, 10, 1000);
         assert_eq!(rig.cpu.ipsr(), exception::HARD_FAULT);
         assert_eq!(cycles, 15);
-        assert_eq!(rig.cpu.systick.cvr, 85, "{blocks:?}");
+        assert_eq!(rig.cpu.systick.cvr, 85, "{mode:?}");
     }
 }
 
@@ -1763,7 +1866,7 @@ impl Bus for StallBus<'_> {
 fn a_faulting_access_counts_its_stall_cycles_before_the_entry() {
     // LDR from a slow address that faults: its 3 stall cycles count before the 15 of the HardFault entry, in the step
     // that faults, not in whichever instruction next collects stall cycles; the same in batches
-    for mode in [None, Some(false), Some(true)] {
+    for (k, mode) in [None, Some(false), Some(true), Some(true)].into_iter().enumerate() {
         let mut rig = Rig::new(&[ldr_i(1, 0, 0), NOP]);
         rig.handler(exception::HARD_FAULT, HANDLER, &[NOP, NOP]);
         rig.cpu.r[0] = 0x3000_0000;
@@ -1777,7 +1880,9 @@ fn a_faulting_access_counts_its_stall_cycles_before_the_entry() {
             }
             Some(blocks) => {
                 rig.cpu.decode_blocks = blocks;
-                let b = rig.cpu.run_batch(&mut bus, 1, u64::MAX, 0);
+                // (The last time compiled: the fault ends the batch, however long it may be)
+                (rig.cpu.jit, rig.cpu.jit_threshold, rig.cpu.jit_sync) = (k == 3, 0, true);
+                let b = rig.cpu.run_batch(&mut bus, if k == 3 { 10 } else { 1 }, u64::MAX, 0);
                 assert_eq!((b.steps, b.cycles), (1, 18), "{mode:?}");
                 let b = rig.cpu.run_batch(&mut bus, 1, u64::MAX, 0);
                 assert_eq!((b.steps, b.cycles), (1, 1), "{mode:?}");
@@ -1794,22 +1899,39 @@ fn systick_counts_the_instruction_that_switches_it_as_a_step_does() {
     // A store to SYST_CSR that starts SysTick on the core clock counts its own 2 cycles, and one that stops it does
     // not: a batch, which ends after the access, does as a step
     for (csr_before, csr_after, counted) in [(0b000, 0b101, 2), (0b101, 0b000, 0)] {
-        for mode in [None, Some(false), Some(true)] {
+        for mode in [Mode::Step, Mode::Interpreted, Mode::Decoded, Mode::Compiled] {
             let mut rig = Rig::new(&[str_i(1, 0, 0), NOP]);
             rig.cpu.r[0] = crate::ppb::SYST_CSR;
             rig.cpu.r[1] = csr_after;
             rig.cpu.systick.rvr = 1000;
             rig.cpu.systick.cvr = 500;
             rig.cpu.systick.csr = csr_before;
-            match mode {
-                None => {
-                    rig.run(1);
-                }
-                Some(blocks) => {
-                    assert_eq!(batch_on(&mut rig, blocks, 10, u64::MAX).steps, 1, "a PPB access ends the batch");
-                }
-            }
+            // (A PPB access ends a batch)
+            mode.run(&mut rig, 1, 10, u64::MAX);
             assert_eq!(rig.cpu.systick.cvr, 500 - counted, "{csr_before:#b} -> {csr_after:#b} {mode:?}");
         }
     }
+}
+
+/// Copies of a core (snapshots, the boards of a robot running ahead after a rollback) start with an empty block
+/// cache, but find the code compiled for the original rather than compile it again: the same function runs.
+#[test]
+fn copies_of_a_core_share_its_compiled_code() {
+    // (A loop no other test has, so that its region is compiled here first)
+    let code = [movs(3, 0x5A), adds_i8(3, 7), adds_i8(3, 9), b(-4)];
+    let mut rig = Rig::new(&code);
+    let copy = rig.cpu.clone();
+    let mut rig2 = Rig::new(&code);
+    batch_jit(&mut rig, 0, 1000, u64::MAX);
+    let compiled = rig.cpu.blocks.compiled_at(CODE + 2);
+    // (Without a code generator nothing is compiled, and nothing shared)
+    let generator = cfg!(all(feature = "jit", any(target_arch = "x86_64", target_arch = "aarch64")));
+    assert_eq!(compiled.is_some(), generator);
+    rig2.cpu = copy;
+    assert!(rig2.cpu.blocks.compiled_at(CODE + 2).is_none());
+    // (Without compiling: `jit_sync` off, a region not yet compiled would only be asked for)
+    (rig2.cpu.decode_blocks, rig2.cpu.jit, rig2.cpu.jit_threshold, rig2.cpu.jit_sync) = (true, true, 0, false);
+    rig2.cpu.run_batch(&mut CodeBus(&mut rig2.bus), 1000, u64::MAX, 0);
+    assert_eq!(rig2.cpu.blocks.compiled_at(CODE + 2), compiled);
+    assert_eq!(core_state(&rig.cpu), core_state(&rig2.cpu));
 }
