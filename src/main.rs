@@ -1702,7 +1702,9 @@ fn main() -> Result<()> {
     // Scenario runs print their own report; the emulator's notes (faults applied, ...) would only interleave with it
     let quiet = matches!(cli.command, Command::Scenario(_) | Command::Compare(_) | Command::Fuzz(_));
     let level = if quiet { "error" } else { "info" };
-    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or(level)).format_timestamp(None).init();
+    // (Cranelift, the JIT's code generator, logs each function it compiles at info)
+    let filter = format!("{level},cranelift_jit=warn,cranelift_codegen=warn,cranelift_frontend=warn");
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or(filter)).format_timestamp(None).init();
     if matches!(cli.command, Command::Run(_) | Command::Robot(_) | Command::Picoboot(_)) {
         // SIGINT and SIGTERM end a run the way reaching its time does (flash file saved, logs and trailers written)
         sim_host::signal::install().context("catching SIGINT and SIGTERM")?;
